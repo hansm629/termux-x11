@@ -124,6 +124,8 @@ static void nativeInit(JNIEnv *env, jobject thiz) {
         MainActivity.resetIme = FindMethodOrDie(env, (*env)->GetObjectClass(env, thiz), "resetIme", "()V", JNI_FALSE);
     }
 
+    rendererInit(env);
+
     (*env)->GetJavaVM(env, &vm);
     (*vm)->AttachCurrentThread(vm, &guienv, NULL);
     globalThiz = (*guienv)->NewGlobalRef(env, thiz);
@@ -415,8 +417,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
     (*vm)->AttachCurrentThread(vm, &env, NULL);
     jclass cls = (*env)->FindClass(env, "com/termux/x11/LorieView");
     (*env)->RegisterNatives(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
-
-    rendererInit(env);
 
     return JNI_VERSION_1_6;
 }
