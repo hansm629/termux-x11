@@ -127,9 +127,12 @@ static volatile ANativeWindow* pendingWin = NULL;
 static volatile int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0, expectedW = 0, expectedH = 0;
 
 static pthread_mutex_t stateLock;
-static pthread_cond_t stateCond;
+// Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
+// (the companion mutex) doesn't need to be shared too.
+static pthread_cond_t* stateCond;
 static pthread_cond_t stateChangeFinishCond;
 static pthread_spinlock_t bufferLock;
+static int stateCondFd = -1;
 
 static volatile bool smoothPresentationEnabled = false;
 static volatile bool rendererPerfLogEnabled = false;
@@ -333,10 +336,6 @@ GLuint g_texture_program_bgra = 0, gv_pos_bgra = 0, gv_coords_bgra = 0;
 
 static void* rendererThread(void);
 
-static void pthreadCondVarProxyInit(void);
-static void* pthreadCondVarProxyThread(void* cookie);
-static void pthreadCondVarProxyListenOtherCondVar(pthread_cond_t* var);
-
 static inline __always_inline void bindTexture(GLuint id) {
     glBindTexture(GL_TEXTURE_2D, id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
@@ -453,15 +452,30 @@ void rendererInit(JNIEnv* env) {
     if (ctx)
         return;
 
-    pthreadCondVarProxyInit();
-
     pthread_mutex_init(&stateLock, NULL);
-    pthread_cond_init(&stateCond, NULL);
+
+    // Created once, never recreated; only the fd is (re)sent to the X server whenever it (re)connects.
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+    stateCondFd = LorieBuffer_createRegion("renderer-cond", sizeof(pthread_cond_t));
+    stateCond = stateCondFd == -1 ? MAP_FAILED : mmap(NULL, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, stateCondFd, 0);
+    if (stateCond == MAP_FAILED) {
+        loge("Failed to allocate renderer wakeup cond var, aborting");
+        abort();
+    }
+    pthread_cond_init(stateCond, &cond_attr);
+
     pthread_cond_init(&stateChangeFinishCond, NULL);
     pthread_spin_init(&bufferLock, false);
 
     rendererOptionsReady = true; pthread_create(&t, NULL, (void*(*)(void*)) rendererInitThread, NULL);
 }
+
+int rendererGetWakeupCondFd(void) {
+    return stateCondFd;
+}
+
 void rendererSetFiltering(JNIEnv* env, jobject self, jint f) {
     filtering = f;
 }
@@ -477,7 +491,7 @@ void rendererSetSmoothPresentationEnabled(JNIEnv* env, jobject self, jboolean en
 
     pthread_mutex_lock(&stateLock);
     presentModeChanged = true;
-    pthread_cond_signal(&stateCond);
+    pthread_cond_signal(stateCond);
     pthread_mutex_unlock(&stateLock);
 }
 
@@ -637,7 +651,7 @@ __unused void rendererSetSharedState(struct lorie_shared_server_state* newState)
     pthread_mutex_lock(&stateLock);
     pendingState = newState;
     stateChanged = true;
-    pthread_cond_signal(&stateCond);
+    pthread_cond_signal(stateCond);
 
     while(stateChanged)
         pthread_cond_wait(&stateChangeFinishCond, &stateLock);
@@ -648,7 +662,7 @@ __unused void rendererSetSharedState(struct lorie_shared_server_state* newState)
 void rendererAddBuffer(LorieBuffer* buf) {
     pthread_spin_lock(&bufferLock);
     LorieBuffer_addToList(buf, &addedBuffers);
-    pthread_cond_signal(&stateCond);
+    pthread_cond_signal(stateCond);
     pthread_spin_unlock(&bufferLock);
 }
 
@@ -704,7 +718,7 @@ void rendererSetWindow(JNIEnv *env, __unused jobject thiz, jobject jsfc) {
     expectedW = expectedH = 0;
     windowChanged = TRUE;
 
-    pthread_cond_signal(&stateCond);
+    pthread_cond_signal(stateCond);
 
     // We should wait until renderer destroys EGLSurface before SurfaceCallback::surfaceDestroyed finishes
     // Otherwise we will have weird errors like
@@ -744,7 +758,7 @@ void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int
     expectedH = eh;
     if (state)
         state->drawRequested = true;
-    pthread_cond_signal(&stateCond);
+    pthread_cond_signal(stateCond);
     pthread_mutex_unlock(&stateLock);
 }
 
@@ -1296,7 +1310,7 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
                     rendererHighRefreshLimitWaitUs = 0;
             }
 
-            pthread_cond_timedwait(&stateCond, &stateLock, &deadline);
+            pthread_cond_timedwait(stateCond, &stateLock, &deadline);
         } else {
             rendererLastPreRedrawCoalesceWaitUs = -1;
             rendererLastHighRefreshLimitWaitUs = -1;
@@ -1314,7 +1328,7 @@ __noreturn static void* rendererThread(void) {
     bool waitingForBuffers = false;
     while (true) {
         while (rendererShouldWait(&waitingForBuffers))
-            pthread_cond_wait(&stateCond, &stateLock);
+            pthread_cond_wait(stateCond, &stateLock);
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = NULL;
@@ -1333,8 +1347,6 @@ __noreturn static void* rendererThread(void) {
                 glClear(GL_COLOR_BUFFER_BIT);
                 eglSwapBuffers(egl_display, sfc);
             }
-
-            pthreadCondVarProxyListenOtherCondVar(state ? &state->cond : NULL);
 
             if (oldState)
                 munmap(oldState, sizeof(*oldState));
@@ -1460,44 +1472,3 @@ __unused static void drawCursor(float displayWidth, float displayHeight) {
     glDisable(GL_BLEND);
 }
 
-// auxillary pthread condition var proxy shenanigans
-static volatile struct {
-    pthread_mutex_t lock;
-    pthread_cond_t def, *current, *pending;
-    bool relocked;
-} proxy = { .current = &proxy.def };
-
-static void pthreadCondVarProxyInit(void) {
-    pthread_t t;
-    pthread_mutex_init(&proxy.lock, NULL);
-    pthread_cond_init(&proxy.def, NULL);
-    pthread_create(&t, NULL, pthreadCondVarProxyThread, NULL);
-}
-
-__noreturn static void* pthreadCondVarProxyThread(void* cookie) {
-    // We can not wait for two conditional variables simultaneously.
-    // But we are required to listen for both remote and local events.
-    // This thread waits for remote signals and proxies them to the local cond var.
-    pthread_setname_np(pthread_self(), "PthreadCondVarProxy");
-    pthread_mutex_lock(&proxy.lock);
-    log("pthreadCondVarProxyThread %ld started", pthread_self());
-    while (true) {
-        pthread_cond_wait(proxy.current, &proxy.lock);
-        if (proxy.pending) {
-            proxy.current = proxy.pending;
-            proxy.pending = NULL;
-        }
-        proxy.relocked = true;
-        pthread_cond_signal(&stateCond);
-    }
-}
-
-static void pthreadCondVarProxyListenOtherCondVar(pthread_cond_t* var) {
-    pthread_mutex_lock(&proxy.lock);
-    pthread_cond_broadcast(proxy.current);
-    proxy.pending = var ?: &proxy.def;
-    proxy.relocked = false;
-    while(!proxy.relocked)
-        pthread_cond_wait(&stateCond, &proxy.lock);
-    pthread_mutex_unlock(&proxy.lock);
-}
