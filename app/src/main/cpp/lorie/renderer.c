@@ -20,6 +20,7 @@
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <time.h>
 #include "list.h"
@@ -330,6 +331,20 @@ static struct {
     GLuint id;
     bool cursorChanged;
 } cursor;
+
+// FBO used to blit deferred Present "copy" entries (see lorieTryScheduleGpuCopy) into the root texture.
+static GLuint gpuCopyFbo = 0;
+
+// The renderer's end of activity.c's socket to the X server; used to notify it immediately when a
+// GPU copy batch finishes instead of it waiting for the next vblank-tick poll.
+extern volatile int conn_fd;
+
+static void notifyGpuCopyDone(void) {
+    if (conn_fd != -1) {
+        lorieEvent e = { .type = EVENT_GPU_COPY_DONE };
+        write(conn_fd, &e, sizeof(e));
+    }
+}
 
 GLuint g_texture_program = 0, gv_pos = 0, gv_coords = 0;
 GLuint g_texture_program_bgra = 0, gv_pos_bgra = 0, gv_coords_bgra = 0;
@@ -1030,6 +1045,157 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 
 
 
+// Drains the deferred GPU copy queue (filled by present_execute_copy) into the root texture via
+// an FBO. Assumes the caller holds state->lock and will flush/fence before unlocking - returns
+// the highest drained serial WITHOUT publishing it to completedSerial, since the caller must only
+// do that after the fence confirms the GPU actually finished (not just submitted) the draws;
+// publishing early would let the client's next write race our still-in-flight read.
+// Looks up a registered buffer by id, waiting briefly (bounded) if it hasn't arrived over the
+// async registration socket yet instead of busy-spinning the outer loop.
+static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
+    LorieBuffer *buf;
+    int attempt;
+
+    pthread_spin_lock(&bufferLock);
+    buf = LorieBufferList_findById(&buffers, id);
+    if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
+        LorieBuffer_attachToGL(buf);
+        LorieBuffer_addToList(buf, &buffers);
+    }
+    pthread_spin_unlock(&bufferLock);
+
+    for (attempt = 0; attempt < 20 && !buf; attempt++) {
+        usleep(5000);
+        pthread_spin_lock(&bufferLock);
+        buf = LorieBufferList_findById(&buffers, id);
+        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
+            LorieBuffer_attachToGL(buf);
+            LorieBuffer_addToList(buf, &buffers);
+        }
+        pthread_spin_unlock(&bufferLock);
+    }
+    return buf;
+}
+
+static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
+    bool fboSetUp = false;
+    uint64_t lastSerial = 0;
+    uint64_t boundDstId = 0;
+    GLint prevViewport[4];
+
+    if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
+        return 0;
+
+    while (state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex) {
+        LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        LorieBuffer *src = rendererFindBufferWithRetry(entry.srcBufferId);
+        LorieBuffer *dst = rendererFindBufferWithRetry(entry.dstBufferId);
+
+        if (!src)
+            log("rendererApplyPendingGpuCopies: source buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.srcBufferId);
+        if (!dst)
+            log("rendererApplyPendingGpuCopies: destination buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.dstBufferId);
+
+        if (src && dst) {
+            const LorieBuffer_Desc *srcDesc = LorieBuffer_description(src);
+            const LorieBuffer_Desc *dstDesc = LorieBuffer_description(dst);
+            int i;
+
+            if (!fboSetUp) {
+                glGetIntegerv(GL_VIEWPORT, prevViewport);
+                if (!gpuCopyFbo)
+                    glGenFramebuffers(1, &gpuCopyFbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, gpuCopyFbo);
+                fboSetUp = true;
+            }
+            // Different entries can target different pixmaps (root, or a Composite-redirected
+            // window's own backing pixmap); only rebind the FBO's attachment when it changes.
+            if (boundDstId != entry.dstBufferId) {
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, LorieBuffer_getGLTextureId(dst), 0);
+                glViewport(0, 0, dstDesc->width, dstDesc->height);
+                boundDstId = entry.dstBufferId;
+
+                // Diagnostic: GLES2 has no glGetTexLevelParameteriv, so ask the AHardwareBuffer
+                // itself what it was actually allocated as, instead of trusting our own desc.
+                {
+                    static uint64_t dstSizeLogCount = 0;
+                    if (lorieDebugEnabled && (dstSizeLogCount++ & 15) == 0 && dstDesc->buffer) {
+                        AHardwareBuffer_Desc realDstDesc;
+                        AHardwareBuffer_describe(dstDesc->buffer, &realDstDesc);
+                        loge("gpucopy dst texId=%u real AHB size %ux%u stride=%u vs LorieBuffer desc %dx%d\n",
+                             LorieBuffer_getGLTextureId(dst), realDstDesc.width, realDstDesc.height,
+                             realDstDesc.stride, dstDesc->width, dstDesc->height);
+                    }
+                }
+            }
+
+            LorieBuffer_bindTexture(src);
+            {
+                static uint64_t srcSizeLogCount = 0;
+                if (lorieDebugEnabled && (srcSizeLogCount++ & 15) == 0 && srcDesc->buffer) {
+                    AHardwareBuffer_Desc realSrcDesc;
+                    AHardwareBuffer_describe(srcDesc->buffer, &realSrcDesc);
+                    loge("gpucopy src texId=%u real AHB size %ux%u stride=%u vs LorieBuffer desc %dx%d (stride=%d)\n",
+                         LorieBuffer_getGLTextureId(src), realSrcDesc.width, realSrcDesc.height,
+                         realSrcDesc.stride, srcDesc->width, srcDesc->height, srcDesc->stride);
+                }
+            }
+            for (i = 0; i < entry.numRects; i++) {
+                LorieGpuCopyRect r = entry.rects[i];
+                float x0 = 2.f * (float) (r.x1 + entry.xOff) / (float) dstDesc->width - 1.f;
+                float x1 = 2.f * (float) (r.x2 + entry.xOff) / (float) dstDesc->width - 1.f;
+                // FBO writes and on-screen draws use opposite y conventions here, unlike x.
+                float y0 = 1.f - 2.f * (float) (r.y1 + entry.yOff) / (float) dstDesc->height;
+                float y1 = 1.f - 2.f * (float) (r.y2 + entry.yOff) / (float) dstDesc->height;
+                // EGLImage-backed textures sample by logical width regardless of row stride;
+                // only our own CPU-uploaded LORIEBUFFER_FD texture is stride-wide.
+                float srcUvDivisor = srcDesc->type == LORIEBUFFER_FD ? (float) srcDesc->stride : (float) srcDesc->width;
+                float u0 = (float) r.x1 / srcUvDivisor;
+                float u1 = (float) r.x2 / srcUvDivisor;
+                float v0 = (float) r.y1 / (float) srcDesc->height;
+                float v1 = (float) r.y2 / (float) srcDesc->height;
+                // Only swap channels if src/dst storage formats actually differ.
+                uint8_t needsSwizzle = LorieBuffer_isRgba(src) != LorieBuffer_isRgba(dst);
+                log("rendererApplyPendingGpuCopies: rect (%d,%d)-(%d,%d) off=(%d,%d) -> ndc=(%.3f,%.3f)-(%.3f,%.3f) uv=(%.3f,%.3f)-(%.3f,%.3f) srcTex=%u dstTex=%u swizzle=%d\n",
+                    r.x1, r.y1, r.x2, r.y2, entry.xOff, entry.yOff, x0, y0, x1, y1, u0, v0, u1, v1,
+                    LorieBuffer_getGLTextureId(src), LorieBuffer_getGLTextureId(dst), needsSwizzle);
+                drawRegion(0, x0, y0, x1, y1, u0, v0, u1, v1, needsSwizzle);
+            }
+        }
+
+        lastSerial = entry.serial;
+        state->gpuCopyQueue.readIndex++;
+    }
+
+    if (fboSetUp) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    }
+    return lastSerial;
+}
+
+// Standalone entry point used by the renderer thread's main loop. Used when no redraw is going to
+// happen on this tick (rare for GPU copies in practice, since scheduling one also marks damage
+// non-empty - see lorieTryScheduleGpuCopy), so it has to take the lock and fence/unlock itself.
+static void rendererApplyPendingGpuCopies(void) {
+    uint64_t serial;
+    if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
+        return;
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    serial = rendererApplyPendingGpuCopiesLocked();
+    if (serial) {
+        EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+        glFlush();
+        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+        eglDestroySyncKHR(egl_display, fence);
+        // Only now that the GPU has actually finished (not just been told to start) is it safe to
+        // let present_execute_copy release/idle the source pixmap back to the client.
+        state->gpuCopyQueue.completedSerial = serial;
+        notifyGpuCopyDone();
+    }
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+}
+
 void rendererRedrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
@@ -1078,6 +1244,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
             state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
             desc->width, desc->height);
+        // Otherwise rendererShouldWait sees drawRequested still set and busy-spins retrying this
+        // same mismatch instead of waiting for the next real trigger (e.g. the pending resize).
+        state->drawRequested = FALSE;
         return;
     }
 
@@ -1104,13 +1273,15 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     // We should signal X server to not use root window while we actively copy it
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    // Share this draw's flush+fence below instead of a separate round trip per frame.
+    uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
     draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
-    if (rootFenceWaitEnabled) {
+    if (rootFenceWaitEnabled || gpuCopySerial) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
     }
@@ -1128,7 +1299,11 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     drawCursor((float) (LorieBuffer_getWidth(buffer)), (float) (LorieBuffer_getHeight(buffer)));
     glFlush();
 
-    /* Wait until root window drawing is finished before giving control back to X server. */ if (rootFenceWaitEnabled && fence != EGL_NO_SYNC_KHR) {
+    /* Wait until root window drawing is finished before giving control back to X server.
+     * A GPU copy applied above is only complete once this fence signals, so a frame that carries
+     * one waits even with the root fence wait turned off; otherwise the X server could hand the
+     * source pixmap back to its client while the GPU still reads it. */
+    if (fence != EGL_NO_SYNC_KHR) {
         if (rendererPerfLogEnabled) {
             int64_t waitStartNs = rendererNowNs();
             eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
@@ -1139,6 +1314,10 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
         eglDestroySyncKHR(egl_display, fence);
         fence = EGL_NO_SYNC_KHR;
+    }
+    if (gpuCopySerial) {
+        state->gpuCopyQueue.completedSerial = gpuCopySerial;
+        notifyGpuCopyDone();
     }
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
@@ -1246,11 +1425,12 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
 static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     static uint64_t lastRequestedBufferId = 0;
-    bool buffersChanged;
+    bool buffersChanged, gpuCopyPending;
     pthread_spin_lock(&bufferLock);
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
-    if (stateChanged || windowChanged || buffersChanged)
+    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
+    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending)
         // If there are pending changes we should process them immediately.
         return false;
 
@@ -1364,9 +1544,14 @@ __noreturn static void* rendererThread(void) {
         pthread_cond_signal(&stateChangeFinishCond);
         pthread_mutex_unlock(&stateLock);
 
+        // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
+        // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
+        bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
         if (state && state->surfaceAvailable && !state->waitForNextFrame &&
-            (state->drawRequested || state->cursor.moved || state->cursor.updated)) {
-rendererRedrawLocked(&waitingForBuffers);
+            (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
+            rendererRedrawLocked(&waitingForBuffers);
+        } else if (gpuCopyPending) {
+            rendererApplyPendingGpuCopies();
         }
 
         pthread_spin_lock(&bufferLock);
