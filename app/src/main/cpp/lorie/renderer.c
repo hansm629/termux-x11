@@ -798,6 +798,7 @@ void rendererRefreshContext(void) {
         eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx);
         if (state)
             state->surfaceAvailable = false;
+        notifyGpuCopyDone(); // Wake up any GPU copy stuck waiting on a surface we no longer have.
         return;
     }
 
@@ -808,6 +809,7 @@ void rendererRefreshContext(void) {
     if (eglMakeCurrent(egl_display, sfc, sfc, ctx) != EGL_TRUE) {
         if (state)
             state->surfaceAvailable = false;
+        notifyGpuCopyDone();
         return vprintEglError("eglMakeCurrent failed", __LINE__);
     }
 
