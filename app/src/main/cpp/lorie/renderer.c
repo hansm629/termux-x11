@@ -824,6 +824,7 @@ void rendererRefreshContext(void) {
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
+static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
 static void drawCursor(float displayWidth, float displayHeight);
 
 
@@ -1617,6 +1618,32 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
     glDeleteProgram(program);
 
     return 0;
+}
+
+// Like draw(), with explicit texture coordinates: the GPU-offloaded Present copies sample a
+// sub-rectangle of their source (from upstream 4d5af156, which this branch does not carry).
+static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {
+    float coords[16] = {
+        x0, -y0, u0, v0,
+        x1, -y0, u1, v0,
+        x0, -y1, u0, v1,
+        x1, -y1, u1, v1,
+    };
+
+    GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
+
+    glActiveTexture(GL_TEXTURE0);
+    glUseProgram(flip ? g_texture_program_bgra : g_texture_program);
+    if (id)
+        glBindTexture(GL_TEXTURE_2D, id);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
+    glVertexAttribPointer(p, 2, GL_FLOAT, GL_FALSE, 16, coords);
+    glVertexAttribPointer(c, 2, GL_FLOAT, GL_FALSE, 16, &coords[2]);
+    glEnableVertexAttribArray(p);
+    glEnableVertexAttribArray(c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip) {
