@@ -28,6 +28,7 @@ import android.view.KeyEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.WindowInsets;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.CompletionInfo;
 import android.view.inputmethod.CorrectionInfo;
@@ -664,6 +665,25 @@ private boolean isDesktopModeOutputProfileActive(android.content.SharedPreferenc
          * available yet but the system reports Desktop Mode.
          */
         return com.termux.x11.utils.DesktopModeOutputHelper.isDesktopMode(getContext());
+    }
+
+    /** Shows or hides the soft keyboard for this view, the same way focusing an editable field would. */
+    public void setKeyboardVisible(boolean visible) {
+        if (visible) {
+            requestFocus();
+            mIMM.showSoftInput(this, 0);
+        } else
+            mIMM.hideSoftInputFromWindow(getWindowToken(), 0);
+    }
+
+    public void toggleKeyboardVisible() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsets insets = getRootWindowInsets();
+            setKeyboardVisible(insets == null || !insets.isVisible(WindowInsets.Type.ime()));
+        } else {
+            requestFocus();
+            mIMM.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
+        }
     }
 
 void getDimensionsFromSettings(int width, int height) {

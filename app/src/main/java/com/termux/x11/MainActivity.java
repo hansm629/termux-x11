@@ -1000,15 +1000,15 @@ private void runTermuxCommandFromTopApp(Intent intent) {
      */
     public static void toggleKeyboardVisibility(Context context) {
         Log.d("MainActivity", "Toggling keyboard visibility");
-        if(inputMethodManager != null) {
-            android.util.Log.d("toggleKeyboardVisibility", "externalKeyboardConnected " + externalKeyboardConnected + " showIMEWhileExternalConnected " + showIMEWhileExternalConnected);
-            if (!externalKeyboardConnected || showIMEWhileExternalConnected)
-                inputMethodManager.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
-            else
-                inputMethodManager.hideSoftInputFromWindow(getInstance().getWindow().getDecorView().getRootView().getWindowToken(), 0);
+        android.util.Log.d("toggleKeyboardVisibility", "externalKeyboardConnected " + externalKeyboardConnected + " showIMEWhileExternalConnected " + showIMEWhileExternalConnected);
+        LorieView view = getInstance().getLorieView();
+        if (view == null)
+            return;
 
-            getInstance().getLorieView().requestFocus();
-        }
+        if (!externalKeyboardConnected || showIMEWhileExternalConnected)
+            view.toggleKeyboardVisible();
+        else
+            view.setKeyboardVisible(false);
     }
 
     @SuppressWarnings("SameParameterValue")
