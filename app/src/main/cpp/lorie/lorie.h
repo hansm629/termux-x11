@@ -48,6 +48,7 @@ __unused void rendererSetPerfLogEnabled(JNIEnv* env, jobject self, jboolean enab
 __unused void rendererSetPostSwapTouchEnabled(JNIEnv* env, jobject self, jboolean enabled);
 __unused void rendererSetPostSwapFenceWaitEnabled(JNIEnv* env, jobject self, jboolean enabled);
 __unused void rendererSetRootFenceWaitEnabled(JNIEnv* env, jobject self, jboolean enabled);
+__unused void rendererSetSwapBackpressureGuardEnabled(JNIEnv* env, jobject self, jboolean enabled);
 __unused void rendererTestCapabilities(int* legacy_drawing);
 __unused void rendererSetWindow(JNIEnv *env, jobject thiz, jobject sfc);
 __unused void rendererSetViewport(JNIEnv *env, jclass clazz, int x, int y, int w, int h, int ew, int eh);

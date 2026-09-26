@@ -136,9 +136,10 @@
     <string name="lorie_pref_rendererRootFenceWait_summary">화면에 출력하기 전 root window draw가 끝날 때까지 기다리는 기존 동작을 유지합니다. 프레임 페이싱 테스트 용도로만 끄세요. 끄면 깜빡임, tearing, 화면 깨짐이 발생할 수 있습니다.</string>
 
     <string name="lorie_pref_rendererOutputMode">렌더러 출력 모드 (실험실)</string>
-    <string name="lorie_pref_rendererOutputMode_summary">호환성 우선 또는 게임용 빠른 출력 중 선택합니다. 게임용 모드는 고해상도 Vulkan/OpenGL 앱을 위한 실험 기능입니다.</string>
+    <string name="lorie_pref_rendererOutputMode_summary">호환성 우선은 스왑 후 추가 제출과 그 fence를 유지합니다. 게임용 빠른 출력은 둘 다 생략합니다. 페이싱 변형은 느린 스왑 뒤 몇 프레임 동안 redraw를 살짝 모아 줍니다. 게임용 모드는 실험 기능입니다.</string>
     <string-array name="lorie_pref_rendererOutputMode_entries">
         <item>호환성 우선</item>
         <item>게임용 빠른 출력</item>
+        <item>게임용 빠른 출력 (페이싱)</item>
     </string-array>
 </resources>

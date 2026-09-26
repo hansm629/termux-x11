@@ -140,6 +140,10 @@ static volatile bool rendererPerfLogEnabled = false;
 static volatile bool rendererPostSwapTouchEnabled = true;
 static volatile bool rendererPostSwapFenceWaitEnabled = true;
 static volatile bool rendererRootFenceWaitEnabled = true;
+// Deliberately delays a redraw by a millisecond or two after a slow swap. Its own flag now:
+// deriving it from the three waits above meant it silently turned itself ON in the mode that
+// asks for the lowest latency, which is the opposite of what the output modes intend.
+static volatile bool rendererSwapBackpressureGuardEnabled = false;
 static volatile bool presentModeChanged = false;
 static volatile bool rendererOptionsReady = false;
 static uint64_t rendererPerfFrameNo = 0;
@@ -537,6 +541,13 @@ void rendererSetRootFenceWaitEnabled(JNIEnv* env, jobject self, jboolean enabled
     (void) self;
 
     rendererRootFenceWaitEnabled = enabled == JNI_TRUE;
+}
+
+void rendererSetSwapBackpressureGuardEnabled(JNIEnv* env, jobject self, jboolean enabled) {
+    (void) env;
+    (void) self;
+
+    rendererSwapBackpressureGuardEnabled = enabled == JNI_TRUE;
 }
 
 
@@ -1214,7 +1225,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     bool rootFenceWaitEnabled = rendererRootFenceWaitEnabled;
     bool postSwapTouchEnabled = rendererPostSwapTouchEnabled;
     bool postSwapFenceWaitEnabled = postSwapTouchEnabled && rendererPostSwapFenceWaitEnabled;
-    bool swapBackpressureGuardEnabled = !rootFenceWaitEnabled && !postSwapTouchEnabled && !postSwapFenceWaitEnabled;
+    bool swapBackpressureGuardEnabled = rendererSwapBackpressureGuardEnabled;
     int64_t frameStartNs = rendererPerfLogEnabled ? rendererNowNs() : 0;
     int64_t rootWaitUs = rootFenceWaitEnabled ? 0 : -1;
     int64_t swapUs = 0;

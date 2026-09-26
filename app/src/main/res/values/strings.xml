@@ -145,13 +145,15 @@ E.g. <b>META</b> for <i>META key</i>, \n
     <string name="lorie_pref_rendererRootFenceWait_summary">Keeps the existing wait for root window drawing to finish before presenting. Turn this off only for frame pacing tests; it may cause flicker, tearing, or visual artifacts.</string>
 
     <string name="lorie_pref_rendererOutputMode">Renderer output mode (experimental)</string>
-    <string name="lorie_pref_rendererOutputMode_summary">Choose compatibility-first output or fast gaming output. Gaming mode is experimental for high-resolution Vulkan/OpenGL apps.</string>
+    <string name="lorie_pref_rendererOutputMode_summary">Compatibility first keeps the extra post-swap submit and its fence. Fast gaming output drops both. The paced variant additionally coalesces a redraw for a few frames after a slow swap. Gaming modes are experimental.</string>
     <string-array name="lorie_pref_rendererOutputMode_entries">
         <item>Compatibility first</item>
         <item>Gaming fast output</item>
+        <item>Gaming fast output (paced)</item>
     </string-array>
     <string-array name="lorie_pref_rendererOutputMode_values">
         <item>compat</item>
         <item>gaming_fast</item>
+        <item>gaming_paced</item>
     </string-array>
 </resources>

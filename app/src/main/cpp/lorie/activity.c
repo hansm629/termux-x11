@@ -407,6 +407,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
 {"setPostSwapTouchEnabled", "(Z)V", (void *)&rendererSetPostSwapTouchEnabled},
 {"setPostSwapFenceWaitEnabled", "(Z)V", (void *)&rendererSetPostSwapFenceWaitEnabled},
 {"setRootFenceWaitEnabled", "(Z)V", (void *)&rendererSetRootFenceWaitEnabled},
+{"setSwapBackpressureGuardEnabled", "(Z)V", (void *)&rendererSetSwapBackpressureGuardEnabled},
             {"connect", "(I)V", (void *)&connect_},
             {"connected", "()Z", (void *)&connected},
             {"startLogcat", "(I)V", (void *)&startLogcat},

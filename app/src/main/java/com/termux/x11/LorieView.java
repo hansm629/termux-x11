@@ -876,26 +876,39 @@ setViewport(viewport.left, viewport.top, viewport.width(), viewport.height(), p.
                     .getDefaultSharedPreferences(getContext())
                     .getString("displayFilteringMode", "nearest");
         setFiltering("nearest".equals(filtering) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
-setRendererPerfLogEnabled(p.get().getBoolean("rendererPerfLog", false));
-    String rendererOutputMode = p.get().getString("rendererOutputMode", "compat");
-    boolean rendererGamingFast = "gaming_fast".equals(rendererOutputMode);
+        setRendererPerfLogEnabled(p.get().getBoolean("rendererPerfLog", false));
 
-    if (rendererGamingFast) {
+        // The root window fence wait stays on in every mode. Without it the render thread runs
+        // ahead of the GPU, which inflates the frame counter while the display still shows late
+        // frames, and a frame carrying a GPU present-copy has to wait for that copy's fence
+        // regardless - so turning it off only makes frame times bimodal, which is what is actually
+        // perceived as stutter. What the fast modes drop instead is the redundant post-swap submit.
+        String rendererOutputMode = p.get().getString("rendererOutputMode", "compat");
         setSmoothPresentationEnabled(false);
-        setPostSwapTouchEnabled(false);
-        setPostSwapFenceWaitEnabled(false);
-        setRootFenceWaitEnabled(false);
-    } else {
-        setSmoothPresentationEnabled(false);
-        setPostSwapTouchEnabled(true);
-        setPostSwapFenceWaitEnabled(true);
-        setRootFenceWaitEnabled(true);
-    }
-// Keep swap backpressure guard disabled because it caused repeated busy skips.
-if ("gaming_fast".equals(rendererOutputMode)) {
-} else if ("gaming_paced".equals(rendererOutputMode)) {
-} else {
-}
+        switch (rendererOutputMode) {
+            case "gaming_fast":
+                // Lowest latency: eglSwapBuffers is the only submit point, nothing delays a redraw.
+                setRootFenceWaitEnabled(true);
+                setPostSwapTouchEnabled(false);
+                setPostSwapFenceWaitEnabled(false);
+                setSwapBackpressureGuardEnabled(false);
+                break;
+            case "gaming_paced":
+                // gaming_fast plus the experimental backpressure guard, which coalesces a redraw by
+                // a millisecond or two for a few frames after a slow swap. The only mode that arms
+                // it - it used to turn itself on in gaming_fast, where it is least wanted.
+                setRootFenceWaitEnabled(true);
+                setPostSwapTouchEnabled(false);
+                setPostSwapFenceWaitEnabled(false);
+                setSwapBackpressureGuardEnabled(true);
+                break;
+            default: // "compat"
+                setRootFenceWaitEnabled(true);
+                setPostSwapTouchEnabled(true);
+                setPostSwapFenceWaitEnabled(true);
+                setSwapBackpressureGuardEnabled(false);
+                break;
+        }
 
 hardwareKbdScancodesWorkaround = p.hardwareKbdScancodesWorkaround.get();
         clipboardSyncEnabled = p.clipboardEnable.get();
@@ -1112,6 +1125,7 @@ private void updateRendererDisplayRefreshRate() {
 @FastNative private native void setPostSwapTouchEnabled(boolean enabled);
 @FastNative private native void setPostSwapFenceWaitEnabled(boolean enabled);
 @FastNative private native void setRootFenceWaitEnabled(boolean enabled);
+@FastNative private native void setSwapBackpressureGuardEnabled(boolean enabled);
     @FastNative static native void connect(int fd);
     @CriticalNative static native boolean connected();
     @FastNative static native void startLogcat(int fd);
