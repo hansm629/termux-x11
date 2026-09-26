@@ -20,6 +20,7 @@
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -1218,6 +1219,47 @@ static void rendererApplyPendingGpuCopies(void) {
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 }
 
+// Frame pacing numbers the X server prints every 5 seconds (see lorieFramecounter). Kept separate
+// from the XloriePerf logging above because those lines only exist in this process' logcat, which
+// is out of reach without root or adb, while this ends up in the terminal's own log.
+static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
+                                      bool carriedGpuCopy, int64_t coalesceWaitUs) {
+    static int64_t lastFrameStartNs = 0;
+
+    if (!state) {
+        lastFrameStartNs = 0;
+        return;
+    }
+
+    if (!state->rendererDriver[0]) {
+        const char *vendor = (const char *) glGetString(GL_VENDOR);
+        const char *renderer = (const char *) glGetString(GL_RENDERER);
+
+        snprintf((char *) state->rendererDriver, sizeof(state->rendererDriver), "%s | %s",
+                 vendor ? vendor : "?", renderer ? renderer : "?");
+    }
+
+    if (lastFrameStartNs) {
+        uint32_t deltaUs = (uint32_t) rendererNsToUs(frameStartNs - lastFrameStartNs);
+
+        state->presentStats.frameSumUs += deltaUs;
+        state->presentStats.frameSamples++;
+        if (deltaUs > state->presentStats.maxFrameUs)
+            state->presentStats.maxFrameUs = deltaUs;
+        if (deltaUs >= LORIE_LONG_FRAME_US)
+            state->presentStats.longFrames++;
+    }
+
+    lastFrameStartNs = frameStartNs;
+
+    if (fenceWaitUs > 0)
+        state->presentStats.fenceWaitUs += (uint32_t) fenceWaitUs;
+    if (carriedGpuCopy)
+        state->presentStats.gpuCopyFrames++;
+    if (coalesceWaitUs > 0)
+        state->presentStats.coalescedFrames++;
+}
+
 void rendererRedrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
@@ -1226,7 +1268,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     bool postSwapTouchEnabled = rendererPostSwapTouchEnabled;
     bool postSwapFenceWaitEnabled = postSwapTouchEnabled && rendererPostSwapFenceWaitEnabled;
     bool swapBackpressureGuardEnabled = rendererSwapBackpressureGuardEnabled;
-    int64_t frameStartNs = rendererPerfLogEnabled ? rendererNowNs() : 0;
+    // Unconditional: rendererPublishFrameStats() needs it even with the perf log off.
+    int64_t frameStartNs = rendererNowNs();
     int64_t rootWaitUs = rootFenceWaitEnabled ? 0 : -1;
     int64_t swapUs = 0;
     int64_t preSwapFlushUs = -1;
@@ -1339,13 +1382,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
      * one waits even with the root fence wait turned off; otherwise the X server could hand the
      * source pixmap back to its client while the GPU still reads it. */
     if (fence != EGL_NO_SYNC_KHR) {
-        if (rendererPerfLogEnabled) {
-            int64_t waitStartNs = rendererNowNs();
-            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-            rootWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
-        } else {
-            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-        }
+        int64_t waitStartNs = rendererNowNs();
+        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+        rootWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
 
         eglDestroySyncKHR(egl_display, fence);
         fence = EGL_NO_SYNC_KHR;
@@ -1414,6 +1453,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     state->renderedFrames++;
+    rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
 
     if (rendererPerfLogEnabled) {
         int64_t totalUs = rendererNsToUs(rendererNowNs() - frameStartNs);

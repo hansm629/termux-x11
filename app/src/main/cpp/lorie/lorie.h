@@ -173,6 +173,9 @@ typedef union {
 
 typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
+/* Two 60Hz frames: a gap this long is a hitch a user can see, not just a missed vsync. */
+#define LORIE_LONG_FRAME_US 33000
+
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
 
@@ -234,6 +237,31 @@ struct lorie_shared_server_state {
 
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
+
+    /*
+     * Renderer-side frame pacing counters. The renderer runs in the activity's process, whose
+     * logcat needs root or adb to read, while the 5 second counter that consumes these runs in the
+     * X server process, next to the terminal - publishing them here is what makes them readable at
+     * all without a PC. The renderer only ever adds, the X server only ever resets; a lost update
+     * right at the 5 second boundary is not worth synchronizing for.
+     */
+    struct {
+        volatile uint32_t frameSamples;   /* frame-to-frame gaps measured */
+        volatile uint64_t frameSumUs;     /* their sum, for the average */
+        volatile uint32_t maxFrameUs;     /* the worst one */
+        volatile uint32_t longFrames;     /* gaps >= LORIE_LONG_FRAME_US, i.e. a visible hitch */
+        volatile uint32_t fenceWaitUs;    /* total time blocked on the root/present-copy fence */
+        volatile uint32_t gpuCopyFrames;  /* frames that carried at least one present copy */
+        volatile uint32_t coalescedFrames;/* redraws the backpressure guard delayed */
+    } presentStats;
+
+    /*
+     * GL_VENDOR | GL_RENDERER of the context the renderer actually draws with, published once so
+     * the X server can log it. testCapabilities() runs its probe in the X server's own process,
+     * which can be given a different GLES implementation than the activity (ANGLE is selected per
+     * package), and it is the activity's one that decides what the present path costs.
+     */
+    volatile char rendererDriver[192];
 
     struct {
         // We should not allow updating cursor content the same time renderer draws it.

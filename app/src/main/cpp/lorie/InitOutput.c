@@ -510,11 +510,47 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    uint32_t samples;
+    static Bool driverLogged = FALSE;
+
+    if (!driverLogged && pvfb->state->rendererDriver[0]) {
+        driverLogged = TRUE;
+        log(INFO, "XlorieFrames: renderer GLES driver: %s", (const char *) pvfb->state->rendererDriver);
+    }
+
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
                                    : "%d frames in 5.0 seconds = %.1f FPS",
             pvfb->state->renderedFrames, ((float) pvfb->state->renderedFrames) / 5,
             (unsigned long long) gpuCopyOffloads, (unsigned long long) gpuCopyAttempts);
+
+    /*
+     * The FPS above counts renderer redraws, which says nothing about how evenly they landed - a
+     * high number with a visibly stuttering picture is exactly what long frames look like. These
+     * come from the renderer through the shared state, since its own logcat is unreachable from
+     * here.
+     */
+    samples = pvfb->state->presentStats.frameSamples;
+    if (samples) {
+        log(INFO, "XlorieFrames: frame avg %.1f ms, max %.1f ms, hitches(>=%d ms) %u, "
+                  "fence wait %.1f ms total, copies on %u frames, coalesced %u",
+            (double) pvfb->state->presentStats.frameSumUs / samples / 1000.0,
+            pvfb->state->presentStats.maxFrameUs / 1000.0,
+            LORIE_LONG_FRAME_US / 1000,
+            pvfb->state->presentStats.longFrames,
+            pvfb->state->presentStats.fenceWaitUs / 1000.0,
+            pvfb->state->presentStats.gpuCopyFrames,
+            pvfb->state->presentStats.coalescedFrames);
+    }
+
+    pvfb->state->presentStats.frameSamples = 0;
+    pvfb->state->presentStats.frameSumUs = 0;
+    pvfb->state->presentStats.maxFrameUs = 0;
+    pvfb->state->presentStats.longFrames = 0;
+    pvfb->state->presentStats.fenceWaitUs = 0;
+    pvfb->state->presentStats.gpuCopyFrames = 0;
+    pvfb->state->presentStats.coalescedFrames = 0;
+
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     return 5000;
