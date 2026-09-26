@@ -127,6 +127,9 @@ static volatile bool stateChanged = false, windowChanged = false;
 static volatile struct lorie_shared_server_state* pendingState = NULL;
 static volatile ANativeWindow* pendingWin = NULL;
 static volatile int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0, expectedW = 0, expectedH = 0;
+// Set whenever the expected root window size is (re)published, so the render thread drops a
+// "waiting for a buffer of the right size" state that this new size may well have resolved.
+static volatile bool expectedSizeChanged = false;
 
 static pthread_mutex_t stateLock;
 // Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
@@ -791,6 +794,7 @@ void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int
     viewportH = h;
     expectedW = ew;
     expectedH = eh;
+    expectedSizeChanged = true;
     if (state)
         state->drawRequested = true;
     pthread_cond_signal(stateCond);
@@ -1509,6 +1513,16 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
         // If there are pending changes we should process them immediately.
         return false;
 
+    if (expectedSizeChanged) {
+        // The size we compare the root buffer against just changed, so a buffer we rejected as
+        // wrong-sized may fit now. Without this the flag could only be cleared by a new buffer, a
+        // new root texture id or a reconnect - none of which happen when the activity simply comes
+        // back to the foreground with unchanged geometry, leaving the screen black until the app
+        // was killed.
+        expectedSizeChanged = false;
+        *waitingForBuffers = false;
+    }
+
     if (state) {
         if (lastRequestedBufferId != state->rootWindowTextureID)
             *waitingForBuffers = false;
@@ -1607,7 +1621,7 @@ __noreturn static void* rendererThread(void) {
                 munmap(oldState, sizeof(*oldState));
         }
 
-        if (windowChanged) rendererRefreshContext(); if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); } // Attach all pending buffers to GL.
+        if (windowChanged) { rendererRefreshContext(); waitingForBuffers = false; } if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); } // Attach all pending buffers to GL.
         pthread_spin_lock(&bufferLock);
         while((buf = LorieBufferList_first(&addedBuffers))) {
             LorieBuffer_attachToGL(buf);
