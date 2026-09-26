@@ -1235,6 +1235,11 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     pthread_spin_unlock(&bufferLock);
     if (!buffer) {
         log("Buffer %llu not found", state->rootWindowTextureID);
+        // The locked apply further down is now unreachable, so drain the queue here: otherwise a
+        // copy queued for a window unrelated to root stalls until root recovers, and it also keeps
+        // this thread spinning, since rendererShouldWait()'s gpuCopyPending check runs before it
+        // ever looks at *waitingForBuffers (upstream 9050f87).
+        rendererApplyPendingGpuCopies();
         return;
     }
 
@@ -1253,6 +1258,11 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         // so clearing drawRequested is not enough (upstream e4475ff).
         state->drawRequested = FALSE;
         *waitingForBuffers = true;
+        // The locked apply further down is now unreachable, so drain the queue here: otherwise a
+        // copy queued for a window unrelated to root stalls until root recovers, and it also keeps
+        // this thread spinning, since rendererShouldWait()'s gpuCopyPending check runs before it
+        // ever looks at *waitingForBuffers (upstream 9050f87).
+        rendererApplyPendingGpuCopies();
         return;
     }
 
