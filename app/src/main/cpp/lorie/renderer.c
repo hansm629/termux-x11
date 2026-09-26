@@ -641,6 +641,14 @@ void rendererTestCapabilities(int* legacy_drawing) {
         if (eglMakeCurrent(egl_display, checksfc, checksfc, testctx) != EGL_TRUE)
             return vprintEglError("check eglMakeCurrent failed", __LINE__);
 
+        // Which GLES implementation we ended up on decides a lot of the present path's cost
+        // (an ANGLE-on-Vulkan driver imports AHardwareBuffers and waits on fences very
+        // differently from a native one), so make it visible in the log instead of guessing.
+        loge("Xlorie: GL_VENDOR=%s GL_RENDERER=%s GL_VERSION=%s",
+             (const char *) glGetString(GL_VENDOR),
+             (const char *) glGetString(GL_RENDERER),
+             (const char *) glGetString(GL_VERSION));
+
         glActiveTexture(GL_TEXTURE0); checkGlError();
         glGenTextures(1, &texture); checkGlError();
         bindTexture(texture);
