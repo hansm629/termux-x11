@@ -1247,9 +1247,12 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
             state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
             desc->width, desc->height);
-        // Otherwise rendererShouldWait sees drawRequested still set and busy-spins retrying this
-        // same mismatch instead of waiting for the next real trigger (e.g. the pending resize).
+        // Otherwise rendererShouldWait sees drawRequested or a pending cursor update and busy-spins
+        // retrying this same mismatch instead of waiting for the buffer of the requested size.
+        // A surface change also raises cursor.updated, which keeps this thread awake on its own,
+        // so clearing drawRequested is not enough (upstream e4475ff).
         state->drawRequested = FALSE;
+        *waitingForBuffers = true;
         return;
     }
 
