@@ -802,6 +802,9 @@ void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int
 }
 
 void rendererRefreshContext(void) {
+    // The surface this frame was drawn into is about to go away.
+    rendererRetireFrame();
+
     int width = pendingWin ? ANativeWindow_getWidth(pendingWin) : 0;
     int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
     log("rendererSetWindow %p %d %d", pendingWin, width, height);
@@ -847,6 +850,7 @@ void rendererRefreshContext(void) {
     log("Xlorie: new surface applied: %p\n", sfc);
 }
 
+static void rendererRetireFrame(void);
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
 static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
 static void drawCursor(float displayWidth, float displayHeight);
@@ -1286,6 +1290,44 @@ static uint64_t rendererClaimRootBuffer(void) {
     return state->rootBufferIds[(claimed >> 1) & 1u];
 }
 
+// The frame's fence is no longer waited for between the drawing and the swap. Waiting there drains
+// the pipeline while the lock is held and before the frame has even been submitted, which on a
+// driver where every flush is a queue submission (ANGLE on Vulkan) costs milliseconds that have
+// nothing to do with how much is being drawn. The fence is created without a flush, eglSwapBuffers
+// submits the whole frame as one, and the wait happens right after it - a point where the thread
+// would be waiting for vsync anyway and where the GPU has already had the frame.
+//
+// The root buffer stays claimed until that wait returns, so the X server still cannot get it back
+// before the GPU is done reading it. This cannot tear.
+static void rendererReleaseRootBuffer(void);
+
+static EGLSync rendererPendingFence = EGL_NO_SYNC_KHR;
+static uint64_t rendererPendingGpuCopySerial = 0;
+
+static void rendererRetireFrame(void) {
+    EGLSync fence = rendererPendingFence;
+
+    if (fence == EGL_NO_SYNC_KHR)
+        return;
+
+    rendererPendingFence = EGL_NO_SYNC_KHR;
+
+    // Zero timeout: this has normally signalled long ago. The flush bit only matters for the rare
+    // case where nothing has been submitted since, and the bounded wait below is the safety net.
+    if (eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 0) == EGL_TIMEOUT_EXPIRED_KHR)
+        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+
+    eglDestroySyncKHR(egl_display, fence);
+
+    if (rendererPendingGpuCopySerial && state) {
+        __atomic_store_n(&state->gpuCopyQueue.completedSerial, rendererPendingGpuCopySerial, __ATOMIC_RELEASE);
+        notifyGpuCopyDone();
+    }
+    rendererPendingGpuCopySerial = 0;
+
+    rendererReleaseRootBuffer();
+}
+
 static void rendererReleaseRootBuffer(void) {
     uint32_t old, released;
 
@@ -1330,6 +1372,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
         rendererLastPerfFrameStartNs = frameStartNs;
     }
+    // Safety net: a frame that never reached its swap would otherwise leave the root claimed.
+    rendererRetireFrame();
+    bool deferFence = state->rootDoubleBuffered != 0;
     uint64_t rootId = rendererClaimRootBuffer();
     // The buffer will not be released until this function ends, but main thread can modify buffer list
     pthread_spin_lock(&bufferLock);
@@ -1385,13 +1430,31 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
      * X viewport is redrawn. Pixels outside the new viewport can keep old
      * Surface contents, which appears as a PiP-like ghost image.
      */
-    if (surfaceW > 0 && surfaceH > 0 &&
-            (viewportX != 0 || viewportY != 0 ||
-             viewportW != surfaceW || viewportH != surfaceH)) {
-        glViewport(0, 0, surfaceW, surfaceH);
-        glDisable(GL_SCISSOR_TEST);
-        glClearColor(0.f, 0.f, 0.f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT);
+    {
+        // The letterbox only has to be cleared when the geometry it surrounds changes - doing it on
+        // every frame is a full surface write that also splits the frame into an extra render pass.
+        // Cleared for a few frames after a change because the surface has several buffers.
+        static int lastSurfaceW = -1, lastSurfaceH = -1, lastViewport[4] = { -1, -1, -1, -1 };
+        static int clearFramesLeft = 0;
+        Bool letterboxed = surfaceW > 0 && surfaceH > 0 &&
+                (viewportX != 0 || viewportY != 0 || viewportW != surfaceW || viewportH != surfaceH);
+
+        if (surfaceW != lastSurfaceW || surfaceH != lastSurfaceH ||
+            viewportX != lastViewport[0] || viewportY != lastViewport[1] ||
+            viewportW != lastViewport[2] || viewportH != lastViewport[3]) {
+            lastSurfaceW = surfaceW; lastSurfaceH = surfaceH;
+            lastViewport[0] = viewportX; lastViewport[1] = viewportY;
+            lastViewport[2] = viewportW; lastViewport[3] = viewportH;
+            clearFramesLeft = 4;
+        }
+
+        if (letterboxed && clearFramesLeft > 0) {
+            clearFramesLeft--;
+            glViewport(0, 0, surfaceW, surfaceH);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
     }
 
     glViewport(viewportX, surfaceH - viewportY - viewportH, viewportW, viewportH);
@@ -1407,9 +1470,10 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
     draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
-    // The double buffered root hands the buffer back to the X server as soon as this fence signals,
-    // so the fence is what makes that handover safe - it is not optional there.
-    if (rootFenceWaitEnabled || gpuCopySerial || state->rootDoubleBuffered) {
+    // With a double buffered root nothing here has to be waited for inside this frame, so no fence
+    // is created yet and no flush is issued: eglSwapBuffers below becomes the single submission
+    // point of the frame, and the fence made just before it is retired at the start of the next one.
+    if (!deferFence && (rootFenceWaitEnabled || gpuCopySerial)) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
     }
@@ -1425,33 +1489,41 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     state->cursor.moved = FALSE;
     drawCursor((float) (LorieBuffer_getWidth(buffer)), (float) (LorieBuffer_getHeight(buffer)));
-    glFlush();
+    if (!deferFence)
+        glFlush();
 
     /* Wait until root window drawing is finished before giving control back to X server.
      * A GPU copy applied above is only complete once this fence signals, so a frame that carries
      * one waits even with the root fence wait turned off; otherwise the X server could hand the
      * source pixmap back to its client while the GPU still reads it. */
-    if (fence != EGL_NO_SYNC_KHR) {
-        int64_t waitStartNs = rendererNowNs();
-        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-        rootWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
+    if (deferFence) {
+        // Created here so it covers everything drawn above; eglSwapBuffers below submits it, and
+        // rendererRetireFrame() right after the swap waits for it and hands the buffer back.
+        rendererPendingFence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+        rendererPendingGpuCopySerial = gpuCopySerial;
+        rootWaitUs = 0;
+    } else {
+        if (fence != EGL_NO_SYNC_KHR) {
+            int64_t waitStartNs = rendererNowNs();
+            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+            rootWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
 
-        eglDestroySyncKHR(egl_display, fence);
-        fence = EGL_NO_SYNC_KHR;
-    }
-    // Sampling of the root buffer is complete, so hand it back before anything else - this is what
-    // lets the X server carry on drawing while we still have the screen draw and the swap to do.
-    rendererReleaseRootBuffer();
-    if (gpuCopySerial) {
-        __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
-        notifyGpuCopyDone();
+            eglDestroySyncKHR(egl_display, fence);
+            fence = EGL_NO_SYNC_KHR;
+        }
+        // Sampling of the root buffer is complete, so hand it back.
+        rendererReleaseRootBuffer();
+        if (gpuCopySerial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
+            notifyGpuCopyDone();
+        }
     }
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
     lockHeldUs = rendererNsToUs(rendererNowNs() - lockStartNs);
 // Gaming fast path: submit GL commands before swap without creating or waiting on fences.
     // This keeps the no-fence fast path but avoids moving all submit work into swap.
-    if (!rootFenceWaitEnabled) {
+    if (!rootFenceWaitEnabled && !deferFence) {
         if (rendererPerfLogEnabled) {
             int64_t preSwapFlushStartNs = rendererNowNs();
             glFlush();
@@ -1471,6 +1543,14 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     } else {
         if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
             printEglError("Failed to swap buffers", __LINE__);
+    }
+
+    // The frame is submitted now, so this is where its fence is waited for and the root buffer is
+    // handed back - leaving the X server the whole remainder of the frame interval to take it.
+    if (deferFence) {
+        int64_t retireStartNs = rendererNowNs();
+        rendererRetireFrame();
+        rootWaitUs = rendererNsToUs(rendererNowNs() - retireStartNs);
     }
 
     int64_t guardTotalUs = rendererNsToUs(rendererNowNs() - frameStartNs);
@@ -1654,6 +1734,8 @@ __noreturn static void* rendererThread(void) {
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = NULL;
+            // Anything still in flight belongs to the state we are leaving.
+            rendererRetireFrame();
             if (state && pendingState != state)
                 oldState = state;
 
