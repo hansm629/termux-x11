@@ -1263,7 +1263,21 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t 
     static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
     lorieNotePresentCompleted();
     RegionReset(DamageRegion(pvfb->damage), &box);
-    pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
+    /*
+     * current_msc is the vblank counter, advanced once per vsync by lorieRedraw. It must not be
+     * clamped here: a flip is executed once its target has arrived, so target_msc is normally at or
+     * below the current value, and min() then cancels that tick's increment - or moves the counter
+     * backwards. With a compositor flipping about as often as the display refreshes, nearly every
+     * increment got cancelled and the counter crawled, while presents that go through the copy path
+     * wait for `crtc_msc + 1` and are re-queued a vblank at a time until it arrives. Measured: the
+     * renderer perfectly even at 8.5 ms a frame with no dropped frames and the X server never stuck
+     * for more than 16 ms, yet individual client presents took 76-142 ms to reach the screen.
+     *
+     * So only ever move it forward, and report where we actually are.
+     */
+    if (target_msc > pvfb->current_msc)
+        pvfb->current_msc = target_msc;
+
     present_event_notify(event_id, ust, pvfb->current_msc);
 }
 
