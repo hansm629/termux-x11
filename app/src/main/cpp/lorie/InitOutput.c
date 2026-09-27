@@ -153,37 +153,56 @@ static void lorieNotePresentCompleted(void) {
 // -single-root-buffer restores the old synchronous behaviour.
 static Bool lorieSingleRootBuffer = FALSE;
 
-// -legacy-flip-msc: restore the old clamp in loriePresentAfterFlip, so the effect of not clamping
-// can be measured within one build instead of across two.
-static Bool lorieLegacyFlipMsc = FALSE;
+// The display's own clock.
+//
+// msc used to be advanced from two places - once per vsync here, and again whenever a flip
+// completed - so it was not a count of anything in particular, and presents that wait on it waited
+// for an arbitrary amount of time. It now counts vsyncs and nothing else: a present completing is
+// not a vsync, and making it look like one is what let the counter drift away from the display.
+//
+// The timestamp is taken with clock_gettime() inside the Choreographer callback rather than from
+// the frameTimeNanos argument the callback is handed. The NDK declares that argument as `long`,
+// which is 32 bits on armeabi-v7a and x86 - both of which we ship - so it wraps every 4.3 seconds
+// there. AChoreographer_postFrameCallback64() passes it intact but needs API 29 against our
+// minSdk 26, and that would mean two clocks with different accuracy depending on the device.
+// Reading the clock at callback entry costs the dispatch latency, is the same everywhere, and is
+// still far closer to the vsync than asking for the time whenever the X server got round to it.
+//
+// Written by the Choreographer thread, read by the X server thread.
+static volatile uint64_t lorieVsyncStampUs = 0;
 
-// -msc-toggle-file <path>: re-read that toggle from the first byte of a file ('1' on, anything else
-// off) once a second, so one session can alternate the two behaviours between benchmark runs with
-// nothing else changing - not the build, not the thermal state, not how the windows were dragged.
-static const char *lorieMscTogglePath = NULL;
+// X server thread only, from lorieRedraw onwards.
+static uint64_t lorieVsyncRawUs = 0;    // the newest stamp the Choreographer has given us
+static uint64_t lorieVsyncUs = 0;       // when the vsync that current_msc counts happened
+static uint64_t lorieVsyncPeriodUs = 16667;
 
-static void loriePollMscToggle(uint64_t nowUs) {
-    static uint64_t nextPollUs = 0;
-    FILE *f;
-    int c;
-    Bool want;
+static void lorieAdvanceVsyncClock(void) {
+    uint64_t us = __atomic_load_n(&lorieVsyncStampUs, __ATOMIC_ACQUIRE);
 
-    if (!lorieMscTogglePath || nowUs < nextPollUs)
-        return;
-    nextPollUs = nowUs + 1000000u;
-
-    f = fopen(lorieMscTogglePath, "re");
-    if (!f)
-        return;
-    c = fgetc(f);
-    fclose(f);
-
-    want = (c == '1');
-    if (want != lorieLegacyFlipMsc) {
-        lorieLegacyFlipMsc = want;
-        // Printed so a run can be attributed from the log alone rather than from memory.
-        log(INFO, "XlorieMsc: legacy flip-msc clamp %s", want ? "ON" : "OFF");
+    if (us > lorieVsyncRawUs) {
+        uint64_t delta = us - lorieVsyncRawUs;
+        // A tick we were never called for stretches the gap, so only believe plausible ones.
+        // 4-40 ms covers everything from 25 to 250 Hz.
+        if (lorieVsyncRawUs && delta >= 4000 && delta <= 40000)
+            lorieVsyncPeriodUs = (lorieVsyncPeriodUs * 7 + delta) / 8;
+        lorieVsyncRawUs = us;
     }
+
+    // current_msc is about to count one more vsync, so ust moves with it. Normally that is the
+    // stamp we were just given; if the work proc ran twice for one callback there is no new one,
+    // and stepping a period keeps the two in step until the next callback resyncs them.
+    lorieVsyncUs = lorieVsyncRawUs > lorieVsyncUs ? lorieVsyncRawUs
+                 : lorieVsyncUs ? lorieVsyncUs + lorieVsyncPeriodUs
+                 : GetTimeInMicros();
+}
+
+// When the given vsync is, or was, on screen.
+static uint64_t lorieUstForMsc(uint64_t msc) {
+    if (msc >= pvfb->current_msc)
+        return lorieVsyncUs + (msc - pvfb->current_msc) * lorieVsyncPeriodUs;
+
+    uint64_t back = (pvfb->current_msc - msc) * lorieVsyncPeriodUs;
+    return back < lorieVsyncUs ? lorieVsyncUs - back : 0;
 }
 
 // Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
@@ -448,16 +467,6 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
         return 1;
     }
 
-    if (strcmp(argv[i], "-legacy-flip-msc") == 0) {
-        lorieLegacyFlipMsc = TRUE;
-        return 1;
-    }
-
-    if (strcmp(argv[i], "-msc-toggle-file") == 0 && i + 1 < argc) {
-        lorieMscTogglePath = argv[i + 1];
-        return 2;
-    }
-
     if (strcmp(argv[i], "-single-root-buffer") == 0) {
         lorieSingleRootBuffer = TRUE;
         return 1;
@@ -615,10 +624,10 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
             pvfb->state->presentStats.xDispatchMaxUs = gapUs;
     }
     lastRedrawUs = nowUs;
-    loriePollMscToggle(nowUs);
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
+    lorieAdvanceVsyncClock();
     pvfb->current_msc++;
     loriePerformVblanks();
 
@@ -950,6 +959,8 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
 
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+    // t is deliberately unused - see lorieVsyncStampUs.
+    __atomic_store_n(&lorieVsyncStampUs, lorieNowUs(), __ATOMIC_RELEASE);
     if (pScreenPtr) {
         QueueWorkProc(lorieRedraw, NULL, NULL);
         lorieWakeServer();
@@ -1114,7 +1125,9 @@ static RRCrtcPtr loriePresentGetCrtc(WindowPtr w) {
 }
 
 static int loriePresentGetUstMsc(__unused RRCrtcPtr crtc, uint64_t *ust, uint64_t *msc) {
-    *ust = GetTimeInMicros();
+    // ust has to be the time of that msc, not the time of this call. Returning "now" made every
+    // msc look like it had just happened, which is a lie clients pace themselves against.
+    *ust = lorieVsyncUs ? lorieVsyncUs : GetTimeInMicros();
     *msc = pvfb->current_msc;
     return Success;
 }
@@ -1149,7 +1162,7 @@ static void loriePerformVblanks(void) {
     struct vblank *vblank, *tmp;
     xorg_list_for_each_entry_safe(vblank, tmp, &pvfb->vblank_queue, link) {
         if (vblank->msc <= pvfb->current_msc) {
-            present_event_notify(vblank->id, GetTimeInMicros(), pvfb->current_msc);
+            present_event_notify(vblank->id, lorieVsyncUs, pvfb->current_msc);
             xorg_list_del(&vblank->link);
             free (vblank);
         }
@@ -1330,7 +1343,7 @@ Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unu
     return TRUE;
 }
 
-void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t ust, uint64_t target_msc, __unused PixmapPtr pixmap) {
+void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, __unused uint64_t ust, uint64_t target_msc, __unused PixmapPtr pixmap) {
     // X server was patched to call this function right after finishing all present_flip shenanigans
     // Since we do not invoke DRM API or anything similar we do not need to implement this as callback
     // For some reason calling present_event_notify in BlockHandler or as QueueWorkProc/eventfd callback
@@ -1339,23 +1352,18 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t 
     lorieNotePresentCompleted();
     RegionReset(DamageRegion(pvfb->damage), &box);
     /*
-     * current_msc is the vblank counter, advanced once per vsync by lorieRedraw. It must not be
-     * clamped here: a flip is executed once its target has arrived, so target_msc is normally at or
-     * below the current value, and min() then cancels that tick's increment - or moves the counter
-     * backwards. With a compositor flipping about as often as the display refreshes, nearly every
-     * increment got cancelled and the counter crawled, while presents that go through the copy path
-     * wait for `crtc_msc + 1` and are re-queued a vblank at a time until it arrives. Measured: the
-     * renderer perfectly even at 8.5 ms a frame with no dropped frames and the X server never stuck
-     * for more than 16 ms, yet individual client presents took 76-142 ms to reach the screen.
+     * A flip is not a vsync, so it does not advance current_msc - lorieRedraw does, once per
+     * vsync, and nothing else may. Assigning here made the counter a count of two different
+     * things, and every present that waits on it inherited the error: the renderer was perfectly
+     * even at 8.5 ms a frame with nothing dropped and the X server was never stuck for more than
+     * 16 ms, yet individual client presents took 76-142 ms to reach the screen.
      *
-     * So only ever move it forward, and report where we actually are.
+     * What to report is target_msc, not where the counter is now. A sync flip executes a vsync
+     * early (present_scmd.c's exec_msc--), so the frame goes up at target_msc, which is what the
+     * client asked for and what it will pace its next frame against. The ust we were handed is the
+     * time of the call, not of that vsync, so derive it from the display's clock instead.
      */
-    if (lorieLegacyFlipMsc)
-        pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
-    else if (target_msc > pvfb->current_msc)
-        pvfb->current_msc = target_msc;
-
-    present_event_notify(event_id, ust, pvfb->current_msc);
+    present_event_notify(event_id, lorieUstForMsc(target_msc), target_msc);
 }
 
 void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
