@@ -305,6 +305,8 @@ struct lorie_shared_server_state {
         volatile uint32_t presentGapMaxUs;
         volatile uint32_t copyDeferrals;  /* copies left queued because a buffer was not registered yet */
         volatile uint32_t copySkips;      /* and the ones eventually given up on */
+        volatile uint32_t presentGapsLate; /* gaps over two frame periods - the distribution, not
+                                            * just the worst one, is what costs throughput */
     } presentStats;
 
     /*

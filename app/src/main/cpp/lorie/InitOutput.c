@@ -643,13 +643,15 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.cursorOnlyFrames,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
-        if (pvfb->state->presentStats.presentCompletions > 1)
+        if (pvfb->state->presentStats.presentCompletions > 1) {
             log(INFO, "XloriePresent: %u client presents reached the screen in 5.0 s "
-                      "(avg %.1f ms apart, longest %.1f ms)",
+                      "(avg %.1f ms apart, longest %.1f ms, %u later than 33 ms)",
                 pvfb->state->presentStats.presentCompletions,
                 pvfb->state->presentStats.presentGapSumUs / 1000.0 /
                     (pvfb->state->presentStats.presentCompletions - 1),
-                pvfb->state->presentStats.presentGapMaxUs / 1000.0);
+                pvfb->state->presentStats.presentGapMaxUs / 1000.0,
+                pvfb->state->presentStats.presentGapsLate);
+        }
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
@@ -685,6 +687,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentGapMaxUs = 0;
     pvfb->state->presentStats.copyDeferrals = 0;
     pvfb->state->presentStats.copySkips = 0;
+    pvfb->state->presentStats.presentGapsLate = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
@@ -1212,6 +1215,9 @@ static void lorieNotePresentCompleted(void) {
         pvfb->state->presentStats.presentGapSumUs += gapUs;
         if (gapUs > pvfb->state->presentStats.presentGapMaxUs)
             pvfb->state->presentStats.presentGapMaxUs = gapUs;
+        // Two frame periods at 60Hz: late enough that the content visibly missed its slot.
+        if (gapUs > 33000)
+            pvfb->state->presentStats.presentGapsLate++;
     }
     lastUs = nowUs;
     pvfb->state->presentStats.presentCompletions++;
