@@ -747,6 +747,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.presentSubmits,
                 pvfb->state->presentStats.submitGapMaxUs / 1000.0);
         }
+        if (pvfb->state->presentStats.copyCompletions)
+            log(INFO, "XlorieCopy: %u copies took avg %.1f ms, longest %.1f ms, found unfinished %u times",
+                pvfb->state->presentStats.copyCompletions,
+                pvfb->state->presentStats.copyLatencySumUs / 1000.0 / pvfb->state->presentStats.copyCompletions,
+                pvfb->state->presentStats.copyLatencyMaxUs / 1000.0,
+                pvfb->state->presentStats.copyRequeues);
+
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
@@ -780,6 +787,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
+    pvfb->state->presentStats.copyLatencySumUs = 0;
+    pvfb->state->presentStats.copyLatencyMaxUs = 0;
+    pvfb->state->presentStats.copyCompletions = 0;
+    pvfb->state->presentStats.copyRequeues = 0;
     pvfb->state->presentStats.copyDeferrals = 0;
     pvfb->state->presentStats.copySkips = 0;
     pvfb->state->presentStats.presentGapsLate = 0;
@@ -1181,6 +1192,12 @@ bool lorieRendererAvailable(void) {
 // for a plain window, or a Composite-redirected window's own backing pixmap. Returns FALSE
 // (caller falls back to the regular CPU present_copy_region) whenever either buffer isn't
 // GPU-sampleable, or the deferred copy queue is currently full.
+// When each outstanding copy was handed to the renderer, so lorieGpuCopyAck can say how long it
+// took. Serials are monotonic and only a handful are ever in flight, so a small ring keyed by the
+// serial is enough; a stale slot just yields a latency we discard.
+#define LORIE_COPY_TIMING_SLOTS 64
+static uint64_t lorieCopyStartUs[LORIE_COPY_TIMING_SLOTS];
+
 Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
                               uint64_t *out_serial, void **out_dst_buffer) {
     LorieBuffer *srcBuffer, *dstBuffer;
@@ -1294,6 +1311,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     pthread_cond_signal(rendererCond);
 
     *out_serial = entry->serial;
+    lorieCopyStartUs[entry->serial % LORIE_COPY_TIMING_SLOTS] = lorieNowUs();
     gpuCopyAttempts++;
     gpuCopyOffloads++;
     lorieNotePresentSubmitted();
@@ -1301,13 +1319,27 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 }
 
 Bool lorieGpuCopyIsDone(uint64_t serial) {
-    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
+    if (__atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial)
+        return TRUE;
+
+    pvfb->state->presentStats.copyRequeues++;
+    return FALSE;
 }
 
-void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
+void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    uint64_t startUs = lorieCopyStartUs[serial % LORIE_COPY_TIMING_SLOTS];
 
     lorieNotePresentCompleted();
+
+    if (startUs) {
+        uint32_t latencyUs = (uint32_t) (lorieNowUs() - startUs);
+        lorieCopyStartUs[serial % LORIE_COPY_TIMING_SLOTS] = 0;
+        pvfb->state->presentStats.copyLatencySumUs += latencyUs;
+        if (latencyUs > pvfb->state->presentStats.copyLatencyMaxUs)
+            pvfb->state->presentStats.copyLatencyMaxUs = latencyUs;
+        pvfb->state->presentStats.copyCompletions++;
+    }
 
     if (priv && priv->buffer)
         LorieBuffer_gpuCopyPendingDec(priv->buffer);

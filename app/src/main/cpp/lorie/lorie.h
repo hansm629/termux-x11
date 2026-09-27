@@ -314,6 +314,14 @@ struct lorie_shared_server_state {
          */
         volatile uint32_t presentSubmits;
         volatile uint32_t submitGapMaxUs;
+
+        /* How long an offloaded copy takes from being handed to the renderer to being acked back.
+         * Without this the copy path can only be observed from outside, where a slow copy and a
+         * client that simply did not send a frame look exactly the same. */
+        volatile uint64_t copyLatencySumUs;
+        volatile uint32_t copyLatencyMaxUs;
+        volatile uint32_t copyCompletions;
+        volatile uint32_t copyRequeues;   /* vblanks spent waiting for one to finish */
     } presentStats;
 
     /*
