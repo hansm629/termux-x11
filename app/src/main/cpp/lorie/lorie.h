@@ -322,6 +322,14 @@ struct lorie_shared_server_state {
         volatile uint32_t copyLatencyMaxUs;
         volatile uint32_t copyCompletions;
         volatile uint32_t copyRequeues;   /* vblanks spent waiting for one to finish */
+
+        /* When client requests actually arrive, which is the one hop everything else is measured
+         * relative to. requestAheadMax is how many vsyncs ahead the furthest one asked to be shown:
+         * a client whose idea of msc has drifted from ours asks for a frame far in the future and
+         * then waits for it, which from outside looks exactly like a client that is simply slow. */
+        volatile uint32_t requests;
+        volatile uint32_t requestGapMaxUs;
+        volatile uint32_t requestAheadMax;
     } presentStats;
 
     /*

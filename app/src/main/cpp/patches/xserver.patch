@@ -401,7 +401,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,31 @@
+@@ -90,8 +91,34 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -420,6 +420,9 @@
 +                                     uint64_t *out_serial, void **out_dst_buffer);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
++/* lorie: called as each client present request is turned into a vblank, so the wait between a
++ * request arriving and it being executed can be told apart from the client being slow. */
++extern void lorieNotePresentRequest(uint64_t target_msc, uint64_t crtc_msc);
 +/* lorie: implemented in lorie/cmdentrypoint.c. Avoids waiting forever on a GPU copy that a dead renderer will never finish. */
 +extern bool lorieConnectionAlive(void);
 +/* lorie: implemented in lorie/InitOutput.c. Renderer can be connected but still unable to
@@ -464,6 +467,19 @@
 +                screen_priv->info->after_flip(vblank->crtc, vblank->event_id, ust, vblank->target_msc, vblank->pixmap);
                  return;
              }
+ 
+@@ -767,6 +784,12 @@
+ 
+     vblank->event_id = ++present_scmd_event_id;
+ 
++    /* lorie: the one hop in the chain nobody has timed - when the client's request actually
++     * arrived, as opposed to when we got round to executing it. Everything downstream is measured
++     * and fast, so if requests arrive evenly and executions do not, the wait is here; and
++     * target_msc - crtc_msc says whether the client asked to be shown that far ahead. */
++    lorieNotePresentRequest(vblank->target_msc, crtc_msc);
++
+     if (vblank->flip && vblank->sync_flip)
+         vblank->exec_msc--;
  
 +++ ./present/present_vblank.c
 @@ -188,6 +188,14 @@

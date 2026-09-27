@@ -125,6 +125,28 @@ static void lorieNotePresentSubmitted(void) {
     pvfb->state->presentStats.presentSubmits++;
 }
 
+// Interval between two client present requests arriving, and how far ahead they aim.
+void lorieNotePresentRequest(uint64_t target_msc, uint64_t crtc_msc) {
+    static uint64_t lastUs = 0;
+    uint64_t nowUs = lorieNowUs();
+    uint32_t ahead;
+
+    if (!pvfb->state)
+        return;
+
+    if (lastUs) {
+        uint32_t gapUs = (uint32_t) (nowUs - lastUs);
+        if (gapUs > pvfb->state->presentStats.requestGapMaxUs)
+            pvfb->state->presentStats.requestGapMaxUs = gapUs;
+    }
+    lastUs = nowUs;
+    pvfb->state->presentStats.requests++;
+
+    ahead = target_msc > crtc_msc ? (uint32_t) (target_msc - crtc_msc) : 0;
+    if (ahead > pvfb->state->presentStats.requestAheadMax)
+        pvfb->state->presentStats.requestAheadMax = ahead;
+}
+
 // Interval between two presents becoming visible. Called from both completion paths below.
 static void lorieNotePresentCompleted(void) {
     static uint64_t lastUs = 0;
@@ -747,6 +769,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.presentSubmits,
                 pvfb->state->presentStats.submitGapMaxUs / 1000.0);
         }
+        if (pvfb->state->presentStats.requests)
+            log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
+                pvfb->state->presentStats.requests,
+                pvfb->state->presentStats.requestGapMaxUs / 1000.0,
+                pvfb->state->presentStats.requestAheadMax);
+
         if (pvfb->state->presentStats.copyCompletions)
             log(INFO, "XlorieCopy: %u copies took avg %.1f ms, longest %.1f ms, found unfinished %u times",
                 pvfb->state->presentStats.copyCompletions,
@@ -787,6 +815,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
+    pvfb->state->presentStats.requests = 0;
+    pvfb->state->presentStats.requestGapMaxUs = 0;
+    pvfb->state->presentStats.requestAheadMax = 0;
     pvfb->state->presentStats.copyLatencySumUs = 0;
     pvfb->state->presentStats.copyLatencyMaxUs = 0;
     pvfb->state->presentStats.copyCompletions = 0;
