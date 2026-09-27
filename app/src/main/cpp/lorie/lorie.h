@@ -294,6 +294,15 @@ struct lorie_shared_server_state {
         volatile uint32_t rootRemapUs;    /* AHardwareBuffer unlock+lock of the root, per frame */
         volatile uint32_t rootRemaps;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
+        /*
+         * When a client's present actually reaches the screen, measured where present reports it as
+         * completed. This is the one thing that matches what a person sees: the renderer can put out
+         * a perfectly even 120 frames a second while the client content inside them arrives in
+         * bursts, and then the picture stutters with every counter above looking healthy.
+         */
+        volatile uint32_t presentCompletions;
+        volatile uint32_t presentGapSumUs;
+        volatile uint32_t presentGapMaxUs;
     } presentStats;
 
     /*

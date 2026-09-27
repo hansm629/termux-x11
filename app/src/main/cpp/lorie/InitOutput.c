@@ -643,6 +643,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.cursorOnlyFrames,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
+        if (pvfb->state->presentStats.presentCompletions > 1)
+            log(INFO, "XloriePresent: %u client presents reached the screen in 5.0 s "
+                      "(avg %.1f ms apart, longest %.1f ms)",
+                pvfb->state->presentStats.presentCompletions,
+                pvfb->state->presentStats.presentGapSumUs / 1000.0 /
+                    (pvfb->state->presentStats.presentCompletions - 1),
+                pvfb->state->presentStats.presentGapMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -670,6 +677,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootRemapUs = 0;
     pvfb->state->presentStats.rootRemaps = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
+    pvfb->state->presentStats.presentCompletions = 0;
+    pvfb->state->presentStats.presentGapSumUs = 0;
+    pvfb->state->presentStats.presentGapMaxUs = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
@@ -1184,8 +1194,29 @@ Bool lorieGpuCopyIsDone(uint64_t serial) {
     return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
 }
 
+// Interval between two presents becoming visible. Called from both completion paths below.
+static void lorieNotePresentCompleted(void) {
+    static uint64_t lastUs = 0;
+    uint64_t nowUs = lorieNowUs();
+
+    if (!pvfb->state)
+        return;
+
+    if (lastUs) {
+        uint32_t gapUs = (uint32_t) (nowUs - lastUs);
+        pvfb->state->presentStats.presentGapSumUs += gapUs;
+        if (gapUs > pvfb->state->presentStats.presentGapMaxUs)
+            pvfb->state->presentStats.presentGapMaxUs = gapUs;
+    }
+    lastUs = nowUs;
+    pvfb->state->presentStats.presentCompletions++;
+}
+
 void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+
+    lorieNotePresentCompleted();
+
     if (priv && priv->buffer)
         LorieBuffer_gpuCopyPendingDec(priv->buffer);
     if (dst_buffer)
@@ -1225,6 +1256,7 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t 
     // For some reason calling present_event_notify in BlockHandler or as QueueWorkProc/eventfd callback
     // adds some delay which may be easily avoided this way.
     static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
+    lorieNotePresentCompleted();
     RegionReset(DamageRegion(pvfb->damage), &box);
     pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
     present_event_notify(event_id, ust, pvfb->current_msc);
