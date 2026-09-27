@@ -515,7 +515,18 @@ static miPointerScreenFuncRec loriePointerCursorFuncs = {
 static void loriePerformVblanks(void);
 
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
+    static uint64_t lastRedrawUs = 0;
+    uint64_t nowUs = lorieNowUs();
     int status, nonEmpty;
+
+    // The renderer ticks this once per vsync. A gap much longer than a frame means the X server
+    // thread was stuck doing something else - which is exactly what a visible hitch is.
+    if (lastRedrawUs && pvfb->state) {
+        uint32_t gapUs = (uint32_t) (nowUs - lastRedrawUs);
+        if (gapUs > pvfb->state->presentStats.xDispatchMaxUs)
+            pvfb->state->presentStats.xDispatchMaxUs = gapUs;
+    }
+    lastRedrawUs = nowUs;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
@@ -541,8 +552,13 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         // Also according to AHardwareBuffer docs simultaneous reading in rendering thread and
         // locking for writing in other thread is fine.
         if (priv->locked) {
+            // Remapping the root for every frame with damage: gralloc can make this a cache
+            // maintenance pass over the whole buffer, on this thread, which nothing else measures.
+            uint64_t remapStartUs = lorieNowUs();
             LorieBuffer_unlock(priv->buffer);
             status = LorieBuffer_lock(priv->buffer, &priv->locked);
+            pvfb->state->presentStats.rootRemapUs += (uint32_t) (lorieNowUs() - remapStartUs);
+            pvfb->state->presentStats.rootRemaps++;
             if (status)
                 FatalError("Failed to lock the surface: %d\n", status);
         }
@@ -626,6 +642,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.cursorOnlyFrames,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
+        log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
+            pvfb->state->presentStats.rootRemapUs / 1000.0,
+            pvfb->state->presentStats.rootRemaps,
+            pvfb->state->presentStats.xDispatchMaxUs / 1000.0);
         if (pvfb->state->presentStats.cursorUploads)
             log(INFO, "XlorieLock: cursor image uploaded %u times, %.1f ms total",
                 pvfb->state->presentStats.cursorUploads,
@@ -646,6 +666,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.pointerMoves = 0;
     pvfb->state->presentStats.cursorUploads = 0;
     pvfb->state->presentStats.cursorUploadUs = 0;
+    pvfb->state->presentStats.rootRemapUs = 0;
+    pvfb->state->presentStats.rootRemaps = 0;
+    pvfb->state->presentStats.xDispatchMaxUs = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;

@@ -291,6 +291,9 @@ struct lorie_shared_server_state {
         volatile uint32_t pointerMoves;   /* cursor motions fed to the renderer (each forces a frame) */
         volatile uint32_t cursorUploads;  /* cursor shape changes that reached the GPU */
         volatile uint32_t cursorUploadUs; /* and what they cost */
+        volatile uint32_t rootRemapUs;    /* AHardwareBuffer unlock+lock of the root, per frame */
+        volatile uint32_t rootRemaps;
+        volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
     } presentStats;
 
     /*
