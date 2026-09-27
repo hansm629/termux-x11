@@ -153,6 +153,10 @@ static void lorieNotePresentCompleted(void) {
 // -single-root-buffer restores the old synchronous behaviour.
 static Bool lorieSingleRootBuffer = FALSE;
 
+// -legacy-flip-msc: restore the old clamp in loriePresentAfterFlip, so the effect of not clamping
+// can be measured within one build instead of across two.
+static Bool lorieLegacyFlipMsc = FALSE;
+
 // Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
 // the first connection so callers don't need a NULL check.
 static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
@@ -412,6 +416,11 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
     if (strcmp(argv[i], "-check-drawing") == 0) {
         NoListenAll = TRUE;
         QueueWorkProc(drawSquares, NULL, NULL);
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-legacy-flip-msc") == 0) {
+        lorieLegacyFlipMsc = TRUE;
         return 1;
     }
 
@@ -1306,7 +1315,9 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t 
      *
      * So only ever move it forward, and report where we actually are.
      */
-    if (target_msc > pvfb->current_msc)
+    if (lorieLegacyFlipMsc)
+        pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
+    else if (target_msc > pvfb->current_msc)
         pvfb->current_msc = target_msc;
 
     present_event_notify(event_id, ust, pvfb->current_msc);
