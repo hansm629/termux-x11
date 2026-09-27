@@ -131,6 +131,9 @@ static volatile int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0, 
 // "waiting for a buffer of the right size" state that this new size may well have resolved.
 static volatile bool expectedSizeChanged = false;
 
+// Defined further down, next to the frame it retires; called from rendererRefreshContext() above it.
+static void rendererRetireFrame(void);
+
 static pthread_mutex_t stateLock;
 // Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
 // (the companion mutex) doesn't need to be shared too.
@@ -850,7 +853,6 @@ void rendererRefreshContext(void) {
     log("Xlorie: new surface applied: %p\n", sfc);
 }
 
-static void rendererRetireFrame(void);
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
 static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
 static void drawCursor(float displayWidth, float displayHeight);

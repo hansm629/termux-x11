@@ -528,8 +528,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         if (priv->rootDouble) {
             // Whatever we just drew only exists in the buffer we drew it into; record it so the
             // other one is brought up to date when it becomes our drawing target again.
-            int write = lorieRootWriteIndex();
-            RegionUnion(&priv->rootStale[write ^ 1], &priv->rootStale[write ^ 1], DamageRegion(pvfb->damage));
+            int writeIdx = lorieRootWriteIndex();
+            RegionUnion(&priv->rootStale[writeIdx ^ 1], &priv->rootStale[writeIdx ^ 1], DamageRegion(pvfb->damage));
         }
 
         DamageEmpty(pvfb->damage);
