@@ -1208,6 +1208,7 @@ static void rendererApplyPendingGpuCopies(void) {
     uint64_t serial;
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return;
+    int64_t lockStartNs = rendererNowNs();
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     serial = rendererApplyPendingGpuCopiesLocked();
     if (serial) {
@@ -1221,6 +1222,7 @@ static void rendererApplyPendingGpuCopies(void) {
         notifyGpuCopyDone();
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    state->presentStats.lockHeldUs += (uint32_t) rendererNsToUs(rendererNowNs() - lockStartNs);
 }
 
 // Frame pacing numbers the X server prints every 5 seconds (see lorieFramecounter). Kept separate
@@ -1262,9 +1264,16 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
         state->presentStats.gpuCopyFrames++;
     if (coalesceWaitUs > 0)
         state->presentStats.coalescedFrames++;
+
+    state->presentStats.displayRefreshMHz = (uint32_t) (rendererDisplayRefreshRateHz * 1000.0f);
 }
 
 void rendererRedrawLocked(bool* waitingForBuffers) {
+    // Captured before the locked section clears it: a frame with no damage at all is one the
+    // cursor alone asked for, which rendererShouldWait() refuses to coalesce.
+    bool cursorOnlyFrame = state && !state->drawRequested &&
+                           (state->cursor.moved || state->cursor.updated);
+    int64_t lockHeldUs = 0;
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
     EGLSync fence = EGL_NO_SYNC_KHR;
@@ -1354,6 +1363,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     glViewport(viewportX, surfaceH - viewportY - viewportH, viewportW, viewportH);
 
     // We should signal X server to not use root window while we actively copy it
+    int64_t lockStartNs = rendererNowNs();
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
@@ -1399,6 +1409,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    lockHeldUs = rendererNsToUs(rendererNowNs() - lockStartNs);
 // Gaming fast path: submit GL commands before swap without creating or waiting on fences.
     // This keeps the no-fence fast path but avoids moving all submit work into swap.
     if (!rootFenceWaitEnabled) {
@@ -1458,6 +1469,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     state->renderedFrames++;
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
+    state->presentStats.lockHeldUs += (uint32_t) lockHeldUs;
+    if (cursorOnlyFrame)
+        state->presentStats.cursorOnlyFrames++;
 
     if (rendererPerfLogEnabled) {
         int64_t totalUs = rendererNsToUs(rendererNowNs() - frameStartNs);

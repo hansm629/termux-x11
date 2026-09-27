@@ -12,6 +12,7 @@
 #include <dix-config.h>
 #endif
 
+#include <time.h>
 #include <sys/eventfd.h>
 #include <sys/errno.h>
 #include <libxcvt/libxcvt.h>
@@ -385,6 +386,7 @@ static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int
     pvfb->state->cursor.x = x;
     pvfb->state->cursor.y = y;
     pvfb->state->cursor.moved = TRUE;
+    pvfb->state->presentStats.pointerMoves++;
     // No need to explicitly lock the mutex, it will cause waiting for rendering to be finished.
     // We are simply signaling the renderer in the case if it sleeps.
     pthread_cond_signal(rendererCond);
@@ -509,6 +511,12 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
+static inline __always_inline uint64_t lorieNowUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
+}
+
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint32_t samples;
     static Bool driverLogged = FALSE;
@@ -541,6 +549,16 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.fenceWaitUs / 1000.0,
             pvfb->state->presentStats.gpuCopyFrames,
             pvfb->state->presentStats.coalescedFrames);
+        log(INFO, "XlorieLock: renderer held the root lock %.1f%% of the time (%.0f ms), "
+                  "X server blocked on it %.0f ms over %u accesses, "
+                  "cursor-only frames %u of %u pointer moves, display %.1f Hz",
+            pvfb->state->presentStats.lockHeldUs / 50000.0,
+            pvfb->state->presentStats.lockHeldUs / 1000.0,
+            pvfb->state->presentStats.xLockWaitUs / 1000.0,
+            pvfb->state->presentStats.xLockWaits,
+            pvfb->state->presentStats.cursorOnlyFrames,
+            pvfb->state->presentStats.pointerMoves,
+            pvfb->state->presentStats.displayRefreshMHz / 1000.0);
     }
 
     pvfb->state->presentStats.frameSamples = 0;
@@ -550,6 +568,11 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.fenceWaitUs = 0;
     pvfb->state->presentStats.gpuCopyFrames = 0;
     pvfb->state->presentStats.coalescedFrames = 0;
+    pvfb->state->presentStats.lockHeldUs = 0;
+    pvfb->state->presentStats.cursorOnlyFrames = 0;
+    pvfb->state->presentStats.xLockWaitUs = 0;
+    pvfb->state->presentStats.xLockWaits = 0;
+    pvfb->state->presentStats.pointerMoves = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
@@ -1171,8 +1194,15 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
+    if (lorieNeedsGpuLock(pPix, priv, index)) {
+        // This is where the X server's own drawing waits for the renderer to let go of the root
+        // window. Timed because it is the whole cost of the renderer's lock occupancy as the X
+        // server experiences it - a client's throughput drops by exactly this.
+        uint64_t waitStartUs = lorieNowUs();
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        pvfb->state->presentStats.xLockWaitUs += (uint32_t) (lorieNowUs() - waitStartUs);
+        pvfb->state->presentStats.xLockWaits++;
+    }
 
     if (!priv->locked && !priv->mem) {
         int err = LorieBuffer_lock(priv->buffer, &priv->locked);

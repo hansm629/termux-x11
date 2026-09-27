@@ -253,6 +253,14 @@ struct lorie_shared_server_state {
         volatile uint32_t fenceWaitUs;    /* total time blocked on the root/present-copy fence */
         volatile uint32_t gpuCopyFrames;  /* frames that carried at least one present copy */
         volatile uint32_t coalescedFrames;/* redraws the backpressure guard delayed */
+        volatile uint32_t lockHeldUs;     /* renderer time holding state->lock, i.e. time the X
+                                           * server's own drawing (loriePrepareAccess) can not run */
+        volatile uint32_t cursorOnlyFrames;/* redraws with no damage at all: only the cursor moved */
+        volatile uint32_t displayRefreshMHz;/* what the renderer paces to, milli-Hz */
+        /* Written by the X server side, not the renderer, but reset together with the rest. */
+        volatile uint32_t xLockWaitUs;    /* time the X server spent blocked on state->lock */
+        volatile uint32_t xLockWaits;     /* how many of its accesses had to take that lock */
+        volatile uint32_t pointerMoves;   /* cursor motions fed to the renderer (each forces a frame) */
     } presentStats;
 
     /*
