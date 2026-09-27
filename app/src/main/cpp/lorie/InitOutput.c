@@ -739,21 +739,23 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     samples = pvfb->state->presentStats.frameSamples;
     if (samples) {
         log(INFO, "XlorieFrames: frame avg %.1f ms, max %.1f ms, hitches(>=%d ms) %u, "
-                  "fence wait %.1f ms total, copies on %u frames, coalesced %u",
+                  "fence wait %.1f ms total (worst %.1f ms), copies on %u frames, coalesced %u",
             (double) pvfb->state->presentStats.frameSumUs / samples / 1000.0,
             pvfb->state->presentStats.maxFrameUs / 1000.0,
             LORIE_LONG_FRAME_US / 1000,
             pvfb->state->presentStats.longFrames,
             pvfb->state->presentStats.fenceWaitUs / 1000.0,
+            pvfb->state->presentStats.fenceWaitMaxUs / 1000.0,
             pvfb->state->presentStats.gpuCopyFrames,
             pvfb->state->presentStats.coalescedFrames);
         log(INFO, "XlorieLock: renderer held the root lock %.1f%% of the time (%.0f ms), "
-                  "X server blocked on it %.0f ms over %u accesses, "
+                  "X server blocked on it %.0f ms over %u accesses (worst %.1f ms), "
                   "cursor-only frames %u of %u pointer moves, display %.1f Hz",
             pvfb->state->presentStats.lockHeldUs / 50000.0,
             pvfb->state->presentStats.lockHeldUs / 1000.0,
             pvfb->state->presentStats.xLockWaitUs / 1000.0,
             pvfb->state->presentStats.xLockWaits,
+            pvfb->state->presentStats.xLockWaitMaxUs / 1000.0,
             pvfb->state->presentStats.cursorOnlyFrames,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
@@ -804,6 +806,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.coalescedFrames = 0;
     pvfb->state->presentStats.lockHeldUs = 0;
     pvfb->state->presentStats.cursorOnlyFrames = 0;
+    pvfb->state->presentStats.xLockWaitMaxUs = 0;
+    pvfb->state->presentStats.fenceWaitMaxUs = 0;
     pvfb->state->presentStats.xLockWaitUs = 0;
     pvfb->state->presentStats.xLockWaits = 0;
     pvfb->state->presentStats.pointerMoves = 0;
@@ -1653,7 +1657,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         // server experiences it - a client's throughput drops by exactly this.
         uint64_t waitStartUs = lorieNowUs();
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
-        pvfb->state->presentStats.xLockWaitUs += (uint32_t) (lorieNowUs() - waitStartUs);
+        uint32_t waitUs = (uint32_t) (lorieNowUs() - waitStartUs);
+        pvfb->state->presentStats.xLockWaitUs += waitUs;
+        if (waitUs > pvfb->state->presentStats.xLockWaitMaxUs)
+            pvfb->state->presentStats.xLockWaitMaxUs = waitUs;
         pvfb->state->presentStats.xLockWaits++;
     }
 

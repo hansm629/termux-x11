@@ -279,6 +279,7 @@ struct lorie_shared_server_state {
         volatile uint32_t maxFrameUs;     /* the worst one */
         volatile uint32_t longFrames;     /* gaps >= LORIE_LONG_FRAME_US, i.e. a visible hitch */
         volatile uint32_t fenceWaitUs;    /* total time blocked on the root/present-copy fence */
+        volatile uint32_t fenceWaitMaxUs; /* and the worst single one - a total hides a lone 100 ms wait */
         volatile uint32_t gpuCopyFrames;  /* frames that carried at least one present copy */
         volatile uint32_t coalescedFrames;/* redraws the backpressure guard delayed */
         volatile uint32_t lockHeldUs;     /* renderer time holding state->lock, i.e. time the X
@@ -288,6 +289,8 @@ struct lorie_shared_server_state {
         /* Written by the X server side, not the renderer, but reset together with the rest. */
         volatile uint32_t xLockWaitUs;    /* time the X server spent blocked on state->lock */
         volatile uint32_t xLockWaits;     /* how many of its accesses had to take that lock */
+        volatile uint32_t xLockWaitMaxUs; /* worst single wait; 190 ms spread over 360 accesses and one
+                                           * 190 ms wait look identical in the total */
         volatile uint32_t pointerMoves;   /* cursor motions fed to the renderer (each forces a frame) */
         volatile uint32_t cursorUploads;  /* cursor shape changes that reached the GPU */
         volatile uint32_t cursorUploadUs; /* and what they cost */

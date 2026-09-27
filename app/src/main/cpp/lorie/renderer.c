@@ -1281,8 +1281,11 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
 
     lastFrameStartNs = frameStartNs;
 
-    if (fenceWaitUs > 0)
+    if (fenceWaitUs > 0) {
         state->presentStats.fenceWaitUs += (uint32_t) fenceWaitUs;
+        if ((uint32_t) fenceWaitUs > state->presentStats.fenceWaitMaxUs)
+            state->presentStats.fenceWaitMaxUs = (uint32_t) fenceWaitUs;
+    }
     if (carriedGpuCopy)
         state->presentStats.gpuCopyFrames++;
     if (coalesceWaitUs > 0)
