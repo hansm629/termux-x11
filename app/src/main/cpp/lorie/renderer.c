@@ -1268,6 +1268,37 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
     state->presentStats.displayRefreshMHz = (uint32_t) (rendererDisplayRefreshRateHz * 1000.0f);
 }
 
+// Root double buffering handshake, see the rootHandover comment in lorie.h. Claiming tells the X
+// server "I am sampling this slot, do not take it back"; it is the only thing that keeps the X
+// server from having to wait for our fence, so every path out of a claimed frame must release.
+static uint64_t rendererClaimRootBuffer(void) {
+    uint32_t old, claimed;
+
+    if (!state->rootDoubleBuffered)
+        return state->rootWindowTextureID;
+
+    do {
+        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+        claimed = old | 1u;
+    } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, claimed, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+
+    return state->rootBufferIds[(claimed >> 1) & 1u];
+}
+
+static void rendererReleaseRootBuffer(void) {
+    uint32_t old, released;
+
+    if (!state->rootDoubleBuffered)
+        return;
+
+    do {
+        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+        released = old & ~1u;
+    } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, released, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+}
+
 void rendererRedrawLocked(bool* waitingForBuffers) {
     // Captured before the locked section clears it: a frame with no damage at all is one the
     // cursor alone asked for, which rendererShouldWait() refuses to coalesce.
@@ -1299,17 +1330,19 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
         rendererLastPerfFrameStartNs = frameStartNs;
     }
+    uint64_t rootId = rendererClaimRootBuffer();
     // The buffer will not be released until this function ends, but main thread can modify buffer list
     pthread_spin_lock(&bufferLock);
-    LorieBuffer *buffer = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
+    LorieBuffer *buffer = LorieBufferList_findById(&buffers, rootId);
     // Probably X server requested us to draw removed buffer and immediately requested to remove it. Let's display it one last time.
     if (!buffer)
-        buffer = LorieBufferList_findById(&removedBuffers, state->rootWindowTextureID);
+        buffer = LorieBufferList_findById(&removedBuffers, rootId);
     if (!buffer)
         *waitingForBuffers = true;
     pthread_spin_unlock(&bufferLock);
     if (!buffer) {
-        log("Buffer %llu not found", state->rootWindowTextureID);
+        log("Buffer %llu not found", (unsigned long long) rootId);
+        rendererReleaseRootBuffer();
         // The locked apply further down is now unreachable, so drain the queue here: otherwise a
         // copy queued for a window unrelated to root stalls until root recovers, and it also keeps
         // this thread spinning, since rendererShouldWait()'s gpuCopyPending check runs before it
@@ -1325,8 +1358,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (!expectedW || !expectedH || desc->height != expectedH ||
         (desc->width != alignedExpectedW && desc->width != expectedW)) {
         log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
-            state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
+            (unsigned long long) rootId, alignedExpectedW, expectedH, expectedW, expectedH,
             desc->width, desc->height);
+        rendererReleaseRootBuffer();
         // Otherwise rendererShouldWait sees drawRequested or a pending cursor update and busy-spins
         // retrying this same mismatch instead of waiting for the buffer of the requested size.
         // A surface change also raises cursor.updated, which keeps this thread awake on its own,
@@ -1373,7 +1407,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
     draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
-    if (rootFenceWaitEnabled || gpuCopySerial) {
+    // The double buffered root hands the buffer back to the X server as soon as this fence signals,
+    // so the fence is what makes that handover safe - it is not optional there.
+    if (rootFenceWaitEnabled || gpuCopySerial || state->rootDoubleBuffered) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
     }
@@ -1403,6 +1439,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         eglDestroySyncKHR(egl_display, fence);
         fence = EGL_NO_SYNC_KHR;
     }
+    // Sampling of the root buffer is complete, so hand it back before anything else - this is what
+    // lets the X server carry on drawing while we still have the screen draw and the swap to do.
+    rendererReleaseRootBuffer();
     if (gpuCopySerial) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();

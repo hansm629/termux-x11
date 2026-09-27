@@ -213,6 +213,31 @@ struct lorie_shared_server_state {
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;
 
+    /*
+     * Root window double buffering.
+     *
+     * With a single root buffer the renderer has to hold state->lock across its whole frame,
+     * including the fence wait for the GPU to finish sampling the root texture, or the X server
+     * would overwrite pixels the GPU is still reading. That makes every X server drawing operation
+     * wait for a GPU round trip - measured at ~230 waits/s of ~0.85ms each on an ANGLE-backed
+     * driver, which is what makes a dragged window advance unevenly.
+     *
+     * So the root gets two buffers: the renderer samples rootBufferIds[slot], the X server draws
+     * into the other one, and neither ever waits for the other. rootHandover carries both the slot
+     * and a "renderer is sampling" bit in one word so the swap needs no mutex:
+     *
+     *   bit 0      set while the renderer is sampling its slot
+     *   bit 1      the slot it samples (index into rootBufferIds)
+     *   bits 2..   handover counter, for debugging
+     *
+     * The renderer claims the word (setting bit 0) before it reads the slot and clears it once its
+     * fence has signalled. The X server only flips the slot when bit 0 is clear, and simply keeps
+     * drawing into the same buffer for another frame when it is not - so it never blocks.
+     */
+    volatile uint64_t rootBufferIds[2];
+    volatile uint32_t rootHandover;
+    volatile uint8_t rootDoubleBuffered;
+
     /* A signal to renderer to update root window texture content from shared fragment if needed */
     volatile uint8_t drawRequested;
 

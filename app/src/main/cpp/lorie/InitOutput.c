@@ -102,6 +102,9 @@ static lorieScreenInfo lorieScreen = {
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 
+// -single-root-buffer: keep the old behaviour where the X server waits for the renderer's fence.
+static Bool lorieSingleRootBuffer = FALSE;
+
 // Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
 // the first connection so callers don't need a NULL check.
 static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
@@ -112,7 +115,23 @@ typedef struct {
     bool flipped, wasLocked, imported;
     void *locked;
     void *mem;
+
+    /*
+     * Root window only: the two buffers the root is double buffered with (see the rootHandover
+     * comment in lorie.h). buffer/locked above always alias whichever one the X server currently
+     * draws into. rootStale[i] is the region buffer i has not received yet, which is copied into it
+     * when it becomes the drawing target again.
+     */
+    LorieBuffer *rootBuf[2];
+    void *rootLocked[2];
+    RegionRec rootStale[2];
+    Bool rootDouble;
 } LoriePixmapPriv;
+
+static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region);
+static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
+static Bool lorieRootHandover(LoriePixmapPriv *priv);
+static inline int lorieRootWriteIndex(void);
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
 #define LORIE_BUFFER_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap))->buffer : NULL)
@@ -348,6 +367,11 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
         return 1;
     }
 
+    if (strcmp(argv[i], "-single-root-buffer") == 0) {
+        lorieSingleRootBuffer = TRUE;
+        return 1;
+    }
+
     if (strcmp(argv[i], "-disable-gpu-present") == 0) {
         pvfb->gpuPresentDisabled = TRUE;
         return 1;
@@ -492,12 +516,24 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
                 FatalError("Failed to lock the surface: %d\n", status);
         }
 
+        lorieEnsureRootDoubleBuffer(root);
+        if (priv->rootDouble) {
+            // Whatever we just drew only exists in the buffer we drew it into; record it so the
+            // other one is brought up to date when it becomes our drawing target again.
+            int write = lorieRootWriteIndex();
+            RegionUnion(&priv->rootStale[write ^ 1], &priv->rootStale[write ^ 1], DamageRegion(pvfb->damage));
+        }
+
         DamageEmpty(pvfb->damage);
+        lorieRootHandover(priv);
         pvfb->state->drawRequested = TRUE;
     }
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
-        pvfb->state->rootWindowTextureID = LorieBuffer_description(priv->buffer)->id;
+        // With a double buffered root this must name the buffer the renderer samples, not the one
+        // we draw into.
+        pvfb->state->rootWindowTextureID = LorieBuffer_description(
+                priv->rootDouble ? priv->rootBuf[lorieRootWriteIndex() ^ 1] : priv->buffer)->id;
 
         // Sending signal about pending root window changes to renderer thread.
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
@@ -1048,6 +1084,19 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         // Tracked so CPU reads of the screen pixmap only pay for the GPU lock (see
         // lorieNeedsGpuLock) while a GPU write into it can actually be in flight.
         pvfb->rootGpuCopyPending++;
+        LoriePixmapPriv *rootPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
+        if (rootPriv && rootPriv->rootDouble) {
+            // The copy lands in the buffer we are drawing into, so the other one misses it too.
+            int other = lorieRootWriteIndex() ^ 1;
+            if (update)
+                RegionUnion(&rootPriv->rootStale[other], &rootPriv->rootStale[other], update);
+            else {
+                RegionRec r;
+                RegionInit(&r, &fullBox, 1);
+                RegionUnion(&rootPriv->rootStale[other], &rootPriv->rootStale[other], &r);
+                RegionUninit(&r);
+            }
+        }
     }
     *out_dst_buffer = dstIsRoot ? NULL : dstBuffer;
 
@@ -1166,6 +1215,25 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
 }
 
 void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
+    {
+        LoriePixmapPriv *rootPriv = driverPriv;
+        if (rootPriv && rootPriv->rootDouble) {
+            // Both buffers belong to this pixmap; the one below frees whichever one `buffer` aliases.
+            int otherIdx = rootPriv->buffer == rootPriv->rootBuf[0] ? 1 : 0;
+            LorieBuffer *other = rootPriv->rootBuf[otherIdx];
+            if (other && rootPriv->rootLocked[otherIdx])
+                LorieBuffer_unlock(other);
+            RegionUninit(&rootPriv->rootStale[0]);
+            RegionUninit(&rootPriv->rootStale[1]);
+            rootPriv->rootDouble = FALSE;
+            rootPriv->rootBuf[0] = rootPriv->rootBuf[1] = NULL;
+            pvfb->state->rootDoubleBuffered = 0;
+            if (other) {
+                lorieUnregisterBuffer(other);
+                LorieBuffer_release(other);
+            }
+        }
+    }
     LoriePixmapPriv *priv = driverPriv;
     if (priv->buffer) {
         if (priv->locked)
@@ -1183,10 +1251,135 @@ Bool lorieModifyPixmapHeader(PixmapPtr pPix, __unused int w, __unused int h, __u
     return FALSE;
 }
 
+// Copies region from one root buffer to the other. Both are CPU mapped and have the same geometry,
+// so this is a plain per-scanline memcpy; nothing here touches the GPU or waits for it.
+static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {
+    const LorieBuffer_Desc *d;
+    const char *src = priv->rootLocked[from];
+    char *dst = priv->rootLocked[to];
+    int nrects = RegionNumRects(region), i;
+    BoxPtr box = RegionRects(region);
+    size_t stride;
+
+    if (!src || !dst || nrects <= 0)
+        return;
+
+    d = LorieBuffer_description(priv->rootBuf[from]);
+    stride = (size_t) d->stride * 4;
+
+    for (i = 0; i < nrects; i++) {
+        int x1 = max(0, box[i].x1), x2 = min((int) d->width, box[i].x2);
+        int y1 = max(0, box[i].y1), y2 = min((int) d->height, box[i].y2), y;
+
+        for (y = y1; x2 > x1 && y < y2; y++)
+            memcpy(dst + (size_t) y * stride + (size_t) x1 * 4,
+                   src + (size_t) y * stride + (size_t) x1 * 4, (size_t) (x2 - x1) * 4);
+    }
+}
+
+// Index of the buffer the X server currently draws into: the one the renderer is not sampling.
+static inline int lorieRootWriteIndex(void) {
+    return (int) (((__atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE) >> 1) & 1u) ^ 1u);
+}
+
+// Allocates the second root buffer. Failing is not fatal, it just leaves the old single-buffered
+// behaviour (where every X server drawing operation waits for the renderer's fence) in place.
+static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(root);
+    const LorieBuffer_Desc *desc;
+    RegionRec all;
+    BoxRec box;
+
+    if (lorieSingleRootBuffer || !priv || priv->rootDouble || !priv->buffer || priv->mem || pvfb->root.legacyDrawing)
+        return;
+
+    desc = LorieBuffer_description(priv->buffer);
+    if (desc->type != LORIEBUFFER_AHARDWAREBUFFER)
+        return;
+
+    priv->rootBuf[0] = priv->buffer;
+    priv->rootLocked[0] = priv->locked;
+    priv->rootBuf[1] = LorieBuffer_allocate((int) desc->width, (int) desc->height,
+                                            AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, LORIEBUFFER_AHARDWAREBUFFER);
+    if (!priv->rootBuf[1]) {
+        log(ERROR, "Failed to allocate the second root buffer, keeping the single buffered root");
+        priv->rootBuf[0] = NULL;
+        return;
+    }
+
+    if (LorieBuffer_lock(priv->rootBuf[1], &priv->rootLocked[1]) || !priv->rootLocked[1]) {
+        log(ERROR, "Failed to lock the second root buffer, keeping the single buffered root");
+        LorieBuffer_release(priv->rootBuf[1]);
+        priv->rootBuf[0] = priv->rootBuf[1] = NULL;
+        priv->rootLocked[1] = NULL;
+        return;
+    }
+
+    RegionInit(&priv->rootStale[0], NULL, 0);
+    RegionInit(&priv->rootStale[1], NULL, 0);
+
+    // Start both buffers identical, then let the renderer sample index 0 while we move on to 1.
+    box = (BoxRec) { 0, 0, (short) desc->width, (short) desc->height };
+    RegionInit(&all, &box, 1);
+    lorieCopyRootRegion(priv, 0, 1, &all);
+    RegionUninit(&all);
+
+    lorieRegisterBuffer(priv->rootBuf[1]);
+
+    pvfb->state->rootBufferIds[0] = LorieBuffer_description(priv->rootBuf[0])->id;
+    pvfb->state->rootBufferIds[1] = LorieBuffer_description(priv->rootBuf[1])->id;
+    __atomic_store_n(&pvfb->state->rootHandover, 0u, __ATOMIC_RELEASE); // slot 0, not claimed
+    priv->buffer = priv->rootBuf[1];
+    priv->locked = priv->rootLocked[1];
+    priv->rootDouble = TRUE;
+    pvfb->state->rootDoubleBuffered = 1;
+
+    log(INFO, "Root window is double buffered (%dx%d, ids %llu/%llu)", desc->width, desc->height,
+        (unsigned long long) pvfb->state->rootBufferIds[0],
+        (unsigned long long) pvfb->state->rootBufferIds[1]);
+}
+
+// Hands the buffer we have just finished drawing to the renderer and takes the other one. Does
+// nothing at all while the renderer is still sampling, in which case we simply keep drawing into the
+// same buffer for another frame - that costs one frame of freshness and never a stall.
+static Bool lorieRootHandover(LoriePixmapPriv *priv) {
+    uint32_t old, new;
+    int drawn, next;
+
+    if (!priv->rootDouble)
+        return FALSE;
+
+    old = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE);
+    if (old & 1u)
+        return FALSE;
+
+    new = (old ^ 2u) + 4u; // flip the sampled slot, bump the handover counter
+    if (!__atomic_compare_exchange_n(&pvfb->state->rootHandover, &old, new, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return FALSE; // the renderer claimed the old slot first, try again next frame
+
+    drawn = (int) ((new >> 1) & 1u);   // what we just drew, now being sampled
+    next = drawn ^ 1;                 // what we draw into from now on
+
+    lorieCopyRootRegion(priv, drawn, next, &priv->rootStale[next]);
+    RegionEmpty(&priv->rootStale[next]);
+
+    priv->buffer = priv->rootBuf[next];
+    priv->locked = priv->rootLocked[next];
+    return TRUE;
+}
+
 // Whether a CPU access to pPix could race a GPU write from the renderer, and so needs state->lock.
 static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmapPriv *priv, int index) {
-    if (pScreenPtr->GetScreenPixmap(pScreenPtr) == pPix)
+    if (pScreenPtr->GetScreenPixmap(pScreenPtr) == pPix) {
+        // With a double buffered root the renderer never samples the buffer we draw into, so our
+        // drawing does not have to wait for its fence at all. Only a GPU copy landing in our own
+        // buffer still needs the lock.
+        if (pvfb->state->rootDoubleBuffered)
+            return pvfb->rootGpuCopyPending && !pvfb->root.legacyDrawing;
+
         return index == EXA_PREPARE_DEST || (pvfb->rootGpuCopyPending && !pvfb->root.legacyDrawing);
+    }
     return !pvfb->root.legacyDrawing && priv->buffer &&
            LorieBuffer_description(priv->buffer)->type == LORIEBUFFER_AHARDWAREBUFFER &&
            LorieBuffer_hasGpuCopyPending(priv->buffer);
