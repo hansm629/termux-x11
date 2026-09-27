@@ -111,6 +111,11 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
         }
     }
 
+    // Which build this actually is. Telling a fresh APK from the one already installed has cost
+    // more test rounds here than any single bug, and the stats lines below cannot do it: they look
+    // identical whichever build produced them.
+    log(INFO, "XlorieBuild: compiled %s %s", __DATE__, __TIME__);
+
     if (getenv("TERMUX_X11_DEBUG") && !fork()) {
         // Printing logs of local logcat.
         char pid[32] = {0};
