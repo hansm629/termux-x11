@@ -173,6 +173,9 @@ typedef union {
 
 typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
+/* The cursor texture is allocated once at this size and updated in place. */
+#define LORIE_CURSOR_TEX_SIZE 512
+
 /* Two 60Hz frames: a gap this long is a hitch a user can see, not just a missed vsync. */
 #define LORIE_LONG_FRAME_US 33000
 
@@ -286,6 +289,8 @@ struct lorie_shared_server_state {
         volatile uint32_t xLockWaitUs;    /* time the X server spent blocked on state->lock */
         volatile uint32_t xLockWaits;     /* how many of its accesses had to take that lock */
         volatile uint32_t pointerMoves;   /* cursor motions fed to the renderer (each forces a frame) */
+        volatile uint32_t cursorUploads;  /* cursor shape changes that reached the GPU */
+        volatile uint32_t cursorUploadUs; /* and what they cost */
     } presentStats;
 
     /*
@@ -302,7 +307,7 @@ struct lorie_shared_server_state {
         pthread_mutex_t lock; // initialized at X server side.
         pid_t lockingPid;
         uint32_t x, y, xhot, yhot, width, height;
-        uint32_t bits[512*512]; // 1 megabyte should be enough for any cursor up to 512x512
+        uint32_t bits[LORIE_CURSOR_TEX_SIZE*LORIE_CURSOR_TEX_SIZE]; // 1 MiB, any cursor up to 512x512
         // Signals to renderer to update cursor's texture or its coordinates
         volatile uint8_t updated, moved;
     } cursor;

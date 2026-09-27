@@ -467,6 +467,13 @@ int rendererInitThread(void) {
 
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(1, &cursor.id);
+    // Allocated once at the largest cursor the shared state can carry (lorieSetCursor rejects
+    // anything bigger). Respecifying a texture with glTexImage2D on every cursor shape change means
+    // a fresh image allocation inside the frame, which is expensive on a driver that has to back it
+    // with a new VkImage; glTexSubImage2D into this one costs nothing but the upload.
+    glBindTexture(GL_TEXTURE_2D, cursor.id);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, LORIE_CURSOR_TEX_SIZE, LORIE_CURSOR_TEX_SIZE, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
     rendererThread();
     return 1;
@@ -1461,6 +1468,23 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     glViewport(viewportX, surfaceH - viewportY - viewportH, viewportW, viewportH);
 
+    // Outside the root lock: this only needs the cursor's own lock, and it used to sit in the middle
+    // of the frame holding up the X server for an upload that has nothing to do with the root.
+    if (state->cursor.updated) {
+        int64_t uploadStartNs = rendererNowNs();
+        lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
+        state->cursor.updated = false;
+        if (state->cursor.width && state->cursor.height &&
+            state->cursor.width <= LORIE_CURSOR_TEX_SIZE && state->cursor.height <= LORIE_CURSOR_TEX_SIZE) {
+            bindTexture(cursor.id);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
+                            GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
+        }
+        lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
+        state->presentStats.cursorUploads++;
+        state->presentStats.cursorUploadUs += (uint32_t) rendererNsToUs(rendererNowNs() - uploadStartNs);
+    }
+
     // We should signal X server to not use root window while we actively copy it
     int64_t lockStartNs = rendererNowNs();
     lorie_mutex_lock(&state->lock, &state->lockingPid);
@@ -1478,15 +1502,6 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (!deferFence && (rootFenceWaitEnabled || gpuCopySerial)) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
-    }
-
-    if (state->cursor.updated) {
-        log("Xlorie: updating cursor\n");
-        lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
-        state->cursor.updated = false;
-        bindTexture(cursor.id);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, state->cursor.bits);
-        lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
     }
 
     state->cursor.moved = FALSE;
@@ -1905,7 +1920,10 @@ __unused static void drawCursor(float displayWidth, float displayHeight) {
     h = 2.f * (float) state->cursor.height / displayHeight;
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    draw(cursor.id, x, y, x + w, y + h, 1.f, false);
+    // The cursor occupies the top left corner of a fixed size texture, so sample just that part.
+    drawRegion(cursor.id, x, y, x + w, y + h, 0.f, 0.f,
+               (float) state->cursor.width / LORIE_CURSOR_TEX_SIZE,
+               (float) state->cursor.height / LORIE_CURSOR_TEX_SIZE, false);
     glDisable(GL_BLEND);
 }
 

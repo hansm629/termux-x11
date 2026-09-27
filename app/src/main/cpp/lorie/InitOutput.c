@@ -451,6 +451,8 @@ static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
     }
 }
 
+static uint32_t lorieLastCursorChecksum = 0;
+
 static void lorieSetCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, CursorPtr pCurs, int x0, int y0) {
     CursorBitsPtr bits = pCurs ? pCurs->bits : NULL;
     if (pCurs && (pCurs->bits->width >= 512 || pCurs->bits->height >= 512))
@@ -459,16 +461,37 @@ static void lorieSetCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, Curs
 
     lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid);
     if (pCurs && bits) {
+        uint32_t sum = 2166136261u;
+        int i, pixels;
+
         pvfb->state->cursor.xhot = bits->xhot;
         pvfb->state->cursor.yhot = bits->yhot;
         pvfb->state->cursor.width = bits->width;
         pvfb->state->cursor.height = bits->height;
-        lorieConvertCursor(pCurs, pvfb->state->cursor.bits);
+        lorieConvertCursor(pCurs, (uint32_t *) pvfb->state->cursor.bits);
+
+        /*
+         * X hands us a cursor again on every crossing, a grab, a pointer confine - usually the very
+         * same image. Uploading it to the GPU each time means an out of band texture update in the
+         * middle of a frame, so only say it changed when it actually did.
+         */
+        pixels = bits->width * bits->height;
+        for (i = 0; i < pixels; i++)
+            sum = (sum ^ pvfb->state->cursor.bits[i]) * 16777619u;
+        sum ^= ((uint32_t) bits->width << 16) ^ (uint32_t) bits->height;
+
+        if (sum != lorieLastCursorChecksum) {
+            lorieLastCursorChecksum = sum;
+            pvfb->state->cursor.updated = true;
+        }
     } else {
         pvfb->state->cursor.xhot = pvfb->state->cursor.yhot = 0;
         pvfb->state->cursor.width = pvfb->state->cursor.height = 0;
+        lorieLastCursorChecksum = 0;
     }
-    pvfb->state->cursor.updated = true;
+    // The hot spot or the position can change without the image doing so, and that still has to be
+    // redrawn - but it does not need an upload.
+    pvfb->state->cursor.moved = TRUE;
     lorie_mutex_unlock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid);
 
     lorieMoveCursor(NULL, NULL, x0, y0);
@@ -603,6 +626,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.cursorOnlyFrames,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
+        if (pvfb->state->presentStats.cursorUploads)
+            log(INFO, "XlorieLock: cursor image uploaded %u times, %.1f ms total",
+                pvfb->state->presentStats.cursorUploads,
+                pvfb->state->presentStats.cursorUploadUs / 1000.0);
     }
 
     pvfb->state->presentStats.frameSamples = 0;
@@ -617,6 +644,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.xLockWaitUs = 0;
     pvfb->state->presentStats.xLockWaits = 0;
     pvfb->state->presentStats.pointerMoves = 0;
+    pvfb->state->presentStats.cursorUploads = 0;
+    pvfb->state->presentStats.cursorUploadUs = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
