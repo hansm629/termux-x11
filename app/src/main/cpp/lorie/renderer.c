@@ -1092,9 +1092,15 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 // publishing early would let the client's next write race our still-in-flight read.
 // Looks up a registered buffer by id, waiting briefly (bounded) if it hasn't arrived over the
 // async registration socket yet instead of busy-spinning the outer loop.
-static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
+// How many frames a queued copy may wait for its buffer to be registered before it is given up on.
+#define LORIE_COPY_DEFER_FRAMES 30
+
+// Looks the buffer up and attaches it if it has arrived but not been attached yet. It used to sleep
+// here - up to 20 x 5 ms - when a buffer had not been registered yet, which stops completedSerial
+// from advancing: every present waiting on it is then re-queued one vblank at a time, and a single
+// unregistered buffer holds up every copy behind it. The caller defers instead.
+static LorieBuffer *rendererFindBuffer(uint64_t id) {
     LorieBuffer *buf;
-    int attempt;
 
     pthread_spin_lock(&bufferLock);
     buf = LorieBufferList_findById(&buffers, id);
@@ -1104,16 +1110,6 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
     }
     pthread_spin_unlock(&bufferLock);
 
-    for (attempt = 0; attempt < 20 && !buf; attempt++) {
-        usleep(5000);
-        pthread_spin_lock(&bufferLock);
-        buf = LorieBufferList_findById(&buffers, id);
-        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
-            LorieBuffer_attachToGL(buf);
-            LorieBuffer_addToList(buf, &buffers);
-        }
-        pthread_spin_unlock(&bufferLock);
-    }
     return buf;
 }
 
@@ -1128,13 +1124,30 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
 
     while (state->gpuCopyQueue.readIndex != __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE)) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
-        LorieBuffer *src = rendererFindBufferWithRetry(entry.srcBufferId);
-        LorieBuffer *dst = rendererFindBufferWithRetry(entry.dstBufferId);
+        LorieBuffer *src = rendererFindBuffer(entry.srcBufferId);
+        LorieBuffer *dst = rendererFindBuffer(entry.dstBufferId);
 
-        if (!src)
-            log("rendererApplyPendingGpuCopies: source buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.srcBufferId);
-        if (!dst)
-            log("rendererApplyPendingGpuCopies: destination buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.dstBufferId);
+        if (!src || !dst) {
+            // Its buffer has not reached us yet. Leave it queued and look again on the next frame
+            // rather than waiting here, which would stall every present behind it as well.
+            static uint64_t deferredSerial = 0;
+            static int deferredFrames = 0;
+
+            if (deferredSerial != entry.serial) {
+                deferredSerial = entry.serial;
+                deferredFrames = 0;
+            }
+
+            if (++deferredFrames <= LORIE_COPY_DEFER_FRAMES) {
+                state->presentStats.copyDeferrals++;
+                break;
+            }
+
+            log("rendererApplyPendingGpuCopies: %s buffer %llu never arrived, skipping\n",
+                src ? "destination" : "source",
+                (unsigned long long) (src ? entry.dstBufferId : entry.srcBufferId));
+            state->presentStats.copySkips++;
+        }
 
         if (src && dst) {
             const LorieBuffer_Desc *srcDesc = LorieBuffer_description(src);
@@ -1196,9 +1209,6 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
                 float v1 = (float) r.y2 / (float) srcDesc->height;
                 // Only swap channels if src/dst storage formats actually differ.
                 uint8_t needsSwizzle = LorieBuffer_isRgba(src) != LorieBuffer_isRgba(dst);
-                log("rendererApplyPendingGpuCopies: rect (%d,%d)-(%d,%d) off=(%d,%d) -> ndc=(%.3f,%.3f)-(%.3f,%.3f) uv=(%.3f,%.3f)-(%.3f,%.3f) srcTex=%u dstTex=%u swizzle=%d\n",
-                    r.x1, r.y1, r.x2, r.y2, entry.xOff, entry.yOff, x0, y0, x1, y1, u0, v0, u1, v1,
-                    LorieBuffer_getGLTextureId(src), LorieBuffer_getGLTextureId(dst), needsSwizzle);
                 drawRegion(0, x0, y0, x1, y1, u0, v0, u1, v1, needsSwizzle);
             }
         }

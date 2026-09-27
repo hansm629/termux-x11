@@ -650,6 +650,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.presentGapSumUs / 1000.0 /
                     (pvfb->state->presentStats.presentCompletions - 1),
                 pvfb->state->presentStats.presentGapMaxUs / 1000.0);
+        if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
+            log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
+                pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -680,6 +683,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
+    pvfb->state->presentStats.copyDeferrals = 0;
+    pvfb->state->presentStats.copySkips = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;

@@ -303,6 +303,8 @@ struct lorie_shared_server_state {
         volatile uint32_t presentCompletions;
         volatile uint32_t presentGapSumUs;
         volatile uint32_t presentGapMaxUs;
+        volatile uint32_t copyDeferrals;  /* copies left queued because a buffer was not registered yet */
+        volatile uint32_t copySkips;      /* and the ones eventually given up on */
     } presentStats;
 
     /*
