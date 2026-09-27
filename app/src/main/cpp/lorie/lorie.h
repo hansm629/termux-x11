@@ -307,6 +307,13 @@ struct lorie_shared_server_state {
         volatile uint32_t copySkips;      /* and the ones eventually given up on */
         volatile uint32_t presentGapsLate; /* gaps over two frame periods - the distribution, not
                                             * just the worst one, is what costs throughput */
+        /*
+         * The same thing measured one step earlier, where a client hands a frame to the X server.
+         * A long gap here means the client stopped producing; a long gap only in the completion
+         * numbers above means we are holding its frames up.
+         */
+        volatile uint32_t presentSubmits;
+        volatile uint32_t submitGapMaxUs;
     } presentStats;
 
     /*

@@ -108,6 +108,45 @@ static inline __always_inline uint64_t lorieNowUs(void) {
     return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
 }
 
+// Interval between two frames being handed to us by a client.
+static void lorieNotePresentSubmitted(void) {
+    static uint64_t lastUs = 0;
+    uint64_t nowUs = lorieNowUs();
+
+    if (!pvfb->state)
+        return;
+
+    if (lastUs) {
+        uint32_t gapUs = (uint32_t) (nowUs - lastUs);
+        if (gapUs > pvfb->state->presentStats.submitGapMaxUs)
+            pvfb->state->presentStats.submitGapMaxUs = gapUs;
+    }
+    lastUs = nowUs;
+    pvfb->state->presentStats.presentSubmits++;
+}
+
+// Interval between two presents becoming visible. Called from both completion paths below.
+static void lorieNotePresentCompleted(void) {
+    static uint64_t lastUs = 0;
+    uint64_t nowUs = lorieNowUs();
+
+    if (!pvfb->state)
+        return;
+
+    if (lastUs) {
+        uint32_t gapUs = (uint32_t) (nowUs - lastUs);
+        pvfb->state->presentStats.presentGapSumUs += gapUs;
+        if (gapUs > pvfb->state->presentStats.presentGapMaxUs)
+            pvfb->state->presentStats.presentGapMaxUs = gapUs;
+        // Two frame periods at 60Hz: late enough that the content visibly missed its slot.
+        if (gapUs > 33000)
+            pvfb->state->presentStats.presentGapsLate++;
+    }
+    lastUs = nowUs;
+    pvfb->state->presentStats.presentCompletions++;
+}
+
+
 // Root double buffering. On its own it only moved the X server's wait around, but it is what lets
 // the renderer stop waiting for its own fence inside every frame (see rendererRetirePreviousFrame):
 // the buffer can be handed back a frame later instead of synchronously, which is the whole point.
@@ -651,6 +690,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                     (pvfb->state->presentStats.presentCompletions - 1),
                 pvfb->state->presentStats.presentGapMaxUs / 1000.0,
                 pvfb->state->presentStats.presentGapsLate);
+            log(INFO, "XloriePresent: %u submitted by clients (longest gap between submissions %.1f ms)",
+                pvfb->state->presentStats.presentSubmits,
+                pvfb->state->presentStats.submitGapMaxUs / 1000.0);
         }
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
@@ -688,6 +730,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.copyDeferrals = 0;
     pvfb->state->presentStats.copySkips = 0;
     pvfb->state->presentStats.presentGapsLate = 0;
+    pvfb->state->presentStats.presentSubmits = 0;
+    pvfb->state->presentStats.submitGapMaxUs = 0;
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
@@ -1195,32 +1239,12 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     *out_serial = entry->serial;
     gpuCopyAttempts++;
     gpuCopyOffloads++;
+    lorieNotePresentSubmitted();
     return TRUE;
 }
 
 Bool lorieGpuCopyIsDone(uint64_t serial) {
     return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
-}
-
-// Interval between two presents becoming visible. Called from both completion paths below.
-static void lorieNotePresentCompleted(void) {
-    static uint64_t lastUs = 0;
-    uint64_t nowUs = lorieNowUs();
-
-    if (!pvfb->state)
-        return;
-
-    if (lastUs) {
-        uint32_t gapUs = (uint32_t) (nowUs - lastUs);
-        pvfb->state->presentStats.presentGapSumUs += gapUs;
-        if (gapUs > pvfb->state->presentStats.presentGapMaxUs)
-            pvfb->state->presentStats.presentGapMaxUs = gapUs;
-        // Two frame periods at 60Hz: late enough that the content visibly missed its slot.
-        if (gapUs > 33000)
-            pvfb->state->presentStats.presentGapsLate++;
-    }
-    lastUs = nowUs;
-    pvfb->state->presentStats.presentCompletions++;
 }
 
 void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
@@ -1258,6 +1282,7 @@ Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unu
         return FALSE;
 
     lorieRegisterBuffer(priv->buffer);
+    lorieNotePresentSubmitted();
     return TRUE;
 }
 
