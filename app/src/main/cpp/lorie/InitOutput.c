@@ -102,8 +102,11 @@ static lorieScreenInfo lorieScreen = {
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 
-// -single-root-buffer: keep the old behaviour where the X server waits for the renderer's fence.
-static Bool lorieSingleRootBuffer = FALSE;
+// Root double buffering. It does remove the X server's wait for the renderer's fence (measured:
+// 1152 lock acquisitions and 976 ms of blocking per 5 s down to zero), but that wait turned out not
+// to be what makes a dragged window stutter - the client's throughput was identical with it gone.
+// So it stays off by default and is opt-in with -double-root-buffer until something shows it helps.
+static Bool lorieSingleRootBuffer = TRUE;
 
 // Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
 // the first connection so callers don't need a NULL check.
@@ -369,6 +372,11 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
 
     if (strcmp(argv[i], "-single-root-buffer") == 0) {
         lorieSingleRootBuffer = TRUE;
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-double-root-buffer") == 0) {
+        lorieSingleRootBuffer = FALSE;
         return 1;
     }
 
