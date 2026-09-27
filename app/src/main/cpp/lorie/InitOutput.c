@@ -157,6 +157,35 @@ static Bool lorieSingleRootBuffer = FALSE;
 // can be measured within one build instead of across two.
 static Bool lorieLegacyFlipMsc = FALSE;
 
+// -msc-toggle-file <path>: re-read that toggle from the first byte of a file ('1' on, anything else
+// off) once a second, so one session can alternate the two behaviours between benchmark runs with
+// nothing else changing - not the build, not the thermal state, not how the windows were dragged.
+static const char *lorieMscTogglePath = NULL;
+
+static void loriePollMscToggle(uint64_t nowUs) {
+    static uint64_t nextPollUs = 0;
+    FILE *f;
+    int c;
+    Bool want;
+
+    if (!lorieMscTogglePath || nowUs < nextPollUs)
+        return;
+    nextPollUs = nowUs + 1000000u;
+
+    f = fopen(lorieMscTogglePath, "re");
+    if (!f)
+        return;
+    c = fgetc(f);
+    fclose(f);
+
+    want = (c == '1');
+    if (want != lorieLegacyFlipMsc) {
+        lorieLegacyFlipMsc = want;
+        // Printed so a run can be attributed from the log alone rather than from memory.
+        log(INFO, "XlorieMsc: legacy flip-msc clamp %s", want ? "ON" : "OFF");
+    }
+}
+
 // Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
 // the first connection so callers don't need a NULL check.
 static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
@@ -424,6 +453,11 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
         return 1;
     }
 
+    if (strcmp(argv[i], "-msc-toggle-file") == 0 && i + 1 < argc) {
+        lorieMscTogglePath = argv[i + 1];
+        return 2;
+    }
+
     if (strcmp(argv[i], "-single-root-buffer") == 0) {
         lorieSingleRootBuffer = TRUE;
         return 1;
@@ -581,6 +615,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
             pvfb->state->presentStats.xDispatchMaxUs = gapUs;
     }
     lastRedrawUs = nowUs;
+    loriePollMscToggle(nowUs);
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
