@@ -270,19 +270,55 @@
      present_check_flip2_ptr             check_flip2;
  
 +++ ./present/present_execute.c
-@@ -34,5 +34,7 @@
+@@ -33,6 +33,8 @@
+     present_vblank_ptr      vblank = param;
      ScreenPtr               screen = vblank->screen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
--
 +    /* lorie: disarm, or miSyncTriggerFence()'s restart-scan re-fires this callback. */
 +    present_fence_set_callback(vblank->wait_fence, NULL, NULL);
-+
+ 
      screen_priv->re_execute(vblank);
  }
-@@ -67,6 +69,14 @@
+@@ -40,17 +42,16 @@
+ Bool
+ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
+ {
+-    WindowPtr                   window = vblank->window;
+-    ScreenPtr                   screen = window->drawable.pScreen;
+-    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+-
+-    /* We may have to requeue for the next MSC if check_flip_window prevented
+-     * using a flip.
+-     */
+-    if (vblank->exec_msc == crtc_msc + 1 &&
+-        screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id,
+-                                  vblank->exec_msc) == Success)
+-        return TRUE;
++    /* lorie: upstream defers a present whose flip was refused to the vsync the client asked for,
++     * because on real hardware a copy done any earlier would land in the scanout buffer mid-scan.
++     * Here the copy goes into the renderer's next frame and the renderer only ever publishes a
++     * whole frame on a vsync, so doing it now puts the pixels up on that same vsync - deferring
++     * first just moves them one frame later. Two waits were being counted for one frame boundary,
++     * and the second one is the renderer's, which we cannot skip.
++     *
++     * exec_msc == crtc_msc + 1 was exactly this case and no other: a present is never executed
++     * before its exec_msc, and present_scmd.c raises exec_msc by one when a flip fails. So this is
++     * what made an obscured window cost a frame more than a fullscreen one, every frame. */
+ 
+     if (vblank->wait_fence) {
+         if (!present_fence_check_triggered(vblank->wait_fence)) {
+@@ -67,24 +68,71 @@
      WindowPtr                   window = vblank->window;
      ScreenPtr                   screen = window->drawable.pScreen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+-
+-    /* If present_flip failed, we may have to requeue for the next MSC */
+-    if (vblank->exec_msc == crtc_msc + 1 &&
+-        Success == screen_priv->queue_vblank(screen,
+-                                             window,
+-                                             vblank->crtc,
+-                                             vblank->event_id,
+-                                             vblank->exec_msc)) {
 +    /* lorie: screen_x/screen_y is dst's own (0,0) in screen coords; window.xy minus that gives the
 +     * window's offset within dst, whether dst is root, itself, or an inherited redirected ancestor. */
 +    PixmapPtr                   gpuCopyDst = screen->GetWindowPixmap(window);
@@ -291,22 +327,19 @@
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
- 
-     /* If present_flip failed, we may have to requeue for the next MSC */
-     if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +95,59 @@
-         return;
-     }
- 
--    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
++
++    /* lorie: the deferral upstream does here is gone for the same reason as in
++     * present_execute_wait() above. */
++
 +    /* lorie: a GPU copy was already scheduled; poll for completion instead of blocking. */
 +    if (vblank->gpu_copy_pending && !lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
 +        !gpuCopyStalled &&
 +        Success == screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1)) {
-+        vblank->queued = TRUE;
-+        return;
-+    }
-+
+         vblank->queued = TRUE;
+         return;
+     }
+ 
+-    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    if (vblank->gpu_copy_pending) {
 +        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
 +        vblank->gpu_copy_pending = FALSE;
