@@ -102,6 +102,12 @@ static lorieScreenInfo lorieScreen = {
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 
+static inline __always_inline uint64_t lorieNowUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
+}
+
 // Root double buffering. On its own it only moved the X server's wait around, but it is what lets
 // the renderer stop waiting for its own fence inside every frame (see rendererRetirePreviousFrame):
 // the buffer can be handed back a frame later instead of synchronously, which is the whole point.
@@ -594,11 +600,6 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
-static inline __always_inline uint64_t lorieNowUs(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
-}
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint32_t samples;
