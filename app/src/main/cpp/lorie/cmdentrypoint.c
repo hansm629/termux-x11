@@ -91,11 +91,24 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
         cpu_set_t mask;
         long num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
 
+        // Without this the mask starts out as whatever was on the stack, so the X server ends up
+        // allowed on "the upper half of the cores, plus a random set of the others" - a different
+        // set on every launch, which can include the little cores.
+        CPU_ZERO(&mask);
+
         for (int i = num_cpus/2; i < num_cpus; i++)
             CPU_SET(i, &mask);
 
         if (sched_setaffinity(0, sizeof(cpu_set_t), &mask) == -1)
             log(ERROR, "Failed to set process affinity: %s", strerror(errno));
+        else {
+            char list[128] = {0};
+            int n = 0;
+            for (int i = 0; i < num_cpus && n < (int) sizeof(list) - 4; i++)
+                if (CPU_ISSET(i, &mask))
+                    n += snprintf(list + n, sizeof(list) - n, "%s%d", n ? "," : "", i);
+            log(INFO, "X server pinned to CPUs %s of %ld", list, num_cpus);
+        }
     }
 
     if (getenv("TERMUX_X11_DEBUG") && !fork()) {
