@@ -2492,48 +2492,6 @@ static void ensureCursorOverlay(void) {
     }
 }
 
-/*
- * Keeping the GPU awake between frames.
- *
- * Xclipse powers the GPU down between frames - IFPO, the counterpart of Adreno's IFPC, and the
- * sgpu_pm_monitor node names it directly. Waking it costs something on every submission that
- * follows an idle gap.
- *
- * A 16x16 clear is enough to leave no gap to power down in, and small enough not to appear in any
- * measurement of GPU work. That matters: the thing previously doing this job was a CPU spinner
- * holding a core at 100%, and on this device it made matters worse rather than better - the power
- * budget went to the CPU, and the GPU clock fell to its minimum the moment a drag asked for more.
- * Measured: with that process running the clock went 600-800MHz idle to 252-545MHz while dragging;
- * without it, 650MHz to 700MHz.
- *
- * Only on the zero-copy path, where the renderer otherwise submits nothing at all. The GL path
- * submits a frame every vsync anyway.
- */
-static GLuint gpuKeepAliveFbo = 0, gpuKeepAliveTex = 0;
-
-static void rendererGpuKeepAlive(void) {
-    GLint prevFbo = 0;
-
-    if (!gpuKeepAliveTex) {
-        glGenTextures(1, &gpuKeepAliveTex);
-        glBindTexture(GL_TEXTURE_2D, gpuKeepAliveTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glGenFramebuffers(1, &gpuKeepAliveFbo);
-    }
-    if (!gpuKeepAliveFbo || !gpuKeepAliveTex)
-        return;
-
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, gpuKeepAliveFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gpuKeepAliveTex, 0);
-    glDisable(GL_SCISSOR_TEST);
-    glViewport(0, 0, 16, 16);
-    glClearColor(0.f, 0.f, 0.f, 0.f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint) prevFbo);
-    glFlush(); // the submission itself is the point
-}
-
 /* --- Handing the root buffer straight to the compositor --- */
 
 static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
@@ -2730,7 +2688,6 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
-    rendererGpuKeepAlive();
     state->presentStats.zeroCopyFrames++;
     // Still worth reporting: without it XlorieFrames would go quiet exactly when the renderer starts
     // doing less, which is the thing being measured.
