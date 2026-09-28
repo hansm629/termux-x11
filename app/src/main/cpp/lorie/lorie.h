@@ -64,7 +64,12 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
     // we will simply reinitialize it.
     struct timespec ts = {0};
     while(true) {
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        // CLOCK_REALTIME, because that is the clock pthread_mutex_timedlock() measures its absolute
+        // deadline against. A CLOCK_MONOTONIC value is seconds since boot where this wants seconds
+        // since the epoch, so the deadline was always already in the past: uncontended locks still
+        // took the fast path, but a contended one returned ETIMEDOUT immediately and the loop below
+        // span on the CPU instead of sleeping for the 33ms this is meant to wait.
+        clock_gettime(CLOCK_REALTIME, &ts);
 
         // 33 msec is enough to complete any drawing operation on both X server and renderer side
         // In the case if mutex is locked most likely other thread died with the mutex locked
@@ -75,7 +80,10 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
         }
 
         int ret = pthread_mutex_timedlock(mutex, &ts);
-        if (ret == ETIMEDOUT) {
+        // Only 0 means we hold it. Anything else went down the recovery path below, which used to
+        // be reached only by ETIMEDOUT - every other error returned as though the lock had been
+        // taken, and the caller went on to touch shared state it did not own.
+        if (ret != 0) {
             if (*lockingPid == getpid() || lorieConnectionAlive())
                 continue;
 
