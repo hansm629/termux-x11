@@ -173,6 +173,56 @@ static uint32_t cursorOverlayRawW = 0, cursorOverlayRawH = 0;
 // has no access to the root buffer, so the renderer publishes it here.
 static volatile float cursorOverlaySourceW = 0.f, cursorOverlaySourceH = 0.f;
 
+// The SurfaceControl entry points are API 29, above our minSdk 26, and the NDK marks anything above
+// minSdk unavailable rather than weak - so __builtin_available cannot guard a call to them and they
+// cannot be linked either. Resolving them at runtime sidesteps both, and doubles as the availability
+// check: on an older device the symbols are simply absent and the GL cursor draw stays. The
+// alternative, turning on weak API references for the whole project, would downgrade every other
+// API guard in it to a warning.
+static struct {
+    ASurfaceControl *(*createFromWindow)(ANativeWindow *, const char *);
+    void (*release)(ASurfaceControl *);
+    ASurfaceTransaction *(*txCreate)(void);
+    void (*txDelete)(ASurfaceTransaction *);
+    void (*txApply)(ASurfaceTransaction *);
+    void (*txSetVisibility)(ASurfaceTransaction *, ASurfaceControl *, int8_t);
+    void (*txSetZOrder)(ASurfaceTransaction *, ASurfaceControl *, int32_t);
+    void (*txSetBuffer)(ASurfaceTransaction *, ASurfaceControl *, AHardwareBuffer *, int);
+    void (*txSetGeometry)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t);
+} scApi;
+
+static bool cursorOverlayResolveApi(void) {
+    static bool tried = false;
+
+    if (tried)
+        return scApi.createFromWindow != NULL;
+    tried = true;
+
+    scApi.createFromWindow = (ASurfaceControl *(*)(ANativeWindow *, const char *))
+        dlsym(RTLD_DEFAULT, "ASurfaceControl_createFromWindow");
+    scApi.release = (void (*)(ASurfaceControl *)) dlsym(RTLD_DEFAULT, "ASurfaceControl_release");
+    scApi.txCreate = (ASurfaceTransaction *(*)(void)) dlsym(RTLD_DEFAULT, "ASurfaceTransaction_create");
+    scApi.txDelete = (void (*)(ASurfaceTransaction *)) dlsym(RTLD_DEFAULT, "ASurfaceTransaction_delete");
+    scApi.txApply = (void (*)(ASurfaceTransaction *)) dlsym(RTLD_DEFAULT, "ASurfaceTransaction_apply");
+    scApi.txSetVisibility = (void (*)(ASurfaceTransaction *, ASurfaceControl *, int8_t))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setVisibility");
+    scApi.txSetZOrder = (void (*)(ASurfaceTransaction *, ASurfaceControl *, int32_t))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setZOrder");
+    scApi.txSetBuffer = (void (*)(ASurfaceTransaction *, ASurfaceControl *, AHardwareBuffer *, int))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBuffer");
+    scApi.txSetGeometry = (void (*)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setGeometry");
+
+    if (!scApi.createFromWindow || !scApi.release || !scApi.txCreate || !scApi.txDelete ||
+        !scApi.txApply || !scApi.txSetVisibility || !scApi.txSetZOrder || !scApi.txSetBuffer ||
+        !scApi.txSetGeometry) {
+        log("Xlorie: no SurfaceControl on this device, drawing the cursor in GL instead");
+        scApi.createFromWindow = NULL; // one missing piece makes the whole path unusable
+        return false;
+    }
+    return true;
+}
+
 static pthread_mutex_t stateLock;
 // Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
 // (the companion mutex) doesn't need to be shared too.
@@ -2092,24 +2142,23 @@ static void applyCursorOverlayIfDirty(void) {
 
     visible = computeCursorOverlayRect(&x, &y, &w, &h);
 
-    // sc can only be non-NULL where the transaction API exists, but the guard has to be written as
-    // a positive test for the compiler to accept it as one.
-    if (__builtin_available(android 29, *)) {
+    {
+        // sc is only ever non-NULL once every entry point resolved, so these need no further check.
         ARect src = { 0, 0, (int32_t) w, (int32_t) h };
         ARect dst = { x, y, x + (int32_t) w, y + (int32_t) h };
-        ASurfaceTransaction *t = ASurfaceTransaction_create();
+        ASurfaceTransaction *t = scApi.txCreate();
 
-        ASurfaceTransaction_setVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
-                                                         : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
-        ASurfaceTransaction_setZOrder(t, sc, 1); // above the window's own buffer
+        scApi.txSetVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                             : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        scApi.txSetZOrder(t, sc, 1); // above the window's own buffer
         if (visible) {
             if (buf)
-                ASurfaceTransaction_setBuffer(t, sc, buf, -1);
+                scApi.txSetBuffer(t, sc, buf, -1);
             // Rendered at exactly w x h already, so the compositor never scales or filters it.
-            ASurfaceTransaction_setGeometry(t, sc, &src, &dst, 0);
+            scApi.txSetGeometry(t, sc, &src, &dst, 0);
         }
-        ASurfaceTransaction_apply(t);
-        ASurfaceTransaction_delete(t);
+        scApi.txApply(t);
+        scApi.txDelete(t);
     }
 
     if (buf)
@@ -2242,8 +2291,7 @@ static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
 static void teardownCursorOverlay(void) {
     pthread_mutex_lock(&cursorOverlayLock);
     if (cursorSurfaceControl) {
-        if (__builtin_available(android 29, *))
-            ASurfaceControl_release(cursorSurfaceControl);
+        scApi.release(cursorSurfaceControl);
         cursorSurfaceControl = NULL;
     }
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
@@ -2257,10 +2305,10 @@ static void teardownCursorOverlay(void) {
 static void ensureCursorOverlay(void) {
     bool created = false;
 
-    if (!win || win == defaultWin)
+    if (!win || win == defaultWin || !cursorOverlayResolveApi())
         return;
 
-    if (__builtin_available(android 29, *)) {
+    {
         if (!cursorOverlayThreadStarted) {
             cursorOverlayThreadStarted = true; // only ever try once, whether it works or not
             if (pthread_create(&cursorOverlayThread, NULL, cursorOverlayThreadMain, NULL) != 0) {
@@ -2275,7 +2323,7 @@ static void ensureCursorOverlay(void) {
 
         pthread_mutex_lock(&cursorOverlayLock);
         if (!cursorSurfaceControl) {
-            cursorSurfaceControl = ASurfaceControl_createFromWindow(win, "lorie-cursor");
+            cursorSurfaceControl = scApi.createFromWindow(win, "lorie-cursor");
             if (!cursorSurfaceControl)
                 log("Xlorie: could not create the cursor overlay layer, drawing the cursor in GL instead");
             else {
