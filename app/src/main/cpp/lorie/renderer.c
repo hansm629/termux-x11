@@ -1563,8 +1563,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     state->cursor.moved = FALSE;
     // The overlay thread places the cursor against the root's size and the viewport, and cannot read
     // the root buffer itself, so hand it this frame's numbers.
-    cursorOverlaySourceW = (float) LorieBuffer_getWidth(buffer);
-    cursorOverlaySourceH = (float) LorieBuffer_getHeight(buffer);
+    int rootW = LorieBuffer_getWidth(buffer), rootH = LorieBuffer_getHeight(buffer);
+    cursorOverlaySourceW = (float) rootW;
+    cursorOverlaySourceH = (float) rootH;
     if (cursorOverlayUsable())
         markCursorOverlayDirty(state->cursor.updated);
     else
@@ -2025,10 +2026,14 @@ static bool computeCursorOverlayRect(int32_t *outX, int32_t *outY, uint32_t *out
         return false;
 
     computeCursorOverlayScale(&scaleX, &scaleY);
-    *outX = viewportX + (int32_t) lroundf(((float) state->cursor.x - (float) state->cursor.xhot) * scaleX);
-    *outY = viewportY + (int32_t) lroundf(((float) state->cursor.y - (float) state->cursor.yhot) * scaleY);
-    *outW = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
-    *outH = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+    long px = lroundf(((float) state->cursor.x - (float) state->cursor.xhot) * scaleX);
+    long py = lroundf(((float) state->cursor.y - (float) state->cursor.yhot) * scaleY);
+    *outX = viewportX + (int32_t) px;
+    *outY = viewportY + (int32_t) py;
+    float rectW = fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
+    float rectH = fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+    *outW = (uint32_t) rectW;
+    *outH = (uint32_t) rectH;
     return true;
 }
 
@@ -2065,12 +2070,8 @@ static void applyCursorOverlayIfDirty(void) {
     bool geometryDirty, bufferDirty, visible;
     ASurfaceControl *sc;
     AHardwareBuffer *buf = NULL;
-    ASurfaceTransaction *t;
     int32_t x = 0, y = 0;
     uint32_t w = 0, h = 0;
-
-    if (!__builtin_available(android 29, *))
-        return;
 
     pthread_mutex_lock(&cursorOverlayLock);
     sc = cursorSurfaceControl;
@@ -2091,20 +2092,25 @@ static void applyCursorOverlayIfDirty(void) {
 
     visible = computeCursorOverlayRect(&x, &y, &w, &h);
 
-    t = ASurfaceTransaction_create();
-    ASurfaceTransaction_setVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
-                                                     : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
-    ASurfaceTransaction_setZOrder(t, sc, 1);
-    if (visible) {
-        if (buf)
-            ASurfaceTransaction_setBuffer(t, sc, buf, -1);
-        // Rendered at exactly w x h already, so the compositor never has to scale or filter it.
+    // sc can only be non-NULL where the transaction API exists, but the guard has to be written as
+    // a positive test for the compiler to accept it as one.
+    if (__builtin_available(android 29, *)) {
         ARect src = { 0, 0, (int32_t) w, (int32_t) h };
         ARect dst = { x, y, x + (int32_t) w, y + (int32_t) h };
-        ASurfaceTransaction_setGeometry(t, sc, src, dst, 0);
+        ASurfaceTransaction *t = ASurfaceTransaction_create();
+
+        ASurfaceTransaction_setVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                                         : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        ASurfaceTransaction_setZOrder(t, sc, 1); // above the window's own buffer
+        if (visible) {
+            if (buf)
+                ASurfaceTransaction_setBuffer(t, sc, buf, -1);
+            // Rendered at exactly w x h already, so the compositor never scales or filters it.
+            ASurfaceTransaction_setGeometry(t, sc, &src, &dst, 0);
+        }
+        ASurfaceTransaction_apply(t);
+        ASurfaceTransaction_delete(t);
     }
-    ASurfaceTransaction_apply(t);
-    ASurfaceTransaction_delete(t);
 
     if (buf)
         AHardwareBuffer_release(buf);
@@ -2224,20 +2230,20 @@ static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
         return;
 
     computeCursorOverlayScale(&scaleX, &scaleY);
-    destW = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
-    destH = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+    float wantW = fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
+    float wantH = fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+    destW = (uint32_t) wantW;
+    destH = (uint32_t) wantH;
 
     if (bufferMightHaveChanged || destW != cursorOverlayRawW || destH != cursorOverlayRawH)
         renderCursorOverlayBuffer(destW, destH);
 }
 
 static void teardownCursorOverlay(void) {
-    if (!__builtin_available(android 29, *))
-        return;
-
     pthread_mutex_lock(&cursorOverlayLock);
     if (cursorSurfaceControl) {
-        ASurfaceControl_release(cursorSurfaceControl);
+        if (__builtin_available(android 29, *))
+            ASurfaceControl_release(cursorSurfaceControl);
         cursorSurfaceControl = NULL;
     }
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
@@ -2251,33 +2257,35 @@ static void teardownCursorOverlay(void) {
 static void ensureCursorOverlay(void) {
     bool created = false;
 
-    if (!__builtin_available(android 29, *) || !win || win == defaultWin)
+    if (!win || win == defaultWin)
         return;
 
-    if (!cursorOverlayThreadStarted) {
-        cursorOverlayThreadStarted = true; // only ever try once, whether it works or not
-        if (pthread_create(&cursorOverlayThread, NULL, cursorOverlayThreadMain, NULL) != 0) {
-            log("Xlorie: could not start the cursor overlay thread, drawing the cursor in GL instead");
+    if (__builtin_available(android 29, *)) {
+        if (!cursorOverlayThreadStarted) {
+            cursorOverlayThreadStarted = true; // only ever try once, whether it works or not
+            if (pthread_create(&cursorOverlayThread, NULL, cursorOverlayThreadMain, NULL) != 0) {
+                log("Xlorie: could not start the cursor overlay thread, drawing the cursor in GL instead");
+                return;
+            }
+            cursorOverlayFeatureAvailable = true;
+        }
+
+        if (!cursorOverlayFeatureAvailable)
             return;
+
+        pthread_mutex_lock(&cursorOverlayLock);
+        if (!cursorSurfaceControl) {
+            cursorSurfaceControl = ASurfaceControl_createFromWindow(win, "lorie-cursor");
+            if (!cursorSurfaceControl)
+                log("Xlorie: could not create the cursor overlay layer, drawing the cursor in GL instead");
+            else {
+                cursorOverlayGeometryDirty = true; // (re)send position and visibility to the new layer
+                created = true;
+            }
         }
-        cursorOverlayFeatureAvailable = true;
+        pthread_mutex_unlock(&cursorOverlayLock);
+
+        if (created)
+            resendCursorOverlayBuffer(); // a new layer starts out with no buffer of its own
     }
-
-    if (!cursorOverlayFeatureAvailable)
-        return;
-
-    pthread_mutex_lock(&cursorOverlayLock);
-    if (!cursorSurfaceControl) {
-        cursorSurfaceControl = ASurfaceControl_createFromWindow(win, "lorie-cursor");
-        if (!cursorSurfaceControl)
-            log("Xlorie: could not create the cursor overlay layer, drawing the cursor in GL instead");
-        else {
-            cursorOverlayGeometryDirty = true; // (re)send position and visibility to the new layer
-            created = true;
-        }
-    }
-    pthread_mutex_unlock(&cursorOverlayLock);
-
-    if (created)
-        resendCursorOverlayBuffer(); // a new layer starts out with no buffer of its own
 }
