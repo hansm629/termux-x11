@@ -157,7 +157,7 @@ static void teardownCursorOverlay(void);
 static void markCursorOverlayDirty(bool bufferMightHaveChanged);
 static void ensureRootOverlay(void);
 static void teardownRootOverlay(void);
-static bool rootZeroCopyUsable(void);
+static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc);
 static bool rootZcDrainRetiring(void);
 static void rootZcReleaseAll(void);
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs);
@@ -1617,7 +1617,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     int surfaceH = ANativeWindow_getHeight(win);
     int surfaceW = ANativeWindow_getWidth(win);
 
-    if (rootZeroCopyUsable()) {
+    if (rootZeroCopyUsable(desc)) {
         if (!rootZcDrainRetiring()) {
             // The compositor has not finished with the buffer before last. Reusing it now is exactly
             // the tearing this cannot afford, so drop the frame instead - what is on screen stays.
@@ -1628,6 +1628,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
                 rendererReleaseRootBuffer();
             rendererRootSlot = -1;
             state->drawRequested = FALSE;
+            // Without this the thread comes straight back round and asks again, millions of times a
+            // second. There is nothing to do until the next vsync signal either way.
+            state->waitForNextFrame = true;
             return;
         }
         if (rootZcPresent(desc, surfaceW, surfaceH, frameStartNs))
@@ -2464,7 +2467,13 @@ static void ensureCursorOverlay(void) {
 
 /* --- Handing the root buffer straight to the compositor --- */
 
-static bool rootZeroCopyUsable(void) {
+static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
+    // The compositor reads the buffer by its declared format and has no equivalent of the swizzling
+    // shader the GL path uses, so a buffer that says RGBX while holding BGRA comes out with red and
+    // blue exchanged. If the root could not be allocated as BGRA, stay on the GL path.
+    if (!desc || desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM)
+        return false;
+
     // Nearest filtering has to go through GL; see the comment on rootSurfaceControl.
     return rootSurfaceControl != NULL && state && state->rootDoubleBuffered &&
            filtering == GL_LINEAR && viewportW > 0 && viewportH > 0;
@@ -2581,6 +2590,12 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     if (!ahb || slot < 0)
         return false;
+
+    // The cursor overlay places itself against these and has no other way to know them. The GL frame
+    // used to publish them on its way past; without this the cursor rect comes out empty and the
+    // layer is hidden, which is a pointer that has simply vanished.
+    cursorOverlaySourceW = (float) desc->width;
+    cursorOverlaySourceH = (float) desc->height;
 
     rootZcClearLetterbox(surfaceW, surfaceH);
 

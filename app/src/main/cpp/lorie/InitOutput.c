@@ -1590,11 +1590,17 @@ static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(root);
     const LorieBuffer_Desc *desc;
+    LorieBuffer *orig;
+    void *origLocked;
     RegionRec all;
     BoxRec box;
-    int i, allocated;
+    int i, allocated, w, h;
 
     if (lorieSingleRootBuffer || !priv || priv->rootDouble || !priv->buffer || priv->mem || pvfb->root.legacyDrawing)
+        return;
+
+    desc = LorieBuffer_description(priv->buffer);
+    if (desc->type != LORIEBUFFER_AHARDWAREBUFFER)
         return;
 
     // Only ever the screen pixmap. lorieRedraw() passes whatever pixmap the root window currently
@@ -1604,17 +1610,25 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     if (!pScreenPtr || root != (*pScreenPtr->GetScreenPixmap)(pScreenPtr))
         return;
 
-    desc = LorieBuffer_description(priv->buffer);
-    if (desc->type != LORIEBUFFER_AHARDWAREBUFFER)
-        return;
+    orig = priv->buffer;
+    origLocked = priv->locked;
+    w = (int) desc->width;
+    h = (int) desc->height;
 
-    // Slot 0 is the buffer the root already has; the rest are ours to allocate.
-    priv->rootBuf[0] = priv->buffer;
-    priv->rootLocked[0] = priv->locked;
-
-    for (allocated = 1; allocated < LORIE_ROOT_SLOTS; allocated++) {
-        priv->rootBuf[allocated] = LorieBuffer_allocate((int) desc->width, (int) desc->height,
-                                                        AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM,
+    /*
+     * Every slot is allocated fresh, and as BGRA rather than the RGBX the root started out with.
+     *
+     * The X server writes BGRA. Declaring the buffer RGBX and letting the GL path make up the
+     * difference with a swizzling shader worked as long as the only consumer was that shader, but
+     * the compositor reads a buffer by its declared format and has no equivalent - the colours come
+     * out with red and blue exchanged. Declaring what is actually in there fixes both at once,
+     * since the shader selection follows the format: GL stops swizzling at the same moment.
+     *
+     * LorieBuffer_convert() cannot do this, it only converts CPU-backed buffers, so the original is
+     * copied into the new slots and dropped.
+     */
+    for (allocated = 0; allocated < LORIE_ROOT_SLOTS; allocated++) {
+        priv->rootBuf[allocated] = LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
                                                         LORIEBUFFER_AHARDWAREBUFFER);
         if (!priv->rootBuf[allocated]) {
             log(ERROR, "Failed to allocate root buffer %d, keeping the single buffered root", allocated);
@@ -1632,19 +1646,30 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
 
     if (allocated < LORIE_ROOT_SLOTS) {
         // All or nothing: a partial set would mean the slot count had to be dynamic everywhere else.
-        for (i = 1; i < allocated; i++) {
+        for (i = 0; i < allocated; i++) {
             LorieBuffer_unlock(priv->rootBuf[i]);
             LorieBuffer_release(priv->rootBuf[i]);
             priv->rootBuf[i] = NULL;
             priv->rootLocked[i] = NULL;
         }
-        priv->rootBuf[0] = NULL;
-        priv->rootLocked[0] = NULL;
         return;
     }
 
-    // Start every slot identical, then let the renderer take slot 0 while we move on to slot 1.
-    box = (BoxRec) { 0, 0, (short) desc->width, (short) desc->height };
+    // Carry the pixels the root already had into slot 0, then make every other slot match it.
+    {
+        const LorieBuffer_Desc *d0 = LorieBuffer_description(priv->rootBuf[0]);
+        const char *src = origLocked;
+        char *dst = priv->rootLocked[0];
+        size_t srcStride = (size_t) desc->stride * 4, dstStride = (size_t) d0->stride * 4;
+        size_t row = (size_t) w * 4;
+        int y;
+
+        if (src && dst)
+            for (y = 0; y < h; y++)
+                memcpy(dst + (size_t) y * dstStride, src + (size_t) y * srcStride, row);
+    }
+
+    box = (BoxRec) { 0, 0, (short) w, (short) h };
     RegionInit(&all, &box, 1);
     for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
         RegionInit(&priv->rootStale[i], NULL, 0);
@@ -1653,11 +1678,10 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     }
     RegionUninit(&all);
 
-    for (i = 1; i < LORIE_ROOT_SLOTS; i++)
+    for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
         lorieRegisterBuffer(priv->rootBuf[i]);
-
-    for (i = 0; i < LORIE_ROOT_SLOTS; i++)
         pvfb->state->rootBufferIds[i] = LorieBuffer_description(priv->rootBuf[i])->id;
+    }
 
     __atomic_store_n(&pvfb->state->rootHandover, 0u, __ATOMIC_RELEASE); // published slot 0, none held
     priv->rootWrite = 1;
@@ -1666,11 +1690,21 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     priv->rootDouble = TRUE;
     pvfb->state->rootDoubleBuffered = 1;
 
-    log(INFO, "Root window has %d buffers (%dx%d, ids %llu/%llu/%llu)", LORIE_ROOT_SLOTS,
-        desc->width, desc->height,
+    // The new slots may be laid out differently from the buffer the root arrived with.
+    pScreenPtr->ModifyPixmapHeader(root, 0, 0, 0, 0,
+                                   LorieBuffer_description(priv->rootBuf[1])->stride * 4, NULL);
+
+    // The root no longer has anything to do with the buffer it was created with.
+    if (origLocked)
+        LorieBuffer_unlock(orig);
+    lorieUnregisterBuffer(orig);
+    LorieBuffer_release(orig);
+
+    log(INFO, "Root window has %d BGRA buffers (%dx%d, ids %llu/%llu/%llu/%llu)", LORIE_ROOT_SLOTS, w, h,
         (unsigned long long) pvfb->state->rootBufferIds[0],
         (unsigned long long) pvfb->state->rootBufferIds[1],
-        (unsigned long long) pvfb->state->rootBufferIds[2]);
+        (unsigned long long) pvfb->state->rootBufferIds[2],
+        (unsigned long long) pvfb->state->rootBufferIds[3]);
 }
 
 // Hands the buffer we have just finished drawing to the renderer and takes the other one. Does

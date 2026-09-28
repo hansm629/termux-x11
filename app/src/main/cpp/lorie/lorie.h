@@ -228,11 +228,11 @@ struct lorie_shared_server_state {
      * So the root gets several buffers: the renderer takes the one the X server published last, the
      * X server draws into one nobody else needs, and neither ever waits for the other.
      *
-     * Three rather than two, because handing a buffer straight to the compositor means it keeps
-     * reading it until a later one is latched - so the renderer can need two at once (the one on
-     * screen and the one queued behind it) while the X server still needs a third to draw into.
-     * With two, the X server could not publish until the compositor let go, and the compositor
-     * would not let go until the X server published.
+     * Four rather than two, because handing a buffer straight to the compositor means it keeps
+     * reading it until a later one is latched. The renderer holds two at once - the one on screen
+     * and the one queued behind it - and the X server needs one to draw into. With only those three
+     * there is nothing left to publish into while the oldest is still being released, which halves
+     * how often the desktop can be updated; the fourth is what keeps it at the display's rate.
      *
      * rootHandover carries all of it in one word, so the handover needs no mutex:
      *
@@ -246,11 +246,11 @@ struct lorie_shared_server_state {
      * the one it has for another frame - so it never blocks, it just drops a frame the display could
      * not have shown anyway.
      */
-#define LORIE_ROOT_SLOTS 3
-#define LORIE_ROOT_HELD_MASK 0x7u
-#define LORIE_ROOT_NEWEST_SHIFT 3
+#define LORIE_ROOT_SLOTS 4
+#define LORIE_ROOT_HELD_MASK 0xfu
+#define LORIE_ROOT_NEWEST_SHIFT 4
 #define LORIE_ROOT_NEWEST_MASK 0x3u
-#define LORIE_ROOT_COUNT_STEP 0x20u
+#define LORIE_ROOT_COUNT_STEP 0x40u
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     volatile uint32_t rootHandover;
