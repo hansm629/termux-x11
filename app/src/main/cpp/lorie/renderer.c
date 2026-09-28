@@ -209,11 +209,18 @@ static volatile float cursorOverlaySourceW = 0.f, cursorOverlaySourceH = 0.f;
  */
 static ASurfaceControl *rootSurfaceControl = NULL;
 static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
+
+// One slot always belongs to the X server, so this is how many we may be holding at once.
+#define LORIE_ZC_MAX_HELD (LORIE_ROOT_SLOTS - 1)
+
 // All guarded by rootOverlayLock.
-static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor is reading it
-static int rootZcRetiringSlot = -1;    // the one before that, waiting for its release fence
-static int rootZcRetiringFenceFd = -1;
-static bool rootZcRetiringFenceArrived = false;
+static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it
+// The ones behind it, each waiting for the release fence that the next transaction's completion
+// reports. More than one, because requiring the oldest to be back before presenting again meant
+// waiting a whole vsync for a callback that arrives during it - which dropped every other frame and
+// left the desktop updating at half the display's rate.
+static struct { int slot, fenceFd; bool fenceArrived; } rootZcRetiring[LORIE_ZC_MAX_HELD];
+static int rootZcRetiringCount = 0;
 
 // The SurfaceControl entry points are API 29, above our minSdk 26, and the NDK marks anything above
 // minSdk unavailable rather than weak - so __builtin_available cannot guard a call to them and they
@@ -1635,8 +1642,15 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             state->presentStats.zeroCopyStalls++;
             // The slot just claimed may be one already held for the compositor; only give back one
             // that is not.
-            if (rendererRootSlot != rootZcDisplayedSlot && rendererRootSlot != rootZcRetiringSlot)
-                rendererReleaseRootBuffer();
+            {
+                int i;
+                bool mine = rendererRootSlot == rootZcDisplayedSlot;
+
+                for (i = 0; !mine && i < rootZcRetiringCount; i++)
+                    mine = rootZcRetiring[i].slot == rendererRootSlot;
+                if (!mine)
+                    rendererReleaseRootBuffer();
+            }
             rendererRootSlot = -1;
             state->drawRequested = FALSE;
             // Without this the thread comes straight back round and asks again, millions of times a
@@ -1646,7 +1660,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         }
         if (rootZcPresent(desc, surfaceW, surfaceH, frameStartNs))
             return;
-    } else if (rootZcDisplayedSlot >= 0 || rootZcRetiringSlot >= 0) {
+    } else if (rootZcDisplayedSlot >= 0 || rootZcRetiringCount > 0) {
         // Dropped out of the path - the filtering preference changed, or the root stopped being one
         // of our slots. Give everything back before drawing through GL again.
         rootZcReleaseAll();
@@ -2502,67 +2516,75 @@ static bool rootZcFenceSignalled(int fd) {
 
 // Binder thread. Reports the release fence of the buffer set by the transaction before this one.
 static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
-    int retiring = (int) (intptr_t) context - 1;
+    int retiring = (int) (intptr_t) context - 1, i;
 
     if (retiring < 0)
         return;
 
     pthread_mutex_lock(&rootOverlayLock);
-    // Only meaningful while that slot is still the one we are waiting on: a teardown in between will
-    // have given it back already.
-    if (rootZcRetiringSlot == retiring && !rootZcRetiringFenceArrived) {
+    for (i = 0; i < rootZcRetiringCount; i++) {
+        if (rootZcRetiring[i].slot != retiring || rootZcRetiring[i].fenceArrived)
+            continue;
         if (rootSurfaceControl && scApi.statsPrevReleaseFenceFd)
-            rootZcRetiringFenceFd = scApi.statsPrevReleaseFenceFd(stats, rootSurfaceControl);
-        rootZcRetiringFenceArrived = true;
+            rootZcRetiring[i].fenceFd = scApi.statsPrevReleaseFenceFd(stats, rootSurfaceControl);
+        rootZcRetiring[i].fenceArrived = true;
+        break;
     }
     pthread_mutex_unlock(&rootOverlayLock);
 }
 
-// Gives back the slot we were waiting on, if the compositor is done with it. Renderer thread.
-// Returns false when it is not done, which means there is no room to queue another buffer yet.
+// Gives back every slot the compositor has finished with. Renderer thread. Returns whether there is
+// room to hand it another one.
 static bool rootZcDrainRetiring(void) {
-    int slot = -1, fd = -1;
+    int freed[LORIE_ZC_MAX_HELD], freedFds[LORIE_ZC_MAX_HELD], freedCount = 0;
+    int i, kept = 0;
+    bool room;
 
     pthread_mutex_lock(&rootOverlayLock);
-    if (rootZcRetiringSlot < 0) {
-        pthread_mutex_unlock(&rootOverlayLock);
-        return true;
+    for (i = 0; i < rootZcRetiringCount; i++) {
+        if (rootZcRetiring[i].fenceArrived && rootZcFenceSignalled(rootZcRetiring[i].fenceFd)) {
+            freedFds[freedCount] = rootZcRetiring[i].fenceFd;
+            freed[freedCount++] = rootZcRetiring[i].slot;
+        } else
+            rootZcRetiring[kept++] = rootZcRetiring[i];
     }
-    if (rootZcRetiringFenceArrived && rootZcFenceSignalled(rootZcRetiringFenceFd)) {
-        slot = rootZcRetiringSlot;
-        fd = rootZcRetiringFenceFd;
-        rootZcRetiringSlot = -1;
-        rootZcRetiringFenceFd = -1;
-        rootZcRetiringFenceArrived = false;
-    }
+    rootZcRetiringCount = kept;
+    // Presenting adds the one on screen to this list and puts a new one on screen, so there has to be
+    // room for two more.
+    room = kept + 2 <= LORIE_ZC_MAX_HELD;
     pthread_mutex_unlock(&rootOverlayLock);
 
-    if (slot < 0)
-        return false;
-
-    if (fd >= 0)
-        close(fd);
-    rendererReleaseRootSlot(slot);
-    return true;
+    for (i = 0; i < freedCount; i++) {
+        if (freedFds[i] >= 0)
+            close(freedFds[i]);
+        rendererReleaseRootSlot(freed[i]);
+    }
+    return room;
 }
 
 // Gives back everything we are holding. Renderer thread, on the way out of the zero-copy path.
 static void rootZcReleaseAll(void) {
-    int displayed, retiring, fd;
+    int freed[LORIE_ZC_MAX_HELD + 1], freedFds[LORIE_ZC_MAX_HELD + 1], freedCount = 0;
+    int i;
 
     pthread_mutex_lock(&rootOverlayLock);
-    displayed = rootZcDisplayedSlot;
-    retiring = rootZcRetiringSlot;
-    fd = rootZcRetiringFenceFd;
-    rootZcDisplayedSlot = rootZcRetiringSlot = -1;
-    rootZcRetiringFenceFd = -1;
-    rootZcRetiringFenceArrived = false;
+    for (i = 0; i < rootZcRetiringCount; i++) {
+        freedFds[freedCount] = rootZcRetiring[i].fenceFd;
+        freed[freedCount++] = rootZcRetiring[i].slot;
+    }
+    rootZcRetiringCount = 0;
+    if (rootZcDisplayedSlot >= 0) {
+        freedFds[freedCount] = -1;
+        freed[freedCount++] = rootZcDisplayedSlot;
+        rootZcDisplayedSlot = -1;
+    }
     pthread_mutex_unlock(&rootOverlayLock);
 
-    if (fd >= 0)
-        close(fd);
-    rendererReleaseRootSlot(retiring);
-    rendererReleaseRootSlot(displayed);
+    for (i = 0; i < freedCount; i++) {
+        if (freedFds[i] >= 0)
+            close(freedFds[i]);
+        rendererReleaseRootSlot(freed[i]);
+    }
 }
 
 // The area around the viewport is the window surface's own buffer, which nothing draws into once the
@@ -2639,9 +2661,12 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     }
 
     retiring = rootZcDisplayedSlot;
-    rootZcRetiringSlot = retiring;
-    rootZcRetiringFenceFd = -1;
-    rootZcRetiringFenceArrived = false;
+    if (retiring >= 0 && rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
+        rootZcRetiring[rootZcRetiringCount].slot = retiring;
+        rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
+        rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
+        rootZcRetiringCount++;
+    }
     rootZcDisplayedSlot = slot;
 
     ARect src = { 0, 0, desc->width, desc->height };
