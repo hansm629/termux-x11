@@ -17,6 +17,9 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/native_window_jni.h>
+#include <android/surface_control.h>
+#include <math.h>
+#include <android/looper.h>
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
@@ -133,6 +136,42 @@ static volatile bool expectedSizeChanged = false;
 
 // Defined further down, next to the frame it retires; called from rendererRefreshContext() above it.
 static void rendererRetireFrame(void);
+
+/*
+ * Cursor as a SurfaceControl overlay.
+ *
+ * Moving the pointer used to cost a whole GL frame and an eglSwapBuffers, which under ANGLE is a
+ * Vulkan queue submission. Measured while a window was being dragged: 33 to 54 of those every five
+ * seconds, spent entirely on the cursor, at exactly the moment the X clients were short of GPU time
+ * and stalling. On API 29 and up the cursor becomes its own layer that a dedicated Choreographer
+ * thread repositions, so a move touches no GL at all.
+ *
+ * Below API 29 the GL cursor draw stays. That split is by Android version, not by GL driver: the
+ * overlay path bypasses GL rather than taking a different route through it, so it behaves the same
+ * whether GLES is the platform driver or ANGLE on Vulkan.
+ */
+static bool cursorOverlayUsable(void);
+static void ensureCursorOverlay(void);
+static void teardownCursorOverlay(void);
+static void markCursorOverlayDirty(bool bufferMightHaveChanged);
+
+static ASurfaceControl *cursorSurfaceControl = NULL;
+static AChoreographer *cursorOverlayChoreographer = NULL;
+static ALooper *cursorOverlayLooper = NULL; // set once by the overlay thread, then read-only
+static pthread_t cursorOverlayThread;
+static bool cursorOverlayThreadStarted = false, cursorOverlayFeatureAvailable = false;
+static pthread_mutex_t cursorOverlayLock = PTHREAD_MUTEX_INITIALIZER;
+// Guarded by cursorOverlayLock.
+static bool cursorOverlayGeometryDirty = false, cursorOverlayBufferDirty = false;
+static bool cursorOverlayCallbackArmed = false; // is a choreographer callback pending?
+static AHardwareBuffer *cursorOverlayPendingBuffer = NULL; // reference held for the overlay thread
+// Renderer thread only.
+static LorieBuffer *cursorOverlayRenderTarget = NULL;
+static GLuint cursorOverlayFbo = 0;
+static uint32_t cursorOverlayRawW = 0, cursorOverlayRawH = 0;
+// The root buffer's size as of the last frame. The overlay thread needs it to place the cursor and
+// has no access to the root buffer, so the renderer publishes it here.
+static volatile float cursorOverlaySourceW = 0.f, cursorOverlaySourceH = 0.f;
 
 static pthread_mutex_t stateLock;
 // Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
@@ -819,6 +858,8 @@ void rendererRefreshContext(void) {
     int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
     log("rendererSetWindow %p %d %d", pendingWin, width, height);
 
+    teardownCursorOverlay(); // bound to the window we are about to drop; recreated for the new one
+
     releaseWinAndSurface(&win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
@@ -858,6 +899,8 @@ void rendererRefreshContext(void) {
 
     glViewport(0, 0, ANativeWindow_getWidth(win), ANativeWindow_getHeight(win));
     log("Xlorie: new surface applied: %p\n", sfc);
+
+    ensureCursorOverlay();
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
@@ -1483,7 +1526,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     // Outside the root lock: this only needs the cursor's own lock, and it used to sit in the middle
     // of the frame holding up the X server for an upload that has nothing to do with the root.
-    if (state->cursor.updated) {
+    if (state->cursor.updated && !cursorOverlayUsable()) {
         int64_t uploadStartNs = rendererNowNs();
         lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
         state->cursor.updated = false;
@@ -1518,7 +1561,15 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     state->cursor.moved = FALSE;
-    drawCursor((float) (LorieBuffer_getWidth(buffer)), (float) (LorieBuffer_getHeight(buffer)));
+    // The overlay thread places the cursor against the root's size and the viewport, and cannot read
+    // the root buffer itself, so hand it this frame's numbers.
+    cursorOverlaySourceW = (float) LorieBuffer_getWidth(buffer);
+    cursorOverlaySourceH = (float) LorieBuffer_getHeight(buffer);
+    if (cursorOverlayUsable())
+        markCursorOverlayDirty(state->cursor.updated);
+    else
+        drawCursor(cursorOverlaySourceW, cursorOverlaySourceH);
+    state->cursor.updated = FALSE;
     if (!deferFence)
         glFlush();
 
@@ -1801,7 +1852,18 @@ __noreturn static void* rendererThread(void) {
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
         bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-        if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        // A pointer move changes where the cursor sits, not the picture under it. With the overlay
+        // that is a transaction on another thread, so there is no reason to build a GL frame for it.
+        // Unlike upstream there is no zoom or panning here, so a move can never need the crop
+        // recomputed and this needs no further check.
+        bool cursorOnly = state && !state->drawRequested && !gpuCopyPending &&
+            (state->cursor.moved || state->cursor.updated);
+
+        if (cursorOnly && state->surfaceAvailable && cursorOverlaySourceW > 0.f && cursorOverlayUsable()) {
+            markCursorOverlayDirty(state->cursor.updated);
+            state->cursor.moved = state->cursor.updated = FALSE;
+            state->presentStats.cursorOverlayMoves++;
+        } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
             (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
             rendererRedrawLocked(&waitingForBuffers);
         } else if (gpuCopyPending) {
@@ -1940,3 +2002,282 @@ __unused static void drawCursor(float displayWidth, float displayHeight) {
     glDisable(GL_BLEND);
 }
 
+
+/* --- Cursor SurfaceControl overlay --- */
+
+static void cursorOverlayFrameCallback(long t, void *data);
+
+static bool cursorOverlayUsable(void) {
+    return cursorOverlayFeatureAvailable && cursorSurfaceControl != NULL;
+}
+
+static void computeCursorOverlayScale(float *scaleX, float *scaleY) {
+    *scaleX = cursorOverlaySourceW > 0.f ? (float) viewportW / cursorOverlaySourceW : 1.f;
+    *scaleY = cursorOverlaySourceH > 0.f ? (float) viewportH / cursorOverlaySourceH : 1.f;
+}
+
+// Destination rect in the parent window's pixel space, top left origin - unlike drawCursor's NDC.
+static bool computeCursorOverlayRect(int32_t *outX, int32_t *outY, uint32_t *outW, uint32_t *outH) {
+    float scaleX, scaleY;
+
+    if (!state || !state->cursor.width || !state->cursor.height ||
+        cursorOverlaySourceW <= 0.f || cursorOverlaySourceH <= 0.f)
+        return false;
+
+    computeCursorOverlayScale(&scaleX, &scaleY);
+    *outX = viewportX + (int32_t) lroundf(((float) state->cursor.x - (float) state->cursor.xhot) * scaleX);
+    *outY = viewportY + (int32_t) lroundf(((float) state->cursor.y - (float) state->cursor.yhot) * scaleY);
+    *outW = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
+    *outH = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+    return true;
+}
+
+// Pulls the overlay thread out of ALooper_pollOnce if it went idle with nothing scheduled. Safe from
+// any thread, and a no-op when a callback is already pending.
+static void wakeCursorOverlayIfIdle(void) {
+    bool idle;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    idle = !cursorOverlayCallbackArmed;
+    pthread_mutex_unlock(&cursorOverlayLock);
+
+    if (idle && cursorOverlayLooper)
+        ALooper_wake(cursorOverlayLooper);
+}
+
+// Overlay thread only: AChoreographer_postFrameCallback has to run on the thread that owns it.
+static void armCursorOverlayCallbackIfNeeded(void) {
+    bool needsArming;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    needsArming = !cursorOverlayCallbackArmed && (cursorOverlayGeometryDirty || cursorOverlayBufferDirty);
+    if (needsArming)
+        cursorOverlayCallbackArmed = true;
+    pthread_mutex_unlock(&cursorOverlayLock);
+
+    if (needsArming && cursorOverlayChoreographer)
+        AChoreographer_postFrameCallback(cursorOverlayChoreographer,
+                                         (AChoreographer_frameCallback) cursorOverlayFrameCallback, NULL);
+}
+
+// Overlay thread, once per vsync.
+static void applyCursorOverlayIfDirty(void) {
+    bool geometryDirty, bufferDirty, visible;
+    ASurfaceControl *sc;
+    AHardwareBuffer *buf = NULL;
+    ASurfaceTransaction *t;
+    int32_t x = 0, y = 0;
+    uint32_t w = 0, h = 0;
+
+    if (!__builtin_available(android 29, *))
+        return;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    sc = cursorSurfaceControl;
+    geometryDirty = cursorOverlayGeometryDirty;
+    bufferDirty = cursorOverlayBufferDirty;
+    cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
+    if (bufferDirty) {
+        buf = cursorOverlayPendingBuffer;
+        cursorOverlayPendingBuffer = NULL;
+    }
+    pthread_mutex_unlock(&cursorOverlayLock);
+
+    if (!sc || (!geometryDirty && !bufferDirty) || !state) {
+        if (buf)
+            AHardwareBuffer_release(buf);
+        return;
+    }
+
+    visible = computeCursorOverlayRect(&x, &y, &w, &h);
+
+    t = ASurfaceTransaction_create();
+    ASurfaceTransaction_setVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                                     : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+    ASurfaceTransaction_setZOrder(t, sc, 1);
+    if (visible) {
+        if (buf)
+            ASurfaceTransaction_setBuffer(t, sc, buf, -1);
+        // Rendered at exactly w x h already, so the compositor never has to scale or filter it.
+        ARect src = { 0, 0, (int32_t) w, (int32_t) h };
+        ARect dst = { x, y, x + (int32_t) w, y + (int32_t) h };
+        ASurfaceTransaction_setGeometry(t, sc, src, dst, 0);
+    }
+    ASurfaceTransaction_apply(t);
+    ASurfaceTransaction_delete(t);
+
+    if (buf)
+        AHardwareBuffer_release(buf);
+}
+
+static void cursorOverlayFrameCallback(__unused long t, __unused void *data) {
+    applyCursorOverlayIfDirty();
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    cursorOverlayCallbackArmed = false; // this posting has fired
+    pthread_mutex_unlock(&cursorOverlayLock);
+
+    armCursorOverlayCallbackIfNeeded();
+}
+
+static void *cursorOverlayThreadMain(__unused void *cookie) {
+    pthread_setname_np(pthread_self(), "LorieCursorOvl");
+    cursorOverlayLooper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    cursorOverlayChoreographer = AChoreographer_getInstance();
+    armCursorOverlayCallbackIfNeeded();
+    for (;;) {
+        ALooper_pollOnce(-1, NULL, NULL, NULL);
+        armCursorOverlayCallbackIfNeeded(); // in case an ALooper_wake is what got us here
+    }
+}
+
+// Hands the overlay thread a fresh reference to the render target's buffer. Used both after
+// re-rendering it and when a brand new ASurfaceControl needs one resent.
+static void resendCursorOverlayBuffer(void) {
+    AHardwareBuffer *ahb;
+
+    if (!cursorOverlayRenderTarget)
+        return;
+
+    ahb = LorieBuffer_description(cursorOverlayRenderTarget)->buffer;
+    if (!ahb)
+        return;
+    AHardwareBuffer_acquire(ahb);
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    if (cursorOverlayPendingBuffer)
+        AHardwareBuffer_release(cursorOverlayPendingBuffer);
+    cursorOverlayPendingBuffer = ahb;
+    cursorOverlayBufferDirty = true;
+    pthread_mutex_unlock(&cursorOverlayLock);
+    wakeCursorOverlayIfIdle();
+}
+
+// Renderer thread, EGL context current. Draws the cursor scaled to its destination size into an
+// AHardwareBuffer, so the compositor gets a buffer already the right size and never filters it.
+static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
+    GLint prevViewport[4];
+    EGLSync fence;
+
+    if (!state->cursor.width || !state->cursor.height ||
+        state->cursor.width > LORIE_CURSOR_TEX_SIZE || state->cursor.height > LORIE_CURSOR_TEX_SIZE)
+        return;
+
+    lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
+    bindTexture(cursor.id);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
+    lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
+
+    if (!cursorOverlayRenderTarget || cursorOverlayRawW != destW || cursorOverlayRawH != destH) {
+        if (cursorOverlayRenderTarget)
+            LorieBuffer_release(cursorOverlayRenderTarget);
+        cursorOverlayRenderTarget = LorieBuffer_allocate((int32_t) destW, (int32_t) destH,
+                                                        AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                                        LORIEBUFFER_AHARDWAREBUFFER);
+        if (cursorOverlayRenderTarget)
+            LorieBuffer_attachToGL(cursorOverlayRenderTarget);
+        cursorOverlayRawW = cursorOverlayRawH = 0;
+    }
+    if (!cursorOverlayRenderTarget)
+        return;
+
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    if (!cursorOverlayFbo)
+        glGenFramebuffers(1, &cursorOverlayFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, cursorOverlayFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           LorieBuffer_getGLTextureId(cursorOverlayRenderTarget), 0);
+    glViewport(0, 0, (GLsizei) destW, (GLsizei) destH);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    // y is inverted because we are drawing into a texture rather than onto the surface. The cursor
+    // sits in the top left corner of a fixed size texture, so sample only that part of it.
+    drawRegion(cursor.id, -1.f, 1.f, 1.f, -1.f, 0.f, 0.f,
+               (float) state->cursor.width / LORIE_CURSOR_TEX_SIZE,
+               (float) state->cursor.height / LORIE_CURSOR_TEX_SIZE, false);
+
+    // The overlay thread hands this buffer straight to the compositor, so it has to be finished.
+    fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+    glFlush();
+    eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+    eglDestroySyncKHR(egl_display, fence);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+
+    cursorOverlayRawW = destW;
+    cursorOverlayRawH = destH;
+    resendCursorOverlayBuffer();
+}
+
+static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
+    float scaleX, scaleY;
+    uint32_t destW, destH;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    cursorOverlayGeometryDirty = true;
+    pthread_mutex_unlock(&cursorOverlayLock);
+    wakeCursorOverlayIfIdle();
+
+    if (!state->cursor.width || !state->cursor.height)
+        return;
+
+    computeCursorOverlayScale(&scaleX, &scaleY);
+    destW = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.width * scaleX));
+    destH = (uint32_t) fmaxf(1.f, roundf((float) state->cursor.height * scaleY));
+
+    if (bufferMightHaveChanged || destW != cursorOverlayRawW || destH != cursorOverlayRawH)
+        renderCursorOverlayBuffer(destW, destH);
+}
+
+static void teardownCursorOverlay(void) {
+    if (!__builtin_available(android 29, *))
+        return;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    if (cursorSurfaceControl) {
+        ASurfaceControl_release(cursorSurfaceControl);
+        cursorSurfaceControl = NULL;
+    }
+    cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
+    if (cursorOverlayPendingBuffer) {
+        AHardwareBuffer_release(cursorOverlayPendingBuffer);
+        cursorOverlayPendingBuffer = NULL;
+    }
+    pthread_mutex_unlock(&cursorOverlayLock);
+}
+
+static void ensureCursorOverlay(void) {
+    bool created = false;
+
+    if (!__builtin_available(android 29, *) || !win || win == defaultWin)
+        return;
+
+    if (!cursorOverlayThreadStarted) {
+        cursorOverlayThreadStarted = true; // only ever try once, whether it works or not
+        if (pthread_create(&cursorOverlayThread, NULL, cursorOverlayThreadMain, NULL) != 0) {
+            log("Xlorie: could not start the cursor overlay thread, drawing the cursor in GL instead");
+            return;
+        }
+        cursorOverlayFeatureAvailable = true;
+    }
+
+    if (!cursorOverlayFeatureAvailable)
+        return;
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    if (!cursorSurfaceControl) {
+        cursorSurfaceControl = ASurfaceControl_createFromWindow(win, "lorie-cursor");
+        if (!cursorSurfaceControl)
+            log("Xlorie: could not create the cursor overlay layer, drawing the cursor in GL instead");
+        else {
+            cursorOverlayGeometryDirty = true; // (re)send position and visibility to the new layer
+            created = true;
+        }
+    }
+    pthread_mutex_unlock(&cursorOverlayLock);
+
+    if (created)
+        resendCursorOverlayBuffer(); // a new layer starts out with no buffer of its own
+}

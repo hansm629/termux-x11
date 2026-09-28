@@ -333,6 +333,7 @@ struct lorie_shared_server_state {
         volatile uint32_t requests;
         volatile uint32_t requestGapMaxUs;
         volatile uint32_t requestAheadMax;
+        volatile uint32_t cursorOverlayMoves; /* pointer moves the overlay absorbed without any GL */
     } presentStats;
 
     /*

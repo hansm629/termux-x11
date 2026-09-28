@@ -750,13 +750,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.coalescedFrames);
         log(INFO, "XlorieLock: renderer held the root lock %.1f%% of the time (%.0f ms), "
                   "X server blocked on it %.0f ms over %u accesses (worst %.1f ms), "
-                  "cursor-only frames %u of %u pointer moves, display %.1f Hz",
+                  "cursor-only frames %u (overlay %u) of %u pointer moves, display %.1f Hz",
             pvfb->state->presentStats.lockHeldUs / 50000.0,
             pvfb->state->presentStats.lockHeldUs / 1000.0,
             pvfb->state->presentStats.xLockWaitUs / 1000.0,
             pvfb->state->presentStats.xLockWaits,
             pvfb->state->presentStats.xLockWaitMaxUs / 1000.0,
             pvfb->state->presentStats.cursorOnlyFrames,
+            pvfb->state->presentStats.cursorOverlayMoves,
             pvfb->state->presentStats.pointerMoves,
             pvfb->state->presentStats.displayRefreshMHz / 1000.0);
         if (pvfb->state->presentStats.presentCompletions > 1) {
@@ -819,6 +820,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
+    pvfb->state->presentStats.cursorOverlayMoves = 0;
     pvfb->state->presentStats.requests = 0;
     pvfb->state->presentStats.requestGapMaxUs = 0;
     pvfb->state->presentStats.requestAheadMax = 0;
