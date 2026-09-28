@@ -225,19 +225,34 @@ struct lorie_shared_server_state {
      * wait for a GPU round trip - measured at ~230 waits/s of ~0.85ms each on an ANGLE-backed
      * driver, which is what makes a dragged window advance unevenly.
      *
-     * So the root gets two buffers: the renderer samples rootBufferIds[slot], the X server draws
-     * into the other one, and neither ever waits for the other. rootHandover carries both the slot
-     * and a "renderer is sampling" bit in one word so the swap needs no mutex:
+     * So the root gets several buffers: the renderer takes the one the X server published last, the
+     * X server draws into one nobody else needs, and neither ever waits for the other.
      *
-     *   bit 0      set while the renderer is sampling its slot
-     *   bit 1      the slot it samples (index into rootBufferIds)
-     *   bits 2..   handover counter, for debugging
+     * Three rather than two, because handing a buffer straight to the compositor means it keeps
+     * reading it until a later one is latched - so the renderer can need two at once (the one on
+     * screen and the one queued behind it) while the X server still needs a third to draw into.
+     * With two, the X server could not publish until the compositor let go, and the compositor
+     * would not let go until the X server published.
      *
-     * The renderer claims the word (setting bit 0) before it reads the slot and clears it once its
-     * fence has signalled. The X server only flips the slot when bit 0 is clear, and simply keeps
-     * drawing into the same buffer for another frame when it is not - so it never blocks.
+     * rootHandover carries all of it in one word, so the handover needs no mutex:
+     *
+     *   bits 0..2  one bit per slot, set while the renderer still needs that slot
+     *   bits 3..4  the slot published most recently - what the renderer takes next
+     *   bits 5..   publish counter, for debugging
+     *
+     * Only the renderer writes the held bits and only the X server writes the published slot, but
+     * both compare-and-swap the whole word, so neither can lose the other's update. The X server
+     * publishes only when a slot is free for it to draw into next, and otherwise keeps drawing into
+     * the one it has for another frame - so it never blocks, it just drops a frame the display could
+     * not have shown anyway.
      */
-    volatile uint64_t rootBufferIds[2];
+#define LORIE_ROOT_SLOTS 3
+#define LORIE_ROOT_HELD_MASK 0x7u
+#define LORIE_ROOT_NEWEST_SHIFT 3
+#define LORIE_ROOT_NEWEST_MASK 0x3u
+#define LORIE_ROOT_COUNT_STEP 0x20u
+
+    volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
 

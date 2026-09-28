@@ -1401,19 +1401,25 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
 // Root double buffering handshake, see the rootHandover comment in lorie.h. Claiming tells the X
 // server "I am sampling this slot, do not take it back"; it is the only thing that keeps the X
 // server from having to wait for our fence, so every path out of a claimed frame must release.
+// Which slot this frame took, so releasing it clears the right bit. Renderer thread only.
+static int rendererRootSlot = -1;
+
 static uint64_t rendererClaimRootBuffer(void) {
     uint32_t old, claimed;
+    int slot;
 
     if (!state->rootDoubleBuffered)
         return state->rootWindowTextureID;
 
     do {
         old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
-        claimed = old | 1u;
+        slot = (int) ((old >> LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_NEWEST_MASK);
+        claimed = old | (1u << slot);
     } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, claimed, false,
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 
-    return state->rootBufferIds[(claimed >> 1) & 1u];
+    rendererRootSlot = slot;
+    return state->rootBufferIds[slot];
 }
 
 // The frame's fence is no longer waited for between the drawing and the swap. Waiting there drains
@@ -1456,13 +1462,15 @@ static void rendererRetireFrame(void) {
 
 static void rendererReleaseRootBuffer(void) {
     uint32_t old, released;
+    int slot = rendererRootSlot;
 
-    if (!state->rootDoubleBuffered)
+    if (!state->rootDoubleBuffered || slot < 0)
         return;
 
+    rendererRootSlot = -1;
     do {
         old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
-        released = old & ~1u;
+        released = old & ~(1u << slot);
     } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, released, false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 }
