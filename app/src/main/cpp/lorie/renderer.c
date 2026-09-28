@@ -21,8 +21,6 @@
 #include <math.h>
 #include <android/looper.h>
 #include <poll.h>
-#include <stdlib.h>
-#include <fcntl.h>
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
@@ -163,8 +161,6 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc);
 static bool rootZcDrainRetiring(void);
 static void rootZcReleaseAll(void);
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs);
-static void rendererFillerAdjust(int64_t nowNs);
-static void rendererFillerRun(void);
 
 static ASurfaceControl *cursorSurfaceControl = NULL;
 static AChoreographer *cursorOverlayChoreographer = NULL;
@@ -2055,13 +2051,6 @@ __noreturn static void* rendererThread(void) {
             rendererApplyPendingGpuCopies();
         }
 
-        // Steady work of our own, sized by what the clock actually does with it. See the comment on
-        // rendererFillerRun.
-        if (state && state->surfaceAvailable) {
-            rendererFillerAdjust(rendererNowNs());
-            rendererFillerRun();
-        }
-
         pthread_spin_lock(&bufferLock);
         // Remove all buffers which were attached to GL.
         while((buf = LorieBufferList_first(&removedBuffers)))
@@ -2501,132 +2490,6 @@ static void ensureCursorOverlay(void) {
                 state->drawRequested = true;
         }
     }
-}
-
-/*
- * Holding the GPU clock up.
- *
- * The governor is `conservative` and raises the clock from utilisation. Measured on this device:
- * 54% busy gives 650MHz, 69% gives 1000MHz, 93% gives 1095MHz - so the top of the table is
- * reachable, and nothing is capping it. What keeps this workload at 545-800MHz is that its load is
- * small and fragmented: the compositor, the window manager, the renderer and the client each submit
- * a little, and the governor reads that as a GPU with time to spare. A single client pushing the
- * same 69% utilisation in one steady stream gets 1000MHz.
- *
- * So this adds steady work of its own until the clock stops responding to it. That is a trade -
- * every fragment it draws is one the client does not get - and it only pays off if the clock rises
- * enough to more than cover it, which is why the size is never guessed. It climbs one step at a
- * time, keeps the step only if the clock actually improved, and stops when it does not. It re-probes
- * occasionally in case the answer changes.
- *
- * A previous attempt at this was a 16x16 clear per frame, which adds no measurable utilisation and
- * duly moved nothing; the one before that was a CPU spinner, which took the power budget the GPU
- * needed and made the clock worse.
- */
-#define LORIE_FILLER_SIZE 1024
-#define LORIE_FILLER_MAX_STEPS 24
-#define LORIE_FILLER_PROBE_NS 1000000000LL   /* how often to look at the clock */
-#define LORIE_FILLER_RESET_NS 30000000000LL  /* and to start climbing again from where it settled */
-
-static GLuint fillerFbo = 0, fillerTex[2] = { 0, 0 };
-static unsigned fillerTarget = 0;
-static int fillerSteps = 0, fillerBestClockKHz = 0;
-static bool fillerSettled = false;
-static int64_t fillerNextProbeNs = 0, fillerNextResetNs = 0;
-
-static int rendererReadGpuKHz(const char *path) {
-    char buf[32];
-    int fd, n;
-
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return 0;
-    n = (int) read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0)
-        return 0;
-    buf[n] = 0;
-    return atoi(buf);
-}
-
-// Renderer thread, once a second. Climbs while the clock is still answering.
-static void rendererFillerAdjust(int64_t nowNs) {
-    int clock, maxClock;
-
-    if (nowNs < fillerNextProbeNs)
-        return;
-    fillerNextProbeNs = nowNs + LORIE_FILLER_PROBE_NS;
-
-    clock = rendererReadGpuKHz("/sys/kernel/gpu/gpu_clock");
-    maxClock = rendererReadGpuKHz("/sys/kernel/gpu/gpu_max_clock");
-    if (clock <= 0 || maxClock <= 0) {
-        fillerSteps = 0; // no way to tell whether this is helping, so do not burn anything
-        return;
-    }
-
-    if (nowNs >= fillerNextResetNs) {
-        fillerNextResetNs = nowNs + LORIE_FILLER_RESET_NS;
-        fillerSettled = false;
-        fillerBestClockKHz = clock;
-    }
-
-    if (clock >= maxClock) {
-        // Already there. Give a step back and see whether it holds without it.
-        if (fillerSteps > 0)
-            fillerSteps--;
-    } else if (!fillerSettled) {
-        if (clock > fillerBestClockKHz) {
-            fillerBestClockKHz = clock;              // the last step bought something
-            if (fillerSteps < LORIE_FILLER_MAX_STEPS)
-                fillerSteps++;
-        } else if (fillerSteps > 0) {
-            fillerSteps--;                           // it did not; hand it back and stop
-            fillerSettled = true;
-        } else
-            fillerSteps++;                           // nothing tried yet
-    }
-
-    log("XlorieFiller: %d steps, clock %d kHz of %d, settled %d",
-        fillerSteps, clock, maxClock, (int) fillerSettled);
-}
-
-// Ping-pong between two textures so each pass is real fragment and bandwidth work rather than
-// something the driver can fold away.
-static void rendererFillerRun(void) {
-    GLint prevFbo = 0, prevViewport[4];
-    int i;
-
-    if (fillerSteps <= 0)
-        return;
-
-    if (!fillerTex[0]) {
-        glGenTextures(2, fillerTex);
-        for (i = 0; i < 2; i++) {
-            glBindTexture(GL_TEXTURE_2D, fillerTex[i]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, LORIE_FILLER_SIZE, LORIE_FILLER_SIZE, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        }
-        glGenFramebuffers(1, &fillerFbo);
-    }
-    if (!fillerFbo || !fillerTex[0] || !fillerTex[1])
-        return;
-
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    glDisable(GL_SCISSOR_TEST);
-    glBindFramebuffer(GL_FRAMEBUFFER, fillerFbo);
-    glViewport(0, 0, LORIE_FILLER_SIZE, LORIE_FILLER_SIZE);
-
-    for (i = 0; i < fillerSteps; i++) {
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                               fillerTex[fillerTarget], 0);
-        draw(fillerTex[fillerTarget ^ 1u], -1.f, -1.f, 1.f, 1.f, 1.f, false);
-        fillerTarget ^= 1u;
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint) prevFbo);
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-    glFlush();
 }
 
 /* --- Handing the root buffer straight to the compositor --- */
