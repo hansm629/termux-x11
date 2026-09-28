@@ -259,7 +259,10 @@ static bool cursorOverlayResolveApi(void) {
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setGeometry");
 
     scApi.txSetOnComplete = (void (*)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *)))
-        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnCompleteFunc");
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnComplete");
+    if (!scApi.txSetOnComplete) // spelled this way in some header revisions
+        scApi.txSetOnComplete = (void (*)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *)))
+            dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnCompleteFunc");
     scApi.statsPrevReleaseFenceFd = (int (*)(ASurfaceTransactionStats *, ASurfaceControl *))
         dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
 
@@ -2673,7 +2676,11 @@ static void ensureRootOverlay(void) {
     // Without these two the buffer could be handed over but never taken back, which would mean
     // reusing it while the compositor still reads it.
     if (!scApi.txSetOnComplete || !scApi.statsPrevReleaseFenceFd) {
-        log("Xlorie: no transaction completion callback, drawing the root through GL instead");
+        // Named, so that getting one of these wrong is a one-line answer next time rather than a
+        // round of guessing.
+        log("Xlorie: root layer needs %s%s, drawing the root through GL instead",
+            !scApi.txSetOnComplete ? "ASurfaceTransaction_setOnComplete " : "",
+            !scApi.statsPrevReleaseFenceFd ? "ASurfaceTransactionStats_getPreviousReleaseFenceFd" : "");
         return;
     }
 
