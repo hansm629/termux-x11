@@ -307,7 +307,7 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -61,30 +62,181 @@
+@@ -61,30 +62,182 @@
      return FALSE;
  }
  
@@ -386,6 +386,20 @@
 +
 +    scheduled = lorieTryScheduleGpuCopy(vblank->pixmap, dst, &region, xOff, yOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer);
++
++    if (scheduled) {
++        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the GC ops Damage
++         * hooks into, so report it here. damageRegionAppend() applies no translation for a window
++         * drawable and goes straight on to intersect with its clipList, so it wants screen
++         * coordinates; a rect in `region` is source-local and is written at
++         * rect + (x_off + window.x, y_off + window.y) on screen. The old code intersected the
++         * source-local update with the screen-space clipList and reported that, which only lined up
++         * when the window sat at the origin with no offset. */
++        RegionTranslate(&region, vblank->x_off + window->drawable.x,
++                                 vblank->y_off + window->drawable.y);
++        DamageDamageRegion(&window->drawable, &region);
++    }
++
 +    RegionUninit(&region);
 +    return scheduled;
 +}
@@ -449,20 +463,7 @@
 +        }
 +    } else if ((gpuCopyScheduled = lorieScheduleGpuCopyClipped(vblank, window, gpuCopyDst,
 +                                                              gpuCopyXOff, gpuCopyYOff))) {
-+        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
-+         * ops that Damage tracking hooks into, so report it manually - same drawable and region
-+         * present_scmd.c's flip success path already uses, so this also reaches Composite's
-+         * per-window damage for redirected windows, not just lorie's own root damage.
-+         *
-+         * Left as it was on purpose. This intersects update with clipList, and the two are not in
-+         * the same coordinate space by the reckoning above: the renderer treats an update rect as
-+         * source-local while clipList is in screen coordinates. Which of the two is wrong is not
-+         * settled by reading the code, and guessing at it here would trade a clipping bug for a
-+         * repaint one. */
-+        RegionPtr damage = vblank->update ? vblank->update : &window->clipList;
-+        if (vblank->update)
-+            RegionIntersect(damage, damage, &window->clipList);
-+        DamageDamageRegion(&window->drawable, damage);
++        /* lorie: damage was reported by lorieScheduleGpuCopyClipped(), from the same region. */
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
 +         * consumed (copied into the shared command queue), so free it like

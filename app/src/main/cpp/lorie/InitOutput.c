@@ -1355,14 +1355,20 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         LoriePixmapPriv *rootPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
         if (rootPriv && rootPriv->rootDouble) {
             // The copy lands in the buffer we are drawing into, so every other slot misses it too.
-            if (update)
-                lorieMarkRootStale(rootPriv, update);
-            else {
-                RegionRec r;
+            // In the root's own coordinates, which is where the GPU writes: an update rect is
+            // source-local and the write goes to rect + (x_off, y_off). Marking the source-local
+            // rect instead recorded the wrong area whenever either offset was nonzero, and the
+            // region carried between slots then did not match the region that changed.
+            RegionRec r;
+
+            if (update) {
+                RegionNull(&r);
+                RegionCopy(&r, update);
+            } else
                 RegionInit(&r, &fullBox, 1);
-                lorieMarkRootStale(rootPriv, &r);
-                RegionUninit(&r);
-            }
+            RegionTranslate(&r, x_off, y_off);
+            lorieMarkRootStale(rootPriv, &r);
+            RegionUninit(&r);
         }
     }
     *out_dst_buffer = dstIsRoot ? NULL : dstBuffer;
