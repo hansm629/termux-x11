@@ -87,7 +87,6 @@ typedef struct {
     uint64_t current_msc;
 
     uint64_t gpuCopySerialCounter;
-    uint64_t rootGpuCopyPending;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -253,6 +252,7 @@ typedef struct {
     void *rootLocked[LORIE_ROOT_SLOTS];
     RegionRec rootStale[LORIE_ROOT_SLOTS];
     int rootWrite;                  // the slot we are drawing into; only this side ever changes it
+    Bool rootDirty;                 // drawn into but not published yet, so the retry below knows
     Bool rootDouble;
 } LoriePixmapPriv;
 
@@ -703,11 +703,30 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         }
 
         lorieEnsureRootDoubleBuffer(root);
-        if (priv->rootDouble)
+        if (priv->rootDouble) {
             lorieMarkRootStale(priv, DamageRegion(pvfb->damage));
+            priv->rootDirty = TRUE;
+        }
 
         DamageEmpty(pvfb->damage);
-        lorieRootHandover(priv);
+        if (lorieRootHandover(priv))
+            priv->rootDirty = FALSE;
+        pvfb->state->drawRequested = TRUE;
+    }
+
+    /*
+     * A handover can decline - no slot free, or a GPU write still running into the one being
+     * published - and the damage that produced the content has already been cleared by then. The
+     * block above is only entered when there is fresh damage, so without this the content sat
+     * unpublished until something else happened to dirty the root, which on a still desktop is
+     * nothing at all.
+     *
+     * Retried here rather than by holding drawRequested high: this runs once per vsync, which is
+     * both the next opportunity to show anything and the rate at which the conditions it is waiting
+     * on change.
+     */
+    if (priv->rootDouble && priv->rootDirty && lorieRootHandover(priv)) {
+        priv->rootDirty = FALSE;
         pvfb->state->drawRequested = TRUE;
     }
 
@@ -1341,18 +1360,21 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     // already-destroyed root buffer. Redirected-window destinations have no such guarantee, so they
     // still need registering and an extra reference.
     Bool dstIsRoot = dst == pScreenPtr->devPrivate;
-    if (!dstIsRoot) {
+
+    // The destination is identified by the buffer the copy was actually aimed at, root or not.
+    // Naming the root with a NULL meant the work could not be matched back to the slot it targeted:
+    // by the time it finished the pixmap had rotated on to another one, so neither its pending mark
+    // nor its lifetime could be undone against the right buffer. A root slot destroyed by a resize
+    // now outlives the copy reading it, which is the point - the renderer looks buffers up by id,
+    // and an id that has been withdrawn is not asked for again.
+    if (!dstIsRoot)
         lorieRegisterBuffer(dstBuffer);
-        LorieBuffer_acquire(dstBuffer);
-        // Tracked so CPU reads of this window's pixmap (e.g. a compositor reading it back to
-        // paint) only pay for the GPU lock (see lorieNeedsGpuLock) while a GPU write into it can
-        // actually be in flight, instead of on every AHardwareBuffer-backed pixmap access.
-        LorieBuffer_gpuCopyPendingInc(dstBuffer);
-    } else {
-        // Tracked so CPU reads of the screen pixmap only pay for the GPU lock (see
-        // lorieNeedsGpuLock) while a GPU write into it can actually be in flight.
-        pvfb->rootGpuCopyPending++;
-        LoriePixmapPriv *rootPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
+    LorieBuffer_acquire(dstBuffer);
+    // Tracked so CPU reads of this pixmap only pay for the GPU lock (see lorieNeedsGpuLock) while a
+    // GPU write into it can actually be in flight, instead of on every access.
+    LorieBuffer_gpuCopyPendingInc(dstBuffer);
+    {
+        LoriePixmapPriv *rootPriv = dstIsRoot ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
         if (rootPriv && rootPriv->rootDouble) {
             // The copy lands in the buffer we are drawing into, so every other slot misses it too.
             // In the root's own coordinates, which is where the GPU writes: an update rect is
@@ -1371,7 +1393,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
             RegionUninit(&r);
         }
     }
-    *out_dst_buffer = dstIsRoot ? NULL : dstBuffer;
+    *out_dst_buffer = dstBuffer;
 
     entry = &pvfb->state->gpuCopyQueue.entries[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
     entry->serial = ++pvfb->gpuCopySerialCounter;
@@ -1434,8 +1456,7 @@ static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
     if (dst) {
         LorieBuffer_gpuCopyPendingDec(dst);
         LorieBuffer_release(dst);
-    } else
-        pvfb->rootGpuCopyPending--;
+    }
 }
 
 typedef struct {
@@ -1792,6 +1813,16 @@ static inline int lorieRootSampledIndex(void) {
                    >> LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_NEWEST_MASK);
 }
 
+// Whether a GPU write into the slot the X server is drawing into may still be running. This used to
+// be a single count of every outstanding root copy, which stays positive for as long as any client
+// keeps presenting - so it said "in flight" about a buffer nothing was writing.
+static Bool lorieRootWriteHasGpuCopyPending(void) {
+    PixmapPtr screenPix = pScreenPtr ? (*pScreenPtr->GetScreenPixmap)(pScreenPtr) : NULL;
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(screenPix);
+
+    return priv && LorieBuffer_hasGpuCopyPending(priv->buffer);
+}
+
 // Everything we draw lands only in the slot we are drawing into, so every other slot is behind by
 // that region until it becomes our drawing target and the handover copies it forward.
 static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {
@@ -1960,7 +1991,11 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
          * actually read `drawn` waits, and it waits by staying on this buffer for another frame
          * rather than by blocking.
          */
-        if (pvfb->rootGpuCopyPending && RegionNotEmpty(&priv->rootStale[next])) {
+        if (LorieBuffer_hasGpuCopyPending(priv->rootBuf[drawn]) &&
+            RegionNotEmpty(&priv->rootStale[next])) {
+            // This slot alone, not the global count: that one stays positive for as long as any
+            // client keeps presenting to the root, and waiting on it would hold the publish back
+            // indefinitely rather than until this buffer is safe to read.
             pvfb->state->presentStats.rootHandoverDeferrals++;
             return FALSE;
         }
@@ -1989,9 +2024,10 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
         // drawing does not have to wait for its fence at all. Only a GPU copy landing in our own
         // buffer still needs the lock.
         if (pvfb->state->rootDoubleBuffered)
-            return pvfb->rootGpuCopyPending && !pvfb->root.legacyDrawing;
+            return lorieRootWriteHasGpuCopyPending() && !pvfb->root.legacyDrawing;
 
-        return index == EXA_PREPARE_DEST || (pvfb->rootGpuCopyPending && !pvfb->root.legacyDrawing);
+        return index == EXA_PREPARE_DEST ||
+               (lorieRootWriteHasGpuCopyPending() && !pvfb->root.legacyDrawing);
     }
     return !pvfb->root.legacyDrawing && priv->buffer &&
            LorieBuffer_description(priv->buffer)->type == LORIEBUFFER_AHARDWAREBUFFER &&
