@@ -1255,7 +1255,16 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 // Looks up a registered buffer by id, waiting briefly (bounded) if it hasn't arrived over the
 // async registration socket yet instead of busy-spinning the outer loop.
 // How many frames a queued copy may wait for its buffer to be registered before it is given up on.
-#define LORIE_COPY_DEFER_FRAMES 30
+// How long a copy may wait for its buffers to be registered. This used to be a count of calls to
+// rendererApplyPendingGpuCopiesLocked(), described as frames - but rendererShouldWait() returns
+// "do not wait" whenever anything is queued, so the thread span and burned all thirty of them in
+// microseconds rather than over thirty displayed frames. A deadline says what was meant.
+#define LORIE_COPY_DEFER_NS 250000000LL
+
+// When the queue is blocked on a buffer that has not been registered yet, and until when. Read by
+// rendererShouldWait() so the thread sleeps instead of spinning, and by the wait itself so it wakes
+// when the deadline passes even if no registration ever arrives.
+static int64_t rendererCopyBlockedUntilNs = 0;
 
 // Looks the buffer up and attaches it if it has arrived but not been attached yet. It used to sleep
 // here - up to 20 x 5 ms - when a buffer had not been registered yet, which stops completedSerial
@@ -1293,17 +1302,18 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             // Its buffer has not reached us yet. Leave it queued and look again on the next frame
             // rather than waiting here, which would stall every present behind it as well.
             static uint64_t deferredSerial = 0;
-            static int deferredFrames = 0;
+            int64_t nowNs = rendererNowNs();
 
             if (deferredSerial != entry.serial) {
                 deferredSerial = entry.serial;
-                deferredFrames = 0;
+                rendererCopyBlockedUntilNs = nowNs + LORIE_COPY_DEFER_NS;
             }
 
-            if (++deferredFrames <= LORIE_COPY_DEFER_FRAMES) {
+            if (nowNs < rendererCopyBlockedUntilNs) {
                 state->presentStats.copyDeferrals++;
                 break;
             }
+            rendererCopyBlockedUntilNs = 0;
 
             log("rendererApplyPendingGpuCopies: %s buffer %llu never arrived, skipping\n",
                 src ? "destination" : "source",
@@ -1375,6 +1385,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             }
         }
 
+        rendererCopyBlockedUntilNs = 0;
         lastSerial = entry.serial;
         state->gpuCopyQueue.readIndex++;
     }
@@ -1904,6 +1915,11 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
+    // A queue held up by an unregistered buffer is not runnable work. Entries are drained in order,
+    // so nothing behind it can run either, and answering "do not wait" for it is what turned the
+    // wait for a registration into a spin.
+    if (gpuCopyPending && rendererCopyBlockedUntilNs && rendererNowNs() < rendererCopyBlockedUntilNs)
+        gpuCopyPending = false;
     if (stateChanged || windowChanged || buffersChanged || gpuCopyPending)
         // If there are pending changes we should process them immediately.
         return false;
@@ -1991,8 +2007,25 @@ __noreturn static void* rendererThread(void) {
     LorieBuffer* buf;
     bool waitingForBuffers = false;
     while (true) {
-        while (rendererShouldWait(&waitingForBuffers))
-            pthread_cond_wait(stateCond, &stateLock);
+        while (rendererShouldWait(&waitingForBuffers)) {
+            int64_t blockedUntilNs = rendererCopyBlockedUntilNs;
+
+            if (blockedUntilNs) {
+                // A registration would signal us, but one may never come, so this wait has to end
+                // by itself for the copy to be given up on. CLOCK_REALTIME because that is what an
+                // untouched condvar measures its absolute timeout against.
+                int64_t remainingNs = blockedUntilNs - rendererNowNs();
+                struct timespec ts;
+
+                if (remainingNs < 0)
+                    remainingNs = 0;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += (time_t) ((remainingNs + ts.tv_nsec) / 1000000000LL);
+                ts.tv_nsec = (long) ((remainingNs + ts.tv_nsec) % 1000000000LL);
+                pthread_cond_timedwait(stateCond, &stateLock, &ts);
+            } else
+                pthread_cond_wait(stateCond, &stateLock);
+        }
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = NULL;
