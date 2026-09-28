@@ -26,7 +26,7 @@
     </string-array>
 
     <string-array name="displayFilteringModeEntries">
-        <item>쌍선형</item>
+        <item>쌍선형 (AHB zero-copy, 권장)</item>
         <item>최근접</item>
     </string-array>
 </resources>

@@ -160,7 +160,7 @@
     </string-array>
 
     <string-array name="displayFilteringModeEntries">
-        <item>Bilinear</item>
+        <item>Bilinear (AHB zero-copy, recommended)</item>
         <item>Nearest</item>
     </string-array>
 

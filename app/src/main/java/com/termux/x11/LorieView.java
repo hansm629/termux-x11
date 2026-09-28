@@ -868,14 +868,12 @@ setViewport(viewport.left, viewport.top, viewport.width(), viewport.height(), p.
     ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::handleClipboardChange;
 
     public void reloadPreferences(Prefs p) {
+        // Read once, through Prefs. A second read through the legacy preference manager used to
+        // follow this one and overwrite it, and it defaulted to nearest where the preference itself
+        // declares bilinear - so with nothing stored yet, picking bilinear in the settings still
+        // ended up as nearest.
         String displayFilteringMode = p.displayFilteringMode.get();
         setFiltering("nearest".equals(displayFilteringMode) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
-
-        String filtering =
-                android.preference.PreferenceManager
-                    .getDefaultSharedPreferences(getContext())
-                    .getString("displayFilteringMode", "nearest");
-        setFiltering("nearest".equals(filtering) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
         setRendererPerfLogEnabled(p.get().getBoolean("rendererPerfLog", false));
 
         // The root window fence wait stays on in every mode. Without it the render thread runs
