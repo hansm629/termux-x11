@@ -194,6 +194,7 @@ static struct {
     void (*txSetZOrder)(ASurfaceTransaction *, ASurfaceControl *, int32_t);
     void (*txSetBuffer)(ASurfaceTransaction *, ASurfaceControl *, AHardwareBuffer *, int);
     void (*txSetGeometry)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t);
+    void (*txReparent)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *); // optional
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -217,6 +218,11 @@ static bool cursorOverlayResolveApi(void) {
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBuffer");
     scApi.txSetGeometry = (void (*)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t))
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setGeometry");
+
+    // Optional: hiding the layer is enough to get it off the screen, taking it out of the tree as
+    // well is just tidier.
+    scApi.txReparent = (void (*)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_reparent");
 
     if (!scApi.createFromWindow || !scApi.release || !scApi.txCreate || !scApi.txDelete ||
         !scApi.txApply || !scApi.txSetVisibility || !scApi.txSetZOrder || !scApi.txSetBuffer ||
@@ -2121,15 +2127,20 @@ static void armCursorOverlayCallbackIfNeeded(void) {
 }
 
 // Overlay thread, once per vsync.
+//
+// The whole body runs under cursorOverlayLock. Copying the ASurfaceControl out and using it outside
+// the lock, which is the obvious way to write this, lets teardownCursorOverlay() release it from the
+// renderer thread in between. Applying a transaction is an asynchronous one-way call, so holding the
+// lock across it costs the renderer nothing worth measuring.
 static void applyCursorOverlayIfDirty(void) {
     bool geometryDirty, bufferDirty, visible;
-    ASurfaceControl *sc;
     AHardwareBuffer *buf = NULL;
+    ASurfaceTransaction *t;
     int32_t x = 0, y = 0;
     uint32_t w = 0, h = 0;
 
     pthread_mutex_lock(&cursorOverlayLock);
-    sc = cursorSurfaceControl;
+
     geometryDirty = cursorOverlayGeometryDirty;
     bufferDirty = cursorOverlayBufferDirty;
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
@@ -2137,34 +2148,28 @@ static void applyCursorOverlayIfDirty(void) {
         buf = cursorOverlayPendingBuffer;
         cursorOverlayPendingBuffer = NULL;
     }
-    pthread_mutex_unlock(&cursorOverlayLock);
 
-    if (!sc || (!geometryDirty && !bufferDirty) || !state) {
-        if (buf)
-            AHardwareBuffer_release(buf);
-        return;
-    }
+    if (cursorSurfaceControl && (geometryDirty || bufferDirty) && state) {
+        visible = computeCursorOverlayRect(&x, &y, &w, &h);
 
-    visible = computeCursorOverlayRect(&x, &y, &w, &h);
-
-    {
-        // sc is only ever non-NULL once every entry point resolved, so these need no further check.
         ARect src = { 0, 0, (int32_t) w, (int32_t) h };
         ARect dst = { x, y, x + (int32_t) w, y + (int32_t) h };
-        ASurfaceTransaction *t = scApi.txCreate();
 
-        scApi.txSetVisibility(t, sc, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
-                                             : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
-        scApi.txSetZOrder(t, sc, 1); // above the window's own buffer
+        t = scApi.txCreate();
+        scApi.txSetVisibility(t, cursorSurfaceControl, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
+                                                              : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        scApi.txSetZOrder(t, cursorSurfaceControl, 1); // above the window's own buffer
         if (visible) {
             if (buf)
-                scApi.txSetBuffer(t, sc, buf, -1);
+                scApi.txSetBuffer(t, cursorSurfaceControl, buf, -1);
             // Rendered at exactly w x h already, so the compositor never scales or filters it.
-            scApi.txSetGeometry(t, sc, &src, &dst, 0);
+            scApi.txSetGeometry(t, cursorSurfaceControl, &src, &dst, 0);
         }
         scApi.txApply(t);
         scApi.txDelete(t);
     }
+
+    pthread_mutex_unlock(&cursorOverlayLock);
 
     if (buf)
         AHardwareBuffer_release(buf);
@@ -2300,15 +2305,30 @@ static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
 
 static void teardownCursorOverlay(void) {
     pthread_mutex_lock(&cursorOverlayLock);
+
     if (cursorSurfaceControl) {
+        // Releasing the handle does not take the layer off the screen. It stays, showing whatever
+        // was last put on it - which is where the frozen X-shaped cursor came from, left behind by
+        // the layer belonging to the previous surface while a new one drew the live cursor. It has
+        // to be hidden, and taken out of the tree, in a transaction first.
+        ASurfaceTransaction *t = scApi.txCreate();
+
+        scApi.txSetVisibility(t, cursorSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        if (scApi.txReparent)
+            scApi.txReparent(t, cursorSurfaceControl, NULL);
+        scApi.txApply(t);
+        scApi.txDelete(t);
+
         scApi.release(cursorSurfaceControl);
         cursorSurfaceControl = NULL;
     }
+
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
     if (cursorOverlayPendingBuffer) {
         AHardwareBuffer_release(cursorOverlayPendingBuffer);
         cursorOverlayPendingBuffer = NULL;
     }
+
     pthread_mutex_unlock(&cursorOverlayLock);
 }
 
