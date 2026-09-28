@@ -307,7 +307,7 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -61,30 +62,146 @@
+@@ -61,30 +62,181 @@
      return FALSE;
  }
  
@@ -339,6 +339,22 @@
 +        RegionInit(out, &full, 1);
 +    }
 +
++    /* lorie: a client's update region is not obliged to stay inside the pixmap it names, and
++     * sampling outside it would be silently turned into edge pixels by the texture clamp rather
++     * than into nothing. Bound it here, in the same source-local space. */
++    {
++        RegionRec   bounds;
++        BoxRec      srcBox;
++
++        srcBox.x1 = 0;
++        srcBox.y1 = 0;
++        srcBox.x2 = vblank->pixmap->drawable.width;
++        srcBox.y2 = vblank->pixmap->drawable.height;
++        RegionInit(&bounds, &srcBox, 1);
++        RegionIntersect(out, out, &bounds);
++        RegionUninit(&bounds);
++    }
++
 +    RegionNull(&clip);
 +    RegionCopy(&clip, &window->clipList);
 +    RegionTranslate(&clip, -(window->drawable.x + vblank->x_off),
@@ -351,6 +367,27 @@
 +
 +    RegionUninit(out);
 +    return FALSE;
++}
++
++/* lorie: builds the clipped region, hands it to the renderer, and releases it - on every path.
++ * Written as one function because the region is a local of this file's making and every way out of
++ * the attempt has to free it exactly once: the caller falls back to the CPU copy when this returns
++ * FALSE, which it does for a queue that is full, a buffer that cannot be imported, GPU present
++ * being off, or nothing left after clipping. */
++static Bool
++lorieScheduleGpuCopyClipped(present_vblank_ptr vblank, WindowPtr window, PixmapPtr dst,
++                            int16_t xOff, int16_t yOff)
++{
++    RegionRec   region;
++    Bool        scheduled;
++
++    if (!lorieBuildGpuCopyRegion(vblank, window, &region))
++        return FALSE;   /* already released, and there is nothing to copy */
++
++    scheduled = lorieTryScheduleGpuCopy(vblank->pixmap, dst, &region, xOff, yOff,
++                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer);
++    RegionUninit(&region);
++    return scheduled;
 +}
 +
  void
@@ -375,7 +412,7 @@
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
-+    RegionRec                    gpuCopyRegion;
++    Bool                         gpuCopyScheduled;
 +
 +    /* lorie: the deferral upstream does here is gone for the same reason as in
 +     * present_execute_wait() above. */
@@ -410,9 +447,8 @@
 +            screen_priv->flush(window);
 +            return;
 +        }
-+    } else if (lorieBuildGpuCopyRegion(vblank, window, &gpuCopyRegion) &&
-+               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, &gpuCopyRegion, gpuCopyXOff, gpuCopyYOff,
-+                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
++    } else if ((gpuCopyScheduled = lorieScheduleGpuCopyClipped(vblank, window, gpuCopyDst,
++                                                              gpuCopyXOff, gpuCopyYOff))) {
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
 +         * ops that Damage tracking hooks into, so report it manually - same drawable and region
 +         * present_scmd.c's flip success path already uses, so this also reaches Composite's
@@ -427,7 +463,6 @@
 +        if (vblank->update)
 +            RegionIntersect(damage, damage, &window->clipList);
 +        DamageDamageRegion(&window->drawable, damage);
-+        RegionUninit(&gpuCopyRegion);
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
 +         * consumed (copied into the shared command queue), so free it like
