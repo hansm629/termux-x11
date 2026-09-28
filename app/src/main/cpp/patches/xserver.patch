@@ -307,7 +307,55 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -67,24 +68,81 @@
+@@ -61,30 +62,138 @@
+     return FALSE;
+ }
+ 
++/* lorie: what the GPU blit is allowed to write, in the source pixmap's own coordinates.
++ *
++ * present_copy_region() goes through a GC on the window, so X clips it to the window's visible
++ * region. Writing the destination pixmap directly has no such clipping, and vblank->update is
++ * whatever the client asked for - so a partly obscured or partly offscreen window would write over
++ * what is on top of it. clipList is in screen coordinates and update is relative to the window's
++ * drawable and shifted by x_off/y_off, which is a pure translation, so the clip can be brought into
++ * the source's coordinates and intersected there.
++ *
++ * Returns FALSE when nothing is left to copy. */
++static Bool
++lorieBuildGpuCopyRegion(present_vblank_ptr vblank, WindowPtr window, RegionPtr out)
++{
++    RegionRec   clip;
++
++    RegionNull(out);
++    if (vblank->update)
++        RegionCopy(out, vblank->update);
++    else {
++        BoxRec  full;
++
++        full.x1 = 0;
++        full.y1 = 0;
++        full.x2 = vblank->pixmap->drawable.width;
++        full.y2 = vblank->pixmap->drawable.height;
++        RegionInit(out, &full, 1);
++    }
++
++    RegionNull(&clip);
++    RegionCopy(&clip, &window->clipList);
++    RegionTranslate(&clip, -(window->drawable.x + vblank->x_off),
++                           -(window->drawable.y + vblank->y_off));
++    RegionIntersect(out, out, &clip);
++    RegionUninit(&clip);
++
++    if (RegionNotEmpty(out))
++        return TRUE;
++
++    RegionUninit(out);
++    return FALSE;
++}
++
+ void
+ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ {
      WindowPtr                   window = vblank->window;
      ScreenPtr                   screen = window->drawable.pScreen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
@@ -327,6 +375,7 @@
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
++    RegionRec                    gpuCopyRegion;
 +
 +    /* lorie: the deferral upstream does here is gone for the same reason as in
 +     * present_execute_wait() above. */
@@ -360,16 +409,24 @@
 +            screen_priv->flush(window);
 +            return;
 +        }
-+    } else if (lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
++    } else if (lorieBuildGpuCopyRegion(vblank, window, &gpuCopyRegion) &&
++               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, &gpuCopyRegion, gpuCopyXOff, gpuCopyYOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
 +         * ops that Damage tracking hooks into, so report it manually - same drawable and region
 +         * present_scmd.c's flip success path already uses, so this also reaches Composite's
-+         * per-window damage for redirected windows, not just lorie's own root damage. */
++         * per-window damage for redirected windows, not just lorie's own root damage.
++         *
++         * Left as it was on purpose. This intersects update with clipList, and the two are not in
++         * the same coordinate space by the reckoning above: the renderer treats an update rect as
++         * source-local while clipList is in screen coordinates. Which of the two is wrong is not
++         * settled by reading the code, and guessing at it here would trade a clipping bug for a
++         * repaint one. */
 +        RegionPtr damage = vblank->update ? vblank->update : &window->clipList;
 +        if (vblank->update)
 +            RegionIntersect(damage, damage, &window->clipList);
 +        DamageDamageRegion(&window->drawable, damage);
++        RegionUninit(&gpuCopyRegion);
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
 +         * consumed (copied into the shared command queue), so free it like
