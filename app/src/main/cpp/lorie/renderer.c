@@ -165,8 +165,13 @@ static pthread_mutex_t cursorOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 static bool cursorOverlayGeometryDirty = false, cursorOverlayBufferDirty = false;
 static bool cursorOverlayCallbackArmed = false; // is a choreographer callback pending?
 static AHardwareBuffer *cursorOverlayPendingBuffer = NULL; // reference held for the overlay thread
-// Renderer thread only.
-static LorieBuffer *cursorOverlayRenderTarget = NULL;
+// Renderer thread only. Two render targets, because the compositor keeps reading the buffer it was
+// given until a later one replaces it: rendering a new cursor image into that same buffer both races
+// its reads and hands it a handle it already has, which is why a cursor change could leave the old
+// image on screen. Alternating means every update arrives as a buffer the compositor has not seen.
+static LorieBuffer *cursorOverlayRenderTarget[2] = { NULL, NULL };
+static uint32_t cursorOverlayTargetW[2] = { 0, 0 }, cursorOverlayTargetH[2] = { 0, 0 };
+static unsigned cursorOverlayTargetIndex = 0;
 static GLuint cursorOverlayFbo = 0;
 static uint32_t cursorOverlayRawW = 0, cursorOverlayRawH = 0;
 // The root buffer's size as of the last frame. The overlay thread needs it to place the cursor and
@@ -2189,12 +2194,13 @@ static void *cursorOverlayThreadMain(__unused void *cookie) {
 // Hands the overlay thread a fresh reference to the render target's buffer. Used both after
 // re-rendering it and when a brand new ASurfaceControl needs one resent.
 static void resendCursorOverlayBuffer(void) {
+    LorieBuffer *target = cursorOverlayRenderTarget[cursorOverlayTargetIndex];
     AHardwareBuffer *ahb;
 
-    if (!cursorOverlayRenderTarget)
+    if (!target)
         return;
 
-    ahb = LorieBuffer_description(cursorOverlayRenderTarget)->buffer;
+    ahb = LorieBuffer_description(target)->buffer;
     if (!ahb)
         return;
     AHardwareBuffer_acquire(ahb);
@@ -2211,6 +2217,7 @@ static void resendCursorOverlayBuffer(void) {
 // Renderer thread, EGL context current. Draws the cursor scaled to its destination size into an
 // AHardwareBuffer, so the compositor gets a buffer already the right size and never filters it.
 static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
+    unsigned slot = cursorOverlayTargetIndex ^ 1u; // never the one the compositor is holding
     GLint prevViewport[4];
     EGLSync fence;
 
@@ -2224,17 +2231,19 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
                     GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
     lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
 
-    if (!cursorOverlayRenderTarget || cursorOverlayRawW != destW || cursorOverlayRawH != destH) {
-        if (cursorOverlayRenderTarget)
-            LorieBuffer_release(cursorOverlayRenderTarget);
-        cursorOverlayRenderTarget = LorieBuffer_allocate((int32_t) destW, (int32_t) destH,
-                                                        AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
-                                                        LORIEBUFFER_AHARDWAREBUFFER);
-        if (cursorOverlayRenderTarget)
-            LorieBuffer_attachToGL(cursorOverlayRenderTarget);
-        cursorOverlayRawW = cursorOverlayRawH = 0;
+    if (!cursorOverlayRenderTarget[slot] ||
+        cursorOverlayTargetW[slot] != destW || cursorOverlayTargetH[slot] != destH) {
+        if (cursorOverlayRenderTarget[slot])
+            LorieBuffer_release(cursorOverlayRenderTarget[slot]);
+        cursorOverlayRenderTarget[slot] = LorieBuffer_allocate((int32_t) destW, (int32_t) destH,
+                                                              AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                                              LORIEBUFFER_AHARDWAREBUFFER);
+        if (cursorOverlayRenderTarget[slot])
+            LorieBuffer_attachToGL(cursorOverlayRenderTarget[slot]);
+        cursorOverlayTargetW[slot] = cursorOverlayRenderTarget[slot] ? destW : 0;
+        cursorOverlayTargetH[slot] = cursorOverlayRenderTarget[slot] ? destH : 0;
     }
-    if (!cursorOverlayRenderTarget)
+    if (!cursorOverlayRenderTarget[slot])
         return;
 
     glGetIntegerv(GL_VIEWPORT, prevViewport);
@@ -2242,12 +2251,12 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
         glGenFramebuffers(1, &cursorOverlayFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, cursorOverlayFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           LorieBuffer_getGLTextureId(cursorOverlayRenderTarget), 0);
+                           LorieBuffer_getGLTextureId(cursorOverlayRenderTarget[slot]), 0);
     glViewport(0, 0, (GLsizei) destW, (GLsizei) destH);
     glClearColor(0.f, 0.f, 0.f, 0.f);
     glClear(GL_COLOR_BUFFER_BIT);
-    // y is inverted because we are drawing into a texture rather than onto the surface. The cursor
-    // sits in the top left corner of a fixed size texture, so sample only that part of it.
+    // y is inverted because this draws into a texture rather than onto the surface. The cursor sits
+    // in the top left corner of a fixed size texture, so sample only that part of it.
     drawRegion(cursor.id, -1.f, 1.f, 1.f, -1.f, 0.f, 0.f,
                (float) state->cursor.width / LORIE_CURSOR_TEX_SIZE,
                (float) state->cursor.height / LORIE_CURSOR_TEX_SIZE, false);
@@ -2261,6 +2270,7 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
+    cursorOverlayTargetIndex = slot;
     cursorOverlayRawW = destW;
     cursorOverlayRawH = destH;
     resendCursorOverlayBuffer();
@@ -2333,7 +2343,12 @@ static void ensureCursorOverlay(void) {
         }
         pthread_mutex_unlock(&cursorOverlayLock);
 
-        if (created)
+        if (created) {
             resendCursorOverlayBuffer(); // a new layer starts out with no buffer of its own
+            // Erase whatever the GL path last drew into the surface: from here on frames carry no
+            // cursor, and on an idle desktop nothing else would redraw over it.
+            if (state)
+                state->drawRequested = true;
+        }
     }
 }
