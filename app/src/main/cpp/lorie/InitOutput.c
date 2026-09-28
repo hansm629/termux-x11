@@ -809,11 +809,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
-        if (pvfb->state->presentStats.rootCopies)
-            log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms",
+        if (pvfb->state->presentStats.rootCopies || pvfb->state->presentStats.rootHandoverDeferrals)
+            log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms, %u publishes held for a pending GPU write",
                 pvfb->state->presentStats.rootCopies,
                 pvfb->state->presentStats.rootCopyBytes / 1048576.0,
-                pvfb->state->presentStats.rootCopyUs / 1000.0);
+                pvfb->state->presentStats.rootCopyUs / 1000.0,
+                pvfb->state->presentStats.rootHandoverDeferrals);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -845,6 +846,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootCopyBytes = 0;
     pvfb->state->presentStats.rootCopyUs = 0;
     pvfb->state->presentStats.rootCopies = 0;
+    pvfb->state->presentStats.rootHandoverDeferrals = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
@@ -1776,6 +1778,24 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
             }
         if (next < 0)
             return FALSE;
+
+        /*
+         * The stale copy below reads `drawn` with the CPU, and `drawn` is the slot every root GPU
+         * copy is queued against - lorieTryScheduleGpuCopy() takes its destination from priv->buffer.
+         * It takes neither state->lock nor EXA's PrepareAccess, so a copy that has been queued but
+         * not yet executed would be read straight past: `next` would get the pixels from before it,
+         * have its stale region cleared as though it were up to date, and never receive them, since
+         * the GPU writes `drawn` afterwards. The wrong content surfaces whenever the rotation comes
+         * back round to that slot.
+         *
+         * There is nothing to get wrong when there is nothing to copy, so only a handover that would
+         * actually read `drawn` waits, and it waits by staying on this buffer for another frame
+         * rather than by blocking.
+         */
+        if (pvfb->rootGpuCopyPending && RegionNotEmpty(&priv->rootStale[next])) {
+            pvfb->state->presentStats.rootHandoverDeferrals++;
+            return FALSE;
+        }
 
         new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT))
             | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT);

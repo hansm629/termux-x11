@@ -346,6 +346,7 @@ struct lorie_shared_server_state {
         volatile uint64_t rootCopyBytes;
         volatile uint32_t rootCopyUs;
         volatile uint32_t rootCopies;
+        volatile uint32_t rootHandoverDeferrals; /* publishes held back for an in-flight GPU write */
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
