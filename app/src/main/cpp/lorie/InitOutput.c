@@ -1385,6 +1385,18 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     return TRUE;
 }
 
+// Whether the renderer gave this copy up rather than making it. Checked before treating a serial as
+// copied, since completedSerial can only carry a watermark and will step over an abandoned one.
+Bool lorieGpuCopyFailed(uint64_t serial) {
+    uint32_t count = __atomic_load_n(&pvfb->state->gpuCopyQueue.failedCount, __ATOMIC_ACQUIRE);
+    uint32_t i, n = min(count, LORIE_GPU_COPY_FAILED_SLOTS);
+
+    for (i = 0; i < n; i++)
+        if (pvfb->state->gpuCopyQueue.failedSerials[(count - 1 - i) % LORIE_GPU_COPY_FAILED_SLOTS] == serial)
+            return TRUE;
+    return FALSE;
+}
+
 Bool lorieGpuCopyIsDone(uint64_t serial) {
     if (__atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial)
         return TRUE;

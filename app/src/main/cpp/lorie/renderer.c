@@ -1319,6 +1319,16 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
                 src ? "destination" : "source",
                 (unsigned long long) (src ? entry.dstBufferId : entry.srcBufferId));
             state->presentStats.copySkips++;
+
+            // Say so. Letting this serial ride out on completedSerial told the X server the copy
+            // had been made, which told the client its frame was on screen when nothing had been
+            // drawn at all.
+            {
+                uint32_t slot = __atomic_load_n(&state->gpuCopyQueue.failedCount, __ATOMIC_RELAXED);
+
+                state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS] = entry.serial;
+                __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
+            }
         }
 
         if (src && dst) {

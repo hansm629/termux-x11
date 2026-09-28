@@ -218,6 +218,14 @@ struct lorie_shared_server_state {
         volatile uint32_t writeIndex;
         volatile uint32_t readIndex;
         volatile uint64_t completedSerial;
+
+        /* Serials the renderer gave up on because a buffer never reached it. completedSerial is a
+         * watermark and cannot express this: if 5 is abandoned and 6 succeeds, publishing 6 would
+         * say 5 succeeded too. So they are listed. At most CAPACITY copies can be outstanding, and
+         * the X server reads each one long before the ring wraps twice that far. */
+#define LORIE_GPU_COPY_FAILED_SLOTS 16
+        volatile uint64_t failedSerials[LORIE_GPU_COPY_FAILED_SLOTS];
+        volatile uint32_t failedCount;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
 
