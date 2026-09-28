@@ -228,11 +228,15 @@ struct lorie_shared_server_state {
      * So the root gets several buffers: the renderer takes the one the X server published last, the
      * X server draws into one nobody else needs, and neither ever waits for the other.
      *
-     * Four rather than two, because handing a buffer straight to the compositor means it keeps
-     * reading it until a later one is latched. The renderer holds two at once - the one on screen
-     * and the one queued behind it - and the X server needs one to draw into. With only those three
-     * there is nothing left to publish into while the oldest is still being released, which halves
-     * how often the desktop can be updated; the fourth is what keeps it at the display's rate.
+     * Five, because handing a buffer straight to the compositor means it keeps reading it until a
+     * later one is latched, and both sides need room at once.
+     *
+     * The renderer holds up to three: the one on screen, and up to two waiting for the release
+     * fence that says the compositor has finished with them - two because that fence arrives during
+     * the vsync after the one that queued it, so insisting the older one be back first costs a
+     * frame every time. The X server needs two: the one it is drawing into and one to move to when
+     * it publishes. Take either side down to what looks sufficient and the publishing rate halves,
+     * which on a 120Hz panel is plainly visible when a window is dragged.
      *
      * rootHandover carries all of it in one word, so the handover needs no mutex:
      *
@@ -246,11 +250,11 @@ struct lorie_shared_server_state {
      * the one it has for another frame - so it never blocks, it just drops a frame the display could
      * not have shown anyway.
      */
-#define LORIE_ROOT_SLOTS 4
-#define LORIE_ROOT_HELD_MASK 0xfu
-#define LORIE_ROOT_NEWEST_SHIFT 4
-#define LORIE_ROOT_NEWEST_MASK 0x3u
-#define LORIE_ROOT_COUNT_STEP 0x40u
+#define LORIE_ROOT_SLOTS 5
+#define LORIE_ROOT_HELD_MASK 0x1fu
+#define LORIE_ROOT_NEWEST_SHIFT 5
+#define LORIE_ROOT_NEWEST_MASK 0x7u
+#define LORIE_ROOT_COUNT_STEP 0x100u
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     volatile uint32_t rootHandover;

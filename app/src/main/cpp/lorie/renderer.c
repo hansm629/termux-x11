@@ -210,8 +210,10 @@ static volatile float cursorOverlaySourceW = 0.f, cursorOverlaySourceH = 0.f;
 static ASurfaceControl *rootSurfaceControl = NULL;
 static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 
-// One slot always belongs to the X server, so this is how many we may be holding at once.
-#define LORIE_ZC_MAX_HELD (LORIE_ROOT_SLOTS - 1)
+// Two slots stay with the X server - one it draws into, one to publish into - so this is how many
+// are ours. Holding one more than this blocks it from publishing at all, which is what dropped the
+// desktop to 72 updates a second against a 120Hz display.
+#define LORIE_ZC_MAX_HELD (LORIE_ROOT_SLOTS - 2)
 
 // All guarded by rootOverlayLock.
 static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it

@@ -1700,11 +1700,8 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     lorieUnregisterBuffer(orig);
     LorieBuffer_release(orig);
 
-    log(INFO, "Root window has %d BGRA buffers (%dx%d, ids %llu/%llu/%llu/%llu)", LORIE_ROOT_SLOTS, w, h,
-        (unsigned long long) pvfb->state->rootBufferIds[0],
-        (unsigned long long) pvfb->state->rootBufferIds[1],
-        (unsigned long long) pvfb->state->rootBufferIds[2],
-        (unsigned long long) pvfb->state->rootBufferIds[3]);
+    log(INFO, "Root window has %d BGRA buffers (%dx%d, first id %llu)", LORIE_ROOT_SLOTS, w, h,
+        (unsigned long long) pvfb->state->rootBufferIds[0]);
 }
 
 // Hands the buffer we have just finished drawing to the renderer and takes the other one. Does
