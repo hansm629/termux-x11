@@ -1618,6 +1618,17 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     int surfaceW = ANativeWindow_getWidth(win);
 
     if (rootZeroCopyUsable(desc)) {
+        // The cursor is the GL frame's job in the other path, and this one returns before reaching
+        // it. It has to happen here, and before the drain below, because a frame that cannot present
+        // the root can still move the pointer - otherwise the pointer only catches up in the gaps
+        // between the X server's own frames, which while dragging a window is not often.
+        cursorOverlaySourceW = (float) desc->width;
+        cursorOverlaySourceH = (float) desc->height;
+        if (cursorOverlayUsable() && (state->cursor.moved || state->cursor.updated)) {
+            markCursorOverlayDirty(state->cursor.updated);
+            state->cursor.moved = state->cursor.updated = FALSE;
+        }
+
         if (!rootZcDrainRetiring()) {
             // The compositor has not finished with the buffer before last. Reusing it now is exactly
             // the tearing this cannot afford, so drop the frame instead - what is on screen stays.
@@ -2590,12 +2601,6 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     if (!ahb || slot < 0)
         return false;
-
-    // The cursor overlay places itself against these and has no other way to know them. The GL frame
-    // used to publish them on its way past; without this the cursor rect comes out empty and the
-    // layer is hidden, which is a pointer that has simply vanished.
-    cursorOverlaySourceW = (float) desc->width;
-    cursorOverlaySourceH = (float) desc->height;
 
     rootZcClearLetterbox(surfaceW, surfaceH);
 
