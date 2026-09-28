@@ -697,6 +697,9 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
         // With a double buffered root this must name the buffer the renderer samples, not the one
         // we draw into.
+        // While a client is flipping, the id above is that client's pixmap rather than one of our
+        // slots, so the renderer must not go looking in the slot table for it either.
+        pvfb->state->rootDoubleBuffered = priv->rootDouble ? 1 : 0;
         pvfb->state->rootWindowTextureID = LorieBuffer_description(
                 priv->rootDouble ? priv->rootBuf[lorieRootSampledIndex()] : priv->buffer)->id;
 
@@ -1432,7 +1435,22 @@ void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, __unused 
     present_event_notify(event_id, lorieUstForMsc(target_msc), target_msc);
 }
 
-void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
+void loriePresentUnflip(ScreenPtr screen, uint64_t event_id) {
+    // Present has just copied the flipped content back into the screen pixmap, which reaches only
+    // the slot being drawn into. That copy is not something our damage tracking sees in full, and a
+    // slot that sat idle for a while would otherwise be handed over still carrying pre-flip pixels.
+    PixmapPtr screenPix = screen ? (*screen->GetScreenPixmap)(screen) : NULL;
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(screenPix);
+
+    if (priv && priv->rootDouble) {
+        RegionRec all;
+        BoxRec box = { 0, 0, (short) screen->width, (short) screen->height };
+
+        RegionInit(&all, &box, 1);
+        lorieMarkRootStale(priv, &all);
+        RegionUninit(&all);
+    }
+
     present_event_notify(event_id, 0, 0);
 }
 
@@ -1571,6 +1589,13 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     int i, allocated;
 
     if (lorieSingleRootBuffer || !priv || priv->rootDouble || !priv->buffer || priv->mem || pvfb->root.legacyDrawing)
+        return;
+
+    // Only ever the screen pixmap. lorieRedraw() passes whatever pixmap the root window currently
+    // has, and while a client is flipping that is the client's own - Present owns it and hands it
+    // back at unflip, so rotating buffers underneath it is wrong, and it needs no rotation anyway
+    // because the X server is not the one drawing into it.
+    if (!pScreenPtr || root != (*pScreenPtr->GetScreenPixmap)(pScreenPtr))
         return;
 
     desc = LorieBuffer_description(priv->buffer);

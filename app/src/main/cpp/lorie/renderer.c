@@ -1464,7 +1464,10 @@ static void rendererReleaseRootBuffer(void) {
     uint32_t old, released;
     int slot = rendererRootSlot;
 
-    if (!state->rootDoubleBuffered || slot < 0)
+    // Deliberately not conditional on rootDoubleBuffered: the X server clears that for the frames
+    // where a client has flipped its own pixmap in, and a slot claimed before that still has to be
+    // given back or it stays marked held forever and the X server loses it.
+    if (slot < 0)
         return;
 
     rendererRootSlot = -1;
