@@ -245,6 +245,10 @@ static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *c
 static Bool handleGpuCopyDoneEvent(__unused ClientPtr pClient, __unused void *closure) {
     // This must be done only on X server thread (touches present's internal vblank queue).
     lorieRecheckGpuCopies();
+    // Same thread, and the same news: a serial the renderer has finished with may be one an
+    // abandoned copy is waiting on, and waiting for the next redraw instead would mean waiting for
+    // one that need not come.
+    lorieReapAbandonedCopies();
     return TRUE;
 }
 

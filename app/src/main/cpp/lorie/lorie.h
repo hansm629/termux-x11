@@ -30,6 +30,10 @@ void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
+/* Hands back what a cancelled-but-unfinished GPU copy was using, once the renderer reports that
+ * serial done or failed. Called from the X server thread: every frame, and on the event that says
+ * the renderer made progress - the frame after may never come. */
+void lorieReapAbandonedCopies(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
