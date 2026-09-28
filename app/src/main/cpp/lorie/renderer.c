@@ -20,6 +20,7 @@
 #include <android/surface_control.h>
 #include <math.h>
 #include <android/looper.h>
+#include <poll.h>
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
@@ -154,6 +155,12 @@ static bool cursorOverlayUsable(void);
 static void ensureCursorOverlay(void);
 static void teardownCursorOverlay(void);
 static void markCursorOverlayDirty(bool bufferMightHaveChanged);
+static void ensureRootOverlay(void);
+static void teardownRootOverlay(void);
+static bool rootZeroCopyUsable(void);
+static bool rootZcDrainRetiring(void);
+static void rootZcReleaseAll(void);
+static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs);
 
 static ASurfaceControl *cursorSurfaceControl = NULL;
 static AChoreographer *cursorOverlayChoreographer = NULL;
@@ -178,6 +185,36 @@ static uint32_t cursorOverlayRawW = 0, cursorOverlayRawH = 0;
 // has no access to the root buffer, so the renderer publishes it here.
 static volatile float cursorOverlaySourceW = 0.f, cursorOverlaySourceH = 0.f;
 
+/*
+ * Handing the root buffer straight to the compositor.
+ *
+ * The renderer's whole job in a frame used to be one full-screen textured quad from the root buffer
+ * into the window surface, followed by eglSwapBuffers - which under ANGLE is a Vulkan queue
+ * submission. The compositor then scaled and composited that surface anyway. Since the root buffer
+ * is already an AHardwareBuffer, it can be given to the compositor as a layer's buffer instead, and
+ * that entire pass disappears: no draw, no swap, and the display's own scaler does the scaling the
+ * GL blit was doing.
+ *
+ * Two things had to exist first. The cursor had to stop being drawn into the same surface, which is
+ * what the cursor overlay is for, and the root had to have three buffers, because the compositor
+ * keeps reading one until a later one is latched.
+ *
+ * The buffer only goes back to the X server once the compositor says it has finished reading it -
+ * the previous-release fence from the transaction's completion callback. Handing it back any earlier
+ * is exactly the tearing this cannot afford, so a frame that arrives before the fence is dropped
+ * rather than rushed.
+ *
+ * Not used when the filtering preference is nearest: the compositor's scaler is bilinear and has no
+ * nearest mode, so there the GL pass is what honours the setting.
+ */
+static ASurfaceControl *rootSurfaceControl = NULL;
+static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
+// All guarded by rootOverlayLock.
+static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor is reading it
+static int rootZcRetiringSlot = -1;    // the one before that, waiting for its release fence
+static int rootZcRetiringFenceFd = -1;
+static bool rootZcRetiringFenceArrived = false;
+
 // The SurfaceControl entry points are API 29, above our minSdk 26, and the NDK marks anything above
 // minSdk unavailable rather than weak - so __builtin_available cannot guard a call to them and they
 // cannot be linked either. Resolving them at runtime sidesteps both, and doubles as the availability
@@ -195,6 +232,8 @@ static struct {
     void (*txSetBuffer)(ASurfaceTransaction *, ASurfaceControl *, AHardwareBuffer *, int);
     void (*txSetGeometry)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t);
     void (*txReparent)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *); // optional
+    void (*txSetOnComplete)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *));
+    int (*statsPrevReleaseFenceFd)(ASurfaceTransactionStats *, ASurfaceControl *);
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -218,6 +257,11 @@ static bool cursorOverlayResolveApi(void) {
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBuffer");
     scApi.txSetGeometry = (void (*)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t))
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setGeometry");
+
+    scApi.txSetOnComplete = (void (*)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *)))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnCompleteFunc");
+    scApi.statsPrevReleaseFenceFd = (int (*)(ASurfaceTransactionStats *, ASurfaceControl *))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
 
     // Optional: hiding the layer is enough to get it off the screen, taking it out of the tree as
     // well is just tidier.
@@ -920,6 +964,7 @@ void rendererRefreshContext(void) {
     log("rendererSetWindow %p %d %d", pendingWin, width, height);
 
     teardownCursorOverlay(); // bound to the window we are about to drop; recreated for the new one
+    teardownRootOverlay();
 
     releaseWinAndSurface(&win, &sfc);
 
@@ -962,6 +1007,7 @@ void rendererRefreshContext(void) {
     log("Xlorie: new surface applied: %p\n", sfc);
 
     ensureCursorOverlay();
+    ensureRootOverlay();
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
@@ -1460,8 +1506,20 @@ static void rendererRetireFrame(void) {
     rendererReleaseRootBuffer();
 }
 
-static void rendererReleaseRootBuffer(void) {
+static void rendererReleaseRootSlot(int slot) {
     uint32_t old, released;
+
+    if (slot < 0)
+        return;
+
+    do {
+        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+        released = old & ~(1u << slot);
+    } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, released, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+}
+
+static void rendererReleaseRootBuffer(void) {
     int slot = rendererRootSlot;
 
     // Deliberately not conditional on rootDoubleBuffered: the X server clears that for the frames
@@ -1471,11 +1529,7 @@ static void rendererReleaseRootBuffer(void) {
         return;
 
     rendererRootSlot = -1;
-    do {
-        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
-        released = old & ~(1u << slot);
-    } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, released, false,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    rendererReleaseRootSlot(slot);
 }
 
 void rendererRedrawLocked(bool* waitingForBuffers) {
@@ -1559,6 +1613,27 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     int surfaceH = ANativeWindow_getHeight(win);
     int surfaceW = ANativeWindow_getWidth(win);
+
+    if (rootZeroCopyUsable()) {
+        if (!rootZcDrainRetiring()) {
+            // The compositor has not finished with the buffer before last. Reusing it now is exactly
+            // the tearing this cannot afford, so drop the frame instead - what is on screen stays.
+            state->presentStats.zeroCopyStalls++;
+            // The slot just claimed may be one already held for the compositor; only give back one
+            // that is not.
+            if (rendererRootSlot != rootZcDisplayedSlot && rendererRootSlot != rootZcRetiringSlot)
+                rendererReleaseRootBuffer();
+            rendererRootSlot = -1;
+            state->drawRequested = FALSE;
+            return;
+        }
+        if (rootZcPresent(desc, surfaceW, surfaceH, frameStartNs))
+            return;
+    } else if (rootZcDisplayedSlot >= 0 || rootZcRetiringSlot >= 0) {
+        // Dropped out of the path - the filtering preference changed, or the root stopped being one
+        // of our slots. Give everything back before drawing through GL again.
+        rootZcReleaseAll();
+    }
 
 /*
      * clear stale area outside X viewport
@@ -2382,4 +2457,231 @@ static void ensureCursorOverlay(void) {
                 state->drawRequested = true;
         }
     }
+}
+
+/* --- Handing the root buffer straight to the compositor --- */
+
+static bool rootZeroCopyUsable(void) {
+    // Nearest filtering has to go through GL; see the comment on rootSurfaceControl.
+    return rootSurfaceControl != NULL && state && state->rootDoubleBuffered &&
+           filtering == GL_LINEAR && viewportW > 0 && viewportH > 0;
+}
+
+// Whether the compositor has finished with whatever fence it handed us. No fence means it never
+// needed one.
+static bool rootZcFenceSignalled(int fd) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+    if (fd < 0)
+        return true;
+    return poll(&pfd, 1, 0) > 0;
+}
+
+// Binder thread. Reports the release fence of the buffer set by the transaction before this one.
+static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
+    int retiring = (int) (intptr_t) context - 1;
+
+    if (retiring < 0)
+        return;
+
+    pthread_mutex_lock(&rootOverlayLock);
+    // Only meaningful while that slot is still the one we are waiting on: a teardown in between will
+    // have given it back already.
+    if (rootZcRetiringSlot == retiring && !rootZcRetiringFenceArrived) {
+        if (rootSurfaceControl && scApi.statsPrevReleaseFenceFd)
+            rootZcRetiringFenceFd = scApi.statsPrevReleaseFenceFd(stats, rootSurfaceControl);
+        rootZcRetiringFenceArrived = true;
+    }
+    pthread_mutex_unlock(&rootOverlayLock);
+}
+
+// Gives back the slot we were waiting on, if the compositor is done with it. Renderer thread.
+// Returns false when it is not done, which means there is no room to queue another buffer yet.
+static bool rootZcDrainRetiring(void) {
+    int slot = -1, fd = -1;
+
+    pthread_mutex_lock(&rootOverlayLock);
+    if (rootZcRetiringSlot < 0) {
+        pthread_mutex_unlock(&rootOverlayLock);
+        return true;
+    }
+    if (rootZcRetiringFenceArrived && rootZcFenceSignalled(rootZcRetiringFenceFd)) {
+        slot = rootZcRetiringSlot;
+        fd = rootZcRetiringFenceFd;
+        rootZcRetiringSlot = -1;
+        rootZcRetiringFenceFd = -1;
+        rootZcRetiringFenceArrived = false;
+    }
+    pthread_mutex_unlock(&rootOverlayLock);
+
+    if (slot < 0)
+        return false;
+
+    if (fd >= 0)
+        close(fd);
+    rendererReleaseRootSlot(slot);
+    return true;
+}
+
+// Gives back everything we are holding. Renderer thread, on the way out of the zero-copy path.
+static void rootZcReleaseAll(void) {
+    int displayed, retiring, fd;
+
+    pthread_mutex_lock(&rootOverlayLock);
+    displayed = rootZcDisplayedSlot;
+    retiring = rootZcRetiringSlot;
+    fd = rootZcRetiringFenceFd;
+    rootZcDisplayedSlot = rootZcRetiringSlot = -1;
+    rootZcRetiringFenceFd = -1;
+    rootZcRetiringFenceArrived = false;
+    pthread_mutex_unlock(&rootOverlayLock);
+
+    if (fd >= 0)
+        close(fd);
+    rendererReleaseRootSlot(retiring);
+    rendererReleaseRootSlot(displayed);
+}
+
+// The area around the viewport is the window surface's own buffer, which nothing draws into once the
+// root stopped going through GL. It has to be blacked out when the geometry changes, and only then -
+// this is the one place the zero-copy path still swaps.
+static void rootZcClearLetterbox(int surfaceW, int surfaceH) {
+    static int lastSurfaceW = -1, lastSurfaceH = -1, lastViewport[4] = { -1, -1, -1, -1 };
+    static int clearFramesLeft = 0;
+
+    if (surfaceW != lastSurfaceW || surfaceH != lastSurfaceH ||
+        viewportX != lastViewport[0] || viewportY != lastViewport[1] ||
+        viewportW != lastViewport[2] || viewportH != lastViewport[3]) {
+        lastSurfaceW = surfaceW; lastSurfaceH = surfaceH;
+        lastViewport[0] = viewportX; lastViewport[1] = viewportY;
+        lastViewport[2] = viewportW; lastViewport[3] = viewportH;
+        clearFramesLeft = 4; // the surface has several buffers and each needs blacking out once
+    }
+
+    if (clearFramesLeft <= 0)
+        return;
+
+    clearFramesLeft--;
+    glViewport(0, 0, surfaceW, surfaceH);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFlush();
+    eglSwapBuffers(egl_display, sfc);
+}
+
+// Returns true when the frame has been dealt with and the GL path should be skipped.
+static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs) {
+    AHardwareBuffer *ahb = desc->buffer;
+    int slot = rendererRootSlot, retiring;
+    ASurfaceTransaction *t;
+
+    if (!ahb || slot < 0)
+        return false;
+
+    rootZcClearLetterbox(surfaceW, surfaceH);
+
+    // Anything the X server asked us to blit into the root still has to happen, and has to be
+    // finished before the compositor reads the buffer. Without a GL frame around it this is the only
+    // GPU work left in a frame, and in most frames there is none at all.
+    {
+        uint64_t gpuCopySerial;
+
+        lorie_mutex_lock(&state->lock, &state->lockingPid);
+        gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
+        state->drawRequested = FALSE;
+        if (gpuCopySerial) {
+            EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+
+            glFlush();
+            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+            eglDestroySyncKHR(egl_display, fence);
+        }
+        state->waitForNextFrame = true;
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+
+        if (gpuCopySerial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
+            notifyGpuCopyDone();
+        }
+    }
+
+    pthread_mutex_lock(&rootOverlayLock);
+
+    if (slot == rootZcDisplayedSlot) {
+        // Nothing new was published; the compositor is already showing this buffer. Keep holding it.
+        pthread_mutex_unlock(&rootOverlayLock);
+        rendererRootSlot = -1;
+        return true;
+    }
+
+    retiring = rootZcDisplayedSlot;
+    rootZcRetiringSlot = retiring;
+    rootZcRetiringFenceFd = -1;
+    rootZcRetiringFenceArrived = false;
+    rootZcDisplayedSlot = slot;
+
+    ARect src = { 0, 0, desc->width, desc->height };
+    ARect dst = { viewportX, viewportY, viewportX + viewportW, viewportY + viewportH };
+
+    t = scApi.txCreate();
+    scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+    scApi.txSetZOrder(t, rootSurfaceControl, 0); // the cursor layer sits at 1, above this
+    scApi.txSetBuffer(t, rootSurfaceControl, ahb, -1);
+    scApi.txSetGeometry(t, rootSurfaceControl, &src, &dst, 0);
+    if (scApi.txSetOnComplete)
+        scApi.txSetOnComplete(t, (void *) (intptr_t) (retiring + 1), rootZcOnComplete);
+    scApi.txApply(t);
+    scApi.txDelete(t);
+
+    pthread_mutex_unlock(&rootOverlayLock);
+
+    // This slot is ours until the compositor lets go, so the generic release must leave it alone.
+    rendererRootSlot = -1;
+    state->presentStats.zeroCopyFrames++;
+    // Still worth reporting: without it XlorieFrames would go quiet exactly when the renderer starts
+    // doing less, which is the thing being measured.
+    rendererPublishFrameStats(frameStartNs, 0, false, 0);
+    return true;
+}
+
+static void teardownRootOverlay(void) {
+    rootZcReleaseAll();
+
+    pthread_mutex_lock(&rootOverlayLock);
+    if (rootSurfaceControl) {
+        // Same as the cursor layer: releasing the handle leaves the layer composited, still showing
+        // the last buffer put on it.
+        ASurfaceTransaction *t = scApi.txCreate();
+
+        scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        if (scApi.txReparent)
+            scApi.txReparent(t, rootSurfaceControl, NULL);
+        scApi.txApply(t);
+        scApi.txDelete(t);
+
+        scApi.release(rootSurfaceControl);
+        rootSurfaceControl = NULL;
+    }
+    pthread_mutex_unlock(&rootOverlayLock);
+}
+
+static void ensureRootOverlay(void) {
+    if (!win || win == defaultWin || !cursorOverlayResolveApi())
+        return;
+
+    // Without these two the buffer could be handed over but never taken back, which would mean
+    // reusing it while the compositor still reads it.
+    if (!scApi.txSetOnComplete || !scApi.statsPrevReleaseFenceFd) {
+        log("Xlorie: no transaction completion callback, drawing the root through GL instead");
+        return;
+    }
+
+    pthread_mutex_lock(&rootOverlayLock);
+    if (!rootSurfaceControl) {
+        rootSurfaceControl = scApi.createFromWindow(win, "lorie-root");
+        if (!rootSurfaceControl)
+            log("Xlorie: could not create the root layer, drawing the root through GL instead");
+    }
+    pthread_mutex_unlock(&rootOverlayLock);
 }

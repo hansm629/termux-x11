@@ -773,6 +773,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.presentSubmits,
                 pvfb->state->presentStats.submitGapMaxUs / 1000.0);
         }
+        if (pvfb->state->presentStats.zeroCopyFrames || pvfb->state->presentStats.zeroCopyStalls)
+            log(INFO, "XlorieZeroCopy: %u root buffers handed to the compositor with no GL, %u frames dropped waiting for one back",
+                pvfb->state->presentStats.zeroCopyFrames, pvfb->state->presentStats.zeroCopyStalls);
+
         if (pvfb->state->presentStats.requests)
             log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
                 pvfb->state->presentStats.requests,
@@ -821,6 +825,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
+    pvfb->state->presentStats.zeroCopyFrames = 0;
+    pvfb->state->presentStats.zeroCopyStalls = 0;
     pvfb->state->presentStats.cursorOverlayMoves = 0;
     pvfb->state->presentStats.requests = 0;
     pvfb->state->presentStats.requestGapMaxUs = 0;
