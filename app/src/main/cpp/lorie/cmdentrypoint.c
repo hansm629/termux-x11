@@ -303,6 +303,10 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         close(fd);
         conn_fd = -1;
         lorieEnableClipboardSync(FALSE);
+        // The renderer will never report the serials copies were waiting on. Its process took its
+        // GPU work with it, and the references held here are the last ones, so this is where they
+        // are let go - otherwise the records sit until the server exits.
+        lorieDropAbandonedCopies();
         while ((buf = LorieBufferList_first(&registeredBuffers)))
             LorieBuffer_removeFromList(buf);
         return;

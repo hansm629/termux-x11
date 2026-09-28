@@ -1442,6 +1442,18 @@ typedef struct {
     struct xorg_list link;
     LorieBuffer *src, *dst;   /* dst NULL means the copy was aimed at the root */
     uint64_t serial;
+
+    /* Telling the client its pixmap is free again is a statement about the GPU, not about the
+     * request: holding a LorieBuffer reference keeps the object alive, it does not stop the client
+     * writing that memory, and nothing orders a client's next write against a copy the renderer has
+     * already submitted. So when a present is cancelled with its copy still running, the idle goes
+     * here and is sent once the renderer is done. The window is held by XID rather than by pointer,
+     * because it can be destroyed in the meantime. */
+    Bool deferIdle;
+    PixmapPtr idlePixmap;
+    XID idleWindow;
+    CARD32 idleSerial;
+    struct present_fence *idleFence;
 } LorieAbandonedCopy;
 
 static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
@@ -1479,13 +1491,29 @@ void lorieReapAbandonedCopies(void) {
             continue;
         xorg_list_del(&c->link);
         lorieReleaseCopyResources(c->src, c->dst);
+
+        if (c->deferIdle) {
+            WindowPtr window = NULL;
+
+            // The window may well be gone by now; the pixmap and the fence are ours to finish with
+            // either way, and without a window there is nobody left to notify.
+            dixLookupResourceByType((void **) &window, c->idleWindow, RT_WINDOW,
+                                    serverClient, DixGetAttrAccess);
+            present_pixmap_idle(c->idlePixmap, window, c->idleSerial, c->idleFence);
+            present_fence_destroy(c->idleFence);
+            dixDestroyPixmap(c->idlePixmap, c->idlePixmap->drawable.id);
+        }
+
         lorieGiveBackAbandonRecord(c);
     }
 }
 
 // The request is over but the GPU work may not be. Takes over the references rather than dropping
 // them, and does not count this as a present that reached the screen.
-void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
+// Returns a token when the copy is still running and its resources have been taken over, so the
+// caller knows the GPU is not finished and can hand over the idle as well. NULL means the work was
+// already resolved and everything has been released.
+void *lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
     LorieBuffer *src = priv ? priv->buffer : NULL;
     LorieAbandonedCopy *c;
@@ -1494,7 +1522,7 @@ void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
 
     if (lorieGpuCopyIsDone(serial) || lorieGpuCopyFailed(serial)) {
         lorieReleaseCopyResources(src, (LorieBuffer *) dst_buffer);
-        return;
+        return NULL;
     }
 
     // A record is taken from a small reserve rather than allocated here: there is nothing safe to
@@ -1508,12 +1536,53 @@ void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
         // it; leaking a buffer is recoverable, handing a live one back is not.
         log(ERROR, "no room to track an abandoned copy for serial %llu; its buffers stay held",
             (unsigned long long) serial);
-        return;
+        return NULL;
     }
     c->src = src;
     c->dst = (LorieBuffer *) dst_buffer;
     c->serial = serial;
     xorg_list_add(&c->link, &lorieAbandonedCopies);
+    return c;
+}
+
+/*
+ * When the renderer is gone for good. It will never report these serials, so waiting is waiting for
+ * nothing - but losing the connection is not evidence the GPU finished either. What settles it is
+ * that the process holding the imported buffers has exited: its GPU work went with it, and the
+ * references here are the last ones.
+ */
+void lorieDropAbandonedCopies(void) {
+    LorieAbandonedCopy *c, *tmp;
+
+    xorg_list_for_each_entry_safe(c, tmp, &lorieAbandonedCopies, link) {
+        xorg_list_del(&c->link);
+        lorieReleaseCopyResources(c->src, c->dst);
+        if (c->deferIdle) {
+            WindowPtr window = NULL;
+
+            dixLookupResourceByType((void **) &window, c->idleWindow, RT_WINDOW,
+                                    serverClient, DixGetAttrAccess);
+            present_pixmap_idle(c->idlePixmap, window, c->idleSerial, c->idleFence);
+            present_fence_destroy(c->idleFence);
+            dixDestroyPixmap(c->idlePixmap, c->idlePixmap->drawable.id);
+        }
+        lorieGiveBackAbandonRecord(c);
+    }
+}
+
+// Holds back the IdleNotify for a cancelled present whose copy is still running. Takes ownership of
+// the pixmap reference and the idle fence; both are finished with when the copy resolves.
+void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, XID window, CARD32 serial,
+                           struct present_fence *idleFence) {
+    LorieAbandonedCopy *c = token;
+
+    if (!c)
+        return;
+    c->deferIdle = TRUE;
+    c->idlePixmap = pixmap;
+    c->idleWindow = window;
+    c->idleSerial = serial;
+    c->idleFence = idleFence;
 }
 
 void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {

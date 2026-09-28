@@ -35,6 +35,10 @@ void lorieRecheckGpuCopies(void);
  * the renderer made progress - the frame after may never come. */
 void lorieReapAbandonedCopies(void);
 void lorieNoteGpuCopyRequeued(void);
+/* 3.5: the terminal path for abandoned copies. A renderer that has gone away will never report a
+ * serial, so the records would sit forever; the connection dropping is not evidence the GPU
+ * finished, but the buffers cannot be waited on either once the process holding them is gone. */
+void lorieDropAbandonedCopies(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
