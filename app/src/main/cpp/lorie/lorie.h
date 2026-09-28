@@ -268,6 +268,15 @@ struct lorie_shared_server_state {
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
 
+    /* Which final output path to use, so the two can be compared in one build without also
+     * changing the filtering, the buffer pool or the cursor path along the way.
+     * 0 = choose per frame, 1 = always the GL blit, 2 = hand the root buffer over when it is
+     * possible at all. Set from the X server's -output-backend argument. */
+#define LORIE_OUTPUT_AUTO 0
+#define LORIE_OUTPUT_GPU_COPY 1
+#define LORIE_OUTPUT_ROOT_DIRECT 2
+    volatile uint8_t outputBackend;
+
     /* A signal to renderer to update root window texture content from shared fragment if needed */
     volatile uint8_t drawRequested;
 
@@ -323,6 +332,12 @@ struct lorie_shared_server_state {
         volatile uint32_t cursorUploadUs; /* and what they cost */
         volatile uint32_t rootRemapUs;    /* AHardwareBuffer unlock+lock of the root, per frame */
         volatile uint32_t rootRemaps;
+
+        /* The CPU copy that brings a root slot up to date when it becomes the drawing target
+         * again. Nothing counted it, so the cost of carrying more slots could not be seen. */
+        volatile uint64_t rootCopyBytes;
+        volatile uint32_t rootCopyUs;
+        volatile uint32_t rootCopies;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
         /*
          * When a client's present actually reaches the screen, measured where present reports it as

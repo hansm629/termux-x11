@@ -175,6 +175,11 @@ static void lorieNotePresentCompleted(void) {
 // -single-root-buffer restores the old synchronous behaviour.
 static Bool lorieSingleRootBuffer = FALSE;
 
+// -output-backend auto|gpu-copy|root-direct: which final output path to use. Published to the
+// renderer through the shared state so the choice can be made without rebuilding, and without
+// changing the filtering preference, which is what the root-direct path otherwise keys off.
+static uint8_t lorieOutputBackend = LORIE_OUTPUT_AUTO;
+
 // The display's own clock.
 //
 // msc used to be advanced from two places - once per vsync here, and again whenever a flip
@@ -491,6 +496,16 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
         return 1;
     }
 
+    if (strcmp(argv[i], "-output-backend") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i + 1], "gpu-copy") == 0)
+            lorieOutputBackend = LORIE_OUTPUT_GPU_COPY;
+        else if (strcmp(argv[i + 1], "root-direct") == 0)
+            lorieOutputBackend = LORIE_OUTPUT_ROOT_DIRECT;
+        else
+            lorieOutputBackend = LORIE_OUTPUT_AUTO;
+        return 2;
+    }
+
     if (strcmp(argv[i], "-single-root-buffer") == 0) {
         lorieSingleRootBuffer = TRUE;
         return 1;
@@ -651,6 +666,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
+    pvfb->state->outputBackend = lorieOutputBackend;
     lorieAdvanceVsyncClock();
     pvfb->current_msc++;
     loriePerformVblanks();
@@ -793,6 +809,11 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
+        if (pvfb->state->presentStats.rootCopies)
+            log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms",
+                pvfb->state->presentStats.rootCopies,
+                pvfb->state->presentStats.rootCopyBytes / 1048576.0,
+                pvfb->state->presentStats.rootCopyUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -821,6 +842,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.cursorUploadUs = 0;
     pvfb->state->presentStats.rootRemapUs = 0;
     pvfb->state->presentStats.rootRemaps = 0;
+    pvfb->state->presentStats.rootCopyBytes = 0;
+    pvfb->state->presentStats.rootCopyUs = 0;
+    pvfb->state->presentStats.rootCopies = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
@@ -1551,10 +1575,13 @@ static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionP
     char *dst = priv->rootLocked[to];
     int nrects = RegionNumRects(region), i;
     BoxPtr box = RegionRects(region);
-    size_t stride;
+    size_t stride, copied = 0;
+    uint64_t startUs;
 
     if (!src || !dst || nrects <= 0)
         return;
+
+    startUs = lorieNowUs();
 
     d = LorieBuffer_description(priv->rootBuf[from]);
     stride = (size_t) d->stride * 4;
@@ -1563,9 +1590,17 @@ static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionP
         int x1 = max(0, box[i].x1), x2 = min((int) d->width, box[i].x2);
         int y1 = max(0, box[i].y1), y2 = min((int) d->height, box[i].y2), y;
 
-        for (y = y1; x2 > x1 && y < y2; y++)
+        for (y = y1; x2 > x1 && y < y2; y++) {
             memcpy(dst + (size_t) y * stride + (size_t) x1 * 4,
                    src + (size_t) y * stride + (size_t) x1 * 4, (size_t) (x2 - x1) * 4);
+            copied += (size_t) (x2 - x1) * 4;
+        }
+    }
+
+    if (pvfb->state) {
+        pvfb->state->presentStats.rootCopyBytes += copied;
+        pvfb->state->presentStats.rootCopyUs += (uint32_t) (lorieNowUs() - startUs);
+        pvfb->state->presentStats.rootCopies++;
     }
 }
 

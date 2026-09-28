@@ -2494,16 +2494,38 @@ static void ensureCursorOverlay(void) {
 
 /* --- Handing the root buffer straight to the compositor --- */
 
+// Says which output path a frame will take and, when it is not the direct one, why. Logged only on
+// a change, so a run's log states the backend it actually used rather than the one it was asked for.
 static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
-    // The compositor reads the buffer by its declared format and has no equivalent of the swizzling
-    // shader the GL path uses, so a buffer that says RGBX while holding BGRA comes out with red and
-    // blue exchanged. If the root could not be allocated as BGRA, stay on the GL path.
-    if (!desc || desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM)
-        return false;
+    static const char *lastReason = NULL;
+    const char *reason = NULL;
+    uint8_t forced = state ? state->outputBackend : LORIE_OUTPUT_AUTO;
 
-    // Nearest filtering has to go through GL; see the comment on rootSurfaceControl.
-    return rootSurfaceControl != NULL && state && state->rootDoubleBuffered &&
-           filtering == GL_LINEAR && viewportW > 0 && viewportH > 0;
+    if (!state)
+        reason = "no shared state";
+    else if (forced == LORIE_OUTPUT_GPU_COPY)
+        reason = "forced to gpu-copy";
+    else if (!rootSurfaceControl)
+        reason = "no root layer";
+    else if (!state->rootDoubleBuffered)
+        reason = "root is not one of our slots (a client has flipped its own in)";
+    else if (!desc || desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM)
+        // The compositor reads a buffer by its declared format and has no equivalent of the
+        // swizzling shader the GL path uses.
+        reason = "root buffer is not BGRA";
+    else if (viewportW <= 0 || viewportH <= 0)
+        reason = "no viewport yet";
+    else if (forced != LORIE_OUTPUT_ROOT_DIRECT && filtering != GL_LINEAR)
+        // The compositor's scaler is bilinear and has no nearest mode, so nearest is honoured by
+        // keeping the GL pass. Forcing root-direct overrides that on purpose, for comparisons.
+        reason = "nearest filtering";
+
+    if (reason != lastReason) {
+        lastReason = reason;
+        log("XlorieBackend: %s%s%s", reason ? "GPU_COPY" : "ROOT_DIRECT",
+            reason ? " - " : "", reason ? reason : "");
+    }
+    return reason == NULL;
 }
 
 // Whether the compositor has finished with whatever fence it handed us. No fence means it never
@@ -2621,6 +2643,8 @@ static void rootZcClearLetterbox(int surfaceW, int surfaceH) {
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs) {
     AHardwareBuffer *ahb = desc->buffer;
     int slot = rendererRootSlot, retiring;
+    int64_t fenceWaitUs = 0;
+    bool carriedGpuCopy = false;
     ASurfaceTransaction *t;
 
     if (!ahb || slot < 0)
@@ -2629,9 +2653,11 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     rootZcClearLetterbox(surfaceW, surfaceH);
 
     // Anything the X server asked us to blit into the root still has to happen, and has to be
-    // finished before the compositor reads the buffer. Without a GL frame around it this is the only
-    // GPU work left in a frame, and in most frames there is none at all.
+    // finished before the compositor reads the buffer. This is real GPU work and a real CPU wait,
+    // and both are reported - passing constants here is what made an earlier reading of this path
+    // claim the renderer had no GPU work at all.
     {
+        int64_t lockStartNs = rendererNowNs();
         uint64_t gpuCopySerial;
 
         lorie_mutex_lock(&state->lock, &state->lockingPid);
@@ -2639,14 +2665,18 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         state->drawRequested = FALSE;
         if (gpuCopySerial) {
             EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+            int64_t waitStartNs = rendererNowNs();
 
             glFlush();
             eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+            fenceWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
             eglDestroySyncKHR(egl_display, fence);
         }
         state->waitForNextFrame = true;
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        state->presentStats.lockHeldUs += (uint32_t) rendererNsToUs(rendererNowNs() - lockStartNs);
 
+        carriedGpuCopy = gpuCopySerial != 0;
         if (gpuCopySerial) {
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
@@ -2657,8 +2687,10 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     if (slot == rootZcDisplayedSlot) {
         // Nothing new was published; the compositor is already showing this buffer. Keep holding it.
+        // The copies above still happened, so they are still reported.
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
+        rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
 
@@ -2689,9 +2721,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
     state->presentStats.zeroCopyFrames++;
-    // Still worth reporting: without it XlorieFrames would go quiet exactly when the renderer starts
-    // doing less, which is the thing being measured.
-    rendererPublishFrameStats(frameStartNs, 0, false, 0);
+    rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;
 }
 
