@@ -1400,12 +1400,15 @@ Bool lorieGpuCopyFailed(uint64_t serial) {
     return FALSE;
 }
 
+// A question, not an event. It used to count a requeue every time the answer was no, so the reaper
+// and the cancellation paths asking after a serial were counted as presents being requeued.
 Bool lorieGpuCopyIsDone(uint64_t serial) {
-    if (__atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial)
-        return TRUE;
+    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
+}
 
+// Called where a present is actually put back on the vblank queue to be asked again.
+void lorieNoteGpuCopyRequeued(void) {
     pvfb->state->presentStats.copyRequeues++;
-    return FALSE;
 }
 
 /*
@@ -1437,6 +1440,29 @@ typedef struct {
 
 static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
 
+/* Pre-allocated, because the moment one of these is needed is the moment an allocation must not be
+ * allowed to fail: the alternative is handing back buffers the GPU has not finished with. Two per
+ * queue slot covers every copy that can be outstanding plus the one being cancelled. */
+#define LORIE_ABANDON_RECORDS (LORIE_GPU_COPY_QUEUE_CAPACITY * 2)
+static LorieAbandonedCopy lorieAbandonRecords[LORIE_ABANDON_RECORDS];
+static Bool lorieAbandonRecordUsed[LORIE_ABANDON_RECORDS];
+
+static LorieAbandonedCopy *lorieTakeAbandonRecord(void) {
+    int i;
+
+    for (i = 0; i < LORIE_ABANDON_RECORDS; i++)
+        if (!lorieAbandonRecordUsed[i]) {
+            lorieAbandonRecordUsed[i] = TRUE;
+            memset(&lorieAbandonRecords[i], 0, sizeof(lorieAbandonRecords[i]));
+            return &lorieAbandonRecords[i];
+        }
+    return NULL;
+}
+
+static void lorieGiveBackAbandonRecord(LorieAbandonedCopy *c) {
+    lorieAbandonRecordUsed[c - lorieAbandonRecords] = FALSE;
+}
+
 // Hands back what a still-running copy is using, once the renderer is done with it. Called every
 // frame and whenever the renderer reports progress.
 void lorieReapAbandonedCopies(void) {
@@ -1447,7 +1473,7 @@ void lorieReapAbandonedCopies(void) {
             continue;
         xorg_list_del(&c->link);
         lorieReleaseCopyResources(c->src, c->dst);
-        free(c);
+        lorieGiveBackAbandonRecord(c);
     }
 }
 
@@ -1465,10 +1491,17 @@ void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
         return;
     }
 
-    c = calloc(1, sizeof(*c));
+    // A record is taken from a small reserve rather than allocated here: there is nothing safe to
+    // do on a failed allocation at this point, since releasing resources the GPU may still be using
+    // is the very thing this exists to prevent. The reserve is sized by how many copies can be
+    // outstanding at once, and the reaper returns records to it.
+    c = lorieTakeAbandonRecord();
     if (!c) {
-        // Nothing better to do than the old behaviour, which is at least not a leak.
-        lorieReleaseCopyResources(src, (LorieBuffer *) dst_buffer);
+        // Out of records means the reaper has not run in a long time and the queue is full, which
+        // cannot happen while the renderer is making progress. Hold the reference rather than free
+        // it; leaking a buffer is recoverable, handing a live one back is not.
+        log(ERROR, "no room to track an abandoned copy for serial %llu; its buffers stay held",
+            (unsigned long long) serial);
         return;
     }
     c->src = src;

@@ -34,6 +34,7 @@ void lorieRecheckGpuCopies(void);
  * serial done or failed. Called from the X server thread: every frame, and on the event that says
  * the renderer made progress - the frame after may never come. */
 void lorieReapAbandonedCopies(void);
+void lorieNoteGpuCopyRequeued(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);

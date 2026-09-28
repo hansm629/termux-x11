@@ -307,7 +307,7 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -61,30 +62,138 @@
+@@ -61,30 +62,146 @@
      return FALSE;
  }
  
@@ -384,6 +384,7 @@
 +    if (vblank->gpu_copy_pending && !lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
 +        !gpuCopyStalled && !lorieGpuCopyFailed(vblank->gpu_copy_serial) &&
 +        Success == screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1)) {
++        lorieNoteGpuCopyRequeued();
          vblank->queued = TRUE;
          return;
      }
@@ -440,9 +441,16 @@
 +            vblank->queued = TRUE;
 +            return;
 +        }
-+        /* Failed to requeue for polling (e.g. OOM) - release our extra ref and treat the
-+         * presumably still in-flight GPU copy as done; same best-effort fallback as above. */
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        /* lorie: the copy is enqueued and running, and we have failed to arrange for anyone to
++         * ask whether it finished. Acking it here said it had, which released the source while the
++         * GPU was still reading it and counted a present that may never have been made. Abandon it
++         * instead: the reaper holds its resources until the renderer reports the serial, and the
++         * present is scrapped rather than claimed. */
++        lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        vblank->gpu_copy_pending = FALSE;
++        present_vblank_scrap(vblank);
++        screen_priv->flush(window);
++        return;
 +    } else {
 +        present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +
@@ -468,7 +476,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,36 @@
+@@ -90,8 +91,37 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -487,6 +495,7 @@
 +                                     uint64_t *out_serial, void **out_dst_buffer);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern Bool lorieGpuCopyFailed(uint64_t serial);
++extern void lorieNoteGpuCopyRequeued(void);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
 +extern void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
 +/* lorie: called as each client present request is turned into a vblank, so the wait between a
