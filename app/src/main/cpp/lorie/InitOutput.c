@@ -666,6 +666,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
+    lorieReapAbandonedCopies();
     pvfb->state->outputBackend = lorieOutputBackend;
     lorieAdvanceVsyncClock();
     pvfb->current_msc++;
@@ -1407,6 +1408,75 @@ Bool lorieGpuCopyIsDone(uint64_t serial) {
     return FALSE;
 }
 
+/*
+ * Letting go of what a copy was using, which is a different thing from the request being over.
+ *
+ * present_vblank_scrap() and present_vblank_destroy() reach a vblank whose copy may still be in
+ * flight, and used to ack it outright: the in-flight markers were cleared and the references
+ * dropped while the GPU was still reading the source and writing the destination, and the present
+ * was counted as one that had reached the screen. Cancelling a request says nothing about whether
+ * the GPU has finished with the buffers it was given.
+ */
+static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
+    if (src) {
+        LorieBuffer_gpuCopyPendingDec(src);
+        LorieBuffer_release(src);
+    }
+    if (dst) {
+        LorieBuffer_gpuCopyPendingDec(dst);
+        LorieBuffer_release(dst);
+    } else
+        pvfb->rootGpuCopyPending--;
+}
+
+typedef struct {
+    struct xorg_list link;
+    LorieBuffer *src, *dst;   /* dst NULL means the copy was aimed at the root */
+    uint64_t serial;
+} LorieAbandonedCopy;
+
+static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
+
+// Hands back what a still-running copy is using, once the renderer is done with it. Called every
+// frame and whenever the renderer reports progress.
+void lorieReapAbandonedCopies(void) {
+    LorieAbandonedCopy *c, *tmp;
+
+    xorg_list_for_each_entry_safe(c, tmp, &lorieAbandonedCopies, link) {
+        if (!lorieGpuCopyIsDone(c->serial) && !lorieGpuCopyFailed(c->serial))
+            continue;
+        xorg_list_del(&c->link);
+        lorieReleaseCopyResources(c->src, c->dst);
+        free(c);
+    }
+}
+
+// The request is over but the GPU work may not be. Takes over the references rather than dropping
+// them, and does not count this as a present that reached the screen.
+void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    LorieBuffer *src = priv ? priv->buffer : NULL;
+    LorieAbandonedCopy *c;
+
+    lorieCopyStartUs[serial % LORIE_COPY_TIMING_SLOTS] = 0;
+
+    if (lorieGpuCopyIsDone(serial) || lorieGpuCopyFailed(serial)) {
+        lorieReleaseCopyResources(src, (LorieBuffer *) dst_buffer);
+        return;
+    }
+
+    c = calloc(1, sizeof(*c));
+    if (!c) {
+        // Nothing better to do than the old behaviour, which is at least not a leak.
+        lorieReleaseCopyResources(src, (LorieBuffer *) dst_buffer);
+        return;
+    }
+    c->src = src;
+    c->dst = (LorieBuffer *) dst_buffer;
+    c->serial = serial;
+    xorg_list_add(&c->link, &lorieAbandonedCopies);
+}
+
 void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
     uint64_t startUs = lorieCopyStartUs[serial % LORIE_COPY_TIMING_SLOTS];
@@ -1422,17 +1492,7 @@ void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial) {
         pvfb->state->presentStats.copyCompletions++;
     }
 
-    if (priv && priv->buffer)
-        LorieBuffer_gpuCopyPendingDec(priv->buffer);
-    if (dst_buffer)
-        LorieBuffer_gpuCopyPendingDec((LorieBuffer *) dst_buffer);
-    else
-        pvfb->rootGpuCopyPending--;
-
-    if (priv && priv->buffer)
-        LorieBuffer_release(priv->buffer);
-    if (dst_buffer)
-        LorieBuffer_release((LorieBuffer *) dst_buffer);
+    lorieReleaseCopyResources(priv ? priv->buffer : NULL, (LorieBuffer *) dst_buffer);
 }
 
 Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {

@@ -307,7 +307,7 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -67,24 +68,74 @@
+@@ -67,24 +68,81 @@
      WindowPtr                   window = vblank->window;
      ScreenPtr                   screen = window->drawable.pScreen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
@@ -341,10 +341,17 @@
  
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    if (vblank->gpu_copy_pending) {
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        Bool gpuCopyMade = lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
++                           !lorieGpuCopyFailed(vblank->gpu_copy_serial);
++
++        /* lorie: a copy that was not made is not a present that reached the screen, and the GPU may
++         * still be reading its source, so its resources go back only once the renderer is done. */
++        if (gpuCopyMade)
++            lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        else
++            lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
 +        vblank->gpu_copy_pending = FALSE;
-+        if (lorieGpuCopyFailed(vblank->gpu_copy_serial) ||
-+            (gpuCopyStalled && !lorieGpuCopyIsDone(vblank->gpu_copy_serial))) {
++        if (!gpuCopyMade) {
 +            /* lorie: the renderer never actually made this copy - it gave up waiting for a buffer
 +             * to be registered, or lost its surface. Tell the client it was skipped rather than
 +             * falsely reporting it as presented. completedSerial is a watermark and steps over an
@@ -404,7 +411,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,35 @@
+@@ -90,8 +91,36 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -424,6 +431,7 @@
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern Bool lorieGpuCopyFailed(uint64_t serial);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
++extern void lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
 +/* lorie: called as each client present request is turned into a vblank, so the wait between a
 + * request arriving and it being executed can be told apart from the client being slow. */
 +extern void lorieNotePresentRequest(uint64_t target_msc, uint64_t crtc_msc);
@@ -486,29 +494,30 @@
          vblank->exec_msc--;
  
 +++ ./present/present_vblank.c
-@@ -188,6 +188,14 @@
+@@ -188,6 +188,15 @@
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,
                    vblank->crtc));
  
-+    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - ack it now, while
-+     * the pixmap is still valid, or the extra buffer references lorieTryScheduleGpuCopy took
-+     * leak forever. */
++    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - let go of it now, while
++     * the pixmap is still valid, or the extra buffer references lorieTryScheduleGpuCopy took leak
++     * forever. Abandoning rather than acking: the request is over, but the GPU may still be reading
++     * the source and writing the destination, and this is not a present that reached the screen. */
 +    if (vblank->gpu_copy_pending) {
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
 +        vblank->gpu_copy_pending = FALSE;
 +    }
 +
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +208,13 @@
+@@ -200,6 +209,13 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
 +    /* lorie: same as in present_vblank_scrap() - must run before vblank->pixmap is dropped below,
 +     * for the destroy paths that reach a still-pending vblank without going through scrap first. */
 +    if (vblank->gpu_copy_pending) {
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
++        lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
 +        vblank->gpu_copy_pending = FALSE;
 +    }
 +
