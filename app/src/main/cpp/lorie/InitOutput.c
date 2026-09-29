@@ -279,6 +279,24 @@ typedef struct {
      */
     RegionRec rootGpuPending[LORIE_ROOT_SLOTS];
     uint64_t rootGpuPendingSerial[LORIE_ROOT_SLOTS];
+
+    /*
+     * What the slot being drawn into still lacks, and where to get it. A handover that could not copy
+     * an area forward - a queued copy had not landed in the slot being published yet - leaves that
+     * area stale in the new drawing slot. It used to stay there as a bare stale mark, with nothing
+     * recording who had the content: the new slot was drawn into, published and used as the source
+     * for the next handover with the area still old, and the next slot's stale mark was cleared from
+     * it - so the area went back to its previous content and the old copy spread from there.
+     *
+     * rootOwedDonor is the slot that has it, once rootOwedSerial - its own pending copies, and the
+     * drawing slot's leftover ones the CPU copy must not race - has landed. There is only ever one
+     * donor: a slot is not published while it owes anything (lorieRootHandover), so the obligation
+     * a handover creates is the only one outstanding. Anything drawn into the area in the meantime
+     * is newer than what the donor would supply, and lorieMarkRootStale takes it back out.
+     */
+    RegionRec rootOwed;
+    int rootOwedDonor;
+    uint64_t rootOwedSerial;
     int rootWrite;                  // the slot we are drawing into; only this side ever changes it
     Bool rootDirty;                 // drawn into but not published yet, so the retry below knows
     uint64_t rootDirtySinceUs;      // when it became so, to measure how long a publish took
@@ -939,10 +957,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.rootStalePostponed);
         if (pvfb->state->presentStats.rootPublishAttempts)
             log(INFO, "XlorieRootPublish: %u of %u attempts published, %u found no free slot, "
+                      "%u held for a repair (%u areas repaired), "
                       "longest wait to publish %.1f ms (still waiting, worst so far %.1f ms)",
                 pvfb->state->presentStats.rootPublishes,
                 pvfb->state->presentStats.rootPublishAttempts,
                 pvfb->state->presentStats.rootPublishNoSlot,
+                pvfb->state->presentStats.rootPublishHeldForRepair,
+                pvfb->state->presentStats.rootOwedRepairs,
                 pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0,
                 pvfb->state->presentStats.rootUnpublishedNowMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
@@ -984,6 +1005,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootPublishAttempts = 0;
     pvfb->state->presentStats.rootPublishes = 0;
     pvfb->state->presentStats.rootPublishNoSlot = 0;
+    pvfb->state->presentStats.rootPublishHeldForRepair = 0;
+    pvfb->state->presentStats.rootOwedRepairs = 0;
     pvfb->state->presentStats.rootUnpublishedMaxUs = 0;
     pvfb->state->presentStats.rootUnpublishedNowMaxUs = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
@@ -2126,6 +2149,11 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
                 RegionUninit(&rootPriv->rootStale[i]);
                 RegionUninit(&rootPriv->rootGpuPending[i]);
                 rootPriv->rootGpuPendingSerial[i] = 0;
+                if (i == 0) {
+                    RegionUninit(&rootPriv->rootOwed);
+                    rootPriv->rootOwedDonor = -1;
+                    rootPriv->rootOwedSerial = 0;
+                }
                 rootPriv->rootBuf[i] = NULL;
                 rootPriv->rootLocked[i] = NULL;
                 if (!slot || slot == rootPriv->buffer)
@@ -2217,6 +2245,39 @@ static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {
     for (i = 0; i < LORIE_ROOT_SLOTS; i++)
         if (i != priv->rootWrite)
             RegionUnion(&priv->rootStale[i], &priv->rootStale[i], region);
+
+    // Whatever was just written into the drawing slot is newer than what the donor holds for it, so
+    // it is no longer owed - copying it across now would put the older content back on top.
+    if (RegionNotEmpty(&priv->rootOwed))
+        RegionSubtract(&priv->rootOwed, &priv->rootOwed, region);
+}
+
+/*
+ * Brings the drawing slot up to date with what a handover had to leave behind, if the content has
+ * landed in the donor by now. Returns whether nothing is owed any more.
+ *
+ * The CPU copy here writes the drawing slot, which the renderer never reads, and reads the donor,
+ * whose pending area is exactly what rootOwedSerial covers. It cannot race a GPU write into the
+ * drawing slot either: every copy queued into it has taken its own area out of rootOwed.
+ */
+static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {
+    if (!priv->rootDouble || !RegionNotEmpty(&priv->rootOwed))
+        return TRUE;
+
+    if (priv->rootOwedDonor < 0 || priv->rootOwedDonor == priv->rootWrite) {
+        RegionEmpty(&priv->rootOwed);
+        return TRUE;
+    }
+
+    if (!lorieGpuCopyResolved(priv->rootOwedSerial))
+        return FALSE;
+
+    lorieCopyRootRegion(priv, priv->rootOwedDonor, priv->rootWrite, &priv->rootOwed);
+    RegionSubtract(&priv->rootStale[priv->rootWrite], &priv->rootStale[priv->rootWrite], &priv->rootOwed);
+    RegionEmpty(&priv->rootOwed);
+    priv->rootOwedDonor = -1;
+    pvfb->state->presentStats.rootOwedRepairs++;
+    return TRUE;
 }
 
 // Allocates the second root buffer. Failing is not fatal, it just leaves the old single-buffered
@@ -2319,6 +2380,10 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         pvfb->state->rootBufferIds[i] = LorieBuffer_description(priv->rootBuf[i])->id;
     }
 
+    RegionInit(&priv->rootOwed, NULL, 0);
+    priv->rootOwedDonor = -1;
+    priv->rootOwedSerial = 0;
+
     __atomic_store_n(&pvfb->state->rootHandover, 0u, __ATOMIC_RELEASE); // published slot 0, none held
     priv->rootWrite = 1;
     priv->buffer = priv->rootBuf[1];
@@ -2384,13 +2449,29 @@ static void lorieNoteRootPublished(LoriePixmapPriv *priv) {
 static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     uint32_t old, new;
     int drawn = priv->rootWrite, next, i;
-    RegionPtr unsafe;
-    RegionRec carry;
+    RegionPtr unsafe, nextPending;
+    RegionRec blocked, carry;
 
     if (!priv->rootDouble)
         return FALSE;
 
     pvfb->state->presentStats.rootPublishAttempts++;
+
+    /*
+     * A slot is not published while it still lacks something a previous handover left behind. It
+     * was, which is how an area went back to old content: the slot went out with the area stale, and
+     * the next handover then used it as the source and cleared the next slot's stale mark from it.
+     *
+     * This cannot bring back the freeze the region tracking replaced. That freeze came from the
+     * slot always having a copy in flight; this waits only for a copy into the *donor* to land,
+     * which is one frame's drain at most - and a client that keeps presenting writes the owed area
+     * afresh into the drawing slot, which takes it out of the obligation before it is ever waited
+     * on. Only a client that has stopped leaves anything to wait for, and then only briefly.
+     */
+    if (!lorieRepairRootOwed(priv)) {
+        pvfb->state->presentStats.rootPublishHeldForRepair++;
+        return FALSE;
+    }
 
     do {
         old = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE);
@@ -2426,37 +2507,52 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 
     /*
-     * The copy below reads `drawn` with the CPU, and `drawn` is the slot every root GPU copy is
-     * queued against - lorieTryScheduleGpuCopy() takes its destination from priv->buffer. It takes
-     * neither state->lock nor EXA's PrepareAccess, so an area a queued copy has not written yet
-     * would be read straight past: `next` would get the pixels from before it, have its stale mark
-     * cleared as though it were up to date, and never receive them, since the GPU writes `drawn`
-     * afterwards. The wrong content then surfaces when the rotation comes back round to that slot.
+     * The copy below reads `drawn` and writes `next`, both with the CPU and outside both the shared
+     * lock and EXA's PrepareAccess. Two areas cannot be copied yet:
      *
-     * So that area alone is left behind, still marked stale, and copied forward on a later handover
-     * once the copy has landed. Holding the whole publish back instead is what froze the screen
-     * under a client that presented every frame: the slot always had a pending copy and the next
-     * slot was always missing something, so the two conditions were permanently true and nothing
-     * was ever published while every frame counter kept climbing.
+     *   - where a queued GPU copy into `drawn` has not landed: reading it gets the pixels from
+     *     before, and the GPU then writes `drawn` where `next` can never pick it up;
+     *   - where a GPU copy into `next` itself, left from when it was last the drawing slot, has not
+     *     landed: the CPU write would race it, and it would then land old content over new.
+     *
+     * Those are left behind and owed to `next`, with `drawn` as the donor once both have landed.
+     * Holding the whole publish back for them instead is what froze the screen under a client that
+     * presented every frame.
      */
     unsafe = lorieRootPendingGpuRegion(priv, drawn);
+    nextPending = lorieRootPendingGpuRegion(priv, next);
+    RegionNull(&blocked);
+    RegionUnion(&blocked, unsafe, nextPending);
+
     RegionNull(&carry);
     RegionCopy(&carry, &priv->rootStale[next]);
-    if (RegionNotEmpty(unsafe) && RegionNotEmpty(&priv->rootStale[next])) {
-        RegionSubtract(&carry, &carry, unsafe);
-        pvfb->state->presentStats.rootStalePostponed++;
-    }
+    RegionSubtract(&carry, &carry, &blocked);
 
     pvfb->state->presentStats.rootPublishes++;
 
     lorieCopyRootRegion(priv, drawn, next, &carry);
-    // Whatever could not be read forward stays owed to this slot.
-    RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], unsafe);
+    RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], &blocked);
+
+    // What `next` still lacks, `drawn` has - `drawn` owed nothing itself, or it would not have been
+    // published above - so record where it is and what has to land before it can be copied.
+    if (RegionNotEmpty(&priv->rootStale[next])) {
+        uint64_t waitFor = max(priv->rootGpuPendingSerial[drawn], priv->rootGpuPendingSerial[next]);
+
+        RegionCopy(&priv->rootOwed, &priv->rootStale[next]);
+        priv->rootOwedDonor = drawn;
+        priv->rootOwedSerial = waitFor;
+        pvfb->state->presentStats.rootStalePostponed++;
+    }
+
     RegionUninit(&carry);
+    RegionUninit(&blocked);
 
     priv->rootWrite = next;
     priv->buffer = priv->rootBuf[next];
     priv->locked = priv->rootLocked[next];
+
+    // It may have landed already.
+    lorieRepairRootOwed(priv);
     return TRUE;
 }
 
@@ -2479,6 +2575,15 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+
+    // The drawing slot may still lack an area a handover left behind. The X server reads the root as
+    // well as writing it - moving a window is a copy from the root to itself - so it is brought up to
+    // date here if the content has landed, before anything reads the old pixels. If it has not, the
+    // access goes ahead: waiting here is waiting on the renderer from inside a PrepareAccess, which
+    // can deadlock, and the handover still will not publish the slot until it is repaired.
+    if (priv && priv->rootDouble)
+        lorieRepairRootOwed(priv);
+
     if (lorieNeedsGpuLock(pPix, priv, index)) {
         /*
          * A queued GPU copy into this buffer is still not ordered against the write that is about

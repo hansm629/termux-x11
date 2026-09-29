@@ -449,6 +449,11 @@ struct lorie_shared_server_state {
         volatile uint32_t rootPublishAttempts;
         volatile uint32_t rootPublishes;
         volatile uint32_t rootPublishNoSlot;
+        /* A publish held back because the slot still lacked an area a previous handover had to leave
+         * behind, and the copy that would supply it had not landed in the donor yet. rootOwedRepairs
+         * is those areas being brought across. */
+        volatile uint32_t rootPublishHeldForRepair;
+        volatile uint32_t rootOwedRepairs;
         /* Waits that finished, measured where they ended, and the worst one still running. Sampling
          * a running wait once per vsync missed the stretch that mattered, because a handover that
          * succeeded cleared the outstanding mark first - so a publish one tick after a failed
