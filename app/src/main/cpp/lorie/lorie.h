@@ -494,6 +494,13 @@ struct lorie_shared_server_state {
      * without root or adb - so from the terminal there was no way to tell a backend that was asked
      * for from the one that ran. Written by the renderer on a change, read by the X server for its
      * five-second summary. */
+    /* The renderer has content it could not put on screen and needs another frame to try again.
+     * Published because the X server is what opens the vsync gate, and its wake-up condition was
+     * new damage or a cursor move - neither of which a retry is. Without this the renderer sat
+     * waiting for a signal that was not coming, and the content stayed off the screen until
+     * something else happened to dirty the root. Written by the renderer, read by the X server. */
+    volatile uint8_t outputRetryPending;
+
     volatile uint8_t outputBackendActive;
     volatile char outputBackendReason[96];
 

@@ -775,7 +775,14 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     } else
         priv->rootDirtySinceUs = 0;
 
-    if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
+    /*
+     * outputRetryPending is the renderer saying it has content it could not put on screen. This is
+     * the only thing that opens its vsync gate, and the condition here was new damage or a cursor
+     * move - so a frame the renderer had to hold back waited for a signal that was never sent, and
+     * on a still desktop it waited forever.
+     */
+    if (pvfb->state->drawRequested || pvfb->state->outputRetryPending ||
+        pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
         // With a double buffered root this must name the buffer the renderer samples, not the one
         // we draw into.
         // While a client is flipping, the id above is that client's pixmap rather than one of our

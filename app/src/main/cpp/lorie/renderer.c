@@ -230,6 +230,7 @@ static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; th
  * which on a still desktop is nothing at all.
  */
 static bool rootZcRetryPending = false;
+
 // The ones behind it, each waiting for the release fence that the next transaction's completion
 // reports. More than one, because requiring the oldest to be back before presenting again meant
 // waiting a whole vsync for a callback that arrives during it - which dropped every other frame and
@@ -527,6 +528,22 @@ static void rendererApplyPresentMode(void) {
 }
 
 static volatile struct lorie_shared_server_state* state = NULL;
+
+/*
+ * One place sets it, because three places have to agree on it: the sleep predicate, the redraw
+ * dispatcher, and the test for a frame that is only a cursor move. The flag was added to the
+ * predicate alone, so the thread woke up, decided there was work, reached a dispatcher that did not
+ * know about it, did nothing, and went round again - a busy loop that submitted nothing. And a
+ * cursor move arriving first took the cursor-only path, which skips the output entirely.
+ *
+ * Also published to the X server, which is what opens the vsync gate and only signalled for new
+ * damage or a cursor move.
+ */
+static void rendererSetOutputRetry(bool pending) {
+    rootZcRetryPending = pending;
+    if (state)
+        state->outputRetryPending = pending ? 1u : 0u;
+}
 static struct {
     GLuint id;
     bool cursorChanged;
@@ -1863,7 +1880,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             // Ask to come back for it, since clearing drawRequested above is what would otherwise
             // lose it. Gated behind waitForNextFrame, so this is one more attempt at the next vsync
             // rather than the thread coming straight back round millions of times a second.
-            rootZcRetryPending = true;
+            rendererSetOutputRetry(true);
             state->waitForNextFrame = true;
             return;
         }
@@ -2246,6 +2263,8 @@ __noreturn static void* rendererThread(void) {
             pendingState = NULL;
             stateChanged = false;
             waitingForBuffers = false;
+            // Whatever was waiting to go out belonged to the state being left.
+            rendererSetOutputRetry(false);
             // The queue that deadline referred to has gone with the old state.
             rendererCopyBlockedUntilNs = 0;
             rendererCopyDeferredSerial = 0;
@@ -2281,7 +2300,9 @@ __noreturn static void* rendererThread(void) {
         // that is a transaction on another thread, so there is no reason to build a GL frame for it.
         // Unlike upstream there is no zoom or panning here, so a move can never need the crop
         // recomputed and this needs no further check.
-        bool cursorOnly = state && !state->drawRequested && !gpuCopyPending &&
+        // A retry is output that still has to go out, so it is not a cursor-only frame however the
+        // cursor happens to have moved in the meantime.
+        bool cursorOnly = state && !state->drawRequested && !gpuCopyPending && !rootZcRetryPending &&
             (state->cursor.moved || state->cursor.updated);
 
         if (cursorOnly && state->surfaceAvailable && cursorOverlaySourceW > 0.f && cursorOverlayUsable()) {
@@ -2289,7 +2310,10 @@ __noreturn static void* rendererThread(void) {
             state->cursor.moved = state->cursor.updated = FALSE;
             state->presentStats.cursorOverlayMoves++;
         } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
-            (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
+            (state->drawRequested || rootZcRetryPending || state->cursor.moved ||
+             state->cursor.updated || gpuCopyPending)) {
+            // rootZcRetryPending has to be here as well as in rendererShouldWait(): the predicate
+            // saying there is work while this said there is none is a loop that never submits.
             rendererRedrawLocked(&waitingForBuffers);
         } else if (gpuCopyPending) {
             rendererApplyPendingGpuCopies();
@@ -2868,7 +2892,7 @@ static void rootZcReleaseAll(void) {
     int i;
 
     // Leaving this path, so there is no zero-copy frame left to retry.
-    rootZcRetryPending = false;
+    rendererSetOutputRetry(false);
 
     pthread_mutex_lock(&rootOverlayLock);
     for (i = 0; i < rootZcRetiringCount; i++) {
@@ -2993,7 +3017,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         // The copies above still happened, so they are still reported.
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
-        rootZcRetryPending = false;   // what the X server has published is on screen
+        rendererSetOutputRetry(false);   // what the X server has published is on screen
         // A frame, like any other. Counting these only on the GL path meant the frame rate the X
         // server reports left out every frame that went straight to the compositor - so the better
         // this path worked, the lower the number it produced.
@@ -3056,7 +3080,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
-    rootZcRetryPending = false;
+    rendererSetOutputRetry(false);
     state->renderedFrames++;
     state->presentStats.zeroCopyFrames++;
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
