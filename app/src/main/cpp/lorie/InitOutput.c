@@ -419,9 +419,26 @@ void lorieSetRendererWakeupCond(int fd) {
 }
 
 void lorieActivityConnected(void) {
+    LoriePixmapPriv *rootPriv = pScreenPtr ? LORIE_PIXMAP_PRIV_FROM_PIXMAP((PixmapPtr) pScreenPtr->devPrivate) : NULL;
+
     pvfb->state->drawRequested = pvfb->state->cursor.updated = true;
     lorieSendSharedServerState(pvfb->stateFd);
     lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+
+    /*
+     * Every slot of a double-buffered root, not just the one being drawn into. The slots are only
+     * registered when they are created, and a renderer that connects after that - the app restarted
+     * or crashed while this server kept running - was sent the drawing slot and nothing else. The
+     * renderer samples the slot published last, which is a different one, so it waited for a buffer
+     * that was never coming and the screen stayed black for as long as this server lived.
+     * Registering an id that is already registered is a no-op.
+     */
+    if (rootPriv && rootPriv->rootDouble) {
+        int i;
+
+        for (i = 0; i < LORIE_ROOT_SLOTS; i++)
+            lorieRegisterBuffer(rootPriv->rootBuf[i]);
+    }
 }
 
 static LoriePixmapPriv* lorieRootWindowPixmapPriv(void) {
