@@ -276,6 +276,10 @@ struct lorie_shared_server_state {
     struct {
         volatile uint32_t writeIndex;
         volatile uint32_t readIndex;
+        /* The GPU has finished with every entry up to and including this serial - applied, given up
+         * on or skipped alike. Advanced only after the batch's fence has signalled, and past every
+         * entry drained, so it is a statement about buffer use and nothing else. Whether a given
+         * entry was actually made is the failed list below. */
         volatile uint64_t completedSerial;
 
         /* Serials the renderer gave up on because a buffer never reached it. completedSerial is a

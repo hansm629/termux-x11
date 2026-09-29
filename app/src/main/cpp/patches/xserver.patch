@@ -531,9 +531,9 @@
 + * window's own backing pixmap) to the renderer's GPU context instead of a CPU CopyArea. */
 +extern Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
 +                                     uint64_t *out_serial, void **out_record);
-+/* lorie: Made is "it landed, ack it"; Resolved is "nothing more is coming, either way". Asking
-+ * IsDone && !Failed instead had no answer for a failure record the renderer had already had to
-+ * overwrite - see lorieGpuCopyKnownNotMade(). */
++/* lorie: Made is "it landed, ack it"; Resolved is "the GPU is finished with its buffers, whichever
++ * way it went". They are separate because an outcome can be known while the GPU is still running
++ * the batch it was part of - see lorieGpuCopyResolved(). */
 +extern Bool lorieGpuCopyMade(uint64_t serial);
 +extern Bool lorieGpuCopyResolved(uint64_t serial);
 +extern void lorieNoteGpuCopyRequeued(void);

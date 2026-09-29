@@ -1389,12 +1389,24 @@ static int rendererRootSlotForBufferId(uint64_t id) {
  * includes the case where the previous frame deferred its fence: its read of the slot has been
  * submitted, so that slot is no safer than any other held one.
  */
-static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot) {
+/*
+ * Returns the highest serial drained - applied, given up on, or skipped - and says separately whether
+ * any GPU work was issued.
+ *
+ * Those are two answers to two questions, and they were one. The serial becomes completedSerial,
+ * which the X server reads as "the GPU has finished with everything up to here": once the fence for
+ * this batch has signalled that is true of every entry drained, whether it drew or not. A skipped
+ * entry used to leave it behind, so a batch of nothing but skips reported nothing, woke nobody, and
+ * left the X server to find out on a later poll. And whether to wait for a fence at all depends only
+ * on whether anything was drawn, which a serial cannot say.
+ */
+static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkIssued) {
     bool fboSetUp = false;
     uint64_t lastSerial = 0;
     uint64_t boundDstId = 0;
     GLint prevViewport[4];
 
+    *gpuWorkIssued = false;
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return 0;
 
@@ -1415,6 +1427,8 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot) {
             // scrapped so the client is told its frame was skipped instead of presented.
             rendererPublishFailedSerial(entry.serial);
             state->presentStats.copySkips++;
+            // Drained like any other entry: nothing of it is left for the GPU to do.
+            lastSerial = entry.serial;
             state->gpuCopyQueue.readIndex++;
             continue;
         }
@@ -1539,6 +1553,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
     }
+    *gpuWorkIssued = fboSetUp;
     return lastSerial;
 }
 
@@ -1604,13 +1619,16 @@ static void rendererApplyPendingGpuCopies(void) {
         return;
     int64_t lockWaitStartNs = rendererNowNs(), lockHeldStartNs;
     int64_t flushUs = 0, waitUs = 0;
+    bool gpuWorkIssued;
 
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     lockHeldStartNs = rendererNowNs();
     // No frame in progress, so no slot is safe merely because this renderer claimed it.
-    serial = rendererApplyPendingGpuCopiesLocked(-1);
+    serial = rendererApplyPendingGpuCopiesLocked(-1, &gpuWorkIssued);
     if (serial) {
-        rendererFinishIssuedWork(&flushUs, &waitUs);
+        // Nothing to wait for if nothing was drawn - a batch of skips still has to be reported.
+        if (gpuWorkIssued)
+            rendererFinishIssuedWork(&flushUs, &waitUs);
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
         // let present_execute_copy release/idle the source pixmap back to the client.
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
@@ -1961,7 +1979,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     lockHeldStartNs = rendererNowNs();
     // Share this draw's flush+fence below instead of a separate round trip per frame.
-    uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked(rendererRootSlot);
+    bool gpuWorkIssued;
+    uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked(rendererRootSlot, &gpuWorkIssued);
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
@@ -1975,7 +1994,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // whether the fence exists, because those are different questions: no fence because none was
     // wanted means there is nothing to wait for, while no fence because creating one failed means
     // the wait still has to happen by other means.
-    fenceWanted = !deferFence && (rootFenceWaitEnabled || gpuCopySerial);
+    fenceWanted = !deferFence && (rootFenceWaitEnabled || gpuWorkIssued);
     if (fenceWanted) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
@@ -3049,7 +3068,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     uint32_t retireSeq;
     int64_t fenceWaitUs = 0;
     uint64_t gpuCopySerial;
-    bool carriedGpuCopy = false, alreadyOnScreen;
+    bool carriedGpuCopy = false, alreadyOnScreen, gpuWorkIssued;
     ASurfaceTransaction *t;
 
     if (!ahb || slot < 0)
@@ -3089,9 +3108,9 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
         lorie_mutex_lock(&state->lock, &state->lockingPid);
         lockHeldStartNs = rendererNowNs();
-        gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot);
+        gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot, &gpuWorkIssued);
         state->drawRequested = FALSE;
-        if (gpuCopySerial)
+        if (gpuWorkIssued)
             rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
         state->waitForNextFrame = true;
         lorie_mutex_unlock(&state->lock, &state->lockingPid);

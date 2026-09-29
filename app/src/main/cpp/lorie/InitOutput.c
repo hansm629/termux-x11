@@ -1709,12 +1709,23 @@ Bool lorieGpuCopyMade(uint64_t serial) {
            !lorieGpuCopyKnownNotMade(serial);
 }
 
-// Nothing more is coming for this serial, whichever way it went. A question, not an event: it used
-// to count a requeue every time the answer was no, so the reaper and the cancellation paths asking
-// after a serial were counted as presents being requeued.
+/*
+ * The GPU has finished with this copy's buffers, whichever way it went - so they can be released,
+ * and a present waiting on it can stop waiting. A question, not an event.
+ *
+ * Only the watermark answers it. This used to be "completedSerial has passed it, or it is known not
+ * to have been made", and the second half is a different question: an outcome, not a statement
+ * about the GPU. A skipped entry is reported as not made the moment it is drained, while earlier
+ * entries of the same batch may still be running - and a serial whose failure record had been
+ * overwritten counted as not made too, with nothing at all said about where the GPU was. Either one
+ * released buffers the GPU could still be using.
+ *
+ * The renderer now advances the watermark past every entry it drains, skips included, and only
+ * once the batch's fence has signalled, so the watermark alone is the complete answer. Whether the
+ * copy was actually made is lorieGpuCopyMade().
+ */
 Bool lorieGpuCopyResolved(uint64_t serial) {
-    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial ||
-           lorieGpuCopyKnownNotMade(serial);
+    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
 }
 
 // Called where a present is actually put back on the vblank queue to be asked again.
