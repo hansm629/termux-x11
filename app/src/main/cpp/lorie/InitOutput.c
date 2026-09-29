@@ -221,6 +221,18 @@ static void lorieAdvanceVsyncClock(void) {
     lorieVsyncUs = lorieVsyncRawUs > lorieVsyncUs ? lorieVsyncRawUs
                  : lorieVsyncUs ? lorieVsyncUs + lorieVsyncPeriodUs
                  : GetTimeInMicros();
+
+    // A backlog of work procs runs the step above several times in a row with no new stamp in
+    // between, and each one moved ust a period further on, so it could march ahead of the clock
+    // itself. Present hands those numbers to clients as the time their frame was shown, and a
+    // client that paces against a completion time in the future is being told its frames are
+    // landing early. The furthest ahead this can honestly be is the next vsync.
+    {
+        uint64_t nowUs = GetTimeInMicros();
+
+        if (lorieVsyncUs > nowUs + lorieVsyncPeriodUs)
+            lorieVsyncUs = nowUs + lorieVsyncPeriodUs;
+    }
 }
 
 // When the given vsync is, or was, on screen.
