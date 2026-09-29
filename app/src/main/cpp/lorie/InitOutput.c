@@ -68,6 +68,7 @@ typedef struct {
 
     SetWindowPixmapProcPtr SetWindowPixmap;
     CloseScreenProcPtr CloseScreen;
+    DestroyWindowProcPtr DestroyWindow;
 
     int eventFd, stateFd;
 
