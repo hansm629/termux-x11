@@ -920,10 +920,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         // How the copies that did not end in an ack ended instead. Both are invisible from outside
         // - an abandoned copy looks like a client that stopped sending, and a copy that was never
         // offered looks like the GPU path simply not being taken.
-        if (pvfb->state->presentStats.copyAbandons || pvfb->state->presentStats.copyRecordExhausted)
-            log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room)",
+        if (pvfb->state->presentStats.copyAbandons || pvfb->state->presentStats.copyRecordExhausted ||
+            pvfb->state->presentStats.copyForcedSettle)
+            log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room), "
+                      "%u let go without a result because their session ended",
                 pvfb->state->presentStats.copyAbandons,
-                pvfb->state->presentStats.copyRecordExhausted);
+                pvfb->state->presentStats.copyRecordExhausted,
+                pvfb->state->presentStats.copyForcedSettle);
 
         // Each one is a client frame dropped because the X server drew into the same buffer before
         // the renderer got to it. A large number here is not a bug, it is windows overlapping.
@@ -1009,6 +1012,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.copyRequeues = 0;
     pvfb->state->presentStats.copyAbandons = 0;
     pvfb->state->presentStats.copyRecordExhausted = 0;
+    pvfb->state->presentStats.copyForcedSettle = 0;
     pvfb->state->presentStats.cpuWriteSupersedes = 0;
     pvfb->state->presentStats.copyDeferrals = 0;
     pvfb->state->presentStats.copySkips = 0;
@@ -1765,16 +1769,27 @@ static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
  * at all, which is a visible slowdown rather than a corruption.
  */
 static Bool lorieCopySettled(LorieAbandonedCopy *c) {
-    if (lorieGpuCopyResolved(c->serial))
-        return TRUE;
-
+    // The shared result belongs to whichever renderer is connected now, so it only answers for that
+    // renderer's work. It was consulted for every record: a new session advancing completedSerial
+    // past an old job's serial made that job look completed by a process that had never seen it.
     if (c->session == lorieRendererSession)
-        return FALSE;   // still the live renderer's answer to give
+        return lorieGpuCopyResolved(c->serial);
 
-    if (!c->settleByUs)
-        return FALSE;   // its session has not been declared over yet
+    if (!c->settleByUs || lorieNowUs() < c->settleByUs)
+        return FALSE;
 
-    return lorieNowUs() >= c->settleByUs;
+    /*
+     * Not a statement that the GPU finished, and there is nothing available that would be one. The
+     * session that owed this answer is gone and will never give it, and the alternative is holding
+     * a live client's pixmap and its IdleNotify for the rest of the server's life.
+     *
+     * What is accepted is bounded: a renderer process that outlived its socket may still read a
+     * source the client has since written, and draw a torn frame into output that is no longer on
+     * screen. That is worse than a proof and better than hanging clients, so it is counted rather
+     * than described as safe.
+     */
+    pvfb->state->presentStats.copyForcedSettle++;
+    return TRUE;
 }
 
 // Lets go of what a cancelled present left with the copy, now that the renderer is done reading it.
@@ -1873,33 +1888,67 @@ Bool lorieGpuCopyAbandon(void *token) {
  * for a report that cannot come and start the bounded wait in lorieCopySettled(); new copies are
  * already refused while there is no connection, so nothing joins them in the meantime.
  */
-void lorieNoteRendererLost(void) {
-    uint64_t settleByUs = lorieNowUs() + LORIE_LOST_SESSION_SETTLE_US;
+/*
+ * Marks every record of the session that has just ended, so lorieCopySettled() stops asking the
+ * live renderer's result about work it never saw.
+ *
+ * settleByUs is when to stop waiting, not when the GPU is known to be done - see lorieCopySettled.
+ */
+static void lorieMarkSessionOver(uint32_t session, uint64_t settleByUs, const char *why) {
     LorieAbandonedCopy *c;
     unsigned held = 0;
 
     xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
-        if (c->session == lorieRendererSession && !c->settleByUs) {
+        if (c->session == session && !c->settleByUs) {
             c->settleByUs = settleByUs;
             held++;
         }
 
     if (held)
-        log(INFO, "renderer session %u ended with %u copies unreported; holding their buffers for "
-                  "up to %llu ms unless a renderer reconnects first",
-            lorieRendererSession, held, LORIE_LOST_SESSION_SETTLE_US / 1000ULL);
+        log(INFO, "renderer session %u ended (%s) with %u copies unreported", session, why, held);
+}
 
+/*
+ * The connection to the renderer broke. Runs on the X server thread, because settling a copy idles
+ * pixmaps and touches Present state; it used to run straight from the socket error on the input
+ * thread, which is not allowed to touch either.
+ *
+ * Nothing is released here. A broken socket says the renderer will never report these serials - it
+ * does not say its GPU work finished, and the old code took it as exactly that, releasing buffers a
+ * renderer process that outlived its socket could still be reading. All this does is stop waiting
+ * for a report that cannot come and start the bounded wait in lorieCopySettled(); new copies are
+ * already refused while there is no connection, so nothing joins them in the meantime.
+ */
+void lorieNoteRendererLost(void) {
+    lorieMarkSessionOver(lorieRendererSession, lorieNowUs() + LORIE_LOST_SESSION_SETTLE_US,
+                         "socket closed");
     lorieReapAbandonedCopies();
 }
 
 /*
  * A renderer connected. Whatever the previous one had not reported, it is not going to: the process
- * that held the imported buffers and submitted the GPU work has been replaced. That is the real
- * answer the bounded wait above exists to avoid needing, so the wait ends here.
+ * that held the imported buffers and submitted the GPU work has been replaced. Those records are
+ * marked over with no further wait - the wait exists for a session that has gone with nothing
+ * taking its place, and that is no longer the case.
  */
 void lorieNoteRendererConnected(void) {
+    uint32_t previous = lorieRendererSession;
+
     lorieRendererSession++;
+    if (previous)
+        lorieMarkSessionOver(previous, lorieNowUs(), "replaced by a new renderer");
     lorieReapAbandonedCopies();
+}
+
+// For the input thread, so a socket error can name the session it belongs to.
+uint32_t lorieRendererSessionId(void) {
+    return lorieRendererSession;
+}
+
+// Ignores a lost event that has been overtaken by a new connection: it would otherwise mark the new
+// session's records over and tear down the buffers it has just registered.
+Bool lorieRendererSessionIsCurrent(uint32_t session) {
+    return session == lorieRendererSession;
 }
 
 // Holds back the IdleNotify for a cancelled present whose copy is still running. Takes ownership of

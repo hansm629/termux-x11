@@ -242,8 +242,14 @@ static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *c
     return TRUE;
 }
 
-static Bool handleRendererLostEvent(__unused ClientPtr pClient, __unused void *closure) {
+static Bool handleRendererLostEvent(__unused ClientPtr pClient, void *closure) {
+    uint32_t session = (uint32_t) (uintptr_t) closure;
     LorieBuffer* buf;
+
+    // A new renderer may have connected while this was queued. Acting on it then would mark the new
+    // session's outstanding work as over and unregister the buffers it has just been given.
+    if (!lorieRendererSessionIsCurrent(session))
+        return TRUE;
 
     // This must be done only on X server thread.
     lorieNoteRendererLost();
@@ -316,7 +322,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         // and settling the copies that were waiting on this renderer both ran here, which is not
         // allowed to touch either: the copies idle pixmaps and read Present's queues, and the
         // buffer list is otherwise only ever changed while registering from the server thread.
-        QueueWorkProc(handleRendererLostEvent, NULL, NULL);
+        QueueWorkProc(handleRendererLostEvent, NULL, (void *) (uintptr_t) lorieRendererSessionId());
         lorieWakeServer();
         return;
     }

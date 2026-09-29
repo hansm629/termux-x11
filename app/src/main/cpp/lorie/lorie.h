@@ -11,6 +11,7 @@
 #include <jni.h>
 #include <screenint.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include "linux/input-event-codes.h"
@@ -42,6 +43,11 @@ void lorieNoteGpuCopyRequeued(void);
  * replaced, so its GPU work is gone with it. */
 void lorieNoteRendererLost(void);
 void lorieNoteRendererConnected(void);
+/* So a socket error can name the session it belongs to, and a lost event that has been overtaken by
+ * a new connection can be dropped instead of marking the new session's work over and tearing down
+ * the buffers it has just registered. */
+uint32_t lorieRendererSessionId(void);
+Bool lorieRendererSessionIsCurrent(uint32_t session);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -98,12 +104,7 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
         // taken, and the caller went on to touch shared state it did not own.
         if (ret != 0) {
             // ETIMEDOUT is the only error that waiting again can fix: it says someone else holds
-            // the lock and had not finished within the deadline. Every other error was retried
-            // just as hard, which for a mutex that can never be acquired - EINVAL on an unusable
-            // one, EAGAIN at the recursive limit - is an endless loop inside the X server with
-            // nothing said about why. So those go straight to the reinitialization below: it is
-            // the only step that can change the answer, and a mutex that cannot be locked at all
-            // is not made worse by it.
+            // the lock and had not finished within the deadline.
             if (ret == ETIMEDOUT && (*lockingPid == getpid() || lorieConnectionAlive())) {
                 // Being alive is not the same as making progress, and this loop has no way to
                 // tell. Reinitializing under a live holder would break mutual exclusion, so the
@@ -115,9 +116,25 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
                 continue;
             }
 
-            if (ret != ETIMEDOUT)
-                __android_log_print(ANDROID_LOG_ERROR, "lorie",
-                                    "shared lock is unusable (%s); reinitializing it", strerror(ret));
+            /*
+             * Anything else is not a lock that is busy, it is a lock that does not work: EINVAL on
+             * memory that is no longer a mutex, EAGAIN past the recursive limit. Those came here
+             * too and were answered by overwriting the mutex, which is only defensible when the
+             * other process is known to be gone - the case just above. Doing it for an error says
+             * nothing about who still holds the lock, and it would release it out from under them.
+             *
+             * There is no correct way to carry on. Returning without the lock races the other
+             * process on the root buffer, reinitialising may free a lock someone still holds, and
+             * asking again cannot change the answer. The shared state this coordinates is what
+             * both processes draw the screen out of, so this stops here rather than corrupting it
+             * quietly.
+             */
+            if (ret != ETIMEDOUT) {
+                __android_log_print(ANDROID_LOG_FATAL, "lorie",
+                                    "shared lock is unusable (%s, held by pid %d) - cannot continue",
+                                    strerror(ret), *lockingPid);
+                abort();
+            }
 
             pthread_mutexattr_t attr;
             pthread_mutex_t initializer = PTHREAD_MUTEX_INITIALIZER;
@@ -469,6 +486,10 @@ struct lorie_shared_server_state {
          * taken - which is why they are counted separately from copyCompletions. */
         volatile uint32_t copyAbandons;
         volatile uint32_t copyRecordExhausted;
+        /* Copies let go of because the session that owed their result is gone, with nothing that
+         * says the GPU finished with them. Not a safe completion - see lorieCopySettled - so it is
+         * counted apart from the ones that were actually reported. */
+        volatile uint32_t copyForcedSettle;
 
         /* Queued copies dropped because the X server wrote their destination first. Applying them
          * afterwards would put the client's older frame on top of what replaced it; the client is

@@ -2001,8 +2001,12 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         rendererPendingGpuCopySerial = gpuCopySerial;
         rootWaitUs = 0;
     } else {
+        // Unconditional, because a fence that could not be created is not a fence that has
+        // signalled. Skipping the wait on EGL_NO_SYNC_KHR and then publishing the serial below
+        // told the X server the copy was made when nothing had been waited for at all;
+        // rendererWaitForFence() falls back to glFinish and counts that it had to.
+        rootWaitUs = rendererWaitForFence(fence);
         if (fence != EGL_NO_SYNC_KHR) {
-            rootWaitUs = rendererWaitForFence(fence);
             eglDestroySyncKHR(egl_display, fence);
             fence = EGL_NO_SYNC_KHR;
         }
