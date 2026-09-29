@@ -1554,11 +1554,27 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     {
         LoriePixmapPriv *rootPriv = dstIsRoot ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
         if (rootPriv && rootPriv->rootDouble) {
-            // The copy lands in the buffer we are drawing into, so every other slot misses it too.
-            // In the root's own coordinates, which is where the GPU writes: an update rect is
-            // source-local and the write goes to rect + (x_off, y_off). Marking the source-local
-            // rect instead recorded the wrong area whenever either offset was nonzero, and the
-            // region carried between slots then did not match the region that changed.
+            /*
+             * The copy lands in the buffer we are drawing into, so every other slot misses it too.
+             *
+             * In the destination's own coordinates, which is where the GPU writes. The three
+             * coordinate spaces in play, for an update rect R that Present gave us:
+             *
+             *   p = the present's x_off/y_off      (offset within the window)
+             *   w = the window's x/y               (window's origin on screen)
+             *   o = the destination's screen_x/y   (destination pixmap's origin on screen)
+             *   d = p + w - o                      (what arrives here as x_off/y_off)
+             *
+             *   the GPU writes      R + d
+             *   the window's Damage R + p + w      (screen space; see lorieScheduleGpuCopyClipped)
+             *   what is marked here R + d
+             *
+             * So for R = [10,20,74,84] presented at p = (0,0) into a window at w = (400,200) with
+             * the root as destination, o = (0,0) and d = (400,200): the GPU writes and this marks
+             * [410,220,474,284]. It is R + d, not R + p - marking the source-local rect recorded
+             * the wrong area whenever either offset was nonzero, and the region carried between
+             * slots then did not match the region that changed.
+             */
             RegionRec r;
 
             if (update) {
