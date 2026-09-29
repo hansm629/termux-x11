@@ -1715,11 +1715,39 @@ void lorieReapAbandonedCopies(void) {
  * There is no third answer - the record was secured before the copy was ever enqueued, so this
  * cannot fail to track a copy it is being asked about.
  */
+/*
+ * Tells the renderer not to bother with one queued copy, if it has not got to it yet.
+ *
+ * Not a cancellation: whether the renderer has already picked the entry up cannot be known from
+ * here, so everything that depends on the copy possibly running still has to hold. What this buys
+ * is the common case - the renderer skips it, reports the serial immediately, and the pixmap a
+ * client is waiting to have back is returned a frame or two sooner instead of after work whose
+ * result nobody wants.
+ */
+static void lorieMarkQueuedCopySuperseded(uint64_t serial) {
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
+
+    for (i = readIndex; i != writeIndex; i++) {
+        LorieGpuCopyEntry *entry = &pvfb->state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+        if (entry->serial == serial) {
+            __atomic_store_n(&entry->superseded, 1u, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
 Bool lorieGpuCopyAbandon(void *token) {
     LorieAbandonedCopy *c = token;
 
     if (!c)
         return FALSE;
+
+    // Nobody wants this copy's result any more, so ask for it not to be made. The handover below
+    // still happens either way: the mark can be missed, and a copy already under way still reads
+    // the source it was given.
+    lorieMarkQueuedCopySuperseded(c->serial);
 
     if (lorieGpuCopyResolved(c->serial)) {
         lorieReleaseCopyResources(c->src, c->dst);
