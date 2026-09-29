@@ -1310,7 +1310,26 @@ static void rendererPublishFailedSerial(uint64_t serial) {
     __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
 }
 
-static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
+// Which root slot a buffer id names, or -1 if it is not a root slot at all.
+static int rendererRootSlotForBufferId(uint64_t id) {
+    int i;
+
+    if (!state->rootDoubleBuffered)
+        return -1;
+
+    for (i = 0; i < LORIE_ROOT_SLOTS; i++)
+        if (state->rootBufferIds[i] == id)
+            return i;
+    return -1;
+}
+
+/*
+ * safeSlot is the root slot this frame has claimed and not yet submitted a read of, so writing into
+ * it here still lands before anything reads it. -1 when there is no frame in progress, which
+ * includes the case where the previous frame deferred its fence: its read of the slot has been
+ * submitted, so that slot is no safer than any other held one.
+ */
+static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot) {
     bool fboSetUp = false;
     uint64_t lastSerial = 0;
     uint64_t boundDstId = 0;
@@ -1323,6 +1342,8 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         uint32_t slot = state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY;
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[slot];
         LorieBuffer *src, *dst;
+        int dstSlot = rendererRootSlotForBufferId(entry.dstBufferId);
+        bool heldOnScreen;
 
         // Read on its own rather than trusting the struct copy above, because this is the one field
         // the X server writes after publishing the entry. Acquire pairs with its release: seeing it
@@ -1341,9 +1362,22 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         src = rendererFindBuffer(entry.srcBufferId);
         dst = rendererFindBuffer(entry.dstBufferId);
 
-        if (!src || !dst) {
-            // Its buffer has not reached us yet. Leave it queued and look again on the next frame
-            // rather than waiting here, which would stall every present behind it as well.
+        /*
+         * A root slot the compositor or the GPU still holds is a buffer that is already being
+         * displayed, and writing into it is tearing by definition. The X server no longer holds a
+         * publish back for a copy it has queued - it cannot, or it stops publishing altogether
+         * while a client keeps presenting - so this is where that copy waits instead.
+         *
+         * The wait is short by construction: the X server publishes a newer slot every frame, and
+         * the hold is dropped when the compositor releases this one. The give-up deadline below
+         * bounds it if that does not happen.
+         */
+        heldOnScreen = dstSlot >= 0 && dstSlot != safeSlot &&
+                       (__atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE) & (1u << dstSlot));
+
+        if (!src || !dst || heldOnScreen) {
+            // Not ready. Leave it queued and look again on the next frame rather than waiting here,
+            // which would stall every present behind it as well.
             int64_t nowNs = rendererNowNs();
 
             if (rendererCopyDeferredSerial != entry.serial) {
@@ -1358,9 +1392,11 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             rendererCopyBlockedUntilNs = 0;
             rendererCopyDeferredSerial = 0;
 
-            log("rendererApplyPendingGpuCopies: %s buffer %llu never arrived, skipping\n",
-                src ? "destination" : "source",
-                (unsigned long long) (src ? entry.dstBufferId : entry.srcBufferId));
+            log("rendererApplyPendingGpuCopies: giving up on serial %llu - %s\n",
+                (unsigned long long) entry.serial,
+                heldOnScreen ? "its destination root slot stayed on screen"
+                             : src ? "its destination buffer never arrived"
+                                   : "its source buffer never arrived");
             state->presentStats.copySkips++;
 
             // Say so. Letting this serial ride out on completedSerial told the X server the copy
@@ -1369,7 +1405,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             rendererPublishFailedSerial(entry.serial);
         }
 
-        if (src && dst) {
+        if (src && dst && !heldOnScreen) {
             const LorieBuffer_Desc *srcDesc = LorieBuffer_description(src);
             const LorieBuffer_Desc *dstDesc = LorieBuffer_description(dst);
             int i;
@@ -1511,7 +1547,8 @@ static void rendererApplyPendingGpuCopies(void) {
 
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     lockHeldStartNs = rendererNowNs();
-    serial = rendererApplyPendingGpuCopiesLocked();
+    // No frame in progress, so no slot is safe merely because this renderer claimed it.
+    serial = rendererApplyPendingGpuCopiesLocked(-1);
     if (serial) {
         rendererFinishIssuedWork(&flushUs, &waitUs);
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
@@ -1855,7 +1892,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     lockHeldStartNs = rendererNowNs();
     // Share this draw's flush+fence below instead of a separate round trip per frame.
-    uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
+    uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked(rendererRootSlot);
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
@@ -2805,13 +2842,21 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     AHardwareBuffer *ahb = desc->buffer;
     int slot = rendererRootSlot, retiring;
     int64_t fenceWaitUs = 0;
-    bool carriedGpuCopy = false;
+    bool carriedGpuCopy = false, alreadyOnScreen;
     ASurfaceTransaction *t;
 
     if (!ahb || slot < 0)
         return false;
 
     rootZcClearLetterbox(surfaceW, surfaceH);
+
+    // The X server had nothing newer to publish, so this is the buffer the compositor is already
+    // showing - which makes it exactly as unsafe to write as any other slot on screen. Checked
+    // before the copies below rather than after them, where the same test only decided whether to
+    // re-publish; the copies went in either way, straight into what was being displayed.
+    pthread_mutex_lock(&rootOverlayLock);
+    alreadyOnScreen = slot == rootZcDisplayedSlot;
+    pthread_mutex_unlock(&rootOverlayLock);
 
     // Anything the X server asked us to blit into the root still has to happen, and has to be
     // finished before the compositor reads the buffer. This is real GPU work and a real CPU wait,
@@ -2823,7 +2868,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
         lorie_mutex_lock(&state->lock, &state->lockingPid);
         lockHeldStartNs = rendererNowNs();
-        gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
+        gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot);
         state->drawRequested = FALSE;
         if (gpuCopySerial)
             rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
