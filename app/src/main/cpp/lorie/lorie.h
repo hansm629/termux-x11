@@ -522,6 +522,12 @@ struct lorie_shared_server_state {
         volatile uint32_t directBufferSubmits;    /* a new root buffer put into a SurfaceControl transaction */
         volatile uint32_t directReuseNoSubmit;    /* nothing new to submit; the compositor keeps what it has */
         volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
+        /* A frame not submitted because a copy into its own slot was still queued behind one the
+         * drain had to wait on. What was on screen stays, and it is tried again next vsync. */
+        volatile uint32_t directHeldIncomplete;
+        /* Copies waiting because their destination slot is still on screen - kept apart from
+         * copyDeferrals, which is a buffer that has not been imported yet. */
+        volatile uint32_t copyWaitHeld;
         /* Release fences the compositor handed over that cannot be waited on. Each one costs the
          * pool a buffer for the rest of that pool's life, because nothing has said the compositor
          * is finished with it and time passing does not say so either. */

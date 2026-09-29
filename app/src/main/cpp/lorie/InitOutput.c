@@ -911,10 +911,11 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                     pvfb->state->presentStats.zeroCopyFenceErrors);
 
             log(INFO, "XlorieBackend: asked for %s; %u direct submits, %u nothing-new, "
-                      "%u GL submits (%u failed), %u held for a buffer back%s%s",
+                      "%u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
                 pvfb->state->presentStats.directBufferSubmits,
                 pvfb->state->presentStats.directReuseNoSubmit,
+                pvfb->state->presentStats.directHeldIncomplete,
                 pvfb->state->presentStats.glOutputSubmits,
                 pvfb->state->presentStats.glOutputSubmitFailures,
                 pvfb->state->presentStats.zeroCopyStalls,
@@ -946,9 +947,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.copyRecordExhausted,
                 pvfb->state->presentStats.copyForcedSettle);
 
-        if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
-            log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
-                pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
+        if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copyWaitHeld ||
+            pvfb->state->presentStats.copySkips)
+            log(INFO, "XloriePresent: copies waited %u times for a late buffer and %u times for a slot "
+                      "still on screen; %u given up on or skipped",
+                pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copyWaitHeld,
+                pvfb->state->presentStats.copySkips);
         if (pvfb->state->presentStats.rootCopies || pvfb->state->presentStats.rootStalePostponed)
             log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms, %u handovers left an area for later",
                 pvfb->state->presentStats.rootCopies,
@@ -1018,6 +1022,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.directBufferSubmits = 0;
     pvfb->state->presentStats.directReuseNoSubmit = 0;
     pvfb->state->presentStats.zeroCopyStalls = 0;
+    pvfb->state->presentStats.directHeldIncomplete = 0;
+    pvfb->state->presentStats.copyWaitHeld = 0;
     pvfb->state->presentStats.zeroCopyFenceErrors = 0;
     pvfb->state->presentStats.cursorOverlayMoves = 0;
     pvfb->state->presentStats.requests = 0;

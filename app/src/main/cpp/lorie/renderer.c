@@ -1379,6 +1379,24 @@ static inline void rendererAdvanceReadIndex(void) {
     __atomic_store_n(&state->gpuCopyQueue.readIndex, state->gpuCopyQueue.readIndex + 1, __ATOMIC_RELEASE);
 }
 
+/*
+ * Whether a copy into this buffer is still waiting in the queue. Entries between readIndex and
+ * writeIndex are published and no longer change, so reading them here is safe.
+ *
+ * This is what makes a frame ready or not. The drain stops at the first entry it has to wait on and
+ * everything behind it waits too, so a frame could be submitted while its own copies sat further
+ * down the queue - and once submitted the slot is held, and those copies could no longer be written
+ * into it at all.
+ */
+static bool rendererBufferHasQueuedCopies(uint64_t bufferId) {
+    uint32_t i, end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+
+    for (i = state->gpuCopyQueue.readIndex; i != end; i++)
+        if (state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].dstBufferId == bufferId)
+            return true;
+    return false;
+}
+
 // Which root slot a buffer id names, or -1 if it is not a root slot at all.
 static int rendererRootSlotForBufferId(uint64_t id) {
     int i;
@@ -1469,7 +1487,14 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
             }
 
             if (nowNs < rendererCopyBlockedUntilNs) {
-                state->presentStats.copyDeferrals++;
+                // Two different waits, counted apart: a buffer that has not been imported yet, and a
+                // destination slot the compositor is still showing. The second ends when a release
+                // arrives, not when an import does, and lumping them together hid which one a stall
+                // was actually made of.
+                if (heldOnScreen)
+                    state->presentStats.copyWaitHeld++;
+                else
+                    state->presentStats.copyDeferrals++;
                 break;
             }
             rendererCopyBlockedUntilNs = 0;
@@ -3077,7 +3102,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     uint32_t retireSeq;
     int64_t fenceWaitUs = 0;
     uint64_t gpuCopySerial;
-    bool carriedGpuCopy = false, alreadyOnScreen, gpuWorkIssued;
+    bool carriedGpuCopy = false, alreadyOnScreen, gpuWorkIssued, frameIncomplete = false;
     ASurfaceTransaction *t;
 
     if (!ahb || slot < 0)
@@ -3118,6 +3143,8 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         lorie_mutex_lock(&state->lock, &state->lockingPid);
         lockHeldStartNs = rendererNowNs();
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot, &gpuWorkIssued);
+        // Checked under the same lock as the drain, so the answer describes the queue it just left.
+        frameIncomplete = !alreadyOnScreen && rendererBufferHasQueuedCopies(desc->id);
         state->drawRequested = FALSE;
         if (gpuWorkIssued)
             rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
@@ -3134,6 +3161,24 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
         }
+    }
+
+    if (frameIncomplete) {
+        /*
+         * The frame this slot holds is not finished: a copy into it is still queued behind one the
+         * drain had to wait on. Submitting it anyway put an incomplete frame on screen, and made the
+         * slot held so the rest of its copies could not be written into it afterwards.
+         *
+         * So what is on screen stays, the claim is given back, and the frame is asked for again at
+         * the next vsync. The wait ends when the entry at the head resolves - its buffer arrives,
+         * its slot is released, or the drain gives up on it - which is bounded by the same deadline
+         * that already bounds every other wait at the head of the queue.
+         */
+        state->presentStats.directHeldIncomplete++;
+        rendererReleaseRootBuffer();
+        rendererSetOutputRetry(true);
+        rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
+        return true;
     }
 
     pthread_mutex_lock(&rootOverlayLock);
