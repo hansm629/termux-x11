@@ -11,6 +11,7 @@
 #include <jni.h>
 #include <screenint.h>
 #include <errno.h>
+#include <string.h>
 #include <sys/socket.h>
 #include "linux/input-event-codes.h"
 #include "buffer.h"
@@ -74,6 +75,7 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
     // so in the case if renderer or X server process unexpectedly die with locked mutex
     // we will simply reinitialize it.
     struct timespec ts = {0};
+    int timeouts = 0;
     while(true) {
         // CLOCK_REALTIME, because that is the clock pthread_mutex_timedlock() measures its absolute
         // deadline against. A CLOCK_MONOTONIC value is seconds since boot where this wants seconds
@@ -95,8 +97,27 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
         // be reached only by ETIMEDOUT - every other error returned as though the lock had been
         // taken, and the caller went on to touch shared state it did not own.
         if (ret != 0) {
-            if (*lockingPid == getpid() || lorieConnectionAlive())
+            // ETIMEDOUT is the only error that waiting again can fix: it says someone else holds
+            // the lock and had not finished within the deadline. Every other error was retried
+            // just as hard, which for a mutex that can never be acquired - EINVAL on an unusable
+            // one, EAGAIN at the recursive limit - is an endless loop inside the X server with
+            // nothing said about why. So those go straight to the reinitialization below: it is
+            // the only step that can change the answer, and a mutex that cannot be locked at all
+            // is not made worse by it.
+            if (ret == ETIMEDOUT && (*lockingPid == getpid() || lorieConnectionAlive())) {
+                // Being alive is not the same as making progress, and this loop has no way to
+                // tell. Reinitializing under a live holder would break mutual exclusion, so the
+                // wait continues - but it says so, once a second, instead of spinning silently.
+                if (++timeouts % 30 == 0)
+                    __android_log_print(ANDROID_LOG_WARN, "lorie",
+                                        "still waiting for the shared lock after %d ms (held by pid %d)",
+                                        timeouts * 33, *lockingPid);
                 continue;
+            }
+
+            if (ret != ETIMEDOUT)
+                __android_log_print(ANDROID_LOG_ERROR, "lorie",
+                                    "shared lock is unusable (%s); reinitializing it", strerror(ret));
 
             pthread_mutexattr_t attr;
             pthread_mutex_t initializer = PTHREAD_MUTEX_INITIALIZER;
@@ -105,6 +126,7 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
             pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
             memcpy(mutex, &initializer, sizeof(initializer));
             pthread_mutex_init(mutex, &attr);
+            timeouts = 0;
             // Mutex will be locked fine on the next iteration
         } else {
             *lockingPid = getpid();
