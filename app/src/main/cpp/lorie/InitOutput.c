@@ -890,16 +890,91 @@ static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint32_t samples;
     static Bool driverLogged = FALSE;
+    /*
+     * Everything this reports is taken in one pass at the start, each counter read and zeroed in the
+     * same atomic exchange, and the report is built from that copy. It used to read the live counters
+     * line by line while the renderer kept adding to them and then zero them all at the end, so an
+     * update landing between a read and its reset was lost, and two numbers on one line could come
+     * from different moments. The renderer's side adds atomically to match. Fields that are values
+     * rather than counters are copied as they are.
+     */
+    __typeof__(pvfb->state->presentStats) snap;
+    int renderedFrames = __atomic_exchange_n(&pvfb->state->renderedFrames, 0, __ATOMIC_RELAXED);
+
+    snap.coalescedFrames = __atomic_exchange_n(&pvfb->state->presentStats.coalescedFrames, 0, __ATOMIC_RELAXED);
+    snap.copyAbandons = __atomic_exchange_n(&pvfb->state->presentStats.copyAbandons, 0, __ATOMIC_RELAXED);
+    snap.copyCompletions = __atomic_exchange_n(&pvfb->state->presentStats.copyCompletions, 0, __ATOMIC_RELAXED);
+    snap.copyDeferrals = __atomic_exchange_n(&pvfb->state->presentStats.copyDeferrals, 0, __ATOMIC_RELAXED);
+    snap.copyForcedSettle = __atomic_exchange_n(&pvfb->state->presentStats.copyForcedSettle, 0, __ATOMIC_RELAXED);
+    snap.copyLatencyMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencyMaxUs, 0, __ATOMIC_RELAXED);
+    snap.copyLatencySumUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencySumUs, 0, __ATOMIC_RELAXED);
+    snap.copyRecordExhausted = __atomic_exchange_n(&pvfb->state->presentStats.copyRecordExhausted, 0, __ATOMIC_RELAXED);
+    snap.copyRequeues = __atomic_exchange_n(&pvfb->state->presentStats.copyRequeues, 0, __ATOMIC_RELAXED);
+    snap.copySkips = __atomic_exchange_n(&pvfb->state->presentStats.copySkips, 0, __ATOMIC_RELAXED);
+    snap.copyWaitHeld = __atomic_exchange_n(&pvfb->state->presentStats.copyWaitHeld, 0, __ATOMIC_RELAXED);
+    snap.cursorOnlyFrames = __atomic_exchange_n(&pvfb->state->presentStats.cursorOnlyFrames, 0, __ATOMIC_RELAXED);
+    snap.cursorOverlayMoves = __atomic_exchange_n(&pvfb->state->presentStats.cursorOverlayMoves, 0, __ATOMIC_RELAXED);
+    snap.cursorUploadUs = __atomic_exchange_n(&pvfb->state->presentStats.cursorUploadUs, 0, __ATOMIC_RELAXED);
+    snap.cursorUploads = __atomic_exchange_n(&pvfb->state->presentStats.cursorUploads, 0, __ATOMIC_RELAXED);
+    snap.directBufferSubmits = __atomic_exchange_n(&pvfb->state->presentStats.directBufferSubmits, 0, __ATOMIC_RELAXED);
+    snap.directHeldIncomplete = __atomic_exchange_n(&pvfb->state->presentStats.directHeldIncomplete, 0, __ATOMIC_RELAXED);
+    snap.directReuseNoSubmit = __atomic_exchange_n(&pvfb->state->presentStats.directReuseNoSubmit, 0, __ATOMIC_RELAXED);
+    snap.displayRefreshMHz = pvfb->state->presentStats.displayRefreshMHz;
+    snap.fenceFallbacks = __atomic_exchange_n(&pvfb->state->presentStats.fenceFallbacks, 0, __ATOMIC_RELAXED);
+    snap.fenceWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.fenceWaitMaxUs, 0, __ATOMIC_RELAXED);
+    snap.fenceWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.fenceWaitUs, 0, __ATOMIC_RELAXED);
+    snap.flushUs = __atomic_exchange_n(&pvfb->state->presentStats.flushUs, 0, __ATOMIC_RELAXED);
+    snap.frameSamples = __atomic_exchange_n(&pvfb->state->presentStats.frameSamples, 0, __ATOMIC_RELAXED);
+    snap.frameSumUs = __atomic_exchange_n(&pvfb->state->presentStats.frameSumUs, 0, __ATOMIC_RELAXED);
+    snap.glOutputSubmitFailures = __atomic_exchange_n(&pvfb->state->presentStats.glOutputSubmitFailures, 0, __ATOMIC_RELAXED);
+    snap.glOutputSubmits = __atomic_exchange_n(&pvfb->state->presentStats.glOutputSubmits, 0, __ATOMIC_RELAXED);
+    snap.gpuCopyFrames = __atomic_exchange_n(&pvfb->state->presentStats.gpuCopyFrames, 0, __ATOMIC_RELAXED);
+    snap.lockHeldUs = __atomic_exchange_n(&pvfb->state->presentStats.lockHeldUs, 0, __ATOMIC_RELAXED);
+    snap.lockWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.lockWaitMaxUs, 0, __ATOMIC_RELAXED);
+    snap.lockWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.lockWaitUs, 0, __ATOMIC_RELAXED);
+    snap.longFrames = __atomic_exchange_n(&pvfb->state->presentStats.longFrames, 0, __ATOMIC_RELAXED);
+    snap.maxFrameUs = __atomic_exchange_n(&pvfb->state->presentStats.maxFrameUs, 0, __ATOMIC_RELAXED);
+    snap.pointerMoves = __atomic_exchange_n(&pvfb->state->presentStats.pointerMoves, 0, __ATOMIC_RELAXED);
+    snap.presentCompletions = __atomic_exchange_n(&pvfb->state->presentStats.presentCompletions, 0, __ATOMIC_RELAXED);
+    snap.presentGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.presentGapMaxUs, 0, __ATOMIC_RELAXED);
+    snap.presentGapSumUs = __atomic_exchange_n(&pvfb->state->presentStats.presentGapSumUs, 0, __ATOMIC_RELAXED);
+    snap.presentGapsLate = __atomic_exchange_n(&pvfb->state->presentStats.presentGapsLate, 0, __ATOMIC_RELAXED);
+    snap.presentSubmits = __atomic_exchange_n(&pvfb->state->presentStats.presentSubmits, 0, __ATOMIC_RELAXED);
+    snap.requestAheadMax = __atomic_exchange_n(&pvfb->state->presentStats.requestAheadMax, 0, __ATOMIC_RELAXED);
+    snap.requestGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.requestGapMaxUs, 0, __ATOMIC_RELAXED);
+    snap.requests = __atomic_exchange_n(&pvfb->state->presentStats.requests, 0, __ATOMIC_RELAXED);
+    snap.rootCopies = __atomic_exchange_n(&pvfb->state->presentStats.rootCopies, 0, __ATOMIC_RELAXED);
+    snap.rootCopyBytes = __atomic_exchange_n(&pvfb->state->presentStats.rootCopyBytes, 0, __ATOMIC_RELAXED);
+    snap.rootCopyUs = __atomic_exchange_n(&pvfb->state->presentStats.rootCopyUs, 0, __ATOMIC_RELAXED);
+    snap.rootOwedRepairs = __atomic_exchange_n(&pvfb->state->presentStats.rootOwedRepairs, 0, __ATOMIC_RELAXED);
+    snap.rootPublishAttempts = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishAttempts, 0, __ATOMIC_RELAXED);
+    snap.rootPublishHeldForRepair = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishHeldForRepair, 0, __ATOMIC_RELAXED);
+    snap.rootPublishNoSlot = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishNoSlot, 0, __ATOMIC_RELAXED);
+    snap.rootPublishes = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishes, 0, __ATOMIC_RELAXED);
+    snap.rootRemapUs = __atomic_exchange_n(&pvfb->state->presentStats.rootRemapUs, 0, __ATOMIC_RELAXED);
+    snap.rootRemaps = __atomic_exchange_n(&pvfb->state->presentStats.rootRemaps, 0, __ATOMIC_RELAXED);
+    snap.rootStalePostponed = __atomic_exchange_n(&pvfb->state->presentStats.rootStalePostponed, 0, __ATOMIC_RELAXED);
+    snap.rootUnpublishedMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.rootUnpublishedMaxUs, 0, __ATOMIC_RELAXED);
+    snap.rootUnpublishedNowMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.rootUnpublishedNowMaxUs, 0, __ATOMIC_RELAXED);
+    snap.submitGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.submitGapMaxUs, 0, __ATOMIC_RELAXED);
+    snap.vsyncRecordsLost = __atomic_exchange_n(&pvfb->state->presentStats.vsyncRecordsLost, 0, __ATOMIC_RELAXED);
+    snap.xDispatchMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.xDispatchMaxUs, 0, __ATOMIC_RELAXED);
+    snap.xLockWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaitMaxUs, 0, __ATOMIC_RELAXED);
+    snap.xLockWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaitUs, 0, __ATOMIC_RELAXED);
+    snap.xLockWaits = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaits, 0, __ATOMIC_RELAXED);
+    snap.zeroCopyFenceErrors = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyFenceErrors, 0, __ATOMIC_RELAXED);
+    snap.zeroCopyStalls = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyStalls, 0, __ATOMIC_RELAXED);
+
 
     if (!driverLogged && pvfb->state->rendererDriver[0]) {
         driverLogged = TRUE;
         log(INFO, "XlorieFrames: renderer GLES driver: %s", (const char *) pvfb->state->rendererDriver);
     }
 
-    if (pvfb->state->renderedFrames || gpuCopyAttempts)
+    if (renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
                                    : "%d frames in 5.0 seconds = %.1f FPS",
-            pvfb->state->renderedFrames, ((float) pvfb->state->renderedFrames) / 5,
+            renderedFrames, ((float) renderedFrames) / 5,
             (unsigned long long) gpuCopyOffloads, (unsigned long long) gpuCopyAttempts);
 
     /*
@@ -908,47 +983,47 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
      * come from the renderer through the shared state, since its own logcat is unreachable from
      * here.
      */
-    samples = pvfb->state->presentStats.frameSamples;
+    samples = snap.frameSamples;
     if (samples) {
         log(INFO, "XlorieFrames: frame avg %.1f ms, max %.1f ms, hitches(>=%d ms) %u, "
                   "submit %.1f ms + fence wait %.1f ms total (worst wait %.1f ms), "
                   "copies on %u frames, coalesced %u, glFinish fallbacks %u",
-            (double) pvfb->state->presentStats.frameSumUs / samples / 1000.0,
-            pvfb->state->presentStats.maxFrameUs / 1000.0,
+            (double) snap.frameSumUs / samples / 1000.0,
+            snap.maxFrameUs / 1000.0,
             LORIE_LONG_FRAME_US / 1000,
-            pvfb->state->presentStats.longFrames,
-            pvfb->state->presentStats.flushUs / 1000.0,
-            pvfb->state->presentStats.fenceWaitUs / 1000.0,
-            pvfb->state->presentStats.fenceWaitMaxUs / 1000.0,
-            pvfb->state->presentStats.gpuCopyFrames,
-            pvfb->state->presentStats.coalescedFrames,
-            pvfb->state->presentStats.fenceFallbacks);
+            snap.longFrames,
+            snap.flushUs / 1000.0,
+            snap.fenceWaitUs / 1000.0,
+            snap.fenceWaitMaxUs / 1000.0,
+            snap.gpuCopyFrames,
+            snap.coalescedFrames,
+            snap.fenceFallbacks);
         log(INFO, "XlorieLock: renderer held the root lock %.1f%% of the time (%.0f ms), "
                   "spent %.0f ms getting it (worst %.1f ms), "
                   "X server blocked on it %.0f ms over %u accesses (worst %.1f ms), "
                   "cursor-only frames %u (overlay %u) of %u pointer moves, display %.1f Hz",
-            pvfb->state->presentStats.lockHeldUs / 50000.0,
-            pvfb->state->presentStats.lockHeldUs / 1000.0,
-            pvfb->state->presentStats.lockWaitUs / 1000.0,
-            pvfb->state->presentStats.lockWaitMaxUs / 1000.0,
-            pvfb->state->presentStats.xLockWaitUs / 1000.0,
-            pvfb->state->presentStats.xLockWaits,
-            pvfb->state->presentStats.xLockWaitMaxUs / 1000.0,
-            pvfb->state->presentStats.cursorOnlyFrames,
-            pvfb->state->presentStats.cursorOverlayMoves,
-            pvfb->state->presentStats.pointerMoves,
-            pvfb->state->presentStats.displayRefreshMHz / 1000.0);
-        if (pvfb->state->presentStats.presentCompletions > 1) {
+            snap.lockHeldUs / 50000.0,
+            snap.lockHeldUs / 1000.0,
+            snap.lockWaitUs / 1000.0,
+            snap.lockWaitMaxUs / 1000.0,
+            snap.xLockWaitUs / 1000.0,
+            snap.xLockWaits,
+            snap.xLockWaitMaxUs / 1000.0,
+            snap.cursorOnlyFrames,
+            snap.cursorOverlayMoves,
+            snap.pointerMoves,
+            snap.displayRefreshMHz / 1000.0);
+        if (snap.presentCompletions > 1) {
             log(INFO, "XloriePresent: %u client presents reached the screen in 5.0 s "
                       "(avg %.1f ms apart, longest %.1f ms, %u later than 33 ms)",
-                pvfb->state->presentStats.presentCompletions,
-                pvfb->state->presentStats.presentGapSumUs / 1000.0 /
-                    (pvfb->state->presentStats.presentCompletions - 1),
-                pvfb->state->presentStats.presentGapMaxUs / 1000.0,
-                pvfb->state->presentStats.presentGapsLate);
+                snap.presentCompletions,
+                snap.presentGapSumUs / 1000.0 /
+                    (snap.presentCompletions - 1),
+                snap.presentGapMaxUs / 1000.0,
+                snap.presentGapsLate);
             log(INFO, "XloriePresent: %u submitted by clients (longest gap between submissions %.1f ms)",
-                pvfb->state->presentStats.presentSubmits,
-                pvfb->state->presentStats.submitGapMaxUs / 1000.0);
+                snap.presentSubmits,
+                snap.submitGapMaxUs / 1000.0);
         }
         /*
          * Which path the frames in this window actually took, and why not the other one. The
@@ -964,147 +1039,84 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
                               : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
 
-            if (pvfb->state->presentStats.zeroCopyFenceErrors)
+            if (snap.zeroCopyFenceErrors)
                 log(INFO, "XlorieBackend: %u release fences could not be waited on; those slots "
                           "stay held until the pool is replaced",
-                    pvfb->state->presentStats.zeroCopyFenceErrors);
+                    snap.zeroCopyFenceErrors);
 
             log(INFO, "XlorieBackend: asked for %s; %u direct submits, %u nothing-new, "
                       "%u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
-                pvfb->state->presentStats.directBufferSubmits,
-                pvfb->state->presentStats.directReuseNoSubmit,
-                pvfb->state->presentStats.directHeldIncomplete,
-                pvfb->state->presentStats.glOutputSubmits,
-                pvfb->state->presentStats.glOutputSubmitFailures,
-                pvfb->state->presentStats.zeroCopyStalls,
+                snap.directBufferSubmits,
+                snap.directReuseNoSubmit,
+                snap.directHeldIncomplete,
+                snap.glOutputSubmits,
+                snap.glOutputSubmitFailures,
+                snap.zeroCopyStalls,
                 pvfb->state->outputBackendReason[0] ? "; not direct because: " : "",
                 pvfb->state->outputBackendReason[0] ? (const char *) pvfb->state->outputBackendReason : "");
         }
 
-        if (pvfb->state->presentStats.requests)
+        if (snap.requests)
             log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
-                pvfb->state->presentStats.requests,
-                pvfb->state->presentStats.requestGapMaxUs / 1000.0,
-                pvfb->state->presentStats.requestAheadMax);
+                snap.requests,
+                snap.requestGapMaxUs / 1000.0,
+                snap.requestAheadMax);
 
-        if (pvfb->state->presentStats.copyCompletions)
+        if (snap.copyCompletions)
             log(INFO, "XlorieCopy: %u copies took avg %.1f ms, longest %.1f ms, found unfinished %u times",
-                pvfb->state->presentStats.copyCompletions,
-                pvfb->state->presentStats.copyLatencySumUs / 1000.0 / pvfb->state->presentStats.copyCompletions,
-                pvfb->state->presentStats.copyLatencyMaxUs / 1000.0,
-                pvfb->state->presentStats.copyRequeues);
+                snap.copyCompletions,
+                snap.copyLatencySumUs / 1000.0 / snap.copyCompletions,
+                snap.copyLatencyMaxUs / 1000.0,
+                snap.copyRequeues);
 
         // How the copies that did not end in an ack ended instead. Both are invisible from outside
         // - an abandoned copy looks like a client that stopped sending, and a copy that was never
         // offered looks like the GPU path simply not being taken.
-        if (pvfb->state->presentStats.copyAbandons || pvfb->state->presentStats.copyRecordExhausted ||
-            pvfb->state->presentStats.copyForcedSettle)
+        if (snap.copyAbandons || snap.copyRecordExhausted ||
+            snap.copyForcedSettle)
             log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room), "
                       "%u let go without a result because their session ended",
-                pvfb->state->presentStats.copyAbandons,
-                pvfb->state->presentStats.copyRecordExhausted,
-                pvfb->state->presentStats.copyForcedSettle);
+                snap.copyAbandons,
+                snap.copyRecordExhausted,
+                snap.copyForcedSettle);
 
-        if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copyWaitHeld ||
-            pvfb->state->presentStats.copySkips)
+        if (snap.copyDeferrals || snap.copyWaitHeld ||
+            snap.copySkips)
             log(INFO, "XloriePresent: copies waited %u times for a late buffer and %u times for a slot "
                       "still on screen; %u given up on or skipped",
-                pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copyWaitHeld,
-                pvfb->state->presentStats.copySkips);
-        if (pvfb->state->presentStats.rootCopies || pvfb->state->presentStats.rootStalePostponed)
+                snap.copyDeferrals, snap.copyWaitHeld,
+                snap.copySkips);
+        if (snap.rootCopies || snap.rootStalePostponed)
             log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms, %u handovers left an area for later",
-                pvfb->state->presentStats.rootCopies,
-                pvfb->state->presentStats.rootCopyBytes / 1048576.0,
-                pvfb->state->presentStats.rootCopyUs / 1000.0,
-                pvfb->state->presentStats.rootStalePostponed);
-        if (pvfb->state->presentStats.rootPublishAttempts)
+                snap.rootCopies,
+                snap.rootCopyBytes / 1048576.0,
+                snap.rootCopyUs / 1000.0,
+                snap.rootStalePostponed);
+        if (snap.rootPublishAttempts)
             log(INFO, "XlorieRootPublish: %u of %u attempts published, %u found no free slot, "
                       "%u held for a repair (%u areas repaired), "
                       "longest wait to publish %.1f ms (still waiting, worst so far %.1f ms)",
-                pvfb->state->presentStats.rootPublishes,
-                pvfb->state->presentStats.rootPublishAttempts,
-                pvfb->state->presentStats.rootPublishNoSlot,
-                pvfb->state->presentStats.rootPublishHeldForRepair,
-                pvfb->state->presentStats.rootOwedRepairs,
-                pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0,
-                pvfb->state->presentStats.rootUnpublishedNowMaxUs / 1000.0);
+                snap.rootPublishes,
+                snap.rootPublishAttempts,
+                snap.rootPublishNoSlot,
+                snap.rootPublishHeldForRepair,
+                snap.rootOwedRepairs,
+                snap.rootUnpublishedMaxUs / 1000.0,
+                snap.rootUnpublishedNowMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms, "
                   "%u vsync times lost to backlog",
-            pvfb->state->presentStats.rootRemapUs / 1000.0,
-            pvfb->state->presentStats.rootRemaps,
-            pvfb->state->presentStats.xDispatchMaxUs / 1000.0,
-            pvfb->state->presentStats.vsyncRecordsLost);
-        if (pvfb->state->presentStats.cursorUploads)
+            snap.rootRemapUs / 1000.0,
+            snap.rootRemaps,
+            snap.xDispatchMaxUs / 1000.0,
+            snap.vsyncRecordsLost);
+        if (snap.cursorUploads)
             log(INFO, "XlorieLock: cursor image uploaded %u times, %.1f ms total",
-                pvfb->state->presentStats.cursorUploads,
-                pvfb->state->presentStats.cursorUploadUs / 1000.0);
+                snap.cursorUploads,
+                snap.cursorUploadUs / 1000.0);
     }
 
-    pvfb->state->presentStats.frameSamples = 0;
-    pvfb->state->presentStats.frameSumUs = 0;
-    pvfb->state->presentStats.maxFrameUs = 0;
-    pvfb->state->presentStats.longFrames = 0;
-    pvfb->state->presentStats.fenceWaitUs = 0;
-    pvfb->state->presentStats.flushUs = 0;
-    pvfb->state->presentStats.fenceFallbacks = 0;
-    pvfb->state->presentStats.lockWaitUs = 0;
-    pvfb->state->presentStats.lockWaitMaxUs = 0;
-    pvfb->state->presentStats.gpuCopyFrames = 0;
-    pvfb->state->presentStats.coalescedFrames = 0;
-    pvfb->state->presentStats.lockHeldUs = 0;
-    pvfb->state->presentStats.cursorOnlyFrames = 0;
-    pvfb->state->presentStats.xLockWaitMaxUs = 0;
-    pvfb->state->presentStats.fenceWaitMaxUs = 0;
-    pvfb->state->presentStats.xLockWaitUs = 0;
-    pvfb->state->presentStats.xLockWaits = 0;
-    pvfb->state->presentStats.pointerMoves = 0;
-    pvfb->state->presentStats.cursorUploads = 0;
-    pvfb->state->presentStats.cursorUploadUs = 0;
-    pvfb->state->presentStats.rootRemapUs = 0;
-    pvfb->state->presentStats.rootRemaps = 0;
-    pvfb->state->presentStats.rootCopyBytes = 0;
-    pvfb->state->presentStats.rootCopyUs = 0;
-    pvfb->state->presentStats.rootCopies = 0;
-    pvfb->state->presentStats.rootStalePostponed = 0;
-    pvfb->state->presentStats.rootPublishAttempts = 0;
-    pvfb->state->presentStats.rootPublishes = 0;
-    pvfb->state->presentStats.rootPublishNoSlot = 0;
-    pvfb->state->presentStats.rootPublishHeldForRepair = 0;
-    pvfb->state->presentStats.rootOwedRepairs = 0;
-    pvfb->state->presentStats.rootUnpublishedMaxUs = 0;
-    pvfb->state->presentStats.rootUnpublishedNowMaxUs = 0;
-    pvfb->state->presentStats.xDispatchMaxUs = 0;
-    pvfb->state->presentStats.vsyncRecordsLost = 0;
-    pvfb->state->presentStats.presentCompletions = 0;
-    pvfb->state->presentStats.presentGapSumUs = 0;
-    pvfb->state->presentStats.presentGapMaxUs = 0;
-    pvfb->state->presentStats.glOutputSubmits = 0;
-    pvfb->state->presentStats.glOutputSubmitFailures = 0;
-    pvfb->state->presentStats.directBufferSubmits = 0;
-    pvfb->state->presentStats.directReuseNoSubmit = 0;
-    pvfb->state->presentStats.zeroCopyStalls = 0;
-    pvfb->state->presentStats.directHeldIncomplete = 0;
-    pvfb->state->presentStats.copyWaitHeld = 0;
-    pvfb->state->presentStats.zeroCopyFenceErrors = 0;
-    pvfb->state->presentStats.cursorOverlayMoves = 0;
-    pvfb->state->presentStats.requests = 0;
-    pvfb->state->presentStats.requestGapMaxUs = 0;
-    pvfb->state->presentStats.requestAheadMax = 0;
-    pvfb->state->presentStats.copyLatencySumUs = 0;
-    pvfb->state->presentStats.copyLatencyMaxUs = 0;
-    pvfb->state->presentStats.copyCompletions = 0;
-    pvfb->state->presentStats.copyRequeues = 0;
-    pvfb->state->presentStats.copyAbandons = 0;
-    pvfb->state->presentStats.copyRecordExhausted = 0;
-    pvfb->state->presentStats.copyForcedSettle = 0;
-    pvfb->state->presentStats.copyDeferrals = 0;
-    pvfb->state->presentStats.copySkips = 0;
-    pvfb->state->presentStats.presentGapsLate = 0;
-    pvfb->state->presentStats.presentSubmits = 0;
-    pvfb->state->presentStats.submitGapMaxUs = 0;
 
-    pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     return 5000;
 }

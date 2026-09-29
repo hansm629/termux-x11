@@ -81,6 +81,21 @@ __unused void rendererRemoveAllBuffers(void);
  * "busy" several times in a row and cannot be relied on; the caller must then leave the shared state
  * it guards alone, and do whatever it would do if it had nothing to draw or copy this time.
  */
+/*
+ * Raises a shared statistics maximum without losing a concurrent reset. The X server reads these
+ * counters and zeroes them in one atomic exchange; a plain "if bigger, store" on the other side
+ * could read the old value, lose the race to that exchange, and then write the stale maximum back
+ * over the reset.
+ */
+#define LORIE_STAT_MAX(ptr, value) do { \
+    __auto_type _lorieOld = __atomic_load_n((ptr), __ATOMIC_RELAXED); \
+    __typeof__(_lorieOld) _lorieNew = (value); \
+    while (_lorieNew > _lorieOld && \
+           !__atomic_compare_exchange_n((ptr), &_lorieOld, _lorieNew, false, \
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) \
+        ; \
+} while (0)
+
 __attribute__((warn_unused_result))
 static inline __always_inline bool lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {
     // Unfortunately there is no robust mutexes in bionic.

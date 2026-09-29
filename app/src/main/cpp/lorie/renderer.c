@@ -1459,7 +1459,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
             // letting it ride out on completedSerial: it was not made, and the present has to be
             // scrapped so the client is told its frame was skipped instead of presented.
             rendererPublishFailedSerial(entry.serial);
-            state->presentStats.copySkips++;
+            __atomic_fetch_add(&state->presentStats.copySkips, 1, __ATOMIC_RELAXED);
             // Drained like any other entry: nothing of it is left for the GPU to do.
             lastSerial = entry.serial;
             rendererAdvanceReadIndex();
@@ -1498,9 +1498,9 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
                 // arrives, not when an import does, and lumping them together hid which one a stall
                 // was actually made of.
                 if (heldOnScreen)
-                    state->presentStats.copyWaitHeld++;
+                    __atomic_fetch_add(&state->presentStats.copyWaitHeld, 1, __ATOMIC_RELAXED);
                 else
-                    state->presentStats.copyDeferrals++;
+                    __atomic_fetch_add(&state->presentStats.copyDeferrals, 1, __ATOMIC_RELAXED);
                 break;
             }
             rendererCopyBlockedUntilNs = 0;
@@ -1511,7 +1511,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
                 heldOnScreen ? "its destination root slot stayed on screen"
                              : src ? "its destination buffer never arrived"
                                    : "its source buffer never arrived");
-            state->presentStats.copySkips++;
+            __atomic_fetch_add(&state->presentStats.copySkips, 1, __ATOMIC_RELAXED);
 
             // Say so. Letting this serial ride out on completedSerial told the X server the copy
             // had been made, which told the client its frame was on screen when nothing had been
@@ -1613,7 +1613,7 @@ static int64_t rendererWaitForFence(EGLSync fence) {
         eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER) != EGL_CONDITION_SATISFIED_KHR) {
         glFinish();
         if (state)
-            state->presentStats.fenceFallbacks++;
+            __atomic_fetch_add(&state->presentStats.fenceFallbacks, 1, __ATOMIC_RELAXED);
     }
     return rendererNsToUs(rendererNowNs() - waitStartNs);
 }
@@ -1644,10 +1644,9 @@ static void rendererFinishIssuedWork(int64_t *flushUs, int64_t *waitUs) {
 static void rendererNoteLock(int64_t waitUs, int64_t heldUs) {
     if (!state)
         return;
-    state->presentStats.lockWaitUs += (uint32_t) waitUs;
-    if ((uint32_t) waitUs > state->presentStats.lockWaitMaxUs)
-        state->presentStats.lockWaitMaxUs = (uint32_t) waitUs;
-    state->presentStats.lockHeldUs += (uint32_t) heldUs;
+    __atomic_fetch_add(&state->presentStats.lockWaitUs, (uint32_t) waitUs, __ATOMIC_RELAXED);
+    LORIE_STAT_MAX(&state->presentStats.lockWaitMaxUs, (uint32_t) waitUs);
+    __atomic_fetch_add(&state->presentStats.lockHeldUs, (uint32_t) heldUs, __ATOMIC_RELAXED);
 }
 
 // Standalone entry point used by the renderer thread's main loop. Used when no redraw is going to
@@ -1678,10 +1677,9 @@ static void rendererApplyPendingGpuCopies(void) {
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
     rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockWaitStartNs),
                      rendererNsToUs(rendererNowNs() - lockHeldStartNs));
-    state->presentStats.flushUs += (uint32_t) flushUs;
-    state->presentStats.fenceWaitUs += (uint32_t) waitUs;
-    if ((uint32_t) waitUs > state->presentStats.fenceWaitMaxUs)
-        state->presentStats.fenceWaitMaxUs = (uint32_t) waitUs;
+    __atomic_fetch_add(&state->presentStats.flushUs, (uint32_t) flushUs, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.fenceWaitUs, (uint32_t) waitUs, __ATOMIC_RELAXED);
+    LORIE_STAT_MAX(&state->presentStats.fenceWaitMaxUs, (uint32_t) waitUs);
 }
 
 // Frame pacing numbers the X server prints every 5 seconds (see lorieFramecounter). Kept separate
@@ -1707,25 +1705,23 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
     if (lastFrameStartNs) {
         uint32_t deltaUs = (uint32_t) rendererNsToUs(frameStartNs - lastFrameStartNs);
 
-        state->presentStats.frameSumUs += deltaUs;
-        state->presentStats.frameSamples++;
-        if (deltaUs > state->presentStats.maxFrameUs)
-            state->presentStats.maxFrameUs = deltaUs;
+        __atomic_fetch_add(&state->presentStats.frameSumUs, deltaUs, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&state->presentStats.frameSamples, 1, __ATOMIC_RELAXED);
+        LORIE_STAT_MAX(&state->presentStats.maxFrameUs, deltaUs);
         if (deltaUs >= LORIE_LONG_FRAME_US)
-            state->presentStats.longFrames++;
+            __atomic_fetch_add(&state->presentStats.longFrames, 1, __ATOMIC_RELAXED);
     }
 
     lastFrameStartNs = frameStartNs;
 
     if (fenceWaitUs > 0) {
-        state->presentStats.fenceWaitUs += (uint32_t) fenceWaitUs;
-        if ((uint32_t) fenceWaitUs > state->presentStats.fenceWaitMaxUs)
-            state->presentStats.fenceWaitMaxUs = (uint32_t) fenceWaitUs;
+        __atomic_fetch_add(&state->presentStats.fenceWaitUs, (uint32_t) fenceWaitUs, __ATOMIC_RELAXED);
+        LORIE_STAT_MAX(&state->presentStats.fenceWaitMaxUs, (uint32_t) fenceWaitUs);
     }
     if (carriedGpuCopy)
-        state->presentStats.gpuCopyFrames++;
+        __atomic_fetch_add(&state->presentStats.gpuCopyFrames, 1, __ATOMIC_RELAXED);
     if (coalesceWaitUs > 0)
-        state->presentStats.coalescedFrames++;
+        __atomic_fetch_add(&state->presentStats.coalescedFrames, 1, __ATOMIC_RELAXED);
 
     state->presentStats.displayRefreshMHz = (uint32_t) (rendererDisplayRefreshRateHz * 1000.0f);
 }
@@ -1783,7 +1779,7 @@ static void rendererRetireFrame(void) {
         // Nothing to wait on, and publishing the serial regardless would say the GPU had finished.
         glFinish();
         if (state)
-            state->presentStats.fenceFallbacks++;
+            __atomic_fetch_add(&state->presentStats.fenceFallbacks, 1, __ATOMIC_RELAXED);
     } else {
         // Zero timeout: this has normally signalled long ago. The flush bit only matters for the
         // rare case where nothing has been submitted since, and the blocking wait is the safety
@@ -1927,7 +1923,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         if (!rootZcDrainRetiring()) {
             // The compositor has not finished with the buffer before last. Reusing it now is exactly
             // the tearing this cannot afford, so drop the frame instead - what is on screen stays.
-            state->presentStats.zeroCopyStalls++;
+            __atomic_fetch_add(&state->presentStats.zeroCopyStalls, 1, __ATOMIC_RELAXED);
             // The slot just claimed may be one already held for the compositor; only give back one
             // that is not.
             {
@@ -2013,8 +2009,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             }
             lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
         }
-        state->presentStats.cursorUploads++;
-        state->presentStats.cursorUploadUs += (uint32_t) rendererNsToUs(rendererNowNs() - uploadStartNs);
+        __atomic_fetch_add(&state->presentStats.cursorUploads, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&state->presentStats.cursorUploadUs, (uint32_t) rendererNsToUs(rendererNowNs() - uploadStartNs), __ATOMIC_RELAXED);
     }
 
     // We should signal X server to not use root window while we actively copy it
@@ -2168,14 +2164,14 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     // A frame that failed to swap put nothing on screen, so it is not one.
     if (swapOk) {
-        state->presentStats.glOutputSubmits++;
-        state->renderedFrames++;
+        __atomic_fetch_add(&state->presentStats.glOutputSubmits, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&state->renderedFrames, 1, __ATOMIC_RELAXED);
     } else
-        state->presentStats.glOutputSubmitFailures++;
+        __atomic_fetch_add(&state->presentStats.glOutputSubmitFailures, 1, __ATOMIC_RELAXED);
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
     rendererNoteLock(lockWaitUs, lockHeldUs);
     if (cursorOnlyFrame)
-        state->presentStats.cursorOnlyFrames++;
+        __atomic_fetch_add(&state->presentStats.cursorOnlyFrames, 1, __ATOMIC_RELAXED);
 
     if (rendererPerfLogEnabled) {
         int64_t totalUs = rendererNsToUs(rendererNowNs() - frameStartNs);
@@ -2408,7 +2404,7 @@ __noreturn static void* rendererThread(void) {
         if (cursorOnly && state->surfaceAvailable && cursorOverlaySourceW > 0.f && cursorOverlayUsable()) {
             markCursorOverlayDirty(state->cursor.updated);
             state->cursor.moved = state->cursor.updated = FALSE;
-            state->presentStats.cursorOverlayMoves++;
+            __atomic_fetch_add(&state->presentStats.cursorOverlayMoves, 1, __ATOMIC_RELAXED);
         } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
             (state->drawRequested || rootZcRetryPending || state->cursor.moved ||
              state->cursor.updated || gpuCopyPending)) {
@@ -3019,7 +3015,7 @@ static bool rootZcDrainRetiring(void) {
             // use. The slot is not freed: nothing has told us the compositor is finished with it.
             log("XlorieRootZc: release fence for slot %d cannot be waited on; holding the slot "
                 "until its pool is replaced\n", rootZcRetiring[i].slot);
-            state->presentStats.zeroCopyFenceErrors++;
+            __atomic_fetch_add(&state->presentStats.zeroCopyFenceErrors, 1, __ATOMIC_RELAXED);
             if (rootZcRetiring[i].fenceFd >= 0)
                 close(rootZcRetiring[i].fenceFd);
             rootZcRetiring[i].fenceFd = -1;
@@ -3197,7 +3193,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockStartNs),
                          rendererNsToUs(rendererNowNs() - lockHeldStartNs));
-        state->presentStats.flushUs += (uint32_t) flushUs;
+        __atomic_fetch_add(&state->presentStats.flushUs, (uint32_t) flushUs, __ATOMIC_RELAXED);
         carriedGpuCopy = gpuCopySerial != 0;
 
         if (gpuCopySerial) {
@@ -3219,7 +3215,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
          * its slot is released, or the drain gives up on it - which is bounded by the same deadline
          * that already bounds every other wait at the head of the queue.
          */
-        state->presentStats.directHeldIncomplete++;
+        __atomic_fetch_add(&state->presentStats.directHeldIncomplete, 1, __ATOMIC_RELAXED);
         rendererReleaseRootBuffer();
         rendererSetOutputRetry(true);
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
@@ -3237,7 +3233,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         // Nothing was submitted: the compositor keeps the buffer it already has. Counting this as a
         // frame was worse than not counting it, because the summary then derived the GL frame count
         // by subtraction and attributed it to a GL pass that never ran.
-        state->presentStats.directReuseNoSubmit++;
+        __atomic_fetch_add(&state->presentStats.directReuseNoSubmit, 1, __ATOMIC_RELAXED);
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
@@ -3298,8 +3294,8 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
     rendererSetOutputRetry(false);
-    state->renderedFrames++;
-    state->presentStats.directBufferSubmits++;
+    __atomic_fetch_add(&state->renderedFrames, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.directBufferSubmits, 1, __ATOMIC_RELAXED);
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;
 }
