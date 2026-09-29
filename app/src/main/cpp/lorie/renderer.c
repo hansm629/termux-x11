@@ -1776,7 +1776,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     bool cursorOnlyFrame = state && !state->drawRequested &&
                            (state->cursor.moved || state->cursor.updated);
     int64_t lockHeldUs = 0, lockWaitUs = 0;
-    bool swapOk = false;
+    bool swapOk = false, fenceWanted = false;
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
     EGLSync fence = EGL_NO_SYNC_KHR;
@@ -1971,7 +1971,12 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // With a double buffered root nothing here has to be waited for inside this frame, so no fence
     // is created yet and no flush is issued: eglSwapBuffers below becomes the single submission
     // point of the frame, and the fence made just before it is retired at the start of the next one.
-    if (!deferFence && (rootFenceWaitEnabled || gpuCopySerial)) {
+    // Whether this frame has to wait at all, decided once. The wait below keys off this and not off
+    // whether the fence exists, because those are different questions: no fence because none was
+    // wanted means there is nothing to wait for, while no fence because creating one failed means
+    // the wait still has to happen by other means.
+    fenceWanted = !deferFence && (rootFenceWaitEnabled || gpuCopySerial);
+    if (fenceWanted) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
     }
@@ -2001,14 +2006,22 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         rendererPendingGpuCopySerial = gpuCopySerial;
         rootWaitUs = 0;
     } else {
-        // Unconditional, because a fence that could not be created is not a fence that has
-        // signalled. Skipping the wait on EGL_NO_SYNC_KHR and then publishing the serial below
-        // told the X server the copy was made when nothing had been waited for at all;
-        // rendererWaitForFence() falls back to glFinish and counts that it had to.
-        rootWaitUs = rendererWaitForFence(fence);
-        if (fence != EGL_NO_SYNC_KHR) {
-            eglDestroySyncKHR(egl_display, fence);
-            fence = EGL_NO_SYNC_KHR;
+        /*
+         * A fence that could not be created is not a fence that has signalled. The wait used to be
+         * skipped whenever fence was EGL_NO_SYNC_KHR, and the serial below then told the X server
+         * the copy was made when nothing had been waited for at all.
+         *
+         * Keyed off fenceWanted, not off the fence: the previous fix made this unconditional, which
+         * turned every frame that deliberately has no fence - root fence wait off and no copy
+         * carried, the fast path - into a glFinish and a counted fallback. rendererWaitForFence()
+         * is for a wait that was meant to happen; given no fence it falls back to glFinish.
+         */
+        if (fenceWanted) {
+            rootWaitUs = rendererWaitForFence(fence);
+            if (fence != EGL_NO_SYNC_KHR) {
+                eglDestroySyncKHR(egl_display, fence);
+                fence = EGL_NO_SYNC_KHR;
+            }
         }
         // Sampling of the root buffer is complete, so hand it back.
         rendererReleaseRootBuffer();
