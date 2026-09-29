@@ -213,6 +213,10 @@ static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 // Two slots stay with the X server - one it draws into, one to publish into - so this is how many
 // are ours. Holding one more than this blocks it from publishing at all, which is what dropped the
 // desktop to 72 updates a second against a 120Hz display.
+/* ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE. Spelled out because the enum is not in the headers this
+ * builds against at minSdk, the same reason the calls themselves are resolved with dlsym. */
+#define LORIE_SC_TRANSPARENCY_OPAQUE 2
+
 #define LORIE_ZC_MAX_HELD (LORIE_ROOT_SLOTS - 2)
 
 // All guarded by rootOverlayLock.
@@ -258,6 +262,7 @@ static struct {
     void (*txSetBuffer)(ASurfaceTransaction *, ASurfaceControl *, AHardwareBuffer *, int);
     void (*txSetGeometry)(ASurfaceTransaction *, ASurfaceControl *, const ARect *, const ARect *, int32_t);
     void (*txReparent)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *); // optional
+    void (*txSetBufferTransparency)(ASurfaceTransaction *, ASurfaceControl *, int8_t); // optional
     void (*txSetOnComplete)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *));
     int (*statsPrevReleaseFenceFd)(ASurfaceTransactionStats *, ASurfaceControl *);
 } scApi;
@@ -294,6 +299,8 @@ static bool cursorOverlayResolveApi(void) {
 
     // Optional: hiding the layer is enough to get it off the screen, taking it out of the tree as
     // well is just tidier.
+    scApi.txSetBufferTransparency = (void (*)(ASurfaceTransaction *, ASurfaceControl *, int8_t))
+            dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBufferTransparency");
     scApi.txReparent = (void (*)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *))
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_reparent");
 
@@ -2996,6 +3003,18 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
     scApi.txSetZOrder(t, rootSurfaceControl, 0); // the cursor layer sits at 1, above this
     scApi.txSetBuffer(t, rootSurfaceControl, ahb, -1);
+    /*
+     * The root is an opaque desktop, but its slots carry an alpha channel because that is the
+     * format the X server draws in, so without saying so the compositor has to treat every pixel as
+     * possibly translucent and blend the whole screen against what is behind it. Nothing is behind
+     * it, and the X server never writes a transparent root pixel, so the blend is work for no
+     * difference - and a layer that might be translucent is also one the compositor cannot put
+     * straight on an overlay.
+     *
+     * The cursor layer is deliberately left alone: its alpha is the whole point of it.
+     */
+    if (scApi.txSetBufferTransparency)
+        scApi.txSetBufferTransparency(t, rootSurfaceControl, LORIE_SC_TRANSPARENCY_OPAQUE);
     scApi.txSetGeometry(t, rootSurfaceControl, &src, &dst, 0);
     if (scApi.txSetOnComplete)
         scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
