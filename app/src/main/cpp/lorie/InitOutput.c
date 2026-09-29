@@ -252,6 +252,21 @@ typedef struct {
     LorieBuffer *rootBuf[LORIE_ROOT_SLOTS];
     void *rootLocked[LORIE_ROOT_SLOTS];
     RegionRec rootStale[LORIE_ROOT_SLOTS];
+
+    /*
+     * Where a GPU copy has been queued into slot i but may not have landed. The handover reads the
+     * slot it is publishing with the CPU, so that area cannot be copied forward yet: it would hand
+     * on the pixels from before the copy and then clear the stale mark, and the copy would land in
+     * the published slot afterwards where the next slot can never pick it up.
+     *
+     * Kept as a region, and paired with the highest serial queued into that slot, so the wait is
+     * for a finite set of copies rather than for the slot to have none. Asking whether the slot had
+     * any pending copy at all never became false while a client kept presenting into the root -
+     * every frame queued another one - so the publish was held back frame after frame with the
+     * screen frozen and every counter looking healthy.
+     */
+    RegionRec rootGpuPending[LORIE_ROOT_SLOTS];
+    uint64_t rootGpuPendingSerial[LORIE_ROOT_SLOTS];
     int rootWrite;                  // the slot we are drawing into; only this side ever changes it
     Bool rootDirty;                 // drawn into but not published yet, so the retry below knows
     Bool rootDouble;
@@ -850,12 +865,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
-        if (pvfb->state->presentStats.rootCopies || pvfb->state->presentStats.rootHandoverDeferrals)
-            log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms, %u publishes held for a pending GPU write",
+        if (pvfb->state->presentStats.rootCopies || pvfb->state->presentStats.rootStalePostponed)
+            log(INFO, "XlorieRootCopy: %u copies, %.1f MB, %.1f ms, %u handovers left an area for later",
                 pvfb->state->presentStats.rootCopies,
                 pvfb->state->presentStats.rootCopyBytes / 1048576.0,
                 pvfb->state->presentStats.rootCopyUs / 1000.0,
-                pvfb->state->presentStats.rootHandoverDeferrals);
+                pvfb->state->presentStats.rootStalePostponed);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -891,7 +906,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootCopyBytes = 0;
     pvfb->state->presentStats.rootCopyUs = 0;
     pvfb->state->presentStats.rootCopies = 0;
-    pvfb->state->presentStats.rootHandoverDeferrals = 0;
+    pvfb->state->presentStats.rootStalePostponed = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
@@ -1413,6 +1428,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     const LorieBuffer_Desc *desc, *dstDesc;
     LorieGpuCopyEntry *entry;
     LorieAbandonedCopy *record;
+    uint64_t serial;
     BoxRec fullBox;
     BoxPtr box;
     int numRects, i;
@@ -1504,6 +1520,9 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     // Tracked so CPU reads of this pixmap only pay for the GPU lock (see lorieNeedsGpuLock) while a
     // GPU write into it can actually be in flight, instead of on every access.
     LorieBuffer_gpuCopyPendingInc(dstBuffer);
+
+    // Taken before the entry is filled in, because the bookkeeping below needs to name this copy.
+    serial = ++pvfb->gpuCopySerialCounter;
     {
         LoriePixmapPriv *rootPriv = dstIsRoot ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
         if (rootPriv && rootPriv->rootDouble) {
@@ -1521,6 +1540,10 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
                 RegionInit(&r, &fullBox, 1);
             RegionTranslate(&r, x_off, y_off);
             lorieMarkRootStale(rootPriv, &r);
+            // And this slot cannot be read forward over that area until the copy has landed.
+            RegionUnion(&rootPriv->rootGpuPending[rootPriv->rootWrite],
+                        &rootPriv->rootGpuPending[rootPriv->rootWrite], &r);
+            rootPriv->rootGpuPendingSerial[rootPriv->rootWrite] = serial;
             RegionUninit(&r);
         }
     }
@@ -1532,7 +1555,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     record->dst = dstBuffer;
 
     entry = &pvfb->state->gpuCopyQueue.entries[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
-    entry->serial = ++pvfb->gpuCopySerialCounter;
+    entry->serial = serial;
     entry->srcBufferId = desc->id;
     entry->dstBufferId = dstDesc->id;
     entry->xOff = x_off;
@@ -1548,7 +1571,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     record->serial = entry->serial;
     record->session = lorieRendererSession;
     // So a later CPU write into the same buffer can be ordered after this one - see
-    // lorieWaitForQueuedGpuWrites().
+    // lorieSupersedeQueuedGpuWrites().
     LorieBuffer_noteGpuWrite(dstBuffer, entry->serial);
     record->startUs = lorieNowUs();
     *out_serial = entry->serial;
@@ -1914,6 +1937,8 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
                 LorieBuffer *slot = rootPriv->rootBuf[i];
 
                 RegionUninit(&rootPriv->rootStale[i]);
+                RegionUninit(&rootPriv->rootGpuPending[i]);
+                rootPriv->rootGpuPendingSerial[i] = 0;
                 rootPriv->rootBuf[i] = NULL;
                 rootPriv->rootLocked[i] = NULL;
                 if (!slot || slot == rootPriv->buffer)
@@ -2095,6 +2120,8 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     RegionInit(&all, &box, 1);
     for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
         RegionInit(&priv->rootStale[i], NULL, 0);
+        RegionInit(&priv->rootGpuPending[i], NULL, 0);
+        priv->rootGpuPendingSerial[i] = 0;
         if (i)
             lorieCopyRootRegion(priv, 0, i, &all);
     }
@@ -2126,12 +2153,33 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         (unsigned long long) pvfb->state->rootBufferIds[0]);
 }
 
-// Hands the buffer we have just finished drawing to the renderer and takes the other one. Does
-// nothing at all while the renderer is still sampling, in which case we simply keep drawing into the
-// same buffer for another frame - that costs one frame of freshness and never a stall.
+/*
+ * The part of a slot that a queued GPU copy may not have written yet, and so must not be read
+ * forward out of it.
+ *
+ * Emptied as soon as the last copy queued into the slot has resolved, which is what makes this a
+ * finite wait: it is for the copies that were queued, not for the slot to be free of them. The
+ * question used to be "does this slot have any pending copy", and with a client presenting into
+ * the root every frame the answer was yes every frame.
+ */
+static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {
+    if (priv->rootGpuPendingSerial[slot] &&
+        lorieGpuCopyResolved(priv->rootGpuPendingSerial[slot])) {
+        RegionEmpty(&priv->rootGpuPending[slot]);
+        priv->rootGpuPendingSerial[slot] = 0;
+    }
+    return &priv->rootGpuPending[slot];
+}
+
+// Hands the buffer we have just finished drawing to the renderer and takes another one. Does
+// nothing at all while the renderer is still sampling every other slot, in which case we simply
+// keep drawing into this one for another frame - that costs one frame of freshness and never a
+// stall.
 static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     uint32_t old, new;
     int drawn = priv->rootWrite, next, i;
+    RegionPtr unsafe;
+    RegionRec carry;
 
     if (!priv->rootDouble)
         return FALSE;
@@ -2152,28 +2200,6 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
         if (next < 0)
             return FALSE;
 
-        /*
-         * The stale copy below reads `drawn` with the CPU, and `drawn` is the slot every root GPU
-         * copy is queued against - lorieTryScheduleGpuCopy() takes its destination from priv->buffer.
-         * It takes neither state->lock nor EXA's PrepareAccess, so a copy that has been queued but
-         * not yet executed would be read straight past: `next` would get the pixels from before it,
-         * have its stale region cleared as though it were up to date, and never receive them, since
-         * the GPU writes `drawn` afterwards. The wrong content surfaces whenever the rotation comes
-         * back round to that slot.
-         *
-         * There is nothing to get wrong when there is nothing to copy, so only a handover that would
-         * actually read `drawn` waits, and it waits by staying on this buffer for another frame
-         * rather than by blocking.
-         */
-        if (LorieBuffer_hasGpuCopyPending(priv->rootBuf[drawn]) &&
-            RegionNotEmpty(&priv->rootStale[next])) {
-            // This slot alone, not the global count: that one stays positive for as long as any
-            // client keeps presenting to the root, and waiting on it would hold the publish back
-            // indefinitely rather than until this buffer is safe to read.
-            pvfb->state->presentStats.rootHandoverDeferrals++;
-            return FALSE;
-        }
-
         new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT))
             | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT);
         new += LORIE_ROOT_COUNT_STEP;
@@ -2182,8 +2208,32 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     } while (!__atomic_compare_exchange_n(&pvfb->state->rootHandover, &old, new, false,
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 
-    lorieCopyRootRegion(priv, drawn, next, &priv->rootStale[next]);
-    RegionEmpty(&priv->rootStale[next]);
+    /*
+     * The copy below reads `drawn` with the CPU, and `drawn` is the slot every root GPU copy is
+     * queued against - lorieTryScheduleGpuCopy() takes its destination from priv->buffer. It takes
+     * neither state->lock nor EXA's PrepareAccess, so an area a queued copy has not written yet
+     * would be read straight past: `next` would get the pixels from before it, have its stale mark
+     * cleared as though it were up to date, and never receive them, since the GPU writes `drawn`
+     * afterwards. The wrong content then surfaces when the rotation comes back round to that slot.
+     *
+     * So that area alone is left behind, still marked stale, and copied forward on a later handover
+     * once the copy has landed. Holding the whole publish back instead is what froze the screen
+     * under a client that presented every frame: the slot always had a pending copy and the next
+     * slot was always missing something, so the two conditions were permanently true and nothing
+     * was ever published while every frame counter kept climbing.
+     */
+    unsafe = lorieRootPendingGpuRegion(priv, drawn);
+    RegionNull(&carry);
+    RegionCopy(&carry, &priv->rootStale[next]);
+    if (RegionNotEmpty(unsafe) && RegionNotEmpty(&priv->rootStale[next])) {
+        RegionSubtract(&carry, &carry, unsafe);
+        pvfb->state->presentStats.rootStalePostponed++;
+    }
+
+    lorieCopyRootRegion(priv, drawn, next, &carry);
+    // Whatever could not be read forward stays owed to this slot.
+    RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], unsafe);
+    RegionUninit(&carry);
 
     priv->rootWrite = next;
     priv->buffer = priv->rootBuf[next];

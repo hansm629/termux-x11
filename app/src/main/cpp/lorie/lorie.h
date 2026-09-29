@@ -410,7 +410,11 @@ struct lorie_shared_server_state {
         volatile uint64_t rootCopyBytes;
         volatile uint32_t rootCopyUs;
         volatile uint32_t rootCopies;
-        volatile uint32_t rootHandoverDeferrals; /* publishes held back for an in-flight GPU write */
+        /* Handovers that could not copy the whole stale area forward, because a queued GPU copy
+         * had not written part of it yet; that part stays owed to the slot and goes across on a
+         * later handover. It replaces a count of publishes held back entirely, which is what the
+         * handover used to do and what could stop it publishing at all. */
+        volatile uint32_t rootStalePostponed;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
