@@ -1265,6 +1265,10 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 // rendererShouldWait() so the thread sleeps instead of spinning, and by the wait itself so it wakes
 // when the deadline passes even if no registration ever arrives.
 static int64_t rendererCopyBlockedUntilNs = 0;
+/* Which entry the deadline above belongs to. Both are cleared whenever the queue they refer to goes
+ * away - the state is swapped, the queue drains - because a deadline left over from a queue nobody
+ * is draining any more is a timed wait with nothing to wait for. */
+static uint64_t rendererCopyDeferredSerial = 0;
 
 // Looks the buffer up and attaches it if it has arrived but not been attached yet. It used to sleep
 // here - up to 20 x 5 ms - when a buffer had not been registered yet, which stops completedSerial
@@ -1301,11 +1305,10 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         if (!src || !dst) {
             // Its buffer has not reached us yet. Leave it queued and look again on the next frame
             // rather than waiting here, which would stall every present behind it as well.
-            static uint64_t deferredSerial = 0;
             int64_t nowNs = rendererNowNs();
 
-            if (deferredSerial != entry.serial) {
-                deferredSerial = entry.serial;
+            if (rendererCopyDeferredSerial != entry.serial) {
+                rendererCopyDeferredSerial = entry.serial;
                 rendererCopyBlockedUntilNs = nowNs + LORIE_COPY_DEFER_NS;
             }
 
@@ -1314,6 +1317,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
                 break;
             }
             rendererCopyBlockedUntilNs = 0;
+            rendererCopyDeferredSerial = 0;
 
             log("rendererApplyPendingGpuCopies: %s buffer %llu never arrived, skipping\n",
                 src ? "destination" : "source",
@@ -1407,6 +1411,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         }
 
         rendererCopyBlockedUntilNs = 0;
+        rendererCopyDeferredSerial = 0;
         lastSerial = entry.serial;
         state->gpuCopyQueue.readIndex++;
     }
@@ -2009,6 +2014,14 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     // wait for a registration into a spin.
     if (gpuCopyPending && rendererCopyBlockedUntilNs && rendererNowNs() < rendererCopyBlockedUntilNs)
         gpuCopyPending = false;
+    else if (!gpuCopyPending) {
+        // Nothing queued - the queue drained, or there is no state at all. A deadline surviving
+        // that is what the wait loop below turns into pthread_cond_timedwait with a deadline
+        // already in the past, woken instantly, on a thread with nothing to do: a full core spent
+        // on a copy that no longer exists.
+        rendererCopyBlockedUntilNs = 0;
+        rendererCopyDeferredSerial = 0;
+    }
     if (stateChanged || windowChanged || buffersChanged || gpuCopyPending)
         // If there are pending changes we should process them immediately.
         return false;
@@ -2098,21 +2111,21 @@ __noreturn static void* rendererThread(void) {
     while (true) {
         while (rendererShouldWait(&waitingForBuffers)) {
             int64_t blockedUntilNs = rendererCopyBlockedUntilNs;
+            int64_t remainingNs = blockedUntilNs ? blockedUntilNs - rendererNowNs() : 0;
 
-            if (blockedUntilNs) {
+            if (remainingNs > 0) {
                 // A registration would signal us, but one may never come, so this wait has to end
                 // by itself for the copy to be given up on. CLOCK_REALTIME because that is what an
                 // untouched condvar measures its absolute timeout against.
-                int64_t remainingNs = blockedUntilNs - rendererNowNs();
                 struct timespec ts;
 
-                if (remainingNs < 0)
-                    remainingNs = 0;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_sec += (time_t) ((remainingNs + ts.tv_nsec) / 1000000000LL);
                 ts.tv_nsec = (long) ((remainingNs + ts.tv_nsec) % 1000000000LL);
                 pthread_cond_timedwait(stateCond, &stateLock, &ts);
             } else
+                // Either nothing is being waited out, or its deadline has already passed - in which
+                // case rendererShouldWait() has cleared it and there is nothing to time.
                 pthread_cond_wait(stateCond, &stateLock);
         }
 
@@ -2127,6 +2140,9 @@ __noreturn static void* rendererThread(void) {
             pendingState = NULL;
             stateChanged = false;
             waitingForBuffers = false;
+            // The queue that deadline referred to has gone with the old state.
+            rendererCopyBlockedUntilNs = 0;
+            rendererCopyDeferredSerial = 0;
 
             if (state)
                 state->surfaceAvailable = win != defaultWin;
