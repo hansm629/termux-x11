@@ -307,7 +307,7 @@
  
      if (vblank->wait_fence) {
          if (!present_fence_check_triggered(vblank->wait_fence)) {
-@@ -61,30 +62,182 @@
+@@ -61,30 +62,183 @@
      return FALSE;
  }
  
@@ -385,7 +385,7 @@
 +        return FALSE;   /* already released, and there is nothing to copy */
 +
 +    scheduled = lorieTryScheduleGpuCopy(vblank->pixmap, dst, &region, xOff, yOff,
-+                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer);
++                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_record);
 +
 +    if (scheduled) {
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the GC ops Damage
@@ -426,7 +426,6 @@
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
-+    Bool                         gpuCopyScheduled;
 +
 +    /* lorie: the deferral upstream does here is gone for the same reason as in
 +     * present_execute_wait() above. */
@@ -442,27 +441,28 @@
  
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    if (vblank->gpu_copy_pending) {
-+        Bool gpuCopyMade = lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
-+                           !lorieGpuCopyFailed(vblank->gpu_copy_serial);
-+
-+        /* lorie: a copy that was not made is not a present that reached the screen, and the GPU may
-+         * still be reading its source, so its resources go back only once the renderer is done. */
-+        if (gpuCopyMade)
-+            lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
-+        else
-+            lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
-+        vblank->gpu_copy_pending = FALSE;
-+        if (!gpuCopyMade) {
++        if (lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
++            !lorieGpuCopyFailed(vblank->gpu_copy_serial)) {
++            lorieGpuCopyAck(vblank->gpu_copy_record);
++            vblank->gpu_copy_record = NULL;
++            vblank->gpu_copy_pending = FALSE;
++        } else {
 +            /* lorie: the renderer never actually made this copy - it gave up waiting for a buffer
 +             * to be registered, or lost its surface. Tell the client it was skipped rather than
 +             * falsely reporting it as presented. completedSerial is a watermark and steps over an
-+             * abandoned serial, so it cannot be asked about this on its own. */
++             * abandoned serial, so it cannot be asked about this on its own.
++             *
++             * gpu_copy_pending is deliberately left set: present_vblank_scrap() is the single
++             * cancel path, and it is what abandons the copy and decides who owns the pixmap and the
++             * IdleNotify afterwards. Clearing the flag and abandoning the copy here instead meant
++             * scrap saw nothing pending and idled the client's pixmap while the GPU was still
++             * reading it. */
 +            present_vblank_scrap(vblank);
 +            screen_priv->flush(window);
 +            return;
 +        }
-+    } else if ((gpuCopyScheduled = lorieScheduleGpuCopyClipped(vblank, window, gpuCopyDst,
-+                                                              gpuCopyXOff, gpuCopyYOff))) {
++    } else if (lorieScheduleGpuCopyClipped(vblank, window, gpuCopyDst,
++                                           gpuCopyXOff, gpuCopyYOff)) {
 +        /* lorie: damage was reported by lorieScheduleGpuCopyClipped(), from the same region. */
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
@@ -472,18 +472,19 @@
 +            RegionDestroy(vblank->update);
 +            vblank->update = NULL;
 +        }
++        /* lorie: the copy is live from the moment it was enqueued, so the vblank owns it from here
++         * on - including on the failure below. Marking it only after queue_vblank succeeded left
++         * that failure path holding a running copy that the cancel path could not see. */
++        vblank->gpu_copy_pending = TRUE;
 +        if (Success == screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1)) {
-+            vblank->gpu_copy_pending = TRUE;
 +            vblank->queued = TRUE;
 +            return;
 +        }
-+        /* lorie: the copy is enqueued and running, and we have failed to arrange for anyone to
-+         * ask whether it finished. Acking it here said it had, which released the source while the
-+         * GPU was still reading it and counted a present that may never have been made. Abandon it
-+         * instead: the reaper holds its resources until the renderer reports the serial, and the
-+         * present is scrapped rather than claimed. */
-+        lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
-+        vblank->gpu_copy_pending = FALSE;
++        /* lorie: the copy is running and we have failed to arrange for anyone to ask whether it
++         * finished. Acking it here said it had, which released the source while the GPU was still
++         * reading it and counted a present that may never have been made. Scrap instead - the one
++         * cancel path abandons the copy and keeps its resources until the renderer reports the
++         * serial, and the present is scrapped rather than claimed. */
 +        present_vblank_scrap(vblank);
 +        screen_priv->flush(window);
 +        return;
@@ -512,7 +513,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,39 @@
+@@ -90,8 +91,47 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -521,19 +522,24 @@
 +     * the vblank stays queued until the copy is acknowledged done. */
 +    Bool                gpu_copy_pending;
 +    uint64_t            gpu_copy_serial;
-+    void                *gpu_copy_dst_buffer; /* opaque LorieBuffer*, held for lorieGpuCopyAck */
++    /* lorie: opaque handle to what the renderer was given, secured before the copy was enqueued.
++     * The buffers used to be named by pointer here and looked up again from the pixmap at
++     * completion time, which by then could be a different buffer. */
++    void                *gpu_copy_record;
  };
  
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
 + * pixmap->dst copy (dst being whatever GetWindowPixmap(window) is - root, or a Composite-redirected
 + * window's own backing pixmap) to the renderer's GPU context instead of a CPU CopyArea. */
 +extern Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
-+                                     uint64_t *out_serial, void **out_dst_buffer);
++                                     uint64_t *out_serial, void **out_record);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern Bool lorieGpuCopyFailed(uint64_t serial);
 +extern void lorieNoteGpuCopyRequeued(void);
-+extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
-+extern void *lorieGpuCopyAbandon(PixmapPtr pixmap, void *dst_buffer, uint64_t serial);
++extern void lorieGpuCopyAck(void *record);
++extern Bool lorieGpuCopyAbandon(void *record);
++extern void lorieHoldPresentResources(void *token, PixmapPtr pixmap,
++                                      struct present_fence *idleFence);
 +extern void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, XID window, CARD32 serial,
 +                                  struct present_fence *idleFence);
 +/* lorie: called as each client present request is turned into a vblank, so the wait between a
@@ -548,6 +554,9 @@
 +
 +/* lorie: implemented in present_scmd.c; re-executes any vblank whose GPU copy has finished. */
 +extern void lorieRecheckGpuCopies(void);
++
++Bool
++lorie_vblank_abandon_gpu_copy(present_vblank_ptr vblank, Bool send_idle);
 +
  typedef struct present_screen_priv present_screen_priv_rec, *present_screen_priv_ptr;
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
@@ -598,47 +607,85 @@
          vblank->exec_msc--;
  
 +++ ./present/present_vblank.c
-@@ -188,6 +188,30 @@
+@@ -180,6 +180,59 @@
+     return NULL;
+ }
+ 
++/*
++ * lorie: the single place a still-running offloaded copy is given up.
++ *
++ * Ending one of these means doing two things together: handing over what the copy is using, and
++ * handing over the IdleNotify that tells the client its pixmap is free again. Those two were
++ * decided in different places - present_execute_copy() abandoned the copy and cleared
++ * gpu_copy_pending itself before calling present_vblank_scrap(), whose handover only ran while that
++ * flag was still set - so those cancellations released the client's pixmap while the GPU was still
++ * reading it. Every caller now goes through here, exactly once per copy, and nobody sets
++ * gpu_copy_pending back on to reach it.
++ *
++ * send_idle says whether this path would have idled the pixmap (scrap) or simply dropped it
++ * (destroy on window teardown). Either way the vblank is left holding nothing that still needs
++ * releasing, so the teardown after the call is correct without knowing which happened.
++ *
++ * Returns TRUE when the copy was still running and the pixmap, the idle fence and any IdleNotify
++ * now belong to it; the caller must not touch them.
++ */
++Bool
++lorie_vblank_abandon_gpu_copy(present_vblank_ptr vblank, Bool send_idle)
++{
++    void *record = vblank->gpu_copy_record;
++
++    if (!vblank->gpu_copy_pending)
++        return FALSE;
++
++    /* Cleared before anything can fail, so this vblank can never be abandoned twice. */
++    vblank->gpu_copy_pending = FALSE;
++    vblank->gpu_copy_record = NULL;
++
++    /* FALSE means the renderer has already finished and everything the copy held is back; the
++     * ordinary teardown is then exactly right. There is no third answer - the record was secured
++     * before the copy was enqueued, so a live copy is always trackable here. */
++    if (!lorieGpuCopyAbandon(record))
++        return FALSE;
++
++    /* The copy is still reading this pixmap. Telling the client it is idle says the memory may be
++     * written again, and nothing orders that write against a copy the renderer has already
++     * submitted: holding a reference keeps the object alive, it does not keep the contents still.
++     * So the pixmap, the fence and the notify go with the copy and are finished with when the
++     * renderer reports the serial. */
++    if (send_idle)
++        lorieDeferPresentIdle(record, vblank->pixmap, vblank->window->drawable.id,
++                              vblank->serial, vblank->idle_fence);
++    else
++        lorieHoldPresentResources(record, vblank->pixmap, vblank->idle_fence);
++
++    vblank->pixmap = NULL;
++    vblank->idle_fence = NULL;
++    vblank->flip = FALSE;
++    return TRUE;
++}
++
+ void
+ present_vblank_scrap(present_vblank_ptr vblank)
+ {
+@@ -188,6 +240,9 @@
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,
                    vblank->crtc));
  
-+    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - let go of it now, while
-+     * the pixmap is still valid, or the extra buffer references lorieTryScheduleGpuCopy took leak
-+     * forever. Abandoning rather than acking: the request is over, but the GPU may still be reading
-+     * the source and writing the destination, and this is not a present that reached the screen. */
-+    if (vblank->gpu_copy_pending) {
-+        void *abandoned = lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer,
-+                                              vblank->gpu_copy_serial);
-+
-+        vblank->gpu_copy_pending = FALSE;
-+        if (abandoned) {
-+            /* lorie: the copy is still running and reading this pixmap. Telling the client it is
-+             * idle says the memory may be written again, and nothing orders that write against a
-+             * copy the renderer has already submitted - holding a reference keeps the object alive,
-+             * it does not keep the contents still. The notify, the fence and the pixmap go with the
-+             * abandoned copy and are finished with when the renderer reports the serial. */
-+            lorieDeferPresentIdle(abandoned, vblank->pixmap, vblank->window->drawable.id,
-+                                  vblank->serial, vblank->idle_fence);
-+            vblank->pixmap = NULL;
-+            vblank->idle_fence = NULL;
-+            vblank->flip = FALSE;
-+            return;
-+        }
-+    }
++    if (lorie_vblank_abandon_gpu_copy(vblank, TRUE))
++        return;
 +
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +224,13 @@
+@@ -200,6 +224,12 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
-+    /* lorie: same as in present_vblank_scrap() - must run before vblank->pixmap is dropped below,
-+     * for the destroy paths that reach a still-pending vblank without going through scrap first. */
-+    if (vblank->gpu_copy_pending) {
-+        lorieGpuCopyAbandon(vblank->pixmap, vblank->gpu_copy_dst_buffer, vblank->gpu_copy_serial);
-+        vblank->gpu_copy_pending = FALSE;
-+    }
++    /* lorie: the destroy paths that reach a still-pending vblank without going through scrap first
++     * - present_free_window_vblank() on window teardown being the one that matters. No IdleNotify
++     * is owed there (upstream drops the pixmap without one), but the GPU may still be reading it,
++     * so the reference is handed over rather than dropped. Must run before the drop below. */
++    lorie_vblank_abandon_gpu_copy(vblank, FALSE);
 +
      /* Remove vblank from window and screen lists */
      xorg_list_del(&vblank->window_list);

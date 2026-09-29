@@ -386,6 +386,15 @@ struct lorie_shared_server_state {
         volatile uint32_t copyCompletions;
         volatile uint32_t copyRequeues;   /* vblanks spent waiting for one to finish */
 
+        /* How a copy ends when it does not end in an ack. A cancelled request whose copy was still
+         * running (copyAbandons) keeps its buffers and its IdleNotify here until the renderer is
+         * done; copyRecordExhausted is a copy that was never offered to the GPU because there was
+         * no room to account for it, so the CPU path took it. Both are silent from outside - the
+         * first looks like a client that stopped sending, the second like the GPU path not being
+         * taken - which is why they are counted separately from copyCompletions. */
+        volatile uint32_t copyAbandons;
+        volatile uint32_t copyRecordExhausted;
+
         /* When client requests actually arrive, which is the one hop everything else is measured
          * relative to. requestAheadMax is how many vsyncs ahead the furthest one asked to be shown:
          * a client whose idea of msc has drifted from ours asks for a frame far in the future and
