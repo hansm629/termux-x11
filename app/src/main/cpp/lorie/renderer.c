@@ -221,6 +221,15 @@ static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 
 // All guarded by rootOverlayLock.
 static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it
+
+/*
+ * A zero-copy frame that had to be dropped has to be tried again, and nothing else will ask for it.
+ * The X server has published content that is not on screen, it does not publish the same content
+ * twice, and dropping the frame clears drawRequested - so with no further damage the renderer went
+ * back to sleep and that content stayed unshown until something else happened to dirty the root,
+ * which on a still desktop is nothing at all.
+ */
+static bool rootZcRetryPending = false;
 // The ones behind it, each waiting for the release fence that the next transaction's completion
 // reports. More than one, because requiring the oldest to be back before presenting again meant
 // waiting a whole vsync for a callback that arrives during it - which dropped every other frame and
@@ -1851,8 +1860,10 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             }
             rendererRootSlot = -1;
             state->drawRequested = FALSE;
-            // Without this the thread comes straight back round and asks again, millions of times a
-            // second. There is nothing to do until the next vsync signal either way.
+            // Ask to come back for it, since clearing drawRequested above is what would otherwise
+            // lose it. Gated behind waitForNextFrame, so this is one more attempt at the next vsync
+            // rather than the thread coming straight back round millions of times a second.
+            rootZcRetryPending = true;
             state->waitForNextFrame = true;
             return;
         }
@@ -2135,6 +2146,11 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     if (!state || !state->surfaceAvailable || state->waitForNextFrame || *waitingForBuffers)
         // Even in the case if there are pending changes, we can not draw it without rendering surface
         return true;
+
+    if (rootZcRetryPending)
+        // Content the X server published and we could not put on screen. After the vsync gate
+        // above, so this is one attempt per frame.
+        return false;
 
     if (state->cursor.moved || state->cursor.updated)
         // Cursor updates should stay responsive. Do not coalesce them.
@@ -2844,6 +2860,9 @@ static void rootZcReleaseAll(void) {
     int freed[LORIE_ZC_MAX_HELD + 1], freedFds[LORIE_ZC_MAX_HELD + 1], freedCount = 0;
     int i;
 
+    // Leaving this path, so there is no zero-copy frame left to retry.
+    rootZcRetryPending = false;
+
     pthread_mutex_lock(&rootOverlayLock);
     for (i = 0; i < rootZcRetiringCount; i++) {
         freedFds[freedCount] = rootZcRetiring[i].fenceFd;
@@ -2967,6 +2986,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         // The copies above still happened, so they are still reported.
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
+        rootZcRetryPending = false;   // what the X server has published is on screen
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
@@ -3025,6 +3045,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
+    rootZcRetryPending = false;
     state->presentStats.zeroCopyFrames++;
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;
