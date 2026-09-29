@@ -489,6 +489,14 @@ struct lorie_shared_server_state {
      */
     volatile char rendererDriver[192];
 
+    /* Which output path frames are actually taking, and when it is not the direct one, why. The
+     * renderer decides this and used to only say so in its own logcat, which is out of reach
+     * without root or adb - so from the terminal there was no way to tell a backend that was asked
+     * for from the one that ran. Written by the renderer on a change, read by the X server for its
+     * five-second summary. */
+    volatile uint8_t outputBackendActive;
+    volatile char outputBackendReason[96];
+
     struct {
         // We should not allow updating cursor content the same time renderer draws it.
         // locking the mutex protecting the root window can cause waiting for the frame to be drawn which is unacceptable

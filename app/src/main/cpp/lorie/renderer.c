@@ -2054,7 +2054,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         }
     }
 
-    state->renderedFrames++;
+    state->renderedFrames++;   // zeroCopyFrames counts the subset that skipped this path entirely
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
     rendererNoteLock(lockWaitUs, lockHeldUs);
     if (cursorOnlyFrame)
@@ -2768,6 +2768,13 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
         lastReason = reason;
         log("XlorieBackend: %s%s%s", reason ? "GPU_COPY" : "ROOT_DIRECT",
             reason ? " - " : "", reason ? reason : "");
+        // Also where the X server can read it: the line above lands in this process' logcat, which
+        // from the terminal is not readable at all.
+        if (state) {
+            state->outputBackendActive = reason ? LORIE_OUTPUT_GPU_COPY : LORIE_OUTPUT_ROOT_DIRECT;
+            snprintf((char *) state->outputBackendReason, sizeof(state->outputBackendReason),
+                     "%s", reason ? reason : "");
+        }
     }
     return reason == NULL;
 }
@@ -2987,6 +2994,10 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
         rootZcRetryPending = false;   // what the X server has published is on screen
+        // A frame, like any other. Counting these only on the GL path meant the frame rate the X
+        // server reports left out every frame that went straight to the compositor - so the better
+        // this path worked, the lower the number it produced.
+        state->renderedFrames++;
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
@@ -3046,6 +3057,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
     rootZcRetryPending = false;
+    state->renderedFrames++;
     state->presentStats.zeroCopyFrames++;
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;

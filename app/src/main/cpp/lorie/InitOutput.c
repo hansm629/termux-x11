@@ -860,9 +860,29 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.presentSubmits,
                 pvfb->state->presentStats.submitGapMaxUs / 1000.0);
         }
-        if (pvfb->state->presentStats.zeroCopyFrames || pvfb->state->presentStats.zeroCopyStalls)
-            log(INFO, "XlorieZeroCopy: %u root buffers handed to the compositor with no GL, %u frames dropped waiting for one back",
-                pvfb->state->presentStats.zeroCopyFrames, pvfb->state->presentStats.zeroCopyStalls);
+        /*
+         * Which path the frames in this window actually took, and why not the other one. The
+         * renderer's own log says this too, but only in its process' logcat, which from the
+         * terminal cannot be read - so a forced backend that turned out to be impossible looked
+         * exactly like one that was working.
+         *
+         * Counted, not declared: the direct frames are the ones the compositor was handed a buffer
+         * for, and the rest went through GL, whatever either side was configured to prefer.
+         */
+        {
+            uint32_t direct = pvfb->state->presentStats.zeroCopyFrames;
+            uint32_t total = pvfb->state->renderedFrames;
+            const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
+                              : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
+
+            if (total || direct)
+                log(INFO, "XlorieBackend: asked for %s, ran %u direct and %u through GL"
+                          "%s%s, %u frames dropped waiting for a buffer back",
+                    asked, direct, total > direct ? total - direct : 0,
+                    pvfb->state->outputBackendReason[0] ? "; not direct because: " : "",
+                    pvfb->state->outputBackendReason[0] ? (const char *) pvfb->state->outputBackendReason : "",
+                    pvfb->state->presentStats.zeroCopyStalls);
+        }
 
         if (pvfb->state->presentStats.requests)
             log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
