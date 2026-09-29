@@ -254,11 +254,20 @@ struct lorie_shared_server_state {
 
         /* Serials the renderer gave up on because a buffer never reached it. completedSerial is a
          * watermark and cannot express this: if 5 is abandoned and 6 succeeds, publishing 6 would
-         * say 5 succeeded too. So they are listed. At most CAPACITY copies can be outstanding, and
-         * the X server reads each one long before the ring wraps twice that far. */
+         * say 5 succeeded too. So they are listed. At most CAPACITY copies can be outstanding, but
+         * cancelled ones wait here to be reaped as well, so the list is not guaranteed to outlast
+         * every reader - hence failedLostUpTo. */
 #define LORIE_GPU_COPY_FAILED_SLOTS 16
         volatile uint64_t failedSerials[LORIE_GPU_COPY_FAILED_SLOTS];
         volatile uint32_t failedCount;
+
+        /* The highest serial whose entry above has been overwritten, published before the overwrite
+         * happens. Without it, a serial pushed out of the list read as "not in the failed list",
+         * which is indistinguishable from never having failed - and completedSerial, being a
+         * watermark, would by then have stepped over it. The copy was then acked as made and the
+         * client's pixmap released although the renderer had given up on it. A serial at or below
+         * this and absent from the list is unknown, which is not the same as succeeded. */
+        volatile uint64_t failedLostUpTo;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
 

@@ -1326,6 +1326,17 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             {
                 uint32_t slot = __atomic_load_n(&state->gpuCopyQueue.failedCount, __ATOMIC_RELAXED);
 
+                // The list is short, and a serial pushed out of it used to read back as "never
+                // failed" - which the X server then took as "copied", because completedSerial is
+                // a watermark and had stepped over it. Saying how far the losses reach, before the
+                // entry actually goes, keeps that from turning into a false ack.
+                if (slot >= LORIE_GPU_COPY_FAILED_SLOTS) {
+                    uint64_t evicted = state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS];
+
+                    if (evicted > __atomic_load_n(&state->gpuCopyQueue.failedLostUpTo, __ATOMIC_RELAXED))
+                        __atomic_store_n(&state->gpuCopyQueue.failedLostUpTo, evicted, __ATOMIC_RELEASE);
+                }
+
                 state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS] = entry.serial;
                 __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
             }

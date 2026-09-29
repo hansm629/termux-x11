@@ -1548,22 +1548,43 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     return TRUE;
 }
 
-// Whether the renderer gave this copy up rather than making it. Checked before treating a serial as
-// copied, since completedSerial can only carry a watermark and will step over an abandoned one.
-Bool lorieGpuCopyFailed(uint64_t serial) {
+/*
+ * What became of one offloaded copy, asked as the two questions a caller actually has: may I treat
+ * this as presented, and may I stop waiting.
+ *
+ * They used to be asked as lorieGpuCopyIsDone() && !lorieGpuCopyFailed(), and the second question
+ * had no answer for a serial whose failure record had been pushed out of the short list the
+ * renderer publishes. Absent from the list read the same as never failed, and completedSerial,
+ * being a watermark, had by then stepped over it - so a copy the renderer had given up on was
+ * acked as made and the client's pixmap released. failedLostUpTo says how far those losses reach,
+ * which turns that case into "unknown", and unknown is settled as not made.
+ */
+static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {
     uint32_t count = __atomic_load_n(&pvfb->state->gpuCopyQueue.failedCount, __ATOMIC_ACQUIRE);
     uint32_t i, n = min(count, LORIE_GPU_COPY_FAILED_SLOTS);
 
     for (i = 0; i < n; i++)
         if (pvfb->state->gpuCopyQueue.failedSerials[(count - 1 - i) % LORIE_GPU_COPY_FAILED_SLOTS] == serial)
             return TRUE;
-    return FALSE;
+
+    // Its record may have been one of the ones overwritten, and there is no way to tell from here
+    // whether it said failed or nothing at all. Not made is the answer that cannot corrupt: the
+    // present is scrapped instead of claimed, and the source stays held until the GPU is done.
+    return serial <= __atomic_load_n(&pvfb->state->gpuCopyQueue.failedLostUpTo, __ATOMIC_ACQUIRE);
 }
 
-// A question, not an event. It used to count a requeue every time the answer was no, so the reaper
-// and the cancellation paths asking after a serial were counted as presents being requeued.
-Bool lorieGpuCopyIsDone(uint64_t serial) {
-    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
+// The copy landed: safe to ack it and to tell the client its frame was presented.
+Bool lorieGpuCopyMade(uint64_t serial) {
+    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial &&
+           !lorieGpuCopyKnownNotMade(serial);
+}
+
+// Nothing more is coming for this serial, whichever way it went. A question, not an event: it used
+// to count a requeue every time the answer was no, so the reaper and the cancellation paths asking
+// after a serial were counted as presents being requeued.
+Bool lorieGpuCopyResolved(uint64_t serial) {
+    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial ||
+           lorieGpuCopyKnownNotMade(serial);
 }
 
 // Called where a present is actually put back on the vblank queue to be asked again.
@@ -1608,7 +1629,7 @@ static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
  * at all, which is a visible slowdown rather than a corruption.
  */
 static Bool lorieCopySettled(LorieAbandonedCopy *c) {
-    if (lorieGpuCopyIsDone(c->serial) || lorieGpuCopyFailed(c->serial))
+    if (lorieGpuCopyResolved(c->serial))
         return TRUE;
 
     if (c->session == lorieRendererSession)
@@ -1666,7 +1687,7 @@ Bool lorieGpuCopyAbandon(void *token) {
     if (!c)
         return FALSE;
 
-    if (lorieGpuCopyIsDone(c->serial) || lorieGpuCopyFailed(c->serial)) {
+    if (lorieGpuCopyResolved(c->serial)) {
         lorieReleaseCopyResources(c->src, c->dst);
         lorieGiveBackCopyRecord(c);
         return FALSE;
