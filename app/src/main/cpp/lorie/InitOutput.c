@@ -1932,11 +1932,17 @@ void lorieReapAbandonedCopies(void) {
 /*
  * Tells the renderer not to bother with one queued copy, if it has not got to it yet.
  *
- * Not a cancellation: whether the renderer has already picked the entry up cannot be known from
- * here, so everything that depends on the copy possibly running still has to hold. What this buys
- * is the common case - the renderer skips it, reports the serial immediately, and the pixmap a
- * client is waiting to have back is returned a frame or two sooner instead of after work whose
- * result nobody wants.
+ * Not a cancellation: with a one-way flag the X server cannot tell whether the renderer had already
+ * picked the entry up, so everything that depends on the copy possibly running still has to hold.
+ * What this buys is the common case - the renderer skips it, reports the serial immediately, and the
+ * pixmap a client is waiting to have back is returned a frame or two sooner.
+ *
+ * An atomic cancel is possible and is not done here. A per-job state that the renderer moves
+ * QUEUED -> CLAIMED and the X server moves QUEUED -> CANCELLED with a compare-and-swap would tell the
+ * X server which side won, without moving writeIndex back and without waiting on the renderer. It is
+ * left out as a matter of scope: a won cancel only proves this job will not run, not that nothing
+ * else in flight is still reading the same pixmap, so releasing on it needs per-buffer tracking
+ * this code does not have yet. Run-to-completion is the choice being made, not the only one there is.
  */
 static void lorieMarkQueuedCopySuperseded(uint64_t serial) {
     uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
