@@ -2891,6 +2891,8 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     int slot = rendererRootSlot, retiring;
     uint32_t retireSeq;
     int64_t fenceWaitUs = 0;
+    uint64_t gpuCopySerial;
+    EGLSync copyFence = EGL_NO_SYNC_KHR;
     bool carriedGpuCopy = false, alreadyOnScreen;
     ASurfaceTransaction *t;
 
@@ -2907,31 +2909,48 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     alreadyOnScreen = slot == rootZcDisplayedSlot;
     pthread_mutex_unlock(&rootOverlayLock);
 
-    // Anything the X server asked us to blit into the root still has to happen, and has to be
-    // finished before the compositor reads the buffer. This is real GPU work and a real CPU wait,
-    // and both are reported - passing constants here is what made an earlier reading of this path
-    // claim the renderer had no GPU work at all.
+    /*
+     * Anything the X server asked us to blit into the root still has to happen, and has to be
+     * finished before the compositor reads the buffer. This is real GPU work and a real CPU wait,
+     * and both are reported - passing constants here is what made an earlier reading of this path
+     * claim the renderer had no GPU work at all.
+     *
+     * The issuing happens under the lock, because that is what keeps the X server out of the buffer
+     * while the blit is set up. The wait does not: it used to, which meant the X server's own
+     * drawing was blocked for the whole length of a GPU read it has no part in - and by then the
+     * only buffers the GPU is still writing are ones the X server has published and rotated off, so
+     * it has nothing to wait for. It still has to finish before the buffer is handed over below.
+     */
     {
-        int64_t lockStartNs = rendererNowNs(), lockHeldStartNs, flushUs = 0;
-        uint64_t gpuCopySerial;
+        int64_t lockStartNs = rendererNowNs(), lockHeldStartNs, flushStartNs, flushUs = 0;
 
         lorie_mutex_lock(&state->lock, &state->lockingPid);
         lockHeldStartNs = rendererNowNs();
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot);
         state->drawRequested = FALSE;
-        if (gpuCopySerial)
-            rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
+        if (gpuCopySerial) {
+            // After the blits it covers, and before the flush that submits it.
+            copyFence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+            flushStartNs = rendererNowNs();
+            glFlush();
+            flushUs = rendererNsToUs(rendererNowNs() - flushStartNs);
+        }
         state->waitForNextFrame = true;
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockStartNs),
                          rendererNsToUs(rendererNowNs() - lockHeldStartNs));
         state->presentStats.flushUs += (uint32_t) flushUs;
-
         carriedGpuCopy = gpuCopySerial != 0;
-        if (gpuCopySerial) {
-            __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
-            notifyGpuCopyDone();
-        }
+    }
+
+    if (gpuCopySerial) {
+        fenceWaitUs = rendererWaitForFence(copyFence);
+        if (copyFence != EGL_NO_SYNC_KHR)
+            eglDestroySyncKHR(egl_display, copyFence);
+        // Only now that the GPU has actually finished is it true that the copy was made: this is
+        // what lets the X server hand the source pixmap back to its client.
+        __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
+        notifyGpuCopyDone();
     }
 
     pthread_mutex_lock(&rootOverlayLock);
