@@ -221,8 +221,25 @@ static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; th
 // reports. More than one, because requiring the oldest to be back before presenting again meant
 // waiting a whole vsync for a callback that arrives during it - which dropped every other frame and
 // left the desktop updating at half the display's rate.
-static struct { int slot, fenceFd; bool fenceArrived; } rootZcRetiring[LORIE_ZC_MAX_HELD];
+/*
+ * seq identifies the handover, not the slot. The completion callback used to be given the slot
+ * index, and matched on it: after the slot pool is recreated - a resize, a reconnect - a callback
+ * still in flight from the old pool matched whichever new entry happened to land on the same index
+ * and marked its release fence as arrived, with a fence from the old transaction that had long
+ * since signalled. The new slot was then given back to the X server while the compositor was still
+ * displaying it. Sequence numbers are never reused, so a stale callback now matches nothing.
+ *
+ * fenceArrivedNs is when the callback came, which is what bounds the wait if the fence it handed
+ * over turns out to be unusable.
+ */
+static struct {
+    int slot, fenceFd;
+    bool fenceArrived;
+    uint32_t seq;
+    int64_t fenceArrivedNs;
+} rootZcRetiring[LORIE_ZC_MAX_HELD];
 static int rootZcRetiringCount = 0;
+static uint32_t rootZcRetireSeq = 0;
 
 // The SurfaceControl entry points are API 29, above our minSdk 26, and the NDK marks anything above
 // minSdk unavailable rather than weak - so __builtin_available cannot guard a call to them and they
@@ -1812,10 +1829,16 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             // that is not.
             {
                 int i;
-                bool mine = rendererRootSlot == rootZcDisplayedSlot;
+                bool mine;
 
+                // Under the lock: the completion callback runs on a binder thread and rewrites
+                // these entries.
+                pthread_mutex_lock(&rootOverlayLock);
+                mine = rendererRootSlot == rootZcDisplayedSlot;
                 for (i = 0; !mine && i < rootZcRetiringCount; i++)
                     mine = rootZcRetiring[i].slot == rendererRootSlot;
+                pthread_mutex_unlock(&rootOverlayLock);
+
                 if (!mine)
                     rendererReleaseRootBuffer();
             }
@@ -2726,30 +2749,54 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
     return reason == NULL;
 }
 
-// Whether the compositor has finished with whatever fence it handed us. No fence means it never
-// needed one.
-static bool rootZcFenceSignalled(int fd) {
+/*
+ * Whether the compositor has finished with whatever fence it handed us. No fence means it never
+ * needed one.
+ *
+ * A bare poll() > 0 answered yes to POLLERR and POLLNVAL as well, which is a broken or closed fd
+ * being read as a signalled fence - the slot would go back to the X server with the compositor
+ * still displaying it. Those now hold the slot, but not forever: an fd that cannot answer will
+ * never report POLLIN either, so waiting on it without a bound strands the slot for the rest of the
+ * session and the pool runs a buffer short from then on. Bounded from when the callback arrived,
+ * and said out loud, because it is a guess either way.
+ */
+#define LORIE_ZC_FENCE_GRACE_NS 100000000LL
+static bool rootZcFenceSignalled(int fd, int64_t arrivedNs) {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
     if (fd < 0)
         return true;
-    return poll(&pfd, 1, 0) > 0;
+    if (poll(&pfd, 1, 0) <= 0)
+        return false;   // not yet, or poll itself failed; neither says it is done
+    if (pfd.revents & POLLIN)
+        return true;
+    if (rendererNowNs() - arrivedNs < LORIE_ZC_FENCE_GRACE_NS)
+        return false;
+
+    log("XlorieRootZc: release fence fd %d cannot be waited on (revents 0x%x); freeing its slot "
+        "after %lld ms\n", fd, pfd.revents, (long long) (LORIE_ZC_FENCE_GRACE_NS / 1000000LL));
+    return true;
 }
 
 // Binder thread. Reports the release fence of the buffer set by the transaction before this one.
 static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
-    int retiring = (int) (intptr_t) context - 1, i;
+    uint32_t seq = (uint32_t) (uintptr_t) context;
+    int i;
 
-    if (retiring < 0)
-        return;
+    if (!seq)
+        return;   // the transaction it belongs to retired nothing
 
     pthread_mutex_lock(&rootOverlayLock);
     for (i = 0; i < rootZcRetiringCount; i++) {
-        if (rootZcRetiring[i].slot != retiring || rootZcRetiring[i].fenceArrived)
+        // By handover, not by slot: this may be a callback from a pool that no longer exists, and
+        // matching it to whatever now sits at the same slot index hands over a fence from a
+        // different buffer entirely.
+        if (rootZcRetiring[i].seq != seq || rootZcRetiring[i].fenceArrived)
             continue;
         if (rootSurfaceControl && scApi.statsPrevReleaseFenceFd)
             rootZcRetiring[i].fenceFd = scApi.statsPrevReleaseFenceFd(stats, rootSurfaceControl);
         rootZcRetiring[i].fenceArrived = true;
+        rootZcRetiring[i].fenceArrivedNs = rendererNowNs();
         break;
     }
     pthread_mutex_unlock(&rootOverlayLock);
@@ -2764,7 +2811,8 @@ static bool rootZcDrainRetiring(void) {
 
     pthread_mutex_lock(&rootOverlayLock);
     for (i = 0; i < rootZcRetiringCount; i++) {
-        if (rootZcRetiring[i].fenceArrived && rootZcFenceSignalled(rootZcRetiring[i].fenceFd)) {
+        if (rootZcRetiring[i].fenceArrived &&
+            rootZcFenceSignalled(rootZcRetiring[i].fenceFd, rootZcRetiring[i].fenceArrivedNs)) {
             freedFds[freedCount] = rootZcRetiring[i].fenceFd;
             freed[freedCount++] = rootZcRetiring[i].slot;
         } else
@@ -2841,6 +2889,7 @@ static void rootZcClearLetterbox(int surfaceW, int surfaceH) {
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs) {
     AHardwareBuffer *ahb = desc->buffer;
     int slot = rendererRootSlot, retiring;
+    uint32_t retireSeq;
     int64_t fenceWaitUs = 0;
     bool carriedGpuCopy = false, alreadyOnScreen;
     ASurfaceTransaction *t;
@@ -2897,11 +2946,27 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     }
 
     retiring = rootZcDisplayedSlot;
-    if (retiring >= 0 && rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
-        rootZcRetiring[rootZcRetiringCount].slot = retiring;
-        rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
-        rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
-        rootZcRetiringCount++;
+    retireSeq = 0;
+    if (retiring >= 0) {
+        if (rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
+            // Never reused, and never zero, so a callback from a pool that has since been replaced
+            // matches nothing instead of matching by slot index.
+            if (++rootZcRetireSeq == 0)
+                rootZcRetireSeq = 1;
+            retireSeq = rootZcRetireSeq;
+            rootZcRetiring[rootZcRetiringCount].slot = retiring;
+            rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
+            rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
+            rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
+            rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
+            rootZcRetiringCount++;
+        } else
+            // rootZcDrainRetiring() leaves room for two before this is reached, so there is no
+            // path here. Untracked would mean the slot is never given back at all - the pool runs
+            // a buffer short for the rest of the session - so it is worth saying rather than
+            // dropping quietly.
+            log("XlorieRootZc: no room to track slot %d on its way off screen; it stays held\n",
+                retiring);
     }
     rootZcDisplayedSlot = slot;
 
@@ -2914,7 +2979,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     scApi.txSetBuffer(t, rootSurfaceControl, ahb, -1);
     scApi.txSetGeometry(t, rootSurfaceControl, &src, &dst, 0);
     if (scApi.txSetOnComplete)
-        scApi.txSetOnComplete(t, (void *) (intptr_t) (retiring + 1), rootZcOnComplete);
+        scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
     scApi.txApply(t);
     scApi.txDelete(t);
 
