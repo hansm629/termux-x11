@@ -1288,6 +1288,28 @@ static LorieBuffer *rendererFindBuffer(uint64_t id) {
     return buf;
 }
 
+/*
+ * Says a copy was not made, which completedSerial cannot: it is a watermark, so publishing a later
+ * success would claim this one succeeded too. The X server scraps the present instead of claiming
+ * it, and tells the client its frame was skipped.
+ */
+static void rendererPublishFailedSerial(uint64_t serial) {
+    uint32_t slot = __atomic_load_n(&state->gpuCopyQueue.failedCount, __ATOMIC_RELAXED);
+
+    // The list is short, and a serial pushed out of it used to read back as "never failed" - which
+    // the X server then took as "copied", because completedSerial had stepped over it. Saying how
+    // far the losses reach, before the entry actually goes, keeps that from becoming a false ack.
+    if (slot >= LORIE_GPU_COPY_FAILED_SLOTS) {
+        uint64_t evicted = state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS];
+
+        if (evicted > __atomic_load_n(&state->gpuCopyQueue.failedLostUpTo, __ATOMIC_RELAXED))
+            __atomic_store_n(&state->gpuCopyQueue.failedLostUpTo, evicted, __ATOMIC_RELEASE);
+    }
+
+    state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS] = serial;
+    __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
+}
+
 static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     bool fboSetUp = false;
     uint64_t lastSerial = 0;
@@ -1298,9 +1320,26 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         return 0;
 
     while (state->gpuCopyQueue.readIndex != __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE)) {
-        LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
-        LorieBuffer *src = rendererFindBuffer(entry.srcBufferId);
-        LorieBuffer *dst = rendererFindBuffer(entry.dstBufferId);
+        uint32_t slot = state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY;
+        LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[slot];
+        LorieBuffer *src, *dst;
+
+        // Read on its own rather than trusting the struct copy above, because this is the one field
+        // the X server writes after publishing the entry. Acquire pairs with its release: seeing it
+        // unset means the X server's own write into this destination has not happened yet, and the
+        // lock held around this loop keeps it from starting until the copy below is done.
+        if (__atomic_load_n(&state->gpuCopyQueue.entries[slot].superseded, __ATOMIC_ACQUIRE)) {
+            // The destination holds newer content than this copy carries. Reporting it rather than
+            // letting it ride out on completedSerial: it was not made, and the present has to be
+            // scrapped so the client is told its frame was skipped instead of presented.
+            rendererPublishFailedSerial(entry.serial);
+            state->presentStats.copySkips++;
+            state->gpuCopyQueue.readIndex++;
+            continue;
+        }
+
+        src = rendererFindBuffer(entry.srcBufferId);
+        dst = rendererFindBuffer(entry.dstBufferId);
 
         if (!src || !dst) {
             // Its buffer has not reached us yet. Leave it queued and look again on the next frame
@@ -1327,23 +1366,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             // Say so. Letting this serial ride out on completedSerial told the X server the copy
             // had been made, which told the client its frame was on screen when nothing had been
             // drawn at all.
-            {
-                uint32_t slot = __atomic_load_n(&state->gpuCopyQueue.failedCount, __ATOMIC_RELAXED);
-
-                // The list is short, and a serial pushed out of it used to read back as "never
-                // failed" - which the X server then took as "copied", because completedSerial is
-                // a watermark and had stepped over it. Saying how far the losses reach, before the
-                // entry actually goes, keeps that from turning into a false ack.
-                if (slot >= LORIE_GPU_COPY_FAILED_SLOTS) {
-                    uint64_t evicted = state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS];
-
-                    if (evicted > __atomic_load_n(&state->gpuCopyQueue.failedLostUpTo, __ATOMIC_RELAXED))
-                        __atomic_store_n(&state->gpuCopyQueue.failedLostUpTo, evicted, __ATOMIC_RELEASE);
-                }
-
-                state->gpuCopyQueue.failedSerials[slot % LORIE_GPU_COPY_FAILED_SLOTS] = entry.serial;
-                __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
-            }
+            rendererPublishFailedSerial(entry.serial);
         }
 
         if (src && dst) {

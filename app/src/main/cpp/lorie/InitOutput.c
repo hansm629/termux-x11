@@ -841,6 +841,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.copyAbandons,
                 pvfb->state->presentStats.copyRecordExhausted);
 
+        // Each one is a client frame dropped because the X server drew into the same buffer before
+        // the renderer got to it. A large number here is not a bug, it is windows overlapping.
+        if (pvfb->state->presentStats.cpuWriteSupersedes)
+            log(INFO, "XlorieCopy: %u queued copies dropped, superseded by the X server's own drawing",
+                pvfb->state->presentStats.cpuWriteSupersedes);
+
         if (pvfb->state->presentStats.copyDeferrals || pvfb->state->presentStats.copySkips)
             log(INFO, "XloriePresent: %u copies deferred for a late buffer, %u given up on",
                 pvfb->state->presentStats.copyDeferrals, pvfb->state->presentStats.copySkips);
@@ -902,6 +908,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.copyRequeues = 0;
     pvfb->state->presentStats.copyAbandons = 0;
     pvfb->state->presentStats.copyRecordExhausted = 0;
+    pvfb->state->presentStats.cpuWriteSupersedes = 0;
     pvfb->state->presentStats.copyDeferrals = 0;
     pvfb->state->presentStats.copySkips = 0;
     pvfb->state->presentStats.presentGapsLate = 0;
@@ -1531,6 +1538,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->xOff = x_off;
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
+    entry->superseded = 0;   // this slot's previous occupant may have been
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
@@ -1539,6 +1547,9 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 
     record->serial = entry->serial;
     record->session = lorieRendererSession;
+    // So a later CPU write into the same buffer can be ordered after this one - see
+    // lorieWaitForQueuedGpuWrites().
+    LorieBuffer_noteGpuWrite(dstBuffer, entry->serial);
     record->startUs = lorieNowUs();
     *out_serial = entry->serial;
     *out_record = record;
@@ -2197,9 +2208,62 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
            LorieBuffer_hasGpuCopyPending(priv->buffer);
 }
 
+/*
+ * Gives up on GPU copies already queued to write this buffer, because the X server is about to
+ * write it itself.
+ *
+ * The shared lock keeps the two from running at the same time. It does not put them in order, and
+ * the order is the whole question: the copy was queued before this write, so applying it afterwards
+ * puts older content on top of newer - a client's frame reappearing over whatever was drawn on top
+ * of it, which is what dragging a window across another one does continuously.
+ *
+ * Marked rather than waited for. Waiting is what it looks like it should be, but only the renderer
+ * can drain the queue and it needs this same lock to do it - and EXA prepares the source of a copy
+ * before its destination, so by the time this is reached the lock is often already held. Waiting
+ * there would deadlock until the timeout, every time.
+ *
+ * Marking a published entry is sound because the lock already orders the writes themselves. The
+ * mark is set before the write, so a renderer that reads it as unset has not yet applied the copy
+ * and will apply it under the lock, before this write can start - copy first, then the write on
+ * top, which is the right order. A renderer that reads it as set skips the copy and reports the
+ * serial as not made, so the present is scrapped rather than claimed and the client is told its
+ * frame was skipped, which is what happened to it.
+ *
+ * The whole copy goes, not just the overlapping part: this hook is given a pixmap and not a region.
+ * Losing a frame of a window that is being drawn over beats showing its previous frame on top of
+ * what replaced it, and a client active enough to be presenting will present again.
+ */
+static void lorieSupersedeQueuedGpuWrites(LorieBuffer *buffer) {
+    uint64_t id;
+    uint32_t readIndex, writeIndex, i;
+
+    if (!LorieBuffer_pendingGpuWriteSerial(buffer))
+        return;
+
+    id = LorieBuffer_description(buffer)->id;
+    readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    writeIndex = pvfb->state->gpuCopyQueue.writeIndex;
+
+    for (i = readIndex; i != writeIndex; i++) {
+        LorieGpuCopyEntry *entry = &pvfb->state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+        if (entry->dstBufferId != id)
+            continue;
+
+        // Release, so the renderer cannot see this after the write below has already happened.
+        __atomic_store_n(&entry->superseded, 1u, __ATOMIC_RELEASE);
+        pvfb->state->presentStats.cpuWriteSupersedes++;
+    }
+}
+
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     if (lorieNeedsGpuLock(pPix, priv, index)) {
+        // Before the write, which is what the mark has to precede. The lock this takes is what
+        // then orders the write against a copy the renderer had already started.
+        if (index == EXA_PREPARE_DEST)
+            lorieSupersedeQueuedGpuWrites(priv->buffer);
+
         // This is where the X server's own drawing waits for the renderer to let go of the root
         // window. Timed because it is the whole cost of the renderer's lock occupancy as the X
         // server experiences it - a client's throughput drops by exactly this.

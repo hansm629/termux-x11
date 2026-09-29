@@ -122,6 +122,17 @@ void LorieBuffer_gpuCopyPendingDec(LorieBuffer* _Nullable buffer);
 bool LorieBuffer_hasGpuCopyPending(LorieBuffer* _Nullable buffer);
 
 /**
+ * The highest serial of a GPU copy queued to write into this buffer, so a CPU write can be ordered
+ * after it. Kept apart from the pending count above, which counts sources too: a queued read of
+ * this buffer does not have to happen before a CPU write into it, and a queued write does.
+ * Monotonic, so a serial that has already been resolved simply compares as resolved.
+ *
+ * @param buffer the buffer
+ */
+void LorieBuffer_noteGpuWrite(LorieBuffer* _Nullable buffer, uint64_t serial);
+uint64_t LorieBuffer_pendingGpuWriteSerial(LorieBuffer* _Nullable buffer);
+
+/**
  * Return a description of the LorieBuffer.
  *
  * @param buffer the buffer to be described
