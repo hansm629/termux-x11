@@ -331,6 +331,9 @@ typedef struct {
     uint64_t rootOwedSerial;
     int rootWrite;                  // the slot we are drawing into; only this side ever changes it
     Bool rootDirty;                 // drawn into but not published yet, so the retry below knows
+    /* How many open CPU accesses to this pixmap took the shared lock - recorded when they took it,
+     * so FinishAccess gives back exactly what PrepareAccess took (see loriePrepareAccess). */
+    int sharedLockDepth;
     uint64_t rootDirtySinceUs;      // when it became so, to measure how long a publish took
     Bool rootDouble;
 } LoriePixmapPriv;
@@ -2638,6 +2641,7 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+    Bool tookSharedLock = FALSE;
 
     // The drawing slot may still lack an area a handover left behind. The X server reads the root as
     // well as writing it - moving a window is a copy from the root to itself - so it is brought up to
@@ -2681,26 +2685,43 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         if (waitUs > pvfb->state->presentStats.xLockWaitMaxUs)
             pvfb->state->presentStats.xLockWaitMaxUs = waitUs;
         pvfb->state->presentStats.xLockWaits++;
+        tookSharedLock = TRUE;
     }
 
     if (!priv->locked && !priv->mem) {
         int err = LorieBuffer_lock(priv->buffer, &priv->locked);
         if (err) {
             dprintf(2, "Failed to lock buffer, err %d\n", err);
+            // An access that failed to start gets no FinishAccess, so the lock taken above has to go
+            // back here. Returning with it held left the renderer waiting on it for good - its own
+            // lock retries while the X server is alive, and the X server was never going to let go.
+            if (tookSharedLock)
+                lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
             return FALSE;
         }
         priv->wasLocked = FALSE;
     } else
         priv->wasLocked = TRUE;
 
+    if (tookSharedLock)
+        priv->sharedLockDepth++;
     pPix->devPrivate.ptr = priv->locked ?: priv->mem;
     return TRUE;
 }
 
-void lorieFinishAccess(PixmapPtr pPix, int index) {
+void lorieFinishAccess(PixmapPtr pPix, __unused int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
+
+    /*
+     * Gives back what PrepareAccess recorded taking, rather than asking lorieNeedsGpuLock() again.
+     * That question depends on whether a GPU copy is pending on the buffer and on whether the root
+     * is double-buffered, and neither is fixed between the two calls - an answer that changed in
+     * between either left the lock held for good or released one this access never took.
+     */
+    if (priv->sharedLockDepth > 0) {
+        priv->sharedLockDepth--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    }
 
     if (!priv->wasLocked) {
         LorieBuffer_unlock(priv->buffer);
