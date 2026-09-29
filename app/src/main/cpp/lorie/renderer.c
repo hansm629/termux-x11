@@ -1407,6 +1407,59 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     return lastSerial;
 }
 
+/*
+ * Blocks until GL work already issued has actually finished, and says so honestly.
+ *
+ * Every EGL return value along this path used to be ignored. eglCreateSyncKHR can fail and hand
+ * back EGL_NO_SYNC_KHR, which was then passed straight to the wait, and the wait itself can return
+ * EGL_FALSE - in either case nothing had been waited for, and the copy's serial was published
+ * anyway, telling the X server it could hand the source pixmap back while the GPU was still reading
+ * it. glFinish is the blunt version of the same guarantee and the one thing left that gives it.
+ */
+static int64_t rendererWaitForFence(EGLSync fence) {
+    int64_t waitStartNs = rendererNowNs();
+
+    if (fence == EGL_NO_SYNC_KHR ||
+        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER) != EGL_CONDITION_SATISFIED_KHR) {
+        glFinish();
+        if (state)
+            state->presentStats.fenceFallbacks++;
+    }
+    return rendererNsToUs(rendererNowNs() - waitStartNs);
+}
+
+/*
+ * Submit what has been issued, then wait for it. The two are timed apart because they move for
+ * different reasons: charging both to the fence wait made every reading of "how long does the GPU
+ * take" include the cost of handing it the work.
+ */
+static void rendererFinishIssuedWork(int64_t *flushUs, int64_t *waitUs) {
+    /* After the commands it is meant to cover, and before the flush that submits it. */
+    EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
+    int64_t flushStartNs = rendererNowNs(), waitStartNs;
+
+    glFlush();
+    waitStartNs = rendererNowNs();
+
+    *waitUs = rendererWaitForFence(fence);
+    if (fence != EGL_NO_SYNC_KHR)
+        eglDestroySyncKHR(egl_display, fence);
+    *flushUs = rendererNsToUs(waitStartNs - flushStartNs);
+}
+
+// Accounts for the lock as two separate things: getting it, and holding it. They were one number
+// measured from before the acquire, so a frame that waited 20 ms on the X server and held the lock
+// for 1 ms read the same as the reverse - and it is the reverse that says the renderer is what
+// blocks the X server.
+static void rendererNoteLock(int64_t waitUs, int64_t heldUs) {
+    if (!state)
+        return;
+    state->presentStats.lockWaitUs += (uint32_t) waitUs;
+    if ((uint32_t) waitUs > state->presentStats.lockWaitMaxUs)
+        state->presentStats.lockWaitMaxUs = (uint32_t) waitUs;
+    state->presentStats.lockHeldUs += (uint32_t) heldUs;
+}
+
 // Standalone entry point used by the renderer thread's main loop. Used when no redraw is going to
 // happen on this tick (rare for GPU copies in practice, since scheduling one also marks damage
 // non-empty - see lorieTryScheduleGpuCopy), so it has to take the lock and fence/unlock itself.
@@ -1414,21 +1467,26 @@ static void rendererApplyPendingGpuCopies(void) {
     uint64_t serial;
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return;
-    int64_t lockStartNs = rendererNowNs();
+    int64_t lockWaitStartNs = rendererNowNs(), lockHeldStartNs;
+    int64_t flushUs = 0, waitUs = 0;
+
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    lockHeldStartNs = rendererNowNs();
     serial = rendererApplyPendingGpuCopiesLocked();
     if (serial) {
-        EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
-        glFlush();
-        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-        eglDestroySyncKHR(egl_display, fence);
+        rendererFinishIssuedWork(&flushUs, &waitUs);
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
         // let present_execute_copy release/idle the source pixmap back to the client.
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
-    state->presentStats.lockHeldUs += (uint32_t) rendererNsToUs(rendererNowNs() - lockStartNs);
+    rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockWaitStartNs),
+                     rendererNsToUs(rendererNowNs() - lockHeldStartNs));
+    state->presentStats.flushUs += (uint32_t) flushUs;
+    state->presentStats.fenceWaitUs += (uint32_t) waitUs;
+    if ((uint32_t) waitUs > state->presentStats.fenceWaitMaxUs)
+        state->presentStats.fenceWaitMaxUs = (uint32_t) waitUs;
 }
 
 // Frame pacing numbers the X server prints every 5 seconds (see lorieFramecounter). Kept separate
@@ -1518,17 +1576,28 @@ static uint64_t rendererPendingGpuCopySerial = 0;
 static void rendererRetireFrame(void) {
     EGLSync fence = rendererPendingFence;
 
-    if (fence == EGL_NO_SYNC_KHR)
+    // A serial still to publish with no fence to wait on means eglCreateSyncKHR failed when the
+    // frame was submitted. Returning here left that serial unpublished and the root slot claimed,
+    // so the X server waited for a copy nobody would ever report and the renderer ran a slot short.
+    if (fence == EGL_NO_SYNC_KHR && !rendererPendingGpuCopySerial)
         return;
 
     rendererPendingFence = EGL_NO_SYNC_KHR;
 
-    // Zero timeout: this has normally signalled long ago. The flush bit only matters for the rare
-    // case where nothing has been submitted since, and the bounded wait below is the safety net.
-    if (eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 0) == EGL_TIMEOUT_EXPIRED_KHR)
-        eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+    if (fence == EGL_NO_SYNC_KHR) {
+        // Nothing to wait on, and publishing the serial regardless would say the GPU had finished.
+        glFinish();
+        if (state)
+            state->presentStats.fenceFallbacks++;
+    } else {
+        // Zero timeout: this has normally signalled long ago. The flush bit only matters for the
+        // rare case where nothing has been submitted since, and the blocking wait is the safety
+        // net - taken for an error as well as a timeout, since neither says the work is done.
+        if (eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 0) != EGL_CONDITION_SATISFIED_KHR)
+            rendererWaitForFence(fence);
 
-    eglDestroySyncKHR(egl_display, fence);
+        eglDestroySyncKHR(egl_display, fence);
+    }
 
     if (rendererPendingGpuCopySerial && state) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, rendererPendingGpuCopySerial, __ATOMIC_RELEASE);
@@ -1570,7 +1639,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // cursor alone asked for, which rendererShouldWait() refuses to coalesce.
     bool cursorOnlyFrame = state && !state->drawRequested &&
                            (state->cursor.moved || state->cursor.updated);
-    int64_t lockHeldUs = 0;
+    int64_t lockHeldUs = 0, lockWaitUs = 0;
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
     EGLSync fence = EGL_NO_SYNC_KHR;
@@ -1743,8 +1812,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     // We should signal X server to not use root window while we actively copy it
-    int64_t lockStartNs = rendererNowNs();
+    int64_t lockStartNs = rendererNowNs(), lockHeldStartNs;
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    lockHeldStartNs = rendererNowNs();
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
@@ -1787,10 +1857,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         rootWaitUs = 0;
     } else {
         if (fence != EGL_NO_SYNC_KHR) {
-            int64_t waitStartNs = rendererNowNs();
-            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-            rootWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
-
+            rootWaitUs = rendererWaitForFence(fence);
             eglDestroySyncKHR(egl_display, fence);
             fence = EGL_NO_SYNC_KHR;
         }
@@ -1803,7 +1870,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
-    lockHeldUs = rendererNsToUs(rendererNowNs() - lockStartNs);
+    lockHeldUs = rendererNsToUs(rendererNowNs() - lockHeldStartNs);
+    lockWaitUs = rendererNsToUs(lockHeldStartNs - lockStartNs);
 // Gaming fast path: submit GL commands before swap without creating or waiting on fences.
     // This keeps the no-fence fast path but avoids moving all submit work into swap.
     if (!rootFenceWaitEnabled && !deferFence) {
@@ -1871,7 +1939,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     state->renderedFrames++;
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
-    state->presentStats.lockHeldUs += (uint32_t) lockHeldUs;
+    rendererNoteLock(lockWaitUs, lockHeldUs);
     if (cursorOnlyFrame)
         state->presentStats.cursorOnlyFrames++;
 
@@ -2700,24 +2768,20 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     // and both are reported - passing constants here is what made an earlier reading of this path
     // claim the renderer had no GPU work at all.
     {
-        int64_t lockStartNs = rendererNowNs();
+        int64_t lockStartNs = rendererNowNs(), lockHeldStartNs, flushUs = 0;
         uint64_t gpuCopySerial;
 
         lorie_mutex_lock(&state->lock, &state->lockingPid);
+        lockHeldStartNs = rendererNowNs();
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
         state->drawRequested = FALSE;
-        if (gpuCopySerial) {
-            EGLSync fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
-            int64_t waitStartNs = rendererNowNs();
-
-            glFlush();
-            eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
-            fenceWaitUs = rendererNsToUs(rendererNowNs() - waitStartNs);
-            eglDestroySyncKHR(egl_display, fence);
-        }
+        if (gpuCopySerial)
+            rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
         state->waitForNextFrame = true;
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
-        state->presentStats.lockHeldUs += (uint32_t) rendererNsToUs(rendererNowNs() - lockStartNs);
+        rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockStartNs),
+                         rendererNsToUs(rendererNowNs() - lockHeldStartNs));
+        state->presentStats.flushUs += (uint32_t) flushUs;
 
         carriedGpuCopy = gpuCopySerial != 0;
         if (gpuCopySerial) {

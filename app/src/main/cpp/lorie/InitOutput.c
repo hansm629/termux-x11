@@ -777,20 +777,26 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     samples = pvfb->state->presentStats.frameSamples;
     if (samples) {
         log(INFO, "XlorieFrames: frame avg %.1f ms, max %.1f ms, hitches(>=%d ms) %u, "
-                  "fence wait %.1f ms total (worst %.1f ms), copies on %u frames, coalesced %u",
+                  "submit %.1f ms + fence wait %.1f ms total (worst wait %.1f ms), "
+                  "copies on %u frames, coalesced %u, glFinish fallbacks %u",
             (double) pvfb->state->presentStats.frameSumUs / samples / 1000.0,
             pvfb->state->presentStats.maxFrameUs / 1000.0,
             LORIE_LONG_FRAME_US / 1000,
             pvfb->state->presentStats.longFrames,
+            pvfb->state->presentStats.flushUs / 1000.0,
             pvfb->state->presentStats.fenceWaitUs / 1000.0,
             pvfb->state->presentStats.fenceWaitMaxUs / 1000.0,
             pvfb->state->presentStats.gpuCopyFrames,
-            pvfb->state->presentStats.coalescedFrames);
+            pvfb->state->presentStats.coalescedFrames,
+            pvfb->state->presentStats.fenceFallbacks);
         log(INFO, "XlorieLock: renderer held the root lock %.1f%% of the time (%.0f ms), "
+                  "spent %.0f ms getting it (worst %.1f ms), "
                   "X server blocked on it %.0f ms over %u accesses (worst %.1f ms), "
                   "cursor-only frames %u (overlay %u) of %u pointer moves, display %.1f Hz",
             pvfb->state->presentStats.lockHeldUs / 50000.0,
             pvfb->state->presentStats.lockHeldUs / 1000.0,
+            pvfb->state->presentStats.lockWaitUs / 1000.0,
+            pvfb->state->presentStats.lockWaitMaxUs / 1000.0,
             pvfb->state->presentStats.xLockWaitUs / 1000.0,
             pvfb->state->presentStats.xLockWaits,
             pvfb->state->presentStats.xLockWaitMaxUs / 1000.0,
@@ -859,6 +865,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.maxFrameUs = 0;
     pvfb->state->presentStats.longFrames = 0;
     pvfb->state->presentStats.fenceWaitUs = 0;
+    pvfb->state->presentStats.flushUs = 0;
+    pvfb->state->presentStats.fenceFallbacks = 0;
+    pvfb->state->presentStats.lockWaitUs = 0;
+    pvfb->state->presentStats.lockWaitMaxUs = 0;
     pvfb->state->presentStats.gpuCopyFrames = 0;
     pvfb->state->presentStats.coalescedFrames = 0;
     pvfb->state->presentStats.lockHeldUs = 0;

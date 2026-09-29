@@ -335,10 +335,24 @@ struct lorie_shared_server_state {
         volatile uint32_t longFrames;     /* gaps >= LORIE_LONG_FRAME_US, i.e. a visible hitch */
         volatile uint32_t fenceWaitUs;    /* total time blocked on the root/present-copy fence */
         volatile uint32_t fenceWaitMaxUs; /* and the worst single one - a total hides a lone 100 ms wait */
+        /* Submitting the copies, separate from waiting for them. Both used to be charged to
+         * fenceWaitUs, which made every reading of "how long does the GPU take" include the cost of
+         * handing it the work - the two move for entirely different reasons. */
+        volatile uint32_t flushUs;
+        /* Waits that had to fall back to glFinish because the fence could not be created or the
+         * wait on it failed. Not an error we can ignore: without this the fallback is invisible and
+         * a failed wait reads exactly like a fast one. */
+        volatile uint32_t fenceFallbacks;
         volatile uint32_t gpuCopyFrames;  /* frames that carried at least one present copy */
         volatile uint32_t coalescedFrames;/* redraws the backpressure guard delayed */
         volatile uint32_t lockHeldUs;     /* renderer time holding state->lock, i.e. time the X
                                            * server's own drawing (loriePrepareAccess) can not run */
+        /* Time the renderer spent getting the lock, as opposed to holding it. These were one number
+         * measured from before the acquire, so a frame that waited 20 ms on the X server and held
+         * the lock for 1 ms was indistinguishable from the reverse - and it is the reverse that
+         * says the renderer is the one blocking the X server. */
+        volatile uint32_t lockWaitUs;
+        volatile uint32_t lockWaitMaxUs;
         volatile uint32_t cursorOnlyFrames;/* redraws with no damage at all: only the cursor moved */
         volatile uint32_t displayRefreshMHz;/* what the renderer paces to, milli-Hz */
         /* Written by the X server side, not the renderer, but reset together with the rest. */
