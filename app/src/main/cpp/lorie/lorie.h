@@ -247,11 +247,12 @@ typedef struct {
     int16_t xOff, yOff;
     uint16_t numRects;
 
-    /* The one field of a published entry the X server still writes, and the only one it may: the
-     * destination has been written by the X server itself since this was queued, so applying it now
-     * would put the client's older frame on top of what replaced it. Set before that write happens,
-     * read atomically by the renderer just before it would apply the entry, and cleared by the X
-     * server when the slot is reused. See lorieSupersedeQueuedGpuWrites(). */
+    /* The one field of a published entry the X server still writes, and the only one it may: this
+     * copy has been cancelled and nobody wants its result any more. Set before the request it
+     * belongs to is torn down, read atomically by the renderer just before it would apply the
+     * entry, and cleared by the X server when the slot is reused. It is a request, not a guarantee -
+     * the renderer may already have the entry - so see lorieGpuCopyAbandon() for what still has to
+     * hold either way. */
     volatile uint32_t superseded;
 
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
@@ -490,11 +491,6 @@ struct lorie_shared_server_state {
          * says the GPU finished with them. Not a safe completion - see lorieCopySettled - so it is
          * counted apart from the ones that were actually reported. */
         volatile uint32_t copyForcedSettle;
-
-        /* Queued copies dropped because the X server wrote their destination first. Applying them
-         * afterwards would put the client's older frame on top of what replaced it; the client is
-         * told the present was skipped, which is what happened. */
-        volatile uint32_t cpuWriteSupersedes;
 
         /* When client requests actually arrive, which is the one hop everything else is measured
          * relative to. requestAheadMax is how many vsyncs ahead the furthest one asked to be shown:

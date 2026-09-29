@@ -39,7 +39,6 @@ struct LorieBuffer {
     struct xorg_list link;
 
     int32_t gpuCopyPending;
-    uint64_t gpuWriteSerial;
 };
 
 void LorieBuffer_gpuCopyPendingInc(LorieBuffer* buffer) {
@@ -56,14 +55,6 @@ bool LorieBuffer_hasGpuCopyPending(LorieBuffer* buffer) {
     return buffer && buffer->gpuCopyPending;
 }
 
-void LorieBuffer_noteGpuWrite(LorieBuffer* buffer, uint64_t serial) {
-    if (buffer && serial > buffer->gpuWriteSerial)
-        buffer->gpuWriteSerial = serial;
-}
-
-uint64_t LorieBuffer_pendingGpuWriteSerial(LorieBuffer* buffer) {
-    return buffer ? buffer->gpuWriteSerial : 0;
-}
 
 __attribute__((unused))
 static int memfd_create(const char *name, unsigned int flags) {
