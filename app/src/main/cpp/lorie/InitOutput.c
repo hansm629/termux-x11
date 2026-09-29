@@ -269,6 +269,7 @@ typedef struct {
     uint64_t rootGpuPendingSerial[LORIE_ROOT_SLOTS];
     int rootWrite;                  // the slot we are drawing into; only this side ever changes it
     Bool rootDirty;                 // drawn into but not published yet, so the retry below knows
+    uint64_t rootDirtySinceUs;      // when it became so, to measure how long a publish took
     Bool rootDouble;
 } LoriePixmapPriv;
 
@@ -727,6 +728,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         DamageEmpty(pvfb->damage);
         if (lorieRootHandover(priv))
             priv->rootDirty = FALSE;
+        else if (!priv->rootDirtySinceUs)
+            priv->rootDirtySinceUs = lorieNowUs();
         pvfb->state->drawRequested = TRUE;
     }
 
@@ -745,6 +748,20 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         priv->rootDirty = FALSE;
         pvfb->state->drawRequested = TRUE;
     }
+
+    /*
+     * How long content has been drawn but not shown. This is the symptom itself: every counter
+     * upstream of it can look healthy - clients presenting, copies completing, frames pacing at the
+     * display rate - while nothing new reaches the screen, and until this was measured there was
+     * nothing that told the two apart.
+     */
+    if (priv->rootDirty && priv->rootDirtySinceUs) {
+        uint32_t ageUs = (uint32_t) (lorieNowUs() - priv->rootDirtySinceUs);
+
+        if (ageUs > pvfb->state->presentStats.rootUnpublishedMaxUs)
+            pvfb->state->presentStats.rootUnpublishedMaxUs = ageUs;
+    } else
+        priv->rootDirtySinceUs = 0;
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
         // With a double buffered root this must name the buffer the renderer samples, not the one
@@ -871,6 +888,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.rootCopyBytes / 1048576.0,
                 pvfb->state->presentStats.rootCopyUs / 1000.0,
                 pvfb->state->presentStats.rootStalePostponed);
+        if (pvfb->state->presentStats.rootPublishAttempts)
+            log(INFO, "XlorieRootPublish: %u of %u attempts published, %u found no free slot, "
+                      "longest drawn-but-unshown %.1f ms",
+                pvfb->state->presentStats.rootPublishes,
+                pvfb->state->presentStats.rootPublishAttempts,
+                pvfb->state->presentStats.rootPublishNoSlot,
+                pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -907,6 +931,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootCopyUs = 0;
     pvfb->state->presentStats.rootCopies = 0;
     pvfb->state->presentStats.rootStalePostponed = 0;
+    pvfb->state->presentStats.rootPublishAttempts = 0;
+    pvfb->state->presentStats.rootPublishes = 0;
+    pvfb->state->presentStats.rootPublishNoSlot = 0;
+    pvfb->state->presentStats.rootUnpublishedMaxUs = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
@@ -2212,6 +2240,8 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     if (!priv->rootDouble)
         return FALSE;
 
+    pvfb->state->presentStats.rootPublishAttempts++;
+
     do {
         old = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE);
 
@@ -2225,8 +2255,13 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
                 next = i;
                 break;
             }
-        if (next < 0)
+        if (next < 0) {
+            // Every other slot is still with the renderer or the compositor, so there is nowhere to
+            // draw next. Distinct from having nothing to publish: this is publishing faster than
+            // the display can show it.
+            pvfb->state->presentStats.rootPublishNoSlot++;
             return FALSE;
+        }
 
         new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT))
             | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT);
@@ -2257,6 +2292,8 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
         RegionSubtract(&carry, &carry, unsafe);
         pvfb->state->presentStats.rootStalePostponed++;
     }
+
+    pvfb->state->presentStats.rootPublishes++;
 
     lorieCopyRootRegion(priv, drawn, next, &carry);
     // Whatever could not be read forward stays owed to this slot.

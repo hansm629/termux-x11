@@ -415,6 +415,16 @@ struct lorie_shared_server_state {
          * later handover. It replaces a count of publishes held back entirely, which is what the
          * handover used to do and what could stop it publishing at all. */
         volatile uint32_t rootStalePostponed;
+
+        /* Whether the screen is actually being updated, which nothing else here answers. Every
+         * counter upstream can look healthy - clients presenting, copies completing, frames pacing
+         * at the display rate - while nothing new reaches the screen. NoSlot is publishing faster
+         * than the display can show it; UnpublishedMax is how long content stayed drawn but
+         * unshown, which is the symptom itself. */
+        volatile uint32_t rootPublishAttempts;
+        volatile uint32_t rootPublishes;
+        volatile uint32_t rootPublishNoSlot;
+        volatile uint32_t rootUnpublishedMaxUs;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
