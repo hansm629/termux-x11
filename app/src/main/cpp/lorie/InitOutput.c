@@ -1559,7 +1559,9 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     }
 
     writeIndex = pvfb->state->gpuCopyQueue.writeIndex;
-    readIndex = pvfb->state->gpuCopyQueue.readIndex;
+    // Acquire, pairing with the renderer's release when it hands a slot back: seeing the slot free
+    // has to mean the renderer's reads of its previous entry are done before this overwrites it.
+    readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
     if (writeIndex - readIndex >= LORIE_GPU_COPY_QUEUE_CAPACITY) {
         gpuCopyAttempts++;
         return FALSE;
@@ -1660,7 +1662,10 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->xOff = x_off;
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
-    entry->superseded = 0;   // this slot's previous occupant may have been
+    // This slot's previous occupant may have been cancelled. Cleared before the release below
+    // publishes the entry, so the renderer can never pair the new entry with the old flag.
+    __atomic_store_n(&pvfb->state->gpuCopyQueue.entryCancelled[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY],
+                     0u, __ATOMIC_RELAXED);
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
@@ -1847,10 +1852,12 @@ static void lorieMarkQueuedCopySuperseded(uint64_t serial) {
     uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
 
     for (i = readIndex; i != writeIndex; i++) {
-        LorieGpuCopyEntry *entry = &pvfb->state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        uint32_t slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
 
-        if (entry->serial == serial) {
-            __atomic_store_n(&entry->superseded, 1u, __ATOMIC_RELEASE);
+        // By serial, which is unique: a slot that has been reused holds a different job, and this
+        // cannot touch it.
+        if (pvfb->state->gpuCopyQueue.entries[slot].serial == serial) {
+            __atomic_store_n(&pvfb->state->gpuCopyQueue.entryCancelled[slot], 1u, __ATOMIC_RELEASE);
             return;
         }
     }

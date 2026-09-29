@@ -1370,6 +1370,15 @@ static void rendererPublishFailedSerial(uint64_t serial) {
     __atomic_store_n(&state->gpuCopyQueue.failedCount, slot + 1, __ATOMIC_RELEASE);
 }
 
+/*
+ * Hands the slot back to the X server. A release store, because this is what tells the X server it may
+ * overwrite the entry, and the entry was read above: a plain increment does not order those reads
+ * before the X server's next writes on a weakly ordered CPU, and the X server reads this with acquire.
+ */
+static inline void rendererAdvanceReadIndex(void) {
+    __atomic_store_n(&state->gpuCopyQueue.readIndex, state->gpuCopyQueue.readIndex + 1, __ATOMIC_RELEASE);
+}
+
 // Which root slot a buffer id names, or -1 if it is not a root slot at all.
 static int rendererRootSlotForBufferId(uint64_t id) {
     int i;
@@ -1421,7 +1430,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
         // the X server writes after publishing the entry. Acquire pairs with its release: seeing it
         // unset means the X server's own write into this destination has not happened yet, and the
         // lock held around this loop keeps it from starting until the copy below is done.
-        if (__atomic_load_n(&state->gpuCopyQueue.entries[slot].superseded, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&state->gpuCopyQueue.entryCancelled[slot], __ATOMIC_ACQUIRE)) {
             // The destination holds newer content than this copy carries. Reporting it rather than
             // letting it ride out on completedSerial: it was not made, and the present has to be
             // scrapped so the client is told its frame was skipped instead of presented.
@@ -1429,7 +1438,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
             state->presentStats.copySkips++;
             // Drained like any other entry: nothing of it is left for the GPU to do.
             lastSerial = entry.serial;
-            state->gpuCopyQueue.readIndex++;
+            rendererAdvanceReadIndex();
             continue;
         }
 
@@ -1546,7 +1555,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
         rendererCopyBlockedUntilNs = 0;
         rendererCopyDeferredSerial = 0;
         lastSerial = entry.serial;
-        state->gpuCopyQueue.readIndex++;
+        rendererAdvanceReadIndex();
     }
 
     if (fboSetUp) {

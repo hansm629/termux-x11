@@ -246,17 +246,8 @@ typedef struct {
     uint64_t dstBufferId;
     int16_t xOff, yOff;
     uint16_t numRects;
-
-    /* The one field of a published entry the X server still writes, and the only one it may: this
-     * copy has been cancelled and nobody wants its result any more. Set before the request it
-     * belongs to is torn down, read atomically by the renderer just before it would apply the
-     * entry, and cleared by the X server when the slot is reused. It is a request, not a guarantee -
-     * the renderer may already have the entry - so see lorieGpuCopyAbandon() for what still has to
-     * hold either way. */
-    volatile uint32_t superseded;
-
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
-} LorieGpuCopyEntry;
+} LorieGpuCopyEntry;   /* immutable once published - see entryCancelled for the one thing that is not */
 
 struct lorie_shared_server_state {
     /*
@@ -299,6 +290,18 @@ struct lorie_shared_server_state {
          * this and absent from the list is unknown, which is not the same as succeeded. */
         volatile uint64_t failedLostUpTo;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+        /* The only thing about a published entry that still changes: its copy has been cancelled and
+         * nobody wants the result. Kept out of the entry itself, because the renderer takes the entry
+         * with a plain struct copy - a field the X server can write concurrently has no business in
+         * something read that way, whatever is done with it afterwards.
+         *
+         * Set by the X server before the request it belongs to is torn down, read atomically by the
+         * renderer just before it would apply the entry at that slot, and cleared by the X server
+         * before the slot is reused - which cannot happen while the renderer is still on it, since
+         * reuse waits for readIndex to move past. It is a request, not a guarantee: the renderer may
+         * already have taken the entry, so see lorieGpuCopyAbandon() for what still has to hold. */
+        volatile uint32_t entryCancelled[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
 
     /* ID of root window texture to be drawn. */
