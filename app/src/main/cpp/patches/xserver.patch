@@ -540,7 +540,7 @@
 +extern Bool lorieGpuCopyAbandon(void *record);
 +extern void lorieHoldPresentResources(void *token, PixmapPtr pixmap,
 +                                      struct present_fence *idleFence);
-+extern void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, XID window, CARD32 serial,
++extern void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, WindowPtr window, CARD32 serial,
 +                                  struct present_fence *idleFence);
 +/* lorie: called as each client present request is turned into a vblank, so the wait between a
 + * request arriving and it being executed can be told apart from the client being slow. */
@@ -653,7 +653,7 @@
 +     * So the pixmap, the fence and the notify go with the copy and are finished with when the
 +     * renderer reports the serial. */
 +    if (send_idle)
-+        lorieDeferPresentIdle(record, vblank->pixmap, vblank->window->drawable.id,
++        lorieDeferPresentIdle(record, vblank->pixmap, vblank->window,
 +                              vblank->serial, vblank->idle_fence);
 +    else
 +        lorieHoldPresentResources(record, vblank->pixmap, vblank->idle_fence);

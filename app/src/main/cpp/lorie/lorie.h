@@ -35,10 +35,12 @@ void lorieRecheckGpuCopies(void);
  * the renderer made progress - the frame after may never come. */
 void lorieReapAbandonedCopies(void);
 void lorieNoteGpuCopyRequeued(void);
-/* 3.5: the terminal path for abandoned copies. A renderer that has gone away will never report a
- * serial, so the records would sit forever; the connection dropping is not evidence the GPU
- * finished, but the buffers cannot be waited on either once the process holding them is gone. */
-void lorieDropAbandonedCopies(void);
+/* Both run on the X server thread, and both only change when a still-unreported copy stops being
+ * worth waiting on - neither releases anything by itself, the reaper does that. A renderer
+ * connecting is the answer that a broken socket is not: the process that owed the report has been
+ * replaced, so its GPU work is gone with it. */
+void lorieNoteRendererLost(void);
+void lorieNoteRendererConnected(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);

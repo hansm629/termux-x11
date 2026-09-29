@@ -242,6 +242,16 @@ static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *c
     return TRUE;
 }
 
+static Bool handleRendererLostEvent(__unused ClientPtr pClient, __unused void *closure) {
+    LorieBuffer* buf;
+
+    // This must be done only on X server thread.
+    lorieNoteRendererLost();
+    while ((buf = LorieBufferList_first(&registeredBuffers)))
+        LorieBuffer_removeFromList(buf);
+    return TRUE;
+}
+
 static Bool handleGpuCopyDoneEvent(__unused ClientPtr pClient, __unused void *closure) {
     // This must be done only on X server thread (touches present's internal vblank queue).
     lorieRecheckGpuCopies();
@@ -298,17 +308,16 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
     valuator_mask_zero(&mask);
 
     if (ready & X_NOTIFY_ERROR) {
-        LorieBuffer* buf;
         InputThreadUnregisterDev(fd);
         close(fd);
         conn_fd = -1;
         lorieEnableClipboardSync(FALSE);
-        // The renderer will never report the serials copies were waiting on. Its process took its
-        // GPU work with it, and the references held here are the last ones, so this is where they
-        // are let go - otherwise the records sit until the server exits.
-        lorieDropAbandonedCopies();
-        while ((buf = LorieBufferList_first(&registeredBuffers)))
-            LorieBuffer_removeFromList(buf);
+        // The rest is the X server's state, and this is the input thread. Unregistering the buffers
+        // and settling the copies that were waiting on this renderer both ran here, which is not
+        // allowed to touch either: the copies idle pixmaps and read Present's queues, and the
+        // buffer list is otherwise only ever changed while registering from the server thread.
+        QueueWorkProc(handleRendererLostEvent, NULL, NULL);
+        lorieWakeServer();
         return;
     }
 
@@ -481,6 +490,8 @@ bool lorieConnectionAlive(void) {
 static Bool addFd(__unused ClientPtr pClient, void *closure) {
     InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, NULL);
     conn_fd = (int) (int64_t) closure;
+    // Before anything is offered to it, so every copy carries the session that owes its report.
+    lorieNoteRendererConnected();
     lorieActivityConnected();
     return TRUE;
 }

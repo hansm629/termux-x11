@@ -917,6 +917,76 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
     return TRUE;
 }
 
+typedef struct {
+    struct xorg_list link;    /* only while waiting to be reaped */
+    Bool inUse;
+
+    /* Taken at enqueue, not looked up again later. The pixmap's current buffer rotates on, so
+     * asking it at completion time asked about a different buffer than the one the work was given. */
+    LorieBuffer *src, *dst;
+    uint64_t serial;
+
+    /* Which renderer connection was supposed to report this serial. The renderer is a separate
+     * process that can be replaced while copies are outstanding - the activity is restarted, the
+     * surface is lost - and nothing in a serial says whose answer it was waiting for. */
+    uint32_t session;
+    uint64_t settleByUs;   /* once its session has ended: how long to hold it (see lorieCopySettled) */
+
+    /* Kept here rather than in a ring keyed by the serial: the ring aliased once more serials had
+     * gone by than it had slots, so a cancelled copy could pick up a later copy's start time. */
+    uint64_t startUs;
+
+    /* What a cancelled present left behind. The pixmap reference and the idle fence are simply
+     * held: dropping them while the GPU still reads the pixmap is the thing being avoided.
+     *
+     * The notify is separate, because telling the client its pixmap is free again is a statement
+     * about the GPU, not about the request - holding a LorieBuffer reference keeps the object
+     * alive, it does not stop the client writing that memory, and nothing orders a client's next
+     * write against a copy the renderer has already submitted. A cancelled present owes that
+     * notify and it is sent once the renderer is done; a present whose window is being torn down
+     * owes nobody anything, and only the references need handing over, so idleWindow is left NULL.
+     *
+     * The window is a pointer, and lorieDestroyWindow() clears it before it can dangle. Holding an
+     * XID and looking it up later meant trusting the XID still named the same window: X reuses
+     * resource ids once the owning client has gone, so a record sitting here across a disconnect
+     * could deliver a stale idle to whatever window inherited the id. */
+    PixmapPtr heldPixmap;
+    struct present_fence *heldFence;
+    WindowPtr idleWindow;
+    CARD32 idleSerial;
+} LorieAbandonedCopy;
+
+static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
+
+/* Bumped on each renderer connection, so a copy can tell whether the process that owed it an answer
+ * is the one that is there now. 0 is "no renderer has ever connected". */
+static uint32_t lorieRendererSession;
+
+/* How long a copy is held once the connection that owed it an answer has gone and nothing has taken
+ * its place. The thing being waited out is GPU work that renderer already submitted and that may
+ * still be reading the source pixmap; that work is bounded by the driver's own timeout, on the
+ * order of a second or two. So this is a bound on the wait, not a guess that the process has
+ * exited - and if a new renderer connects first, that is the real answer and this never applies. */
+#define LORIE_LOST_SESSION_SETTLE_US (2 * 1000 * 1000ULL)
+
+// A deferred IdleNotify names the window it is owed to, and that window can be destroyed while the
+// renderer is still reading the pixmap. Forgetting it here is what keeps the pointer from dangling,
+// and what stops a stale idle reaching whatever later inherits the resource id.
+static Bool lorieDestroyWindow(WindowPtr pWin) {
+    ScreenPtr pScreen = pWin->drawable.pScreen;
+    LorieAbandonedCopy *c;
+    Bool ret;
+
+    xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
+        if (c->idleWindow == pWin)
+            c->idleWindow = NULL;
+
+    pScreen->DestroyWindow = pvfb->DestroyWindow;
+    ret = pScreen->DestroyWindow ? pScreen->DestroyWindow(pWin) : TRUE;
+    pScreen->DestroyWindow = lorieDestroyWindow;
+    return ret;
+}
+
 static Bool lorieCloseScreen(ScreenPtr pScreen) {
     pScreenPtr = NULL;
     pScreen->DestroyPixmap(pScreen->devPrivate);
@@ -1110,6 +1180,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
 
     pvfb->CloseScreen = pScreen->CloseScreen;
     pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
+    pvfb->DestroyWindow = pScreen->DestroyWindow;
+    pScreen->DestroyWindow = lorieDestroyWindow;
     pScreen->CloseScreen = lorieCloseScreen;
     pScreen->SetWindowPixmap = lorieSetWindowPixmap;
 
@@ -1292,37 +1364,6 @@ bool lorieRendererAvailable(void) {
 // for a plain window, or a Composite-redirected window's own backing pixmap. Returns FALSE
 // (caller falls back to the regular CPU present_copy_region) whenever either buffer isn't
 // GPU-sampleable, or the deferred copy queue is currently full.
-typedef struct {
-    struct xorg_list link;    /* only while waiting to be reaped */
-    Bool inUse;
-
-    /* Taken at enqueue, not looked up again later. The pixmap's current buffer rotates on, so
-     * asking it at completion time asked about a different buffer than the one the work was given. */
-    LorieBuffer *src, *dst;
-    uint64_t serial;
-
-    /* Kept here rather than in a ring keyed by the serial: the ring aliased once more serials had
-     * gone by than it had slots, so a cancelled copy could pick up a later copy's start time. */
-    uint64_t startUs;
-
-    /* What a cancelled present left behind. The pixmap reference and the idle fence are simply
-     * held: dropping them while the GPU still reads the pixmap is the thing being avoided.
-     *
-     * notifyIdle is separate, because telling the client its pixmap is free again is a statement
-     * about the GPU, not about the request - holding a LorieBuffer reference keeps the object
-     * alive, it does not stop the client writing that memory, and nothing orders a client's next
-     * write against a copy the renderer has already submitted. A cancelled present owes that
-     * notify and it is sent once the renderer is done; a present whose window is being torn down
-     * owes nobody anything, and only the references need handing over. The window is held by XID
-     * rather than by pointer, because it can be destroyed in the meantime. */
-    PixmapPtr heldPixmap;
-    struct present_fence *heldFence;
-    Bool notifyIdle;
-    XID idleWindow;
-    CARD32 idleSerial;
-} LorieAbandonedCopy;
-
-static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
 
 /* A record is claimed before a copy is enqueued, never after. Claiming it at cancellation time
  * meant the claim could fail exactly when failing was unacceptable - the only thing left to do
@@ -1486,6 +1527,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     pthread_cond_signal(rendererCond);
 
     record->serial = entry->serial;
+    record->session = lorieRendererSession;
     record->startUs = lorieNowUs();
     *out_serial = entry->serial;
     *out_record = record;
@@ -1539,17 +1581,41 @@ static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
 }
 
 
+/*
+ * Whether it is safe to let go of what this copy was using.
+ *
+ * The renderer having reported the serial is the only direct answer, and used to be the only one
+ * asked - which left every copy of a connection that broke waiting forever for a report that could
+ * not come. The other way it ends is that the process which held the imported buffers and submitted
+ * the GPU work is gone, and a different renderer having connected since is exactly that: the
+ * session number only moves when a connection is established.
+ *
+ * A socket error on its own is neither. It says the request channel is gone, not that the GPU
+ * finished, and treating it as completion is what released buffers a still-living renderer could
+ * still be reading. So a lost session without a replacement is held instead - for a bounded time,
+ * because the records come from a small reserve and holding them all means no copy can be offered
+ * at all, which is a visible slowdown rather than a corruption.
+ */
+static Bool lorieCopySettled(LorieAbandonedCopy *c) {
+    if (lorieGpuCopyIsDone(c->serial) || lorieGpuCopyFailed(c->serial))
+        return TRUE;
+
+    if (c->session == lorieRendererSession)
+        return FALSE;   // still the live renderer's answer to give
+
+    if (!c->settleByUs)
+        return FALSE;   // its session has not been declared over yet
+
+    return lorieNowUs() >= c->settleByUs;
+}
+
 // Lets go of what a cancelled present left with the copy, now that the renderer is done reading it.
 static void lorieFinishHeldPresentResources(LorieAbandonedCopy *c) {
-    if (c->notifyIdle) {
-        WindowPtr window = NULL;
-
-        // The window may well be gone by now; the pixmap and the fence are ours to finish with
-        // either way, and without a window there is nobody left to notify.
-        dixLookupResourceByType((void **) &window, c->idleWindow, RT_WINDOW,
-                                serverClient, DixGetAttrAccess);
-        present_pixmap_idle(c->heldPixmap, window, c->idleSerial, c->heldFence);
-    }
+    // A NULL window is one that was destroyed while this waited, or a handover that owed no notify
+    // in the first place - either way there is nobody left to tell, which is also what upstream
+    // does for a present whose window goes away. The pixmap and the fence are ours regardless.
+    if (c->idleWindow)
+        present_pixmap_idle(c->heldPixmap, c->idleWindow, c->idleSerial, c->heldFence);
     if (c->heldFence)
         present_fence_destroy(c->heldFence);
     if (c->heldPixmap)
@@ -1562,7 +1628,7 @@ void lorieReapAbandonedCopies(void) {
     LorieAbandonedCopy *c, *tmp;
 
     xorg_list_for_each_entry_safe(c, tmp, &lorieAbandonedCopies, link) {
-        if (!lorieGpuCopyIsDone(c->serial) && !lorieGpuCopyFailed(c->serial))
+        if (!lorieCopySettled(c))
             continue;
         xorg_list_del(&c->link);
         lorieReleaseCopyResources(c->src, c->dst);
@@ -1601,26 +1667,49 @@ Bool lorieGpuCopyAbandon(void *token) {
 }
 
 /*
- * When the renderer is gone for good. It will never report these serials, so waiting is waiting for
- * nothing - but losing the connection is not evidence the GPU finished either. What settles it is
- * that the process holding the imported buffers has exited: its GPU work went with it, and the
- * references here are the last ones.
+ * The connection to the renderer broke. Runs on the X server thread, because settling a copy idles
+ * pixmaps and touches Present state; it used to run straight from the socket error on the input
+ * thread, which is not allowed to touch either.
+ *
+ * Nothing is released here. A broken socket says the renderer will never report these serials - it
+ * does not say its GPU work finished, and the old code took it as exactly that, releasing buffers a
+ * renderer process that outlived its socket could still be reading. All this does is stop waiting
+ * for a report that cannot come and start the bounded wait in lorieCopySettled(); new copies are
+ * already refused while there is no connection, so nothing joins them in the meantime.
  */
-void lorieDropAbandonedCopies(void) {
-    LorieAbandonedCopy *c, *tmp;
+void lorieNoteRendererLost(void) {
+    uint64_t settleByUs = lorieNowUs() + LORIE_LOST_SESSION_SETTLE_US;
+    LorieAbandonedCopy *c;
+    unsigned held = 0;
 
-    xorg_list_for_each_entry_safe(c, tmp, &lorieAbandonedCopies, link) {
-        xorg_list_del(&c->link);
-        lorieReleaseCopyResources(c->src, c->dst);
-        lorieFinishHeldPresentResources(c);
-        lorieGiveBackCopyRecord(c);
-    }
+    xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
+        if (c->session == lorieRendererSession && !c->settleByUs) {
+            c->settleByUs = settleByUs;
+            held++;
+        }
+
+    if (held)
+        log(INFO, "renderer session %u ended with %u copies unreported; holding their buffers for "
+                  "up to %llu ms unless a renderer reconnects first",
+            lorieRendererSession, held, LORIE_LOST_SESSION_SETTLE_US / 1000ULL);
+
+    lorieReapAbandonedCopies();
+}
+
+/*
+ * A renderer connected. Whatever the previous one had not reported, it is not going to: the process
+ * that held the imported buffers and submitted the GPU work has been replaced. That is the real
+ * answer the bounded wait above exists to avoid needing, so the wait ends here.
+ */
+void lorieNoteRendererConnected(void) {
+    lorieRendererSession++;
+    lorieReapAbandonedCopies();
 }
 
 // Holds back the IdleNotify for a cancelled present whose copy is still running. Takes ownership of
 // the pixmap reference and the idle fence; both are finished with when the copy resolves. Only ever
 // called after lorieGpuCopyAbandon() answered TRUE, which is what makes the token valid here.
-void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, XID window, CARD32 serial,
+void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, WindowPtr window, CARD32 serial,
                            struct present_fence *idleFence) {
     LorieAbandonedCopy *c = token;
 
@@ -1628,7 +1717,6 @@ void lorieDeferPresentIdle(void *token, PixmapPtr pixmap, XID window, CARD32 ser
         return;
     c->heldPixmap = pixmap;
     c->heldFence = idleFence;
-    c->notifyIdle = TRUE;
     c->idleWindow = window;
     c->idleSerial = serial;
 }
@@ -1643,7 +1731,7 @@ void lorieHoldPresentResources(void *token, PixmapPtr pixmap, struct present_fen
         return;
     c->heldPixmap = pixmap;
     c->heldFence = idleFence;
-    c->notifyIdle = FALSE;
+    c->idleWindow = NULL;
 }
 
 // The renderer made this copy and it landed. Releases exactly what the copy was given.
