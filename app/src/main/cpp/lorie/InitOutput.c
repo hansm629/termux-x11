@@ -195,44 +195,76 @@ static uint8_t lorieOutputBackend = LORIE_OUTPUT_AUTO;
 // Reading the clock at callback entry costs the dispatch latency, is the same everywhere, and is
 // still far closer to the vsync than asking for the time whenever the X server got round to it.
 //
-// Written by the Choreographer thread, read by the X server thread.
-static volatile uint64_t lorieVsyncStampUs = 0;
+/*
+ * One record per Choreographer callback, written once and never changed. Single producer (the
+ * Choreographer thread), single consumer (the X server thread).
+ *
+ * This was a single stamp the callback overwrote. Each callback queues one lorieRedraw, so when the
+ * X server fell behind, several of those ran back to back and every one of them read the newest
+ * stamp: ticks that had happened in the past at different times were all dated to the last one, and
+ * the ones after it were then pushed a period at a time past it, into the future - which is the time
+ * Present reports to a client as when its frame was shown. Clamping that to "now plus a period"
+ * limited how far off it could be, not whether it was right. With a record per tick, each one
+ * keeps the time it actually happened.
+ */
+#define LORIE_VSYNC_RECORDS 16
+static volatile uint64_t lorieVsyncRecordUs[LORIE_VSYNC_RECORDS];
+static volatile uint32_t lorieVsyncProduced = 0;   // Choreographer thread only writes this
+
+// Choreographer thread.
+static void lorieRecordVsync(uint64_t stampUs) {
+    uint32_t n = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_RELAXED);
+
+    lorieVsyncRecordUs[n % LORIE_VSYNC_RECORDS] = stampUs;
+    __atomic_store_n(&lorieVsyncProduced, n + 1, __ATOMIC_RELEASE);
+}
 
 // X server thread only, from lorieRedraw onwards.
-static uint64_t lorieVsyncRawUs = 0;    // the newest stamp the Choreographer has given us
+static uint32_t lorieVsyncConsumed = 0;
 static uint64_t lorieVsyncUs = 0;       // when the vsync that current_msc counts happened
 static uint64_t lorieVsyncPeriodUs = 16667;
 
-static void lorieAdvanceVsyncClock(void) {
-    uint64_t us = __atomic_load_n(&lorieVsyncStampUs, __ATOMIC_ACQUIRE);
+/*
+ * Takes the next tick, if there is one, and returns how many vsyncs current_msc has to move - 0 if
+ * this call was not for a tick at all, more than 1 only if the X server fell so far behind that
+ * records were overwritten before it read them. Those ticks did happen and are counted; only their
+ * times are gone, and the newest surviving one is used for the lot.
+ */
+static uint32_t lorieAdvanceVsyncClock(void) {
+    uint32_t produced = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE);
+    uint32_t steps = 1, idx;
+    uint64_t us;
 
-    if (us > lorieVsyncRawUs) {
-        uint64_t delta = us - lorieVsyncRawUs;
-        // A tick we were never called for stretches the gap, so only believe plausible ones.
-        // 4-40 ms covers everything from 25 to 250 Hz.
-        if (lorieVsyncRawUs && delta >= 4000 && delta <= 40000)
+    if (produced == lorieVsyncConsumed)
+        return 0;
+
+    if (produced - lorieVsyncConsumed > LORIE_VSYNC_RECORDS) {
+        steps = produced - lorieVsyncConsumed;
+        lorieVsyncConsumed = produced - 1;
+        pvfb->state->presentStats.vsyncRecordsLost += steps - 1;
+    }
+
+    idx = lorieVsyncConsumed;
+    us = lorieVsyncRecordUs[idx % LORIE_VSYNC_RECORDS];
+    // The producer could only have overwritten this slot by lapping the whole ring while it was
+    // being read. Not a practical case, but a torn read would date a tick wrongly, so it is checked.
+    if (__atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - idx > LORIE_VSYNC_RECORDS) {
+        lorieVsyncConsumed = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - 1;
+        idx = lorieVsyncConsumed;
+        us = lorieVsyncRecordUs[idx % LORIE_VSYNC_RECORDS];
+    }
+    lorieVsyncConsumed = idx + 1;
+
+    // Only plausible gaps feed the period estimate: a tick that was never called for stretches it.
+    // 4-40 ms covers everything from 25 to 250 Hz.
+    if (lorieVsyncUs && us > lorieVsyncUs) {
+        uint64_t delta = (us - lorieVsyncUs) / steps;
+
+        if (delta >= 4000 && delta <= 40000)
             lorieVsyncPeriodUs = (lorieVsyncPeriodUs * 7 + delta) / 8;
-        lorieVsyncRawUs = us;
     }
-
-    // current_msc is about to count one more vsync, so ust moves with it. Normally that is the
-    // stamp we were just given; if the work proc ran twice for one callback there is no new one,
-    // and stepping a period keeps the two in step until the next callback resyncs them.
-    lorieVsyncUs = lorieVsyncRawUs > lorieVsyncUs ? lorieVsyncRawUs
-                 : lorieVsyncUs ? lorieVsyncUs + lorieVsyncPeriodUs
-                 : GetTimeInMicros();
-
-    // A backlog of work procs runs the step above several times in a row with no new stamp in
-    // between, and each one moved ust a period further on, so it could march ahead of the clock
-    // itself. Present hands those numbers to clients as the time their frame was shown, and a
-    // client that paces against a completion time in the future is being told its frames are
-    // landing early. The furthest ahead this can honestly be is the next vsync.
-    {
-        uint64_t nowUs = GetTimeInMicros();
-
-        if (lorieVsyncUs > nowUs + lorieVsyncPeriodUs)
-            lorieVsyncUs = nowUs + lorieVsyncPeriodUs;
-    }
+    lorieVsyncUs = us;
+    return steps;
 }
 
 // When the given vsync is, or was, on screen.
@@ -716,11 +748,16 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
     lorieReapAbandonedCopies();
     pvfb->state->outputBackend = lorieOutputBackend;
-    lorieAdvanceVsyncClock();
-    pvfb->current_msc++;
-    loriePerformVblanks();
+    {
+        uint32_t steps = lorieAdvanceVsyncClock();
 
-    pvfb->state->waitForNextFrame = false;
+        // Only a tick moves the counter. It moved once per call, and a call is not a vsync.
+        if (steps) {
+            pvfb->current_msc += steps;
+            loriePerformVblanks();
+            pvfb->state->waitForNextFrame = false;
+        }
+    }
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
         return TRUE;
@@ -970,10 +1007,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.rootOwedRepairs,
                 pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0,
                 pvfb->state->presentStats.rootUnpublishedNowMaxUs / 1000.0);
-        log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
+        log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms, "
+                  "%u vsync times lost to backlog",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
-            pvfb->state->presentStats.xDispatchMaxUs / 1000.0);
+            pvfb->state->presentStats.xDispatchMaxUs / 1000.0,
+            pvfb->state->presentStats.vsyncRecordsLost);
         if (pvfb->state->presentStats.cursorUploads)
             log(INFO, "XlorieLock: cursor image uploaded %u times, %.1f ms total",
                 pvfb->state->presentStats.cursorUploads,
@@ -1014,6 +1053,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootUnpublishedMaxUs = 0;
     pvfb->state->presentStats.rootUnpublishedNowMaxUs = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
+    pvfb->state->presentStats.vsyncRecordsLost = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
@@ -1285,8 +1325,8 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
 
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
-    // t is deliberately unused - see lorieVsyncStampUs.
-    __atomic_store_n(&lorieVsyncStampUs, lorieNowUs(), __ATOMIC_RELEASE);
+    // t is deliberately unused - see the comment above lorieVsyncRecordUs.
+    lorieRecordVsync(lorieNowUs());
     if (pScreenPtr) {
         QueueWorkProc(lorieRedraw, NULL, NULL);
         lorieWakeServer();

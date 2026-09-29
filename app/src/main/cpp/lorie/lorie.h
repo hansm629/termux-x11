@@ -462,6 +462,9 @@ struct lorie_shared_server_state {
         volatile uint32_t rootUnpublishedMaxUs;
         volatile uint32_t rootUnpublishedNowMaxUs;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
+        /* Vsync ticks the X server fell so far behind on that their records were overwritten before
+         * it read them. The ticks are still counted in msc; only their individual times are lost. */
+        volatile uint32_t vsyncRecordsLost;
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
          * completed. This is the one thing that matches what a person sees: the renderer can put out
