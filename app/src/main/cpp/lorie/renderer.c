@@ -285,6 +285,8 @@ static struct {
     void (*txSetBufferTransparency)(ASurfaceTransaction *, ASurfaceControl *, int8_t); // optional
     void (*txSetOnComplete)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *));
     int (*statsPrevReleaseFenceFd)(ASurfaceTransactionStats *, ASurfaceControl *);
+    void (*statsGetControls)(ASurfaceTransactionStats *, ASurfaceControl ***, size_t *);
+    void (*statsReleaseControls)(ASurfaceControl **);
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -316,6 +318,10 @@ static bool cursorOverlayResolveApi(void) {
             dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnCompleteFunc");
     scApi.statsPrevReleaseFenceFd = (int (*)(ASurfaceTransactionStats *, ASurfaceControl *))
         dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
+    scApi.statsGetControls = (void (*)(ASurfaceTransactionStats *, ASurfaceControl ***, size_t *))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getASurfaceControls");
+    scApi.statsReleaseControls = (void (*)(ASurfaceControl **))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_releaseASurfaceControls");
 
     // Optional: hiding the layer is enough to get it off the screen, taking it out of the tree as
     // well is just tidier.
@@ -2949,8 +2955,25 @@ static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
         // different buffer entirely.
         if (rootZcRetiring[i].seq != seq || rootZcRetiring[i].fenceArrived)
             continue;
-        if (rootSurfaceControl && scApi.statsPrevReleaseFenceFd)
-            rootZcRetiring[i].fenceFd = scApi.statsPrevReleaseFenceFd(stats, rootSurfaceControl);
+
+        /*
+         * The fence is asked for with the SurfaceControl the transaction itself carried, taken from
+         * the stats. It was asked for with whatever rootSurfaceControl happened to be at the time,
+         * and after a window change that is a different, newly created one: the platform treats a
+         * control that is not in the stats as a fatal error and aborts the process. That is what
+         * killed the app on its first resize, and the reconnect that followed left the screen black.
+         * Every transaction here carries exactly one control, the root layer.
+         */
+        {
+            ASurfaceControl **controls = NULL;
+            size_t count = 0;
+
+            scApi.statsGetControls(stats, &controls, &count);
+            if (count > 0)
+                rootZcRetiring[i].fenceFd = scApi.statsPrevReleaseFenceFd(stats, controls[0]);
+            if (controls)
+                scApi.statsReleaseControls(controls);
+        }
         rootZcRetiring[i].fenceArrived = true;
         rootZcRetiring[i].fenceArrivedNs = rendererNowNs();
         break;
@@ -3286,12 +3309,15 @@ static void ensureRootOverlay(void) {
 
     // Without these two the buffer could be handed over but never taken back, which would mean
     // reusing it while the compositor still reads it.
-    if (!scApi.txSetOnComplete || !scApi.statsPrevReleaseFenceFd) {
+    if (!scApi.txSetOnComplete || !scApi.statsPrevReleaseFenceFd ||
+        !scApi.statsGetControls || !scApi.statsReleaseControls) {
         // Named, so that getting one of these wrong is a one-line answer next time rather than a
         // round of guessing.
-        log("Xlorie: root layer needs %s%s, drawing the root through GL instead",
+        log("Xlorie: root layer needs %s%s%s, drawing the root through GL instead",
             !scApi.txSetOnComplete ? "ASurfaceTransaction_setOnComplete " : "",
-            !scApi.statsPrevReleaseFenceFd ? "ASurfaceTransactionStats_getPreviousReleaseFenceFd" : "");
+            !scApi.statsPrevReleaseFenceFd ? "ASurfaceTransactionStats_getPreviousReleaseFenceFd " : "",
+            !scApi.statsGetControls || !scApi.statsReleaseControls
+                ? "ASurfaceTransactionStats_getASurfaceControls/releaseASurfaceControls" : "");
         return;
     }
 
