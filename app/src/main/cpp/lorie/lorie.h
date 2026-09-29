@@ -11,6 +11,7 @@
 #include <jni.h>
 #include <screenint.h>
 #include <errno.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -75,13 +76,19 @@ __unused void rendererAddBuffer(LorieBuffer* buf);
 __unused void rendererRemoveBuffer(uint64_t id);
 __unused void rendererRemoveAllBuffers(void);
 
-static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {
+/*
+ * Returns whether the lock was taken. False means the mutex answered with something other than
+ * "busy" several times in a row and cannot be relied on; the caller must then leave the shared state
+ * it guards alone, and do whatever it would do if it had nothing to draw or copy this time.
+ */
+__attribute__((warn_unused_result))
+static inline __always_inline bool lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {
     // Unfortunately there is no robust mutexes in bionic.
     // Posix does not define any valid way to unlock stuck non-robust mutex
     // so in the case if renderer or X server process unexpectedly die with locked mutex
     // we will simply reinitialize it.
     struct timespec ts = {0};
-    int timeouts = 0;
+    int timeouts = 0, failures = 0;
     while(true) {
         // CLOCK_REALTIME, because that is the clock pthread_mutex_timedlock() measures its absolute
         // deadline against. A CLOCK_MONOTONIC value is seconds since boot where this wants seconds
@@ -118,22 +125,26 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
 
             /*
              * Anything else is not a lock that is busy, it is a lock that does not work: EINVAL on
-             * memory that is no longer a mutex, EAGAIN past the recursive limit. Those came here
-             * too and were answered by overwriting the mutex, which is only defensible when the
-             * other process is known to be gone - the case just above. Doing it for an error says
-             * nothing about who still holds the lock, and it would release it out from under them.
+             * memory that is no longer a mutex, EAGAIN past the recursive limit. Those used to be
+             * answered by overwriting the mutex, which is only defensible when the other process is
+             * known to be gone - the case below. Doing it for an error says nothing about who still
+             * holds the lock, and it would release it out from under them.
              *
-             * There is no correct way to carry on. Returning without the lock races the other
-             * process on the root buffer, reinitialising may free a lock someone still holds, and
-             * asking again cannot change the answer. The shared state this coordinates is what
-             * both processes draw the screen out of, so this stops here rather than corrupting it
-             * quietly.
+             * Nor is aborting the answer, which is what replaced it for a while: it takes the whole
+             * app or server down over one call. The one error that can be transient is a read that
+             * overlapped the other process reinitialising the mutex after deciding this one was gone,
+             * so it is asked again a couple of times, a millisecond apart. Past that the caller is
+             * told it did not get the lock, and skips whatever it needed it for.
              */
             if (ret != ETIMEDOUT) {
-                __android_log_print(ANDROID_LOG_FATAL, "lorie",
-                                    "shared lock is unusable (%s, held by pid %d) - cannot continue",
+                if (++failures < 3) {
+                    usleep(1000);
+                    continue;
+                }
+                __android_log_print(ANDROID_LOG_ERROR, "lorie",
+                                    "shared lock is unusable (%s, held by pid %d); skipping this access",
                                     strerror(ret), *lockingPid);
-                abort();
+                return false;
             }
 
             pthread_mutexattr_t attr;
@@ -147,7 +158,7 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
             // Mutex will be locked fine on the next iteration
         } else {
             *lockingPid = getpid();
-            return;
+            return true;
         }
     }
 }

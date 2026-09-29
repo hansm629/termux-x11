@@ -695,7 +695,9 @@ static void lorieSetCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, Curs
         // We do not have enough memory allocated for such a big cursor, let's display default "X" cursor
         pCurs = rootCursor;
 
-    lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid);
+    // Not updated this time if the lock cannot be taken; the next cursor change tries again.
+    if (!lorie_mutex_lock(&pvfb->state->cursor.lock, &pvfb->state->cursor.lockingPid))
+        return;
     if (pCurs && bits) {
         uint32_t sum = 2166136261u;
         int i, pixels;
@@ -2679,7 +2681,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         // window. Timed because it is the whole cost of the renderer's lock occupancy as the X
         // server experiences it - a client's throughput drops by exactly this.
         uint64_t waitStartUs = lorieNowUs();
-        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        // Without the lock there is no safe way to touch this buffer, so the access fails; EXA
+        // handles that as it does any other PrepareAccess failure.
+        if (!lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid))
+            return FALSE;
         uint32_t waitUs = (uint32_t) (lorieNowUs() - waitStartUs);
         pvfb->state->presentStats.xLockWaitUs += waitUs;
         if (waitUs > pvfb->state->presentStats.xLockWaitMaxUs)

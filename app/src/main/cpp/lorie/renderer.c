@@ -1661,7 +1661,8 @@ static void rendererApplyPendingGpuCopies(void) {
     int64_t flushUs = 0, waitUs = 0;
     bool gpuWorkIssued;
 
-    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    if (!lorie_mutex_lock(&state->lock, &state->lockingPid))
+        return;   // the queue stays as it is and is drained next time
     lockHeldStartNs = rendererNowNs();
     // No frame in progress, so no slot is safe merely because this renderer claimed it.
     serial = rendererApplyPendingGpuCopiesLocked(-1, &gpuWorkIssued);
@@ -2001,22 +2002,30 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // of the frame holding up the X server for an upload that has nothing to do with the root.
     if (state->cursor.updated && !cursorOverlayUsable()) {
         int64_t uploadStartNs = rendererNowNs();
-        lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
-        state->cursor.updated = false;
-        if (state->cursor.width && state->cursor.height &&
-            state->cursor.width <= LORIE_CURSOR_TEX_SIZE && state->cursor.height <= LORIE_CURSOR_TEX_SIZE) {
-            bindTexture(cursor.id);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
-                            GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
+        // Left marked as updated if the lock cannot be taken, so the next frame uploads it.
+        if (lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid)) {
+            state->cursor.updated = false;
+            if (state->cursor.width && state->cursor.height &&
+                state->cursor.width <= LORIE_CURSOR_TEX_SIZE && state->cursor.height <= LORIE_CURSOR_TEX_SIZE) {
+                bindTexture(cursor.id);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
+                                GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
+            }
+            lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
         }
-        lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
         state->presentStats.cursorUploads++;
         state->presentStats.cursorUploadUs += (uint32_t) rendererNsToUs(rendererNowNs() - uploadStartNs);
     }
 
     // We should signal X server to not use root window while we actively copy it
     int64_t lockStartNs = rendererNowNs(), lockHeldStartNs;
-    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    if (!lorie_mutex_lock(&state->lock, &state->lockingPid)) {
+        // Nothing of the root can be read without it. The claim is given back and the frame is
+        // tried again at the next vsync; what is on screen stays.
+        rendererReleaseRootBuffer();
+        state->waitForNextFrame = true;
+        return;
+    }
     lockHeldStartNs = rendererNowNs();
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     bool gpuWorkIssued;
@@ -2708,7 +2717,9 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
         state->cursor.width > LORIE_CURSOR_TEX_SIZE || state->cursor.height > LORIE_CURSOR_TEX_SIZE)
         return;
 
-    lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
+    // The overlay keeps its previous image if the lock cannot be taken.
+    if (!lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid))
+        return;
     bindTexture(cursor.id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
                     GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
@@ -3163,7 +3174,18 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     {
         int64_t lockStartNs = rendererNowNs(), lockHeldStartNs, flushUs = 0;
 
-        lorie_mutex_lock(&state->lock, &state->lockingPid);
+        if (!lorie_mutex_lock(&state->lock, &state->lockingPid)) {
+            // Nothing submitted: what is on screen stays, and the frame is asked for again at the next
+            // vsync. The claim goes back unless this slot is the one on screen - that one stays held
+            // for the compositor, exactly as the nothing-new path below keeps it.
+            if (alreadyOnScreen)
+                rendererRootSlot = -1;
+            else
+                rendererReleaseRootBuffer();
+            rendererSetOutputRetry(true);
+            state->waitForNextFrame = true;
+            return true;
+        }
         lockHeldStartNs = rendererNowNs();
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot, &gpuWorkIssued);
         // Checked under the same lock as the drain, so the answer describes the queue it just left.
