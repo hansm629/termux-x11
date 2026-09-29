@@ -1766,6 +1766,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     bool cursorOnlyFrame = state && !state->drawRequested &&
                            (state->cursor.moved || state->cursor.updated);
     int64_t lockHeldUs = 0, lockWaitUs = 0;
+    bool swapOk = false;
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
     EGLSync fence = EGL_NO_SYNC_KHR;
@@ -2021,14 +2022,13 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (rendererPerfLogEnabled) {
         int64_t swapStartNs = rendererNowNs();
 
-        if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
-            printEglError("Failed to swap buffers", __LINE__);
-
+        swapOk = eglSwapBuffers(egl_display, sfc) == EGL_TRUE;
         swapUs = rendererNsToUs(rendererNowNs() - swapStartNs);
-    } else {
-        if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
-            printEglError("Failed to swap buffers", __LINE__);
-    }
+    } else
+        swapOk = eglSwapBuffers(egl_display, sfc) == EGL_TRUE;
+
+    if (!swapOk)
+        printEglError("Failed to swap buffers", __LINE__);
 
     // The frame is submitted now, so this is where its fence is waited for and the root buffer is
     // handed back - leaving the X server the whole remainder of the frame interval to take it.
@@ -2071,7 +2071,12 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         }
     }
 
-    state->renderedFrames++;   // zeroCopyFrames counts the subset that skipped this path entirely
+    // A frame that failed to swap put nothing on screen, so it is not one.
+    if (swapOk) {
+        state->presentStats.glOutputSubmits++;
+        state->renderedFrames++;
+    } else
+        state->presentStats.glOutputSubmitFailures++;
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
     rendererNoteLock(lockWaitUs, lockHeldUs);
     if (cursorOnlyFrame)
@@ -2766,6 +2771,15 @@ static void ensureCursorOverlay(void) {
 // a change, so a run's log states the backend it actually used rather than the one it was asked for.
 static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
     static const char *lastReason = NULL;
+    static bool logged = false;
+    /* What was last written to the shared state, and which state it was written to. Kept apart from
+     * the log's own de-duplication: the direct path being available from the first frame leaves both
+     * reasons NULL, so the change test never fires and the X server never learns which backend is
+     * running - and a replaced shared state starts blank, so a reason that had not changed was
+     * never published into it either. */
+    static const char *publishedReason = NULL;
+    static volatile struct lorie_shared_server_state *publishedTo = NULL;
+    static bool published = false;
     const char *reason = NULL;
     uint8_t forced = state ? state->outputBackend : LORIE_OUTPUT_AUTO;
 
@@ -2788,17 +2802,22 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
         // keeping the GL pass. Forcing root-direct overrides that on purpose, for comparisons.
         reason = "nearest filtering";
 
-    if (reason != lastReason) {
+    if (!logged || reason != lastReason) {
+        logged = true;
         lastReason = reason;
         log("XlorieBackend: %s%s%s", reason ? "GPU_COPY" : "ROOT_DIRECT",
             reason ? " - " : "", reason ? reason : "");
-        // Also where the X server can read it: the line above lands in this process' logcat, which
-        // from the terminal is not readable at all.
-        if (state) {
-            state->outputBackendActive = reason ? LORIE_OUTPUT_GPU_COPY : LORIE_OUTPUT_ROOT_DIRECT;
-            snprintf((char *) state->outputBackendReason, sizeof(state->outputBackendReason),
-                     "%s", reason ? reason : "");
-        }
+    }
+
+    // Also where the X server can read it: the line above lands in this process' logcat, which from
+    // the terminal is not readable at all.
+    if (state && (!published || publishedReason != reason || publishedTo != state)) {
+        published = true;
+        publishedReason = reason;
+        publishedTo = state;
+        state->outputBackendActive = reason ? LORIE_OUTPUT_GPU_COPY : LORIE_OUTPUT_ROOT_DIRECT;
+        snprintf((char *) state->outputBackendReason, sizeof(state->outputBackendReason),
+                 "%s", reason ? reason : "");
     }
     return reason == NULL;
 }
@@ -3018,10 +3037,10 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
         rendererSetOutputRetry(false);   // what the X server has published is on screen
-        // A frame, like any other. Counting these only on the GL path meant the frame rate the X
-        // server reports left out every frame that went straight to the compositor - so the better
-        // this path worked, the lower the number it produced.
-        state->renderedFrames++;
+        // Nothing was submitted: the compositor keeps the buffer it already has. Counting this as a
+        // frame was worse than not counting it, because the summary then derived the GL frame count
+        // by subtraction and attributed it to a GL pass that never ran.
+        state->presentStats.directReuseNoSubmit++;
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
@@ -3082,7 +3101,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     rendererRootSlot = -1;
     rendererSetOutputRetry(false);
     state->renderedFrames++;
-    state->presentStats.zeroCopyFrames++;
+    state->presentStats.directBufferSubmits++;
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;
 }

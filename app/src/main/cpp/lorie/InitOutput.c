@@ -288,6 +288,7 @@ typedef struct {
 static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region);
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
 static Bool lorieRootHandover(LoriePixmapPriv *priv);
+static void lorieNoteRootPublished(LoriePixmapPriv *priv);
 static inline int lorieRootSampledIndex(void);
 static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region);
 
@@ -738,9 +739,10 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         }
 
         DamageEmpty(pvfb->damage);
-        if (lorieRootHandover(priv))
+        if (lorieRootHandover(priv)) {
             priv->rootDirty = FALSE;
-        else if (!priv->rootDirtySinceUs)
+            lorieNoteRootPublished(priv);
+        } else if (!priv->rootDirtySinceUs)
             priv->rootDirtySinceUs = lorieNowUs();
         pvfb->state->drawRequested = TRUE;
     }
@@ -758,21 +760,25 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
      */
     if (priv->rootDouble && priv->rootDirty && lorieRootHandover(priv)) {
         priv->rootDirty = FALSE;
+        lorieNoteRootPublished(priv);
         pvfb->state->drawRequested = TRUE;
     }
 
     /*
-     * How long content has been drawn but not shown. This is the symptom itself: every counter
-     * upstream of it can look healthy - clients presenting, copies completing, frames pacing at the
-     * display rate - while nothing new reaches the screen, and until this was measured there was
-     * nothing that told the two apart.
+     * A wait that is still running, kept apart from the finished ones above. A wait that never ends
+     * has no endpoint to be measured at, and reporting only finished waits would show nothing at
+     * all for exactly the case that matters most.
+     *
+     * Note what this does and does not say: it is the gap between the X server drawing into a root
+     * slot and handing that slot on. It is not a measure of what reached the screen - the renderer
+     * still has to pick the slot up and submit it, and the compositor still has to show it.
      */
     if (priv->rootDirty && priv->rootDirtySinceUs) {
         uint32_t ageUs = (uint32_t) (lorieNowUs() - priv->rootDirtySinceUs);
 
-        if (ageUs > pvfb->state->presentStats.rootUnpublishedMaxUs)
-            pvfb->state->presentStats.rootUnpublishedMaxUs = ageUs;
-    } else
+        if (ageUs > pvfb->state->presentStats.rootUnpublishedNowMaxUs)
+            pvfb->state->presentStats.rootUnpublishedNowMaxUs = ageUs;
+    } else if (!priv->rootDirty)
         priv->rootDirtySinceUs = 0;
 
     /*
@@ -873,22 +879,24 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
          * terminal cannot be read - so a forced backend that turned out to be impossible looked
          * exactly like one that was working.
          *
-         * Counted, not declared: the direct frames are the ones the compositor was handed a buffer
-         * for, and the rest went through GL, whatever either side was configured to prefer.
+         * Each number is its own counted event. Deriving the GL count as total minus direct made a
+         * tick that submitted nothing into a GL frame, so a run that was entirely direct with a few
+         * no-submit ticks reported most of its frames as having gone through GL.
          */
         {
-            uint32_t direct = pvfb->state->presentStats.zeroCopyFrames;
-            uint32_t total = pvfb->state->renderedFrames;
             const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
                               : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
 
-            if (total || direct)
-                log(INFO, "XlorieBackend: asked for %s, ran %u direct and %u through GL"
-                          "%s%s, %u frames dropped waiting for a buffer back",
-                    asked, direct, total > direct ? total - direct : 0,
-                    pvfb->state->outputBackendReason[0] ? "; not direct because: " : "",
-                    pvfb->state->outputBackendReason[0] ? (const char *) pvfb->state->outputBackendReason : "",
-                    pvfb->state->presentStats.zeroCopyStalls);
+            log(INFO, "XlorieBackend: asked for %s; %u direct submits, %u nothing-new, "
+                      "%u GL submits (%u failed), %u held for a buffer back%s%s",
+                asked,
+                pvfb->state->presentStats.directBufferSubmits,
+                pvfb->state->presentStats.directReuseNoSubmit,
+                pvfb->state->presentStats.glOutputSubmits,
+                pvfb->state->presentStats.glOutputSubmitFailures,
+                pvfb->state->presentStats.zeroCopyStalls,
+                pvfb->state->outputBackendReason[0] ? "; not direct because: " : "",
+                pvfb->state->outputBackendReason[0] ? (const char *) pvfb->state->outputBackendReason : "");
         }
 
         if (pvfb->state->presentStats.requests)
@@ -929,11 +937,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->presentStats.rootStalePostponed);
         if (pvfb->state->presentStats.rootPublishAttempts)
             log(INFO, "XlorieRootPublish: %u of %u attempts published, %u found no free slot, "
-                      "longest drawn-but-unshown %.1f ms",
+                      "longest wait to publish %.1f ms (still waiting, worst so far %.1f ms)",
                 pvfb->state->presentStats.rootPublishes,
                 pvfb->state->presentStats.rootPublishAttempts,
                 pvfb->state->presentStats.rootPublishNoSlot,
-                pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0);
+                pvfb->state->presentStats.rootUnpublishedMaxUs / 1000.0,
+                pvfb->state->presentStats.rootUnpublishedNowMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms",
             pvfb->state->presentStats.rootRemapUs / 1000.0,
             pvfb->state->presentStats.rootRemaps,
@@ -974,11 +983,15 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.rootPublishes = 0;
     pvfb->state->presentStats.rootPublishNoSlot = 0;
     pvfb->state->presentStats.rootUnpublishedMaxUs = 0;
+    pvfb->state->presentStats.rootUnpublishedNowMaxUs = 0;
     pvfb->state->presentStats.xDispatchMaxUs = 0;
     pvfb->state->presentStats.presentCompletions = 0;
     pvfb->state->presentStats.presentGapSumUs = 0;
     pvfb->state->presentStats.presentGapMaxUs = 0;
-    pvfb->state->presentStats.zeroCopyFrames = 0;
+    pvfb->state->presentStats.glOutputSubmits = 0;
+    pvfb->state->presentStats.glOutputSubmitFailures = 0;
+    pvfb->state->presentStats.directBufferSubmits = 0;
+    pvfb->state->presentStats.directReuseNoSubmit = 0;
     pvfb->state->presentStats.zeroCopyStalls = 0;
     pvfb->state->presentStats.cursorOverlayMoves = 0;
     pvfb->state->presentStats.requests = 0;
@@ -2282,6 +2295,25 @@ static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {
     return &priv->rootGpuPending[slot];
 }
 
+/*
+ * Closes out a wait for the root to be published, at the point it actually ends.
+ *
+ * The duration used to be sampled once per vsync while the wait was still running, and the sample
+ * that mattered - the one covering the last stretch - never happened: a handover that succeeded
+ * cleared rootDirty first, so the measurement saw nothing outstanding and simply forgot when the
+ * wait had started. A publish one tick after a failed attempt therefore recorded a longest wait of
+ * zero.
+ */
+static void lorieNoteRootPublished(LoriePixmapPriv *priv) {
+    if (priv->rootDirtySinceUs) {
+        uint32_t waitedUs = (uint32_t) (lorieNowUs() - priv->rootDirtySinceUs);
+
+        if (waitedUs > pvfb->state->presentStats.rootUnpublishedMaxUs)
+            pvfb->state->presentStats.rootUnpublishedMaxUs = waitedUs;
+        priv->rootDirtySinceUs = 0;
+    }
+}
+
 // Hands the buffer we have just finished drawing to the renderer and takes another one. Does
 // nothing at all while the renderer is still sampling every other slot, in which case we simply
 // keep drawing into this one for another frame - that costs one frame of freshness and never a
@@ -2311,9 +2343,13 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
                 break;
             }
         if (next < 0) {
-            // Every other slot is still with the renderer or the compositor, so there is nowhere to
-            // draw next. Distinct from having nothing to publish: this is publishing faster than
-            // the display can show it.
+            /*
+             * Every other slot is still marked as held, so there is nowhere to draw next. That can
+             * simply be producing faster than the display can show it - but a slot whose release
+             * fence never signalled, a completion callback that was dropped, a held bit left set by
+             * a torn-down pool, and an outright leak all read exactly the same from here. So this
+             * counts the symptom and does not name a cause.
+             */
             pvfb->state->presentStats.rootPublishNoSlot++;
             return FALSE;
         }

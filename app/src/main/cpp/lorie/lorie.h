@@ -424,7 +424,13 @@ struct lorie_shared_server_state {
         volatile uint32_t rootPublishAttempts;
         volatile uint32_t rootPublishes;
         volatile uint32_t rootPublishNoSlot;
+        /* Waits that finished, measured where they ended, and the worst one still running. Sampling
+         * a running wait once per vsync missed the stretch that mattered, because a handover that
+         * succeeded cleared the outstanding mark first - so a publish one tick after a failed
+         * attempt recorded a longest wait of zero. Both are the gap between the X server drawing a
+         * slot and handing it on; neither says what reached the screen. */
         volatile uint32_t rootUnpublishedMaxUs;
+        volatile uint32_t rootUnpublishedNowMaxUs;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
@@ -477,8 +483,16 @@ struct lorie_shared_server_state {
         volatile uint32_t requestGapMaxUs;
         volatile uint32_t requestAheadMax;
         volatile uint32_t cursorOverlayMoves; /* pointer moves the overlay absorbed without any GL */
-        volatile uint32_t zeroCopyFrames;     /* root buffers handed to the compositor with no GL at all */
-        volatile uint32_t zeroCopyStalls;     /* frames skipped because it had not released the previous one */
+        /* What actually went out, counted as separate events rather than derived from each other.
+         * The summary printed GL frames as total minus direct, and a tick that submitted nothing at
+         * all was counted in the total - so a run that was entirely direct with a few no-submit
+         * ticks reported most of its frames as having gone through GL. A failed swap was counted
+         * as a frame too. */
+        volatile uint32_t glOutputSubmits;        /* GL frames whose eglSwapBuffers succeeded */
+        volatile uint32_t glOutputSubmitFailures; /* and the ones where it did not */
+        volatile uint32_t directBufferSubmits;    /* a new root buffer put into a SurfaceControl transaction */
+        volatile uint32_t directReuseNoSubmit;    /* nothing new to submit; the compositor keeps what it has */
+        volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
     } presentStats;
 
     /*
