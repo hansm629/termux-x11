@@ -887,6 +887,11 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
                               : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
 
+            if (pvfb->state->presentStats.zeroCopyFenceErrors)
+                log(INFO, "XlorieBackend: %u release fences could not be waited on; those slots "
+                          "stay held until the pool is replaced",
+                    pvfb->state->presentStats.zeroCopyFenceErrors);
+
             log(INFO, "XlorieBackend: asked for %s; %u direct submits, %u nothing-new, "
                       "%u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
@@ -993,6 +998,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->presentStats.directBufferSubmits = 0;
     pvfb->state->presentStats.directReuseNoSubmit = 0;
     pvfb->state->presentStats.zeroCopyStalls = 0;
+    pvfb->state->presentStats.zeroCopyFenceErrors = 0;
     pvfb->state->presentStats.cursorOverlayMoves = 0;
     pvfb->state->presentStats.requests = 0;
     pvfb->state->presentStats.requestGapMaxUs = 0;

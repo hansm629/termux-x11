@@ -159,7 +159,7 @@ static void ensureRootOverlay(void);
 static void teardownRootOverlay(void);
 static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc);
 static bool rootZcDrainRetiring(void);
-static void rootZcReleaseAll(void);
+static void rootZcStopPresenting(void);
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs);
 
 static ASurfaceControl *cursorSurfaceControl = NULL;
@@ -249,11 +249,21 @@ static bool rootZcRetryPending = false;
 static struct {
     int slot, fenceFd;
     bool fenceArrived;
+    /* The fence arrived but cannot be waited on - a bad or closed descriptor. The slot stays held:
+     * the compositor has not said it is finished with the buffer, and time passing is not the same
+     * statement. It is given back when the pool it belongs to is destroyed, and until then the
+     * pool simply runs one buffer short, which shows up as slots being unavailable rather than as
+     * a torn frame. */
+    bool fenceUnusable;
     uint32_t seq;
     int64_t fenceArrivedNs;
 } rootZcRetiring[LORIE_ZC_MAX_HELD];
 static int rootZcRetiringCount = 0;
 static uint32_t rootZcRetireSeq = 0;
+/* How many of the entries above will never resolve. Past a point there is no longer room to retire
+ * a slot at all, and this path would hold every frame back forever; falling back to GL and saying
+ * why beats a screen that has stopped updating. */
+static int rootZcUnusableCount = 0;
 
 // The SurfaceControl entry points are API 29, above our minSdk 26, and the NDK marks anything above
 // minSdk unavailable rather than weak - so __builtin_available cannot guard a call to them and they
@@ -1890,7 +1900,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     } else if (rootZcDisplayedSlot >= 0 || rootZcRetiringCount > 0) {
         // Dropped out of the path - the filtering preference changed, or the root stopped being one
         // of our slots. Give everything back before drawing through GL again.
-        rootZcReleaseAll();
+        rootZcStopPresenting();
     }
 
 /*
@@ -2797,6 +2807,10 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
         reason = "root buffer is not BGRA";
     else if (viewportW <= 0 || viewportH <= 0)
         reason = "no viewport yet";
+    else if (rootZcUnusableCount + 2 > LORIE_ZC_MAX_HELD)
+        // Held slots that will never come back, so there is no longer room to retire one. Going on
+        // would hold every frame back instead, which stops the screen updating altogether.
+        reason = "release fences could not be waited on; too many slots stuck";
     else if (forced != LORIE_OUTPUT_ROOT_DIRECT && filtering != GL_LINEAR)
         // The compositor's scaler is bilinear and has no nearest mode, so nearest is honoured by
         // keeping the GL pass. Forcing root-direct overrides that on purpose, for comparisons.
@@ -2823,32 +2837,31 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
 }
 
 /*
- * Whether the compositor has finished with whatever fence it handed us. No fence means it never
- * needed one.
+ * What the compositor's release fence says about the buffer it was handed.
  *
- * A bare poll() > 0 answered yes to POLLERR and POLLNVAL as well, which is a broken or closed fd
- * being read as a signalled fence - the slot would go back to the X server with the compositor
- * still displaying it. Those now hold the slot, but not forever: an fd that cannot answer will
- * never report POLLIN either, so waiting on it without a bound strands the slot for the rest of the
- * session and the pool runs a buffer short from then on. Bounded from when the callback arrived,
- * and said out loud, because it is a guess either way.
+ * A bare poll() > 0 answered yes to POLLERR and POLLNVAL as well, which is a broken or closed
+ * descriptor read as a signalled fence: the slot went back to the X server with the compositor
+ * still displaying it. Nor is the time since then an answer - a descriptor that cannot be waited
+ * on will not start reporting POLLIN later, and letting the slot go once enough of it had passed
+ * was the same claim with a delay in front of it.
+ *
+ * So there are three answers, and only one of them frees the buffer.
  */
-#define LORIE_ZC_FENCE_GRACE_NS 100000000LL
-static bool rootZcFenceSignalled(int fd, int64_t arrivedNs) {
+typedef enum { LORIE_ZC_FENCE_DONE, LORIE_ZC_FENCE_WAITING, LORIE_ZC_FENCE_UNUSABLE } LorieZcFence;
+
+static LorieZcFence rootZcFenceState(int fd) {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
+    // No fence at all is the compositor's way of saying it did not need one, which is an answer.
     if (fd < 0)
-        return true;
+        return LORIE_ZC_FENCE_DONE;
     if (poll(&pfd, 1, 0) <= 0)
-        return false;   // not yet, or poll itself failed; neither says it is done
+        // Not yet, or poll itself failed; neither says the buffer is free. A failing poll is worth
+        // asking again rather than condemning the slot on one errno.
+        return LORIE_ZC_FENCE_WAITING;
     if (pfd.revents & POLLIN)
-        return true;
-    if (rendererNowNs() - arrivedNs < LORIE_ZC_FENCE_GRACE_NS)
-        return false;
-
-    log("XlorieRootZc: release fence fd %d cannot be waited on (revents 0x%x); freeing its slot "
-        "after %lld ms\n", fd, pfd.revents, (long long) (LORIE_ZC_FENCE_GRACE_NS / 1000000LL));
-    return true;
+        return LORIE_ZC_FENCE_DONE;
+    return LORIE_ZC_FENCE_UNUSABLE;
 }
 
 // Binder thread. Reports the release fence of the buffer set by the transaction before this one.
@@ -2884,12 +2897,33 @@ static bool rootZcDrainRetiring(void) {
 
     pthread_mutex_lock(&rootOverlayLock);
     for (i = 0; i < rootZcRetiringCount; i++) {
-        if (rootZcRetiring[i].fenceArrived &&
-            rootZcFenceSignalled(rootZcRetiring[i].fenceFd, rootZcRetiring[i].fenceArrivedNs)) {
+        LorieZcFence answer = LORIE_ZC_FENCE_WAITING;
+
+        if (rootZcRetiring[i].fenceUnusable)
+            answer = LORIE_ZC_FENCE_UNUSABLE;
+        else if (rootZcRetiring[i].fenceArrived)
+            answer = rootZcFenceState(rootZcRetiring[i].fenceFd);
+
+        if (answer == LORIE_ZC_FENCE_DONE) {
             freedFds[freedCount] = rootZcRetiring[i].fenceFd;
             freed[freedCount++] = rootZcRetiring[i].slot;
-        } else
-            rootZcRetiring[kept++] = rootZcRetiring[i];
+            continue;
+        }
+
+        if (answer == LORIE_ZC_FENCE_UNUSABLE && !rootZcRetiring[i].fenceUnusable) {
+            // Said once, and the descriptor closed here because it is ours and it is of no further
+            // use. The slot is not freed: nothing has told us the compositor is finished with it.
+            log("XlorieRootZc: release fence for slot %d cannot be waited on; holding the slot "
+                "until its pool is replaced\n", rootZcRetiring[i].slot);
+            state->presentStats.zeroCopyFenceErrors++;
+            if (rootZcRetiring[i].fenceFd >= 0)
+                close(rootZcRetiring[i].fenceFd);
+            rootZcRetiring[i].fenceFd = -1;
+            rootZcRetiring[i].fenceUnusable = true;
+            rootZcUnusableCount++;
+        }
+
+        rootZcRetiring[kept++] = rootZcRetiring[i];
     }
     rootZcRetiringCount = kept;
     // Presenting adds the one on screen to this list and puts a new one on screen, so there has to be
@@ -2906,31 +2940,61 @@ static bool rootZcDrainRetiring(void) {
 }
 
 // Gives back everything we are holding. Renderer thread, on the way out of the zero-copy path.
-static void rootZcReleaseAll(void) {
-    int freed[LORIE_ZC_MAX_HELD + 1], freedFds[LORIE_ZC_MAX_HELD + 1], freedCount = 0;
-    int i;
-
+/*
+ * Stops presenting through this path, without pretending the compositor is finished.
+ *
+ * This used to hand every slot straight back to the X server and close the fences it had not
+ * waited for. Leaving the path does not stop the compositor displaying the buffer on the layer -
+ * the layer is still there with that buffer on it - so the X server was free to draw into exactly
+ * what was on screen. Nor does destroying the layer handle stop it: the layer stays composited,
+ * showing the last buffer put on it.
+ *
+ * So the layer is hidden first, which is what makes a release possible at all, and the slot that
+ * was on it joins the retiring list to be given back when its release actually arrives. Draining
+ * continues from the GL path, so nothing is stranded by the switch.
+ */
+static void rootZcStopPresenting(void) {
     // Leaving this path, so there is no zero-copy frame left to retry.
     rendererSetOutputRetry(false);
 
     pthread_mutex_lock(&rootOverlayLock);
-    for (i = 0; i < rootZcRetiringCount; i++) {
-        freedFds[freedCount] = rootZcRetiring[i].fenceFd;
-        freed[freedCount++] = rootZcRetiring[i].slot;
-    }
-    rootZcRetiringCount = 0;
+
     if (rootZcDisplayedSlot >= 0) {
-        freedFds[freedCount] = -1;
-        freed[freedCount++] = rootZcDisplayedSlot;
+        uint32_t retireSeq = 0;
+
+        if (rootSurfaceControl && rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
+            if (++rootZcRetireSeq == 0)
+                rootZcRetireSeq = 1;
+            retireSeq = rootZcRetireSeq;
+            rootZcRetiring[rootZcRetiringCount].slot = rootZcDisplayedSlot;
+            rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
+            rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
+            rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
+            rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
+            rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
+            rootZcRetiringCount++;
+
+            // Hiding it is the request that gets the buffer back; the completion tells us when.
+            ASurfaceTransaction *t = scApi.txCreate();
+
+            scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+            if (scApi.txSetOnComplete)
+                scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
+            scApi.txApply(t);
+            scApi.txDelete(t);
+        } else
+            // Nowhere to track it, so it stays held rather than being handed back while it may
+            // still be on screen. It comes back when the pool is replaced.
+            log("XlorieRootZc: no room to retire slot %d on the way out; it stays held\n",
+                rootZcDisplayedSlot);
+
         rootZcDisplayedSlot = -1;
     }
+
     pthread_mutex_unlock(&rootOverlayLock);
 
-    for (i = 0; i < freedCount; i++) {
-        if (freedFds[i] >= 0)
-            close(freedFds[i]);
-        rendererReleaseRootSlot(freed[i]);
-    }
+    // Whatever has actually been released is released here; the rest keeps waiting.
+    rootZcDrainRetiring();
 }
 
 // The area around the viewport is the window surface's own buffer, which nothing draws into once the
@@ -3057,6 +3121,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
             rootZcRetiring[rootZcRetiringCount].slot = retiring;
             rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
             rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
+            rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
             rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
             rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
             rootZcRetiringCount++;
@@ -3107,7 +3172,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 }
 
 static void teardownRootOverlay(void) {
-    rootZcReleaseAll();
+    rootZcStopPresenting();
 
     pthread_mutex_lock(&rootOverlayLock);
     if (rootSurfaceControl) {

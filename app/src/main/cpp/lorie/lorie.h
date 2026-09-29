@@ -493,6 +493,10 @@ struct lorie_shared_server_state {
         volatile uint32_t directBufferSubmits;    /* a new root buffer put into a SurfaceControl transaction */
         volatile uint32_t directReuseNoSubmit;    /* nothing new to submit; the compositor keeps what it has */
         volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
+        /* Release fences the compositor handed over that cannot be waited on. Each one costs the
+         * pool a buffer for the rest of that pool's life, because nothing has said the compositor
+         * is finished with it and time passing does not say so either. */
+        volatile uint32_t zeroCopyFenceErrors;
     } presentStats;
 
     /*
