@@ -24,6 +24,8 @@
 #include <dri3.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include "fb.h"
 #include "mipointer.h"
 #include "micmap.h"
@@ -994,6 +996,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.exaPreflightWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightWaitUs, 0, __ATOMIC_RELAXED);
     snap.exaPreflightTimeouts = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightTimeouts, 0, __ATOMIC_RELAXED);
     snap.exaPreflightSkipped = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightSkipped, 0, __ATOMIC_RELAXED);
+    snap.copyCancelledForCpuWrite = __atomic_exchange_n(&pvfb->state->presentStats.copyCancelledForCpuWrite, 0, __ATOMIC_RELAXED);
+    snap.copyClaimedBeforeCpuWrite = __atomic_exchange_n(&pvfb->state->presentStats.copyClaimedBeforeCpuWrite, 0, __ATOMIC_RELAXED);
     snap.copyRequeues = __atomic_exchange_n(&pvfb->state->presentStats.copyRequeues, 0, __ATOMIC_RELAXED);
     snap.copySkips = __atomic_exchange_n(&pvfb->state->presentStats.copySkips, 0, __ATOMIC_RELAXED);
     snap.copyWaitHeld = __atomic_exchange_n(&pvfb->state->presentStats.copyWaitHeld, 0, __ATOMIC_RELAXED);
@@ -1168,6 +1172,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         // offered looks like the GPU path simply not being taken.
         // What putting queued copies ahead of the X server's own drawing costs. The wait total is the
         // number to compare against a run with TERMUX_X11_EXA_PREFLIGHT=0.
+        // Each cancellation is a client frame dropped because the X server drew over the area it
+        // would have landed in - newer content, but a frame the client will not see presented.
+        if (snap.copyCancelledForCpuWrite || snap.copyClaimedBeforeCpuWrite)
+            log(INFO, "XlorieCopy: %u queued copies cancelled for an overlapping CPU write, "
+                      "%u already claimed by the renderer and waited out",
+                snap.copyCancelledForCpuWrite, snap.copyClaimedBeforeCpuWrite);
         if (snap.exaPreflightWaits || snap.exaPreflightSkipped)
             log(INFO, "XlorieCopy: %u drawing operations waited %.1f ms in total for queued copies to "
                       "drain first (%u ran out of time, %u could not wait)",
@@ -1916,10 +1926,10 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->xOff = x_off;
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
-    // This slot's previous occupant may have been cancelled. Cleared before the release below
-    // publishes the entry, so the renderer can never pair the new entry with the old flag.
-    __atomic_store_n(&pvfb->state->gpuCopyQueue.entryCancelled[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY],
-                     0u, __ATOMIC_RELAXED);
+    // Queued, before the release below publishes the entry, so the renderer can never pair the new
+    // entry with the previous occupant's state.
+    __atomic_store_n(&pvfb->state->gpuCopyQueue.entryState[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY],
+                     (uint32_t) LORIE_JOB_QUEUED, __ATOMIC_RELAXED);
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
@@ -2108,6 +2118,15 @@ void lorieReapAbandonedCopies(void) {
  * else in flight is still reading the same pixmap, so releasing on it needs per-buffer tracking
  * this code does not have yet. Run-to-completion is the choice being made, not the only one there is.
  */
+/* Moves a queued entry to CANCELLED, if the renderer has not claimed it first. True if the cancel won,
+ * in which case the entry will never run. */
+static Bool lorieCancelQueuedEntry(uint32_t slot) {
+    uint32_t expected = LORIE_JOB_QUEUED;
+
+    return __atomic_compare_exchange_n(&pvfb->state->gpuCopyQueue.entryState[slot], &expected,
+                                       (uint32_t) LORIE_JOB_CANCELLED, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static void lorieMarkQueuedCopySuperseded(uint64_t serial) {
     uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
     uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
@@ -2116,12 +2135,98 @@ static void lorieMarkQueuedCopySuperseded(uint64_t serial) {
         uint32_t slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
 
         // By serial, which is unique: a slot that has been reused holds a different job, and this
-        // cannot touch it.
+        // cannot touch it. Losing the race means the renderer already has it, which is the
+        // run-to-completion case lorieGpuCopyAbandon() still handles.
         if (pvfb->state->gpuCopyQueue.entries[slot].serial == serial) {
-            __atomic_store_n(&pvfb->state->gpuCopyQueue.entryCancelled[slot], 1u, __ATOMIC_RELEASE);
+            (void) lorieCancelQueuedEntry(slot);
             return;
         }
     }
+}
+
+/*
+ * Whether any of a queued copy's rectangles, offset into the coordinates of the buffer they touch,
+ * meets the region. A copy's rects are in its source's coordinates; it writes them at (xOff, yOff) in
+ * its destination.
+ */
+static Bool lorieEntryTouches(const LorieGpuCopyEntry *e, int16_t dx, int16_t dy, RegionPtr region) {
+    int i;
+
+    for (i = 0; i < e->numRects && i < LORIE_GPU_COPY_MAX_RECTS; i++) {
+        BoxRec b = { (short) (e->rects[i].x1 + dx), (short) (e->rects[i].y1 + dy),
+                     (short) (e->rects[i].x2 + dx), (short) (e->rects[i].y2 + dy) };
+
+        if (b.x1 < b.x2 && b.y1 < b.y2 && RegionContainsRect(region, &b) != rgnOUT)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * The X server is about to write `region` of buffer `bufferId` with the CPU. Any copy queued before
+ * now that writes into that area, or reads from it, has to be out of the way first: one that has not
+ * run would otherwise run afterwards - an older frame landing on top of newer drawing, or a frame read
+ * from pixels that have since been drawn over.
+ *
+ * Each such copy is cancelled if it is still queued. One the renderer has already claimed is being run
+ * under the shared lock and is finished, fence and all, before that lock is released - so taking the
+ * lock, which PrepareAccess does next, waits for it. Either way none of them can land after the write.
+ * There is no waiting here and no time limit, so there is nothing that gives the ordering up.
+ *
+ * Copies that do not touch the area are left alone. Two windows share the root, and a write into one
+ * says nothing about a frame queued for the other.
+ */
+static void lorieCancelConflictingCopies(uint64_t bufferId, RegionPtr region) {
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
+
+    for (i = readIndex; i != writeIndex; i++) {
+        uint32_t slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
+        const LorieGpuCopyEntry *e = &pvfb->state->gpuCopyQueue.entries[slot];
+        Bool conflict = (e->dstBufferId == bufferId && lorieEntryTouches(e, e->xOff, e->yOff, region)) ||
+                        (e->srcBufferId == bufferId && lorieEntryTouches(e, 0, 0, region));
+
+        if (!conflict)
+            continue;
+        if (lorieCancelQueuedEntry(slot)) {
+            pvfb->state->presentStats.copyCancelledForCpuWrite++;
+            lorieTrace(pvfb->state, LORIE_TRACE_CANCEL, 1, e->serial);
+        } else if (__atomic_load_n(&pvfb->state->gpuCopyQueue.entryState[slot], __ATOMIC_ACQUIRE) == LORIE_JOB_CLAIMED)
+            pvfb->state->presentStats.copyClaimedBeforeCpuWrite++;
+    }
+}
+
+/*
+ * EXA's single way into a CPU access (exaPrepareAccess, see xserver.patch), with the drawable still
+ * known - the driver's PrepareAccess gets only the pixmap, and is skipped altogether when one pixmap is
+ * both source and destination of the same operation.
+ *
+ * For a write, the area that can be written is bounded by the drawable: a window draws only within its
+ * borderClip, a pixmap anywhere in itself. That bound is what is checked against queued copies.
+ */
+void lorieExaAccess(DrawablePtr pDrawable, PixmapPtr pPixmap, int index) {
+    LoriePixmapPriv *priv;
+    RegionRec region;
+
+    if (index != EXA_PREPARE_DEST && index != EXA_PREPARE_AUX_DEST)
+        return;
+    if (!pvfb->state || !(priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pPixmap)) || !priv->buffer ||
+        !LorieBuffer_hasGpuCopyPending(priv->buffer))
+        return;   // nothing queued touches this buffer: the common case
+
+    if (pDrawable->type == DRAWABLE_WINDOW) {
+        RegionNull(&region);
+        RegionCopy(&region, &((WindowPtr) pDrawable)->borderClip);
+        // Screen coordinates to the pixmap's own.
+        RegionTranslate(&region, -pPixmap->screen_x, -pPixmap->screen_y);
+    } else {
+        BoxRec all = { 0, 0, (short) pPixmap->drawable.width, (short) pPixmap->drawable.height };
+
+        RegionInit(&region, &all, 1);
+    }
+
+    lorieCancelConflictingCopies(LorieBuffer_description(priv->buffer)->id, &region);
+    RegionUninit(&region);
 }
 
 Bool lorieGpuCopyAbandon(void *token) {
@@ -2845,20 +2950,19 @@ static int lorieSharedLockHeld = 0;
  * Called as the outermost EXA fallback begins - before any operand has been prepared, so before any
  * lock is held (see the EXA_PRE_FALLBACK hunk in xserver.patch).
  *
- * A GPU copy that is queued but not yet drained has not happened yet, so it will land after whatever
- * this operation draws, and where the two overlap that puts a client's older frame on top of newer
- * drawing. The shared lock taken later keeps the two from running at once; it does not put them in
- * order. This puts them in order: whatever was queued before the operation started is drained first.
+ * Not what keeps the ordering correct any more - lorieExaAccess() does that, without waiting, by
+ * cancelling any queued copy the operation is about to draw over. What this adds is letting those
+ * copies run first where the renderer can get to them in time: a copy that runs is a client frame
+ * shown, a copy that is cancelled is a frame dropped. It also makes a CPU read see a queued copy's
+ * result rather than the pixels from before it, which cancellation cannot do.
  *
- * It has to happen here. Inside PrepareAccess the lock is usually already held - EXA prepares the
- * source of a copy before its destination - and the renderer needs that same lock to drain, so
- * waiting there deadlocks. Here nothing is held. And once the entries are drained, the lock that
- * PrepareAccess then takes is enough: every path the renderer drains on waits for its copies' fence
- * before letting go of the lock.
+ * It can only wait here, where nothing is held: inside PrepareAccess the lock usually already is
+ * (EXA prepares a copy's source before its destination), and the renderer needs it to drain. Running
+ * out of time, or skipping, now costs a dropped frame or a read one frame stale - never an older frame
+ * landing over newer drawing.
  *
- * The operands are not known yet, so it waits for everything queued rather than only the copies into
- * buffers this operation touches. That is broader than needed; the count and total wait are reported
- * so the cost is visible, and TERMUX_X11_EXA_PREFLIGHT=0 turns it off for comparison.
+ * The operands are not known yet, so it waits for everything queued. The count and total wait are
+ * reported, and TERMUX_X11_EXA_PREFLIGHT=0 turns it off for comparison.
  */
 #define LORIE_PREFLIGHT_MAX_US 20000ULL
 void lorieExaFallbackBegin(void) {
@@ -2882,10 +2986,13 @@ void lorieExaFallbackBegin(void) {
     // drain until it is released. Waiting would only run out the clock.
     if (lorieSharedLockHeld > 0) {
         pvfb->state->presentStats.exaPreflightSkipped++;
+        lorieTrace(pvfb->state, LORIE_TRACE_PREFLIGHT, LORIE_PREFLIGHT_SKIP_LOCKED, 0);
         return;
     }
-    if (!lorieConnectionAlive() || !lorieRendererAvailable())
+    if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
+        lorieTrace(pvfb->state, LORIE_TRACE_PREFLIGHT, LORIE_PREFLIGHT_NO_RENDERER, 0);
         return;
+    }
 
     // An entry that already made one of these waits run out is stuck - an import that has not
     // arrived, a slot still on screen - and will stay stuck for a while. Waiting on it again for
@@ -2894,21 +3001,40 @@ void lorieExaFallbackBegin(void) {
             __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) % LORIE_GPU_COPY_QUEUE_CAPACITY].serial;
     if (headSerial == stuckSerial) {
         pvfb->state->presentStats.exaPreflightSkipped++;
+        lorieTrace(pvfb->state, LORIE_TRACE_PREFLIGHT, LORIE_PREFLIGHT_SKIP_STUCK, 0);
         return;
     }
 
     pthread_cond_signal(rendererCond);
     startUs = lorieNowUs();
-    while ((int32_t) (__atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) - target) < 0) {
-        if (lorieNowUs() - startUs >= LORIE_PREFLIGHT_MAX_US) {
+    __atomic_fetch_add(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    for (;;) {
+        uint32_t seen = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+        uint64_t elapsedUs = lorieNowUs() - startUs;
+        struct timespec left;
+
+        if ((int32_t) (seen - target) >= 0)
+            break;
+        if (elapsedUs >= LORIE_PREFLIGHT_MAX_US) {
             stuckSerial = headSerial;
             pvfb->state->presentStats.exaPreflightTimeouts++;
             break;
         }
-        // Polled: the renderer's progress notification goes to this thread's event loop, which is
-        // what is waiting here.
-        usleep(200);
+        /*
+         * Asleep until readIndex changes from what was just read, rather than polled. The renderer's
+         * own progress notification goes to this thread's event loop - which is what is waiting here,
+         * so it cannot be used - but readIndex lives in memory both processes map, and a futex on it
+         * works across them; the renderer wakes it when it advances readIndex and sees a waiter.
+         * Re-checked after every return, so a spurious or missed wake costs only another loop.
+         */
+        left.tv_sec = 0;
+        left.tv_nsec = (long) ((LORIE_PREFLIGHT_MAX_US - elapsedUs) * 1000u);
+        syscall(__NR_futex, &pvfb->state->gpuCopyQueue.readIndex, FUTEX_WAIT, seen, &left, NULL, 0);
     }
+    __atomic_fetch_sub(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    lorieTrace(pvfb->state, LORIE_TRACE_PREFLIGHT,
+               stuckSerial == headSerial ? LORIE_PREFLIGHT_TIMEOUT : LORIE_PREFLIGHT_DRAINED,
+               lorieNowUs() - startUs);
 
     pvfb->state->presentStats.exaPreflightWaits++;
     pvfb->state->presentStats.exaPreflightWaitUs += (uint32_t) (lorieNowUs() - startUs);
@@ -2928,26 +3054,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
 
     if (lorieNeedsGpuLock(pPix, priv, index)) {
         /*
-         * A queued GPU copy into this buffer is still not ordered against the write that is about
-         * to happen - the lock below stops the two running at once, it does not put them in order,
-         * so a copy queued first can land afterwards and put the client's older frame on top of
-         * what replaced it.
-         *
-         * What was here was giving up on every queued copy into this buffer. That is wrong in the
-         * common case and wrong in the direction that matters: two windows on the root share the
-         * destination, so a client presenting into one area had its copy dropped because something
-         * else was drawn into a completely different area. A demo that stops updating while another
-         * window is dragged over the desktop is the symptom this whole effort started from, and
-         * that rule can produce it.
-         *
-         * It cannot be narrowed here, either. The only region that would settle it is the area this
-         * CPU access is about to write, and EXA does not pass one: with EXA_HANDLES_PIXMAPS and no
-         * EXA_MIXED_PIXMAPS it leaves prepare_access_reg NULL, so PrepareAccess is handed a pixmap
-         * and an index and nothing else. Ordering instead of dropping needs the dependencies
-         * resolved above this hook, before any of these locks are taken, which is where it belongs
-         * and is not done.
-         *
-         * So the narrower bug stays for now rather than being traded for a wider one.
+         * Queued copies that this access is about to draw over have already been cancelled or waited
+         * for by lorieExaAccess(), which runs first with the drawable (and so the area) still known.
+         * The lock taken below is what completes that: a copy the renderer had already claimed is
+         * finished, fence and all, before the renderer lets go of it.
          */
 
         // This is where the X server's own drawing waits for the renderer to let go of the root

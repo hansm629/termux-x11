@@ -132,8 +132,21 @@
  
          InputThreadInit();
  
++++ ./exa/exa.c
+@@ -376,6 +376,11 @@
+ 
+     ExaScreenPriv(pDrawable->pScreen);
+ 
++    /* lorie: every CPU access passes here with its drawable, before the driver is asked - and before
++     * the driver is skipped when one pixmap is both source and destination of the same operation.
++     * Queued GPU copies this access would draw over are dealt with now; see lorieExaAccess(). */
++    lorieExaAccess(pDrawable, pPixmap, index);
++
+     if (pExaScr->prepare_access_reg)
+         pExaScr->prepare_access_reg(pPixmap, index, NULL);
+     else
 +++ ./exa/exa_priv.h
-@@ -250,19 +250,26 @@
+@@ -250,19 +250,28 @@
  }
  #endif
  
@@ -141,6 +154,8 @@
 + * and so before any lock is held - the one point where waiting on the renderer cannot deadlock. See
 + * lorieExaFallbackBegin() in lorie/InitOutput.c. */
 +extern void lorieExaFallbackBegin(void);
++/* lorie: lorie/InitOutput.c, called from exaPrepareAccess() for every CPU access. */
++extern void lorieExaAccess(DrawablePtr pDrawable, PixmapPtr pPixmap, int index);
 +
  #define EXA_PRE_FALLBACK(_screen_) \
      ExaScreenPriv(_screen_); \

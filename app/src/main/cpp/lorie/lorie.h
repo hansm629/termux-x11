@@ -56,6 +56,11 @@ void lorieChoreographerStart(AChoreographer *d);
 void lorieTraceInput(uint32_t eventType);
 /* Called from EXA's fallback entry (xserver.patch, exa_priv.h) before any operand is prepared. */
 void lorieExaFallbackBegin(void);
+/* Called from exaPrepareAccess (xserver.patch, exa.c) with the drawable still known. Declared with the
+ * struct tags rather than DrawablePtr/PixmapPtr: the renderer includes this header without pixmap.h. */
+struct _Drawable;
+struct _Pixmap;
+void lorieExaAccess(struct _Drawable *pDrawable, struct _Pixmap *pPixmap, int index);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
@@ -294,7 +299,13 @@ typedef struct {
     int16_t xOff, yOff;
     uint16_t numRects;
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
-} LorieGpuCopyEntry;   /* immutable once published - see entryCancelled for the one thing that is not */
+} LorieGpuCopyEntry;   /* immutable once published - see entryState for the one thing that is not */
+
+/* Who a queued copy belongs to. Both sides move it out of QUEUED with a compare-and-swap, so exactly
+ * one of them wins: the renderer claiming it to run, or the X server cancelling it. A cancelled copy
+ * is never run; a claimed one is run under the shared lock and finished - fence and all - before that
+ * lock is let go, so an X server that holds the lock never sees a claimed copy still running. */
+enum { LORIE_JOB_QUEUED = 0, LORIE_JOB_CLAIMED = 1, LORIE_JOB_CANCELLED = 2 };
 
 /*
  * Event trace, off unless TERMUX_X11_TRACE names a file. Every step a frame takes on its way to the
@@ -324,7 +335,12 @@ enum {
     LORIE_TRACE_GLSWAP,       /* renderer: GL frame swapped            a = 1 if ok,             b = root id */
     LORIE_TRACE_RELEASE,      /* renderer: compositor gave a slot back a = slot,                b = buffer id */
     LORIE_TRACE_HOLD,         /* renderer: frame held back             a = 1 incomplete, 2 no slot back, 3 lock; b = slot */
+    LORIE_TRACE_CANCEL,       /* X: queued copy cancelled              a = 1 for a conflicting CPU write, b = serial */
+    LORIE_TRACE_PREFLIGHT,    /* X: EXA fallback waited for the queue  a = result (below),  b = wait us */
 };
+/* LORIE_TRACE_PREFLIGHT results */
+enum { LORIE_PREFLIGHT_DRAINED = 1, LORIE_PREFLIGHT_TIMEOUT = 2, LORIE_PREFLIGHT_SKIP_LOCKED = 3,
+       LORIE_PREFLIGHT_SKIP_STUCK = 4, LORIE_PREFLIGHT_NO_RENDERER = 5 };
 
 #define LORIE_TRACE_RECORDS 4096
 
@@ -370,17 +386,19 @@ struct lorie_shared_server_state {
         volatile uint64_t failedLostUpTo;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
 
-        /* The only thing about a published entry that still changes: its copy has been cancelled and
-         * nobody wants the result. Kept out of the entry itself, because the renderer takes the entry
-         * with a plain struct copy - a field the X server can write concurrently has no business in
-         * something read that way, whatever is done with it afterwards.
+        /* The only thing about a published entry that still changes: whether it is queued, claimed by
+         * the renderer or cancelled by the X server (LORIE_JOB_*). Kept out of the entry itself,
+         * because the renderer takes the entry with a plain struct copy - a field the other process
+         * can write concurrently has no business in something read that way.
          *
-         * Set by the X server before the request it belongs to is torn down, read atomically by the
-         * renderer just before it would apply the entry at that slot, and cleared by the X server
-         * before the slot is reused - which cannot happen while the renderer is still on it, since
-         * reuse waits for readIndex to move past. It is a request, not a guarantee: the renderer may
-         * already have taken the entry, so see lorieGpuCopyAbandon() for what still has to hold. */
-        volatile uint32_t entryCancelled[LORIE_GPU_COPY_QUEUE_CAPACITY];
+         * Set to QUEUED by the X server before it publishes the entry, and only ever moved out of
+         * QUEUED by a compare-and-swap. A slot is reused only after readIndex has moved past it, so a
+         * state can never be confused with the next job's. */
+        volatile uint32_t entryState[LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+        /* X server threads waiting on a futex for readIndex to move. The renderer only makes the wake
+         * call when this is non-zero, so draining costs nothing extra when nobody is waiting. */
+        volatile uint32_t readIndexWaiters;
     } gpuCopyQueue;
 
     /* ID of root window texture to be drawn. */
@@ -591,6 +609,10 @@ struct lorie_shared_server_state {
         volatile uint32_t exaPreflightWaitUs;
         volatile uint32_t exaPreflightTimeouts;
         volatile uint32_t exaPreflightSkipped;
+        /* Queued copies cancelled because the X server was about to write the area they touch, and
+         * copies the renderer had already claimed by then (which the shared lock then waited out). */
+        volatile uint32_t copyCancelledForCpuWrite;
+        volatile uint32_t copyClaimedBeforeCpuWrite;
         /* Copies let go of because the session that owed their result is gone, with nothing that
          * says the GPU finished with them. Not a safe completion - see lorieCopySettled - so it is
          * counted apart from the ones that were actually reported. */

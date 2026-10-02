@@ -38,6 +38,14 @@ recipes = {
         + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
         + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
         + func(I, "static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {"),
+    "t25_src_types": lambda: macro(H, "LORIE_GPU_COPY_MAX_RECTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyRect;")
+        + span(H, "typedef struct {\n    uint64_t serial;\n    uint64_t srcBufferId;", "} LorieGpuCopyEntry;")
+        + span(H, "enum { LORIE_JOB_QUEUED = 0", "};"),
+    "t25_src_funcs": lambda: func(I, "static Bool lorieCancelQueuedEntry(uint32_t slot) {")
+        + func(I, "static Bool lorieEntryTouches(const LorieGpuCopyEntry *e, int16_t dx, int16_t dy, RegionPtr region) {")
+        + func(I, "static void lorieCancelConflictingCopies(uint64_t bufferId, RegionPtr region) {")
+        + func(R, "static bool rendererClaimEntry(uint32_t slot) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

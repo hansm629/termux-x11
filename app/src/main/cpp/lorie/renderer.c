@@ -14,6 +14,9 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <limits.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/native_window_jni.h>
@@ -1421,6 +1424,30 @@ static void rendererPublishFailedSerial(uint64_t serial) {
  */
 static inline void rendererAdvanceReadIndex(void) {
     __atomic_store_n(&state->gpuCopyQueue.readIndex, state->gpuCopyQueue.readIndex + 1, __ATOMIC_RELEASE);
+    // An X server thread may be asleep on a futex waiting for exactly this (lorieExaFallbackBegin).
+    // Not FUTEX_PRIVATE: the word is in memory shared with the X server process.
+    if (__atomic_load_n(&state->gpuCopyQueue.readIndexWaiters, __ATOMIC_ACQUIRE))
+        syscall(__NR_futex, &state->gpuCopyQueue.readIndex, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+// Takes a queued entry to run. False means the X server cancelled it first, and it must not run.
+static bool rendererClaimEntry(uint32_t slot) {
+    uint32_t expected = LORIE_JOB_QUEUED;
+
+    return __atomic_compare_exchange_n(&state->gpuCopyQueue.entryState[slot], &expected, LORIE_JOB_CLAIMED,
+                                       false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+/*
+ * Moves past an entry the X server cancelled. Reported as not made rather than left to ride out on
+ * completedSerial, so the present is scrapped and the client told its frame was skipped. Still drained
+ * like any other entry: nothing of it is left for the GPU to do.
+ */
+static void rendererSkipCancelledEntry(uint64_t serial, uint64_t *lastSerial) {
+    rendererPublishFailedSerial(serial);
+    __atomic_fetch_add(&state->presentStats.copySkips, 1, __ATOMIC_RELAXED);
+    *lastSerial = serial;
+    rendererAdvanceReadIndex();
 }
 
 /*
@@ -1488,19 +1515,11 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
         int dstSlot = rendererRootSlotForBufferId(entry.dstBufferId);
         bool heldOnScreen;
 
-        // Read on its own rather than trusting the struct copy above, because this is the one field
-        // the X server writes after publishing the entry. Acquire pairs with its release: seeing it
-        // unset means the X server's own write into this destination has not happened yet, and the
-        // lock held around this loop keeps it from starting until the copy below is done.
-        if (__atomic_load_n(&state->gpuCopyQueue.entryCancelled[slot], __ATOMIC_ACQUIRE)) {
-            // The destination holds newer content than this copy carries. Reporting it rather than
-            // letting it ride out on completedSerial: it was not made, and the present has to be
-            // scrapped so the client is told its frame was skipped instead of presented.
-            rendererPublishFailedSerial(entry.serial);
-            __atomic_fetch_add(&state->presentStats.copySkips, 1, __ATOMIC_RELAXED);
-            // Drained like any other entry: nothing of it is left for the GPU to do.
-            lastSerial = entry.serial;
-            rendererAdvanceReadIndex();
+        // Already cancelled by the X server - its request torn down, or newer drawing written over
+        // the area it would have landed in. Read on its own rather than from the struct copy above,
+        // because this is the one field the X server writes after publishing the entry.
+        if (__atomic_load_n(&state->gpuCopyQueue.entryState[slot], __ATOMIC_ACQUIRE) == LORIE_JOB_CANCELLED) {
+            rendererSkipCancelledEntry(entry.serial, &lastSerial);
             continue;
         }
 
@@ -1555,6 +1574,19 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
             // had been made, which told the client its frame was on screen when nothing had been
             // drawn at all.
             rendererPublishFailedSerial(entry.serial);
+        }
+
+        /*
+         * Claimed only now, at the moment it is about to run - not before the waits above. An entry
+         * claimed and then left waiting would be one the X server could no longer cancel, while it
+         * also had not happened yet: the X server would draw, let go of the lock, and the copy would
+         * land on top afterwards. Unclaimed, it stays cancellable for as long as it is waiting.
+         *
+         * Losing the race means the X server cancelled it in the meantime, and it is not run.
+         */
+        if (src && dst && !heldOnScreen && !rendererClaimEntry(slot)) {
+            rendererSkipCancelledEntry(entry.serial, &lastSerial);
+            continue;
         }
 
         if (src && dst && !heldOnScreen) {
