@@ -125,6 +125,10 @@ static EGLSurface defaultSfc = EGL_NO_SURFACE, sfc = EGL_NO_SURFACE;
 static EGLConfig cfg = 0;
 static ANativeWindow *defaultWin = NULL, *win = NULL;
 static volatile struct xorg_list addedBuffers, buffers, removedBuffers;
+/* Removed buffers still named by a queued copy, kept imported until it has been drained. A list of
+ * their own, because removedBuffers being non-empty is what wakes the renderer to release it - kept
+ * there, they would wake it every time round and make the loop spin. */
+static struct xorg_list retainedBuffers;
 volatile jint filtering = GL_NEAREST;
 
 static volatile bool stateChanged = false, windowChanged = false;
@@ -626,6 +630,7 @@ int rendererInitThread(void) {
     xorg_list_init(&addedBuffers);
     xorg_list_init(&buffers);
     xorg_list_init(&removedBuffers);
+    xorg_list_init(&retainedBuffers);
 
     egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (egl_display == EGL_NO_DISPLAY)
@@ -1343,6 +1348,15 @@ static uint64_t rendererCopyDeferredSerial = 0;
 // here - up to 20 x 5 ms - when a buffer had not been registered yet, which stops completedSerial
 // from advancing: every present waiting on it is then re-queued one vblank at a time, and a single
 // unregistered buffer holds up every copy behind it. The caller defers instead.
+/*
+ * Unregistered is not the same as gone. The X server unregisters a buffer when the pixmap behind it is
+ * destroyed or the root pool is replaced, and a copy queued before that still names it - with the
+ * X server still holding a reference to the memory for exactly as long as the copy is outstanding.
+ * The import was destroyed at the end of the same loop iteration regardless, so the copy found
+ * nothing, waited out the 250 ms registration deadline at the head of the queue with every copy
+ * behind it waiting too, and was then given up on and its present scrapped. A removed buffer is
+ * still found here, and kept imported until nothing in the queue names it.
+ */
 static LorieBuffer *rendererFindBuffer(uint64_t id) {
     LorieBuffer *buf;
 
@@ -1352,9 +1366,30 @@ static LorieBuffer *rendererFindBuffer(uint64_t id) {
         LorieBuffer_attachToGL(buf);
         LorieBuffer_addToList(buf, &buffers);
     }
+    if (!buf)
+        buf = LorieBufferList_findById(&removedBuffers, id);
+    if (!buf)
+        buf = LorieBufferList_findById(&retainedBuffers, id);
     pthread_spin_unlock(&bufferLock);
 
     return buf;
+}
+
+// Whether any copy still waiting in the queue reads or writes this buffer.
+static bool rendererBufferNamedByQueue(uint64_t bufferId) {
+    uint32_t i, end;
+
+    if (!state)
+        return false;
+
+    end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+    for (i = state->gpuCopyQueue.readIndex; i != end; i++) {
+        const LorieGpuCopyEntry *e = &state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+        if (e->srcBufferId == bufferId || e->dstBufferId == bufferId)
+            return true;
+    }
+    return false;
 }
 
 /*
@@ -2446,9 +2481,28 @@ __noreturn static void* rendererThread(void) {
         }
 
         pthread_spin_lock(&bufferLock);
-        // Remove all buffers which were attached to GL.
-        while((buf = LorieBufferList_first(&removedBuffers)))
-            LorieBuffer_release(buf);
+        // Release the buffers that were attached to GL and that nothing queued still needs; the
+        // rest stay imported until the copies naming them have been drained (see rendererFindBuffer).
+        while ((buf = LorieBufferList_first(&removedBuffers))) {
+            if (rendererBufferNamedByQueue(LorieBuffer_description(buf)->id))
+                LorieBuffer_addToList(buf, &retainedBuffers);
+            else
+                LorieBuffer_release(buf);
+        }
+        // And the ones kept from before, whose copies may have been drained this time round.
+        {
+            struct xorg_list stillNeeded;
+
+            xorg_list_init(&stillNeeded);
+            while ((buf = LorieBufferList_first(&retainedBuffers))) {
+                if (rendererBufferNamedByQueue(LorieBuffer_description(buf)->id))
+                    LorieBuffer_addToList(buf, &stillNeeded);
+                else
+                    LorieBuffer_release(buf);
+            }
+            while ((buf = LorieBufferList_first(&stillNeeded)))
+                LorieBuffer_addToList(buf, &retainedBuffers);
+        }
         pthread_spin_unlock(&bufferLock);
         pthread_mutex_lock(&stateLock);
     }
