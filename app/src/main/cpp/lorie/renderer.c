@@ -2099,6 +2099,22 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked(rendererRootSlot, &gpuWorkIssued);
     state->drawRequested = FALSE;
 
+    /*
+     * Deferring the fence means letting go of the shared lock before the GPU has finished, and that
+     * is only safe for what this frame reads and nobody else touches: the root slot it has claimed,
+     * which its held bit keeps the X server out of. The copies drained just above are a different
+     * matter - they write the X server's current drawing slot or a redirected window's own pixmap,
+     * and read the client pixmaps they came from, none of which anything but this lock keeps the X
+     * server away from. With the lock released early it could take it for a CPU access to a buffer
+     * the GPU was still writing, and since the queue had already moved past those entries nothing
+     * else would stop it.
+     *
+     * So a frame that carried copies waits inside the lock, as the single-buffered path always has.
+     * A frame that carried none still defers, which is the case the deferral was made for.
+     */
+    if (gpuWorkIssued)
+        deferFence = false;
+
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
