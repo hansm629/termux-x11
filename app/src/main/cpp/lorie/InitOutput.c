@@ -807,8 +807,15 @@ static void lorieTraceFlush(Bool force) {
             pvfb->state->traceDropped++;
             continue;               // lapped by a writer
         }
-        out.tUs = r->tUs; out.kind = r->kind; out.a = r->a; out.b = r->b;
-        if (__atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) != seq) {
+        out.tUs = __atomic_load_n(&r->tUs, __ATOMIC_RELAXED);
+        out.kind = __atomic_load_n(&r->kind, __ATOMIC_RELAXED);
+        out.a = __atomic_load_n(&r->a, __ATOMIC_RELAXED);
+        out.b = __atomic_load_n(&r->b, __ATOMIC_RELAXED);
+        // The seqlock read: the fields must be read before seq is looked at again, and an acquire
+        // fence is what keeps them there - an acquire load of seq alone would not stop the field
+        // reads from being satisfied after it. Pairs with the writer's release fence.
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&r->seq, __ATOMIC_RELAXED) != seq) {
             pvfb->state->traceDropped++;
             continue;               // overwritten while being read
         }

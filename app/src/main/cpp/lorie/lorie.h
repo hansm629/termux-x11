@@ -826,10 +826,17 @@ static inline __always_inline void lorieTraceAt(struct lorie_shared_server_state
     uint64_t idx = __atomic_fetch_add(&st->traceHead, 1, __ATOMIC_RELAXED);
     LorieTraceRecord *r = &st->trace[idx % LORIE_TRACE_RECORDS];
 
-    __atomic_store_n(&r->seq, 0, __ATOMIC_RELAXED);   /* being rewritten */
-    r->tUs = tUs;
-    r->kind = kind;
-    r->a = a;
-    r->b = b;
+    /*
+     * A seqlock write: seq is cleared, then the fields change, then seq is set. The fence is what makes
+     * that order visible to the reader. Without it a weakly ordered CPU may let the new fields be seen
+     * before seq is cleared, and a reader that read the old seq would then accept the new fields as the
+     * old record - which the host test caught as a record turning up twice and out of order.
+     */
+    __atomic_store_n(&r->seq, 0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&r->tUs, tUs, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->kind, kind, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->a, a, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->b, b, __ATOMIC_RELAXED);
     __atomic_store_n(&r->seq, idx + 1, __ATOMIC_RELEASE);
 }
