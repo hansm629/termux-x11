@@ -963,6 +963,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.xLockWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaitUs, 0, __ATOMIC_RELAXED);
     snap.xLockWaits = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaits, 0, __ATOMIC_RELAXED);
     snap.zeroCopyFenceErrors = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyFenceErrors, 0, __ATOMIC_RELAXED);
+    snap.rootStaleSlotReleases = __atomic_exchange_n(&pvfb->state->presentStats.rootStaleSlotReleases, 0, __ATOMIC_RELAXED);
     snap.zeroCopyStalls = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyStalls, 0, __ATOMIC_RELAXED);
 
 
@@ -1039,6 +1040,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
                               : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
 
+            if (snap.rootStaleSlotReleases)
+                log(INFO, "XlorieBackend: %u slot releases arrived after their pool was replaced and were "
+                          "not applied to the new one", snap.rootStaleSlotReleases);
             if (snap.zeroCopyFenceErrors)
                 log(INFO, "XlorieBackend: %u release fences could not be waited on; those slots "
                           "stay held until the pool is replaced",

@@ -561,6 +561,9 @@ struct lorie_shared_server_state {
          * pool a buffer for the rest of that pool's life, because nothing has said the compositor
          * is finished with it and time passing does not say so either. */
         volatile uint32_t zeroCopyFenceErrors;
+        /* Slot releases that arrived after the X server had replaced the pool, and so named an index
+         * that now belongs to a different buffer. Not released - see rendererReleaseRootSlot. */
+        volatile uint32_t rootStaleSlotReleases;
     } presentStats;
 
     /*
