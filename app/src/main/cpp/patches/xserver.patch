@@ -177,6 +177,20 @@
  #define EXA_POST_FALLBACK_GC(_gc_) \
      pExaScr->fallback_counter--; \
      swap(pExaGC, _gc_, ops);
++++ ./exa/exa_unaccel.c
+@@ -374,6 +374,12 @@
+     EXA_PRE_FALLBACK(pScreen);
+     EXA_FALLBACK(("from %p\n", pWin));
+ 
++    /* lorie: CopyWindow writes the window's new area of this pixmap, but prepares the pixmap only as
++     * a source below - so the write would never be seen as one. Every window move lands here (lorie's
++     * EXA driver accelerates no copies), so queued GPU copies into that area are dealt with now, as
++     * for any other write; see lorieExaAccess(). */
++    lorieExaAccess(pDrawable, pScreen->GetWindowPixmap(pWin), EXA_PREPARE_DEST);
++
+     /* Only need the source bits, the destination region will be overwritten */
+     if (pExaScr->prepare_access_reg) {
+         PixmapPtr pPixmap = pScreen->GetWindowPixmap(pWin);
 +++ ./include/os.h
 @@ -557,6 +557,8 @@
  extern _X_EXPORT void
