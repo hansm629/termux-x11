@@ -132,6 +132,36 @@
  
          InputThreadInit();
  
++++ ./exa/exa_priv.h
+@@ -250,19 +250,26 @@
+ }
+ #endif
+ 
++/* lorie: called as the outermost EXA fallback begins, before any of its operands have been prepared
++ * and so before any lock is held - the one point where waiting on the renderer cannot deadlock. See
++ * lorieExaFallbackBegin() in lorie/InitOutput.c. */
++extern void lorieExaFallbackBegin(void);
++
+ #define EXA_PRE_FALLBACK(_screen_) \
+     ExaScreenPriv(_screen_); \
+-    pExaScr->fallback_counter++;
++    if (pExaScr->fallback_counter++ == 0) \
++        lorieExaFallbackBegin();
+ 
+ #define EXA_POST_FALLBACK(_screen_) \
+     pExaScr->fallback_counter--;
+ 
+ #define EXA_PRE_FALLBACK_GC(_gc_) \
+     ExaScreenPriv(_gc_->pScreen); \
+     ExaGCPriv(_gc_); \
+-    pExaScr->fallback_counter++; \
++    if (pExaScr->fallback_counter++ == 0) \
++        lorieExaFallbackBegin(); \
+     swap(pExaGC, _gc_, ops);
+ 
+ #define EXA_POST_FALLBACK_GC(_gc_) \
+     pExaScr->fallback_counter--; \
+     swap(pExaGC, _gc_, ops);
 +++ ./include/os.h
 @@ -557,6 +557,8 @@
  extern _X_EXPORT void

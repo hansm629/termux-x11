@@ -983,6 +983,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.copyLatencyMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencyMaxUs, 0, __ATOMIC_RELAXED);
     snap.copyLatencySumUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencySumUs, 0, __ATOMIC_RELAXED);
     snap.copyRecordExhausted = __atomic_exchange_n(&pvfb->state->presentStats.copyRecordExhausted, 0, __ATOMIC_RELAXED);
+    snap.exaPreflightWaits = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightWaits, 0, __ATOMIC_RELAXED);
+    snap.exaPreflightWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightWaitUs, 0, __ATOMIC_RELAXED);
+    snap.exaPreflightTimeouts = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightTimeouts, 0, __ATOMIC_RELAXED);
+    snap.exaPreflightSkipped = __atomic_exchange_n(&pvfb->state->presentStats.exaPreflightSkipped, 0, __ATOMIC_RELAXED);
     snap.copyRequeues = __atomic_exchange_n(&pvfb->state->presentStats.copyRequeues, 0, __ATOMIC_RELAXED);
     snap.copySkips = __atomic_exchange_n(&pvfb->state->presentStats.copySkips, 0, __ATOMIC_RELAXED);
     snap.copyWaitHeld = __atomic_exchange_n(&pvfb->state->presentStats.copyWaitHeld, 0, __ATOMIC_RELAXED);
@@ -1155,6 +1159,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         // How the copies that did not end in an ack ended instead. Both are invisible from outside
         // - an abandoned copy looks like a client that stopped sending, and a copy that was never
         // offered looks like the GPU path simply not being taken.
+        // What putting queued copies ahead of the X server's own drawing costs. The wait total is the
+        // number to compare against a run with TERMUX_X11_EXA_PREFLIGHT=0.
+        if (snap.exaPreflightWaits || snap.exaPreflightSkipped)
+            log(INFO, "XlorieCopy: %u drawing operations waited %.1f ms in total for queued copies to "
+                      "drain first (%u ran out of time, %u could not wait)",
+                snap.exaPreflightWaits, snap.exaPreflightWaitUs / 1000.0,
+                snap.exaPreflightTimeouts, snap.exaPreflightSkipped);
         if (snap.copyAbandons || snap.copyRecordExhausted ||
             snap.copyForcedSettle)
             log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room), "
@@ -2820,6 +2831,82 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
            LorieBuffer_hasGpuCopyPending(priv->buffer);
 }
 
+/* How many CPU accesses currently hold the shared lock. X server thread only. */
+static int lorieSharedLockHeld = 0;
+
+/*
+ * Called as the outermost EXA fallback begins - before any operand has been prepared, so before any
+ * lock is held (see the EXA_PRE_FALLBACK hunk in xserver.patch).
+ *
+ * A GPU copy that is queued but not yet drained has not happened yet, so it will land after whatever
+ * this operation draws, and where the two overlap that puts a client's older frame on top of newer
+ * drawing. The shared lock taken later keeps the two from running at once; it does not put them in
+ * order. This puts them in order: whatever was queued before the operation started is drained first.
+ *
+ * It has to happen here. Inside PrepareAccess the lock is usually already held - EXA prepares the
+ * source of a copy before its destination - and the renderer needs that same lock to drain, so
+ * waiting there deadlocks. Here nothing is held. And once the entries are drained, the lock that
+ * PrepareAccess then takes is enough: every path the renderer drains on waits for its copies' fence
+ * before letting go of the lock.
+ *
+ * The operands are not known yet, so it waits for everything queued rather than only the copies into
+ * buffers this operation touches. That is broader than needed; the count and total wait are reported
+ * so the cost is visible, and TERMUX_X11_EXA_PREFLIGHT=0 turns it off for comparison.
+ */
+#define LORIE_PREFLIGHT_MAX_US 20000ULL
+void lorieExaFallbackBegin(void) {
+    static int enabled = -1;
+    static uint64_t stuckSerial = 0;
+    uint32_t target;
+    uint64_t startUs, headSerial;
+
+    if (enabled < 0) {
+        const char *e = getenv("TERMUX_X11_EXA_PREFLIGHT");
+        enabled = !(e && !strcmp(e, "0"));
+    }
+    if (!enabled || !pvfb->state)
+        return;
+
+    target = pvfb->state->gpuCopyQueue.writeIndex;
+    if (__atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) == target)
+        return;   // nothing queued: the common case, two loads
+
+    // Holding the lock already - an access opened outside a fallback - means the renderer cannot
+    // drain until it is released. Waiting would only run out the clock.
+    if (lorieSharedLockHeld > 0) {
+        pvfb->state->presentStats.exaPreflightSkipped++;
+        return;
+    }
+    if (!lorieConnectionAlive() || !lorieRendererAvailable())
+        return;
+
+    // An entry that already made one of these waits run out is stuck - an import that has not
+    // arrived, a slot still on screen - and will stay stuck for a while. Waiting on it again for
+    // every operation would stall the X server once per operation; it is skipped until it moves.
+    headSerial = pvfb->state->gpuCopyQueue.entries[
+            __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) % LORIE_GPU_COPY_QUEUE_CAPACITY].serial;
+    if (headSerial == stuckSerial) {
+        pvfb->state->presentStats.exaPreflightSkipped++;
+        return;
+    }
+
+    pthread_cond_signal(rendererCond);
+    startUs = lorieNowUs();
+    while ((int32_t) (__atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) - target) < 0) {
+        if (lorieNowUs() - startUs >= LORIE_PREFLIGHT_MAX_US) {
+            stuckSerial = headSerial;
+            pvfb->state->presentStats.exaPreflightTimeouts++;
+            break;
+        }
+        // Polled: the renderer's progress notification goes to this thread's event loop, which is
+        // what is waiting here.
+        usleep(200);
+    }
+
+    pvfb->state->presentStats.exaPreflightWaits++;
+    pvfb->state->presentStats.exaPreflightWaitUs += (uint32_t) (lorieNowUs() - startUs);
+}
+
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool tookSharedLock = FALSE;
@@ -2887,8 +2974,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     } else
         priv->wasLocked = TRUE;
 
-    if (tookSharedLock)
+    if (tookSharedLock) {
         priv->sharedLockDepth++;
+        lorieSharedLockHeld++;
+    }
     pPix->devPrivate.ptr = priv->locked ?: priv->mem;
     return TRUE;
 }
@@ -2904,6 +2993,7 @@ void lorieFinishAccess(PixmapPtr pPix, __unused int index) {
      */
     if (priv->sharedLockDepth > 0) {
         priv->sharedLockDepth--;
+        lorieSharedLockHeld--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
     }
 

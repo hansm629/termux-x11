@@ -54,6 +54,8 @@ void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieChoreographerStart(AChoreographer *d);
 /* Input thread: records a pointer or touch event in the trace, if tracing is on. */
 void lorieTraceInput(uint32_t eventType);
+/* Called from EXA's fallback entry (xserver.patch, exa_priv.h) before any operand is prepared. */
+void lorieExaFallbackBegin(void);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
@@ -582,6 +584,13 @@ struct lorie_shared_server_state {
          * taken - which is why they are counted separately from copyCompletions. */
         volatile uint32_t copyAbandons;
         volatile uint32_t copyRecordExhausted;
+        /* EXA fallbacks that waited for queued copies to drain before drawing (see
+         * lorieExaFallbackBegin), how long in total, how many ran out of time, and how many could
+         * not wait because a lock was already held or the head entry was known to be stuck. */
+        volatile uint32_t exaPreflightWaits;
+        volatile uint32_t exaPreflightWaitUs;
+        volatile uint32_t exaPreflightTimeouts;
+        volatile uint32_t exaPreflightSkipped;
         /* Copies let go of because the session that owed their result is gone, with nothing that
          * says the GPU finished with them. Not a safe completion - see lorieCopySettled - so it is
          * counted apart from the ones that were actually reported. */
