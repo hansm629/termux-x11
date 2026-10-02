@@ -2992,6 +2992,9 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
 
     // Also where the X server can read it: the line above lands in this process' logcat, which from
     // the terminal is not readable at all.
+    if (state)
+        state->outputFilterNearest = filtering == GL_NEAREST ? 1u : 0u;
+
     if (state && (!published || publishedReason != reason || publishedTo != state)) {
         published = true;
         publishedReason = reason;
@@ -3380,12 +3383,15 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     scApi.txSetZOrder(t, rootSurfaceControl, 0); // the cursor layer sits at 1, above this
     scApi.txSetBuffer(t, rootSurfaceControl, ahb, -1);
     /*
-     * The root is an opaque desktop, but its slots carry an alpha channel because that is the
-     * format the X server draws in, so without saying so the compositor has to treat every pixel as
-     * possibly translucent and blend the whole screen against what is behind it. Nothing is behind
-     * it, and the X server never writes a transparent root pixel, so the blend is work for no
-     * difference - and a layer that might be translucent is also one the compositor cannot put
-     * straight on an overlay.
+     * The root is an opaque desktop: its depth is 24, so the fourth byte of each pixel is padding,
+     * not alpha. The slots are allocated BGRA because that is the layout the X server writes, which
+     * leaves the compositor free to read that padding as alpha. Declaring the layer opaque says how it
+     * is meant to be read - it does not claim the padding byte is 255 everywhere, because nothing
+     * guarantees that, and it is exactly why the declaration is needed.
+     *
+     * It also removes one reason the compositor might decline to put the layer on a hardware plane.
+     * Whether it then does is the compositor's decision and depends on the buffer's usage and on the
+     * device; nothing here claims that it does, or that a full-screen blend was happening before.
      *
      * The cursor layer is deliberately left alone: its alpha is the whole point of it.
      */

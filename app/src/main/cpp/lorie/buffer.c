@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -201,6 +202,40 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
     }
 
     return allocate(width, width, height, format, type, ahardwarebuffer, fd, size, 0, true);
+}
+
+/*
+ * The same AHardwareBuffer allocation as LorieBuffer_allocate(), additionally asking for
+ * COMPOSER_OVERLAY usage - which is what lets the compositor put the buffer straight on a hardware
+ * plane instead of compositing it with the GPU. Only asked for when the allocator says the
+ * combination is supported (AHardwareBuffer_isSupported, API 29, resolved at runtime), and the plain
+ * allocation is used otherwise. *granted says which one was made.
+ *
+ * Not used by default: an allocator honouring overlay usage may choose memory that is slower for the
+ * CPU to write, and the X server draws the root with the CPU. Whether that costs more than it saves
+ * is a question for a measurement, not for this function.
+ */
+__LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocateForComposer(int32_t width, int32_t height, int8_t format, bool *granted) {
+    static int (*isSupported)(const AHardwareBuffer_Desc *) = NULL;
+    static bool resolved = false;
+    AHardwareBuffer *ahardwarebuffer = NULL;
+    AHardwareBuffer_Desc desc = { .width = width, .height = height, .format = format, .layers = 1,
+            .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                     AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                     AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY };
+
+    *granted = false;
+    if (!resolved) {
+        resolved = true;
+        isSupported = (int (*)(const AHardwareBuffer_Desc *)) dlsym(RTLD_DEFAULT, "AHardwareBuffer_isSupported");
+    }
+
+    if (isSupported && isSupported(&desc) && AHardwareBuffer_allocate(&desc, &ahardwarebuffer) == 0) {
+        *granted = true;
+        return allocate(width, width, height, format, LORIEBUFFER_AHARDWAREBUFFER, ahardwarebuffer, -1, 0, 0, true);
+    }
+
+    return LorieBuffer_allocate(width, height, format, LORIEBUFFER_AHARDWAREBUFFER);
 }
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32_t stride, int32_t height, int8_t format, int fd, off_t offset) {

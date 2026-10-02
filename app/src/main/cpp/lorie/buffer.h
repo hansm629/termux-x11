@@ -46,6 +46,12 @@ int LorieBuffer_createRegion(char const* _Nonnull name, size_t size);
 LorieBuffer* _Nullable LorieBuffer_allocate(int32_t width, int32_t height, int8_t format, int8_t type);
 
 /**
+ * LorieBuffer_allocate() for an AHardwareBuffer the compositor will be handed directly, also asking
+ * for COMPOSER_OVERLAY usage where the allocator supports it. *granted says whether it did.
+ */
+LorieBuffer* _Nullable LorieBuffer_allocateForComposer(int32_t width, int32_t height, int8_t format, bool* _Nonnull granted);
+
+/**
  * Wraps given memory fragment file descriptor into LorieBuffer.
  * Takes ownership on the given file descriptor.
  *

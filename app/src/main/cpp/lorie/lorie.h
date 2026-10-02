@@ -592,6 +592,10 @@ struct lorie_shared_server_state {
     volatile uint8_t outputRetryPending;
 
     volatile uint8_t outputBackendActive;
+    /* The scaling filter the user asked for. Published alongside the backend because the direct path
+     * cannot honour nearest - the compositor scales bilinearly - so a comparison between the two
+     * paths is only like for like when this says linear. */
+    volatile uint8_t outputFilterNearest;
     volatile char outputBackendReason[96];
 
     struct {

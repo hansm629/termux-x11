@@ -1049,9 +1049,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                           "stay held until the pool is replaced",
                     snap.zeroCopyFenceErrors);
 
-            log(INFO, "XlorieBackend: asked for %s; %u direct submits, %u nothing-new, "
+            log(INFO, "XlorieBackend: asked for %s, filtering %s%s; %u direct submits, %u nothing-new, "
                       "%u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
+                pvfb->state->outputFilterNearest ? "nearest" : "linear",
+                pvfb->state->outputFilterNearest && snap.directBufferSubmits
+                    ? " (direct frames were scaled bilinearly regardless)" : "",
                 snap.directBufferSubmits,
                 snap.directReuseNoSubmit,
                 snap.directHeldIncomplete,
@@ -2428,7 +2431,8 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     void *origLocked;
     RegionRec all;
     BoxRec box;
-    int i, allocated, w, h;
+    int i, allocated, w, h, overlayGranted = 0;
+    Bool overlayAsked;
 
     if (lorieSingleRootBuffer || !priv || priv->rootDouble || !priv->buffer || priv->mem || pvfb->root.legacyDrawing)
         return;
@@ -2461,9 +2465,28 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
      * LorieBuffer_convert() cannot do this, it only converts CPU-backed buffers, so the original is
      * copied into the new slots and dropped.
      */
+    /*
+     * TERMUX_X11_ROOT_OVERLAY_USAGE=1 asks for the slots to be allocated with COMPOSER_OVERLAY usage
+     * as well, so the compositor may put the root straight on a hardware plane. Off unless asked for,
+     * because the allocator may then choose memory that is slower for the CPU to write, and the X
+     * server draws the root with the CPU - whether that costs more than it saves is for an A/B on the
+     * device to say. What was actually granted is logged with the slot count below.
+     */
+    {
+        const char *overlay = getenv("TERMUX_X11_ROOT_OVERLAY_USAGE");
+        overlayAsked = overlay && !strcmp(overlay, "1");
+    }
+
     for (allocated = 0; allocated < LORIE_ROOT_SLOTS; allocated++) {
-        priv->rootBuf[allocated] = LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
-                                                        LORIEBUFFER_AHARDWAREBUFFER);
+        if (overlayAsked) {
+            bool granted = false;
+
+            priv->rootBuf[allocated] = LorieBuffer_allocateForComposer(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, &granted);
+            if (granted)
+                overlayGranted++;
+        } else
+            priv->rootBuf[allocated] = LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
+                                                            LORIEBUFFER_AHARDWAREBUFFER);
         if (!priv->rootBuf[allocated]) {
             log(ERROR, "Failed to allocate root buffer %d, keeping the single buffered root", allocated);
             break;
@@ -2540,7 +2563,10 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     lorieUnregisterBuffer(orig);
     LorieBuffer_release(orig);
 
-    log(INFO, "Root window has %d BGRA buffers (%dx%d, first id %llu)", LORIE_ROOT_SLOTS, w, h,
+    log(INFO, "Root window has %d BGRA buffers (%dx%d, composer overlay usage %s), first id %llu",
+        LORIE_ROOT_SLOTS, w, h,
+        !overlayAsked ? "not asked for" : overlayGranted == LORIE_ROOT_SLOTS ? "granted"
+                      : overlayGranted ? "granted for some" : "not supported",
         (unsigned long long) pvfb->state->rootBufferIds[0]);
 }
 
