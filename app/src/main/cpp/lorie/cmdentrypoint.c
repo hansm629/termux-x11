@@ -341,6 +341,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             }
             case EVENT_TOUCH: {
+                lorieTraceInput(e.type);
                 lorieEvent *copy = calloc(1, sizeof(lorieEvent));
                 memcpy(copy, &e, sizeof(e));
                 QueueWorkProc(handleTouchEvent, NULL, copy);
@@ -393,6 +394,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             }
             case EVENT_MOUSE: {
+                lorieTraceInput(e.type);
                 int flags;
                 switch(e.mouse.detail) {
                     case 0: // BUTTON_UNDEFINED

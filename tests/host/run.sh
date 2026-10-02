@@ -10,8 +10,8 @@ mkdir -p "$OUT"
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/gen.py" "$LORIE" "$OUT"
 CC=${CC:-cc}
 status=0
-for t in t07 t19 t21 tstat; do
+for t in t07 t19 t21 tstat ttrace; do
     "$CC" -Wall -Wno-unused-function -O2 -pthread -I"$OUT" "$HERE/$t.c" -o "$OUT/$t"
-    "$OUT/$t" || status=1
+    OUT="$OUT" "$OUT/$t" || status=1
 done
 exit $status

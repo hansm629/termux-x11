@@ -127,6 +127,7 @@ static void lorieNotePresentSubmitted(void) {
 
 // Interval between two client present requests arriving, and how far ahead they aim.
 void lorieNotePresentRequest(uint64_t target_msc, uint64_t crtc_msc) {
+    lorieTrace(pvfb->state, LORIE_TRACE_REQUEST, (uint32_t) (target_msc - crtc_msc), crtc_msc);
     static uint64_t lastUs = 0;
     uint64_t nowUs = lorieNowUs();
     uint32_t ahead;
@@ -752,6 +753,77 @@ static miPointerScreenFuncRec loriePointerCursorFuncs = {
 
 static void loriePerformVblanks(void);
 
+/*
+ * Writes trace records out to the file TERMUX_X11_TRACE names. X server thread only. Records are
+ * taken in order and only once they are complete; one that a writer has lapped is counted as lost
+ * rather than written half-overwritten. The file holds a 16-byte header ("LTR1", record size, start
+ * time) and then fixed 24-byte records - tools/trace/analyze.py turns it into something readable.
+ */
+static FILE *lorieTraceFile = NULL;
+
+static void lorieTraceOpen(void) {
+    const char *path = getenv("TERMUX_X11_TRACE");
+    struct { char magic[4]; uint32_t recordSize; uint64_t startUs; } header = { {'L', 'T', 'R', '1'}, 24, 0 };
+
+    if (!path || !*path || !pvfb->state)
+        return;
+    if (!(lorieTraceFile = fopen(path, "wb"))) {
+        log(ERROR, "TERMUX_X11_TRACE: cannot open %s: %s", path, strerror(errno));
+        return;
+    }
+    header.startUs = lorieTraceNowUs();
+    fwrite(&header, sizeof(header), 1, lorieTraceFile);
+    pvfb->state->traceTail = __atomic_load_n(&pvfb->state->traceHead, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&pvfb->state->traceEnabled, 1, __ATOMIC_RELEASE);
+    log(INFO, "TERMUX_X11_TRACE: recording to %s", path);
+}
+
+static void lorieTraceFlush(Bool force) {
+    static uint64_t lastUs = 0;
+    uint64_t nowUs, head, tail;
+
+    if (!lorieTraceFile)
+        return;
+    nowUs = lorieTraceNowUs();
+    if (!force && nowUs - lastUs < 250000)
+        return;
+    lastUs = nowUs;
+
+    head = __atomic_load_n(&pvfb->state->traceHead, __ATOMIC_ACQUIRE);
+    tail = pvfb->state->traceTail;
+    if (head - tail > LORIE_TRACE_RECORDS) {
+        pvfb->state->traceDropped += (uint32_t) (head - tail - LORIE_TRACE_RECORDS);
+        tail = head - LORIE_TRACE_RECORDS;
+    }
+
+    for (; tail != head; tail++) {
+        LorieTraceRecord *r = &pvfb->state->trace[tail % LORIE_TRACE_RECORDS];
+        struct { uint64_t tUs; uint32_t kind; uint32_t a; uint64_t b; } out;
+        uint64_t seq = __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE);
+
+        if (seq == 0 || seq < tail + 1)
+            break;                  // claimed but not written yet: take it next time
+        if (seq != tail + 1) {
+            pvfb->state->traceDropped++;
+            continue;               // lapped by a writer
+        }
+        out.tUs = r->tUs; out.kind = r->kind; out.a = r->a; out.b = r->b;
+        if (__atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) != seq) {
+            pvfb->state->traceDropped++;
+            continue;               // overwritten while being read
+        }
+        fwrite(&out, sizeof(out), 1, lorieTraceFile);
+    }
+    pvfb->state->traceTail = tail;
+    fflush(lorieTraceFile);
+}
+
+// Input thread. Only pointer and touch events: they are what a drag is made of.
+void lorieTraceInput(uint32_t eventType) {
+    if (pvfb->state)
+        lorieTrace(pvfb->state, LORIE_TRACE_INPUT, eventType, 0);
+}
+
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     static uint64_t lastRedrawUs = 0;
     uint64_t nowUs = lorieNowUs();
@@ -776,6 +848,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         // Only a tick moves the counter. It moved once per call, and a call is not a vsync.
         if (steps) {
             pvfb->current_msc += steps;
+            lorieTrace(pvfb->state, LORIE_TRACE_TICK, steps, pvfb->current_msc);
+            lorieTraceFlush(FALSE);
             loriePerformVblanks();
             pvfb->state->waitForNextFrame = false;
         }
@@ -1427,6 +1501,9 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     static int eventFd = -1;
     pScreenPtr = pScreen;
 
+    if (!lorieTraceFile)
+        lorieTraceOpen();
+
     if (eventFd == -1)
         eventFd = eventfd(0, EFD_CLOEXEC);
 
@@ -1833,6 +1910,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 
     record->serial = entry->serial;
     record->session = lorieRendererSession;
+    lorieTrace(pvfb->state, LORIE_TRACE_ENQUEUE, dstIsRoot ? 1 : 0, entry->serial);
     record->startUs = lorieNowUs();
     *out_serial = entry->serial;
     *out_record = record;
@@ -2034,6 +2112,8 @@ Bool lorieGpuCopyAbandon(void *token) {
     if (!c)
         return FALSE;
 
+    lorieTrace(pvfb->state, LORIE_TRACE_RESOLVED, 0, c->serial);
+
     // Nobody wants this copy's result any more, so ask for it not to be made. The handover below
     // still happens either way: the mark can be missed, and a copy already under way still reads
     // the source it was given.
@@ -2160,6 +2240,7 @@ void lorieGpuCopyAck(void *token) {
         return;
 
     lorieNotePresentCompleted();
+    lorieTrace(pvfb->state, LORIE_TRACE_RESOLVED, 1, c->serial);
 
     if (c->startUs) {
         uint32_t latencyUs = (uint32_t) (lorieNowUs() - c->startUs);
@@ -2694,6 +2775,7 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     RegionSubtract(&carry, &carry, &blocked);
 
     pvfb->state->presentStats.rootPublishes++;
+    lorieTrace(pvfb->state, LORIE_TRACE_PUBLISH, drawn, pvfb->state->rootBufferIds[drawn]);
 
     lorieCopyRootRegion(priv, drawn, next, &carry);
     RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], &blocked);

@@ -1632,6 +1632,8 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
         glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
     }
     *gpuWorkIssued = fboSetUp;
+    if (lastSerial)
+        lorieTrace(state, LORIE_TRACE_DRAIN, fboSetUp, lastSerial);
     return lastSerial;
 }
 
@@ -1710,6 +1712,7 @@ static void rendererApplyPendingGpuCopies(void) {
         // Only now that the GPU has actually finished (not just been told to start) is it safe to
         // let present_execute_copy release/idle the source pixmap back to the client.
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
+        lorieTrace(state, LORIE_TRACE_FENCE, 0, serial);
         notifyGpuCopyDone();
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
@@ -1843,6 +1846,7 @@ static void rendererRetireFrame(void) {
 
     if (rendererPendingGpuCopySerial && state) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, rendererPendingGpuCopySerial, __ATOMIC_RELEASE);
+        lorieTrace(state, LORIE_TRACE_FENCE, 0, rendererPendingGpuCopySerial);
         notifyGpuCopyDone();
     }
     rendererPendingGpuCopySerial = 0;
@@ -1988,6 +1992,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
             // The compositor has not finished with the buffer before last. Reusing it now is exactly
             // the tearing this cannot afford, so drop the frame instead - what is on screen stays.
             __atomic_fetch_add(&state->presentStats.zeroCopyStalls, 1, __ATOMIC_RELAXED);
+            lorieTrace(state, LORIE_TRACE_HOLD, 2, rendererRootSlot);
             // The slot just claimed may be one already held for the compositor; only give back one
             // that is not.
             {
@@ -2083,6 +2088,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (!lorie_mutex_lock(&state->lock, &state->lockingPid)) {
         // Nothing of the root can be read without it. The claim is given back and the frame is
         // tried again at the next vsync; what is on screen stays.
+        lorieTrace(state, LORIE_TRACE_HOLD, 3, rendererRootSlot);
         rendererReleaseRootBuffer();
         state->waitForNextFrame = true;
         return;
@@ -2156,6 +2162,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         rendererReleaseRootBuffer();
         if (gpuCopySerial) {
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
+        lorieTrace(state, LORIE_TRACE_FENCE, 0, gpuCopySerial);
             notifyGpuCopyDone();
         }
     }
@@ -2228,6 +2235,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     // A frame that failed to swap put nothing on screen, so it is not one.
+    lorieTrace(state, LORIE_TRACE_GLSWAP, swapOk, rootId);
     if (swapOk) {
         __atomic_fetch_add(&state->presentStats.glOutputSubmits, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&state->renderedFrames, 1, __ATOMIC_RELAXED);
@@ -3138,6 +3146,7 @@ static bool rootZcDrainRetiring(void) {
     for (i = 0; i < freedCount; i++) {
         if (freedFds[i] >= 0)
             close(freedFds[i]);
+        lorieTrace(state, LORIE_TRACE_RELEASE, freed[i], freedIds[i]);
         rendererReleaseRootSlot(freed[i], freedIds[i]);
     }
     return room;
@@ -3281,6 +3290,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
             // Nothing submitted: what is on screen stays, and the frame is asked for again at the next
             // vsync. The claim goes back unless this slot is the one on screen - that one stays held
             // for the compositor, exactly as the nothing-new path below keeps it.
+            lorieTrace(state, LORIE_TRACE_HOLD, 3, slot);
             if (alreadyOnScreen)
                 rendererRootSlot = -1;
             else
@@ -3307,6 +3317,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
             // The GPU has actually finished, so the copy was made: this is what lets the X server
             // hand the source pixmap back to its client.
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
+        lorieTrace(state, LORIE_TRACE_FENCE, 0, gpuCopySerial);
             notifyGpuCopyDone();
         }
     }
@@ -3323,6 +3334,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
          * that already bounds every other wait at the head of the queue.
          */
         __atomic_fetch_add(&state->presentStats.directHeldIncomplete, 1, __ATOMIC_RELAXED);
+        lorieTrace(state, LORIE_TRACE_HOLD, 1, slot);
         rendererReleaseRootBuffer();
         rendererSetOutputRetry(true);
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
@@ -3410,6 +3422,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     rendererSetOutputRetry(false);
     __atomic_fetch_add(&state->renderedFrames, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&state->presentStats.directBufferSubmits, 1, __ATOMIC_RELAXED);
+    lorieTrace(state, LORIE_TRACE_DIRECT, slot, rootZcDisplayedId);
     rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
     return true;
 }

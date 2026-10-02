@@ -52,6 +52,8 @@ Bool lorieRendererSessionIsCurrent(uint32_t session);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 /* Starts the vsync callbacks, with the 64-bit frame time where the platform has it. */
 void lorieChoreographerStart(AChoreographer *d);
+/* Input thread: records a pointer or touch event in the trace, if tracing is on. */
+void lorieTraceInput(uint32_t eventType);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
@@ -96,6 +98,21 @@ __unused void rendererRemoveAllBuffers(void);
            !__atomic_compare_exchange_n((ptr), &_lorieOld, _lorieNew, false, \
                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) \
         ; \
+} while (0)
+
+/* Appends one trace record if tracing is on. Never blocks: a writer that laps the reader overwrites,
+ * and the reader notices from seq and counts what it lost. */
+static inline __always_inline void lorieTraceAt(struct lorie_shared_server_state *st, uint32_t kind,
+                                                 uint32_t a, uint64_t b, uint64_t tUs);
+static inline __always_inline uint64_t lorieTraceNowUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
+}
+#define lorieTrace(st, kind, a, b) do { \
+    struct lorie_shared_server_state *_lorieTs = (struct lorie_shared_server_state *) (st); \
+    if (_lorieTs && _lorieTs->traceEnabled) \
+        lorieTraceAt(_lorieTs, (kind), (uint32_t) (a), (uint64_t) (b), lorieTraceNowUs()); \
 } while (0)
 
 __attribute__((warn_unused_result))
@@ -276,6 +293,38 @@ typedef struct {
     uint16_t numRects;
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
 } LorieGpuCopyEntry;   /* immutable once published - see entryCancelled for the one thing that is not */
+
+/*
+ * Event trace, off unless TERMUX_X11_TRACE names a file. Every step a frame takes on its way to the
+ * screen, from both processes, on one CLOCK_MONOTONIC time line, so a stall can be followed to the step
+ * it is in - which the five-second totals cannot do. Written by the X server thread, the input thread
+ * and the renderer; read and written out by the X server. Record layout is fixed (32 bytes) because
+ * tools/trace/analyze.py reads it.
+ */
+typedef struct {
+    volatile uint64_t seq;   /* index + 1, published last; a reader takes a record only when it matches */
+    uint64_t tUs;            /* CLOCK_MONOTONIC */
+    uint32_t kind;
+    uint32_t a;
+    uint64_t b;
+} LorieTraceRecord;
+
+enum {
+    LORIE_TRACE_REQUEST = 1,  /* X: client present request arrived    a = target - crtc msc, b = crtc msc */
+    LORIE_TRACE_ENQUEUE,      /* X: copy offloaded to the renderer     a = 1 if into the root,  b = serial */
+    LORIE_TRACE_RESOLVED,     /* X: copy finished at the X server      a = 1 if made,           b = serial */
+    LORIE_TRACE_PUBLISH,      /* X: root slot handed on                a = slot,                b = buffer id */
+    LORIE_TRACE_TICK,         /* X: vsync redraw                       a = steps,               b = msc */
+    LORIE_TRACE_INPUT,        /* input thread: pointer/touch event     a = event type,          b = 0 */
+    LORIE_TRACE_DRAIN,        /* renderer: queue drained               a = 1 if GPU work issued, b = last serial */
+    LORIE_TRACE_FENCE,        /* renderer: copies' fence signalled     a = wait us,             b = serial */
+    LORIE_TRACE_DIRECT,       /* renderer: root buffer to compositor   a = slot,                b = buffer id */
+    LORIE_TRACE_GLSWAP,       /* renderer: GL frame swapped            a = 1 if ok,             b = root id */
+    LORIE_TRACE_RELEASE,      /* renderer: compositor gave a slot back a = slot,                b = buffer id */
+    LORIE_TRACE_HOLD,         /* renderer: frame held back             a = 1 incomplete, 2 no slot back, 3 lock; b = slot */
+};
+
+#define LORIE_TRACE_RECORDS 4096
 
 struct lorie_shared_server_state {
     /*
@@ -591,6 +640,14 @@ struct lorie_shared_server_state {
      * something else happened to dirty the root. Written by the renderer, read by the X server. */
     volatile uint8_t outputRetryPending;
 
+    /* See LorieTraceRecord. traceHead is claimed by writers with a fetch-add, so any thread of either
+     * process can write; traceTail belongs to the X server, which drains it. */
+    volatile uint8_t traceEnabled;
+    volatile uint64_t traceHead;
+    volatile uint64_t traceTail;
+    volatile uint32_t traceDropped;
+    LorieTraceRecord trace[LORIE_TRACE_RECORDS];
+
     volatile uint8_t outputBackendActive;
     /* The scaling filter the user asked for. Published alongside the backend because the direct path
      * cannot honour nearest - the compositor scales bilinearly - so a comparison between the two
@@ -754,3 +811,16 @@ static int android_to_linux_keycode[304] = {
         [ 208  /* ANDROID_KEYCODE_CALENDAR */] = KEY_CALENDAR,
         [ 210  /* ANDROID_KEYCODE_CALCULATOR */] = KEY_CALC,
 };
+
+static inline __always_inline void lorieTraceAt(struct lorie_shared_server_state *st, uint32_t kind,
+                                                 uint32_t a, uint64_t b, uint64_t tUs) {
+    uint64_t idx = __atomic_fetch_add(&st->traceHead, 1, __ATOMIC_RELAXED);
+    LorieTraceRecord *r = &st->trace[idx % LORIE_TRACE_RECORDS];
+
+    __atomic_store_n(&r->seq, 0, __ATOMIC_RELAXED);   /* being rewritten */
+    r->tUs = tUs;
+    r->kind = kind;
+    r->a = a;
+    r->b = b;
+    __atomic_store_n(&r->seq, idx + 1, __ATOMIC_RELEASE);
+}

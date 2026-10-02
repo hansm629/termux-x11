@@ -24,7 +24,15 @@ recipes = {
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {"),
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
+    "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
+        + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
+          " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"
+        + func(H, "static inline __always_inline uint64_t lorieTraceNowUs(void) {")
+        + func(H, "static inline __always_inline void lorieTraceAt(struct lorie_shared_server_state *st, uint32_t kind,\n"
+                  "                                                 uint32_t a, uint64_t b, uint64_t tUs) {"),
+    "ttrace_src_funcs": lambda: "static FILE *lorieTraceFile = NULL;\n"
+        + func(I, "static void lorieTraceFlush(Bool force) {"),
 }
 for name, make in recipes.items():
-    with open(os.path.join(OUT, name + "_src.inc"), "w") as f:
+    with open(os.path.join(OUT, (name if name.endswith("_types") or name.endswith("_funcs") else name + "_src") + ".inc"), "w") as f:
         f.write(make())
