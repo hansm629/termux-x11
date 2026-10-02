@@ -220,7 +220,7 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
 
     AChoreographer *choreographer = AChoreographer_getInstance();
     // Trigger it first time
-    AChoreographer_postFrameCallback(choreographer, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, choreographer);
+    lorieChoreographerStart(choreographer);
 
     xorg_list_init(&registeredBuffers);
     pthread_create(&t, NULL, startServer, vm);

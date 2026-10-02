@@ -50,6 +50,8 @@ void lorieNoteRendererConnected(void);
 uint32_t lorieRendererSessionId(void);
 Bool lorieRendererSessionIsCurrent(uint32_t session);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
+/* Starts the vsync callbacks, with the 64-bit frame time where the platform has it. */
+void lorieChoreographerStart(AChoreographer *d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
@@ -491,6 +493,9 @@ struct lorie_shared_server_state {
         /* Vsync ticks the X server fell so far behind on that their records were overwritten before
          * it read them. The ticks are still counted in msc; only their individual times are lost. */
         volatile uint32_t vsyncRecordsLost;
+        /* Longest gap between a frame's start, as the Choreographer reports it, and its callback
+         * actually running here. 0 where the 64-bit frame time is not available. */
+        volatile uint32_t vsyncDispatchMaxUs;
         /*
          * When a client's present actually reaches the screen, measured where present reports it as
          * completed. This is the one thing that matches what a person sees: the renderer can put out

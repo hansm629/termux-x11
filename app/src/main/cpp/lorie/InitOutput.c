@@ -958,6 +958,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.rootUnpublishedNowMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.rootUnpublishedNowMaxUs, 0, __ATOMIC_RELAXED);
     snap.submitGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.submitGapMaxUs, 0, __ATOMIC_RELAXED);
     snap.vsyncRecordsLost = __atomic_exchange_n(&pvfb->state->presentStats.vsyncRecordsLost, 0, __ATOMIC_RELAXED);
+    snap.vsyncDispatchMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.vsyncDispatchMaxUs, 0, __ATOMIC_RELAXED);
     snap.xDispatchMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.xDispatchMaxUs, 0, __ATOMIC_RELAXED);
     snap.xLockWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaitMaxUs, 0, __ATOMIC_RELAXED);
     snap.xLockWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaitUs, 0, __ATOMIC_RELAXED);
@@ -1109,11 +1110,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.rootUnpublishedMaxUs / 1000.0,
                 snap.rootUnpublishedNowMaxUs / 1000.0);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms, "
-                  "%u vsync times lost to backlog",
+                  "%u vsync times lost to backlog, vsync callback up to %.1f ms late",
             snap.rootRemapUs / 1000.0,
             snap.rootRemaps,
             snap.xDispatchMaxUs / 1000.0,
-            snap.vsyncRecordsLost);
+            snap.vsyncRecordsLost,
+            snap.vsyncDispatchMaxUs / 1000.0);
         if (snap.cursorUploads)
             log(INFO, "XlorieLock: cursor image uploaded %u times, %.1f ms total",
                 snap.cursorUploads,
@@ -1361,14 +1363,61 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
-    AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
-    // t is deliberately unused - see the comment above lorieVsyncRecordUs.
-    lorieRecordVsync(lorieNowUs());
+/*
+ * The 64-bit frame callback, resolved at runtime: it is API 29 and minSdk is 26, the same reason the
+ * SurfaceControl calls are resolved this way. Without it the callback is handed the frame time as a
+ * `long`, which is 32 bits on the 32-bit ABIs this ships for and wraps every 4.3 seconds there, so
+ * that path takes the time at callback entry instead.
+ */
+static void (*loriePostFrameCallback64)(AChoreographer *, void (*)(int64_t, void *), void *);
+static void lorieChoreographerFrameCallback64(int64_t frameTimeNanos, void *data);
+
+static void loriePostVsyncCallback(AChoreographer *d) {
+    if (loriePostFrameCallback64)
+        loriePostFrameCallback64(d, lorieChoreographerFrameCallback64, d);
+    else
+        AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
+}
+
+// Choreographer thread, from CmdEntryPoint.start.
+void lorieChoreographerStart(AChoreographer *d) {
+    loriePostFrameCallback64 = (void (*)(AChoreographer *, void (*)(int64_t, void *), void *))
+        dlsym(RTLD_DEFAULT, "AChoreographer_postFrameCallback64");
+    loriePostVsyncCallback(d);
+}
+
+/*
+ * One vsync. frameUs is when the frame actually began according to the Choreographer, or 0 when that
+ * is not available; the record then takes the time the callback ran, which is later by however long
+ * the Choreographer thread took to get to it. That gap is reported separately rather than being
+ * folded into the vsync time, because it is a property of this process's scheduling, not of the
+ * display - and a frame time that is in the future, or older than any plausible delay, is not used.
+ */
+static void lorieVsyncTick(uint64_t frameUs) {
+    uint64_t nowUs = lorieNowUs(), stampUs = nowUs;
+
+    if (frameUs && frameUs <= nowUs && nowUs - frameUs < 1000000) {
+        stampUs = frameUs;
+        if (pvfb->state)
+            LORIE_STAT_MAX(&pvfb->state->presentStats.vsyncDispatchMaxUs, (uint32_t) (nowUs - frameUs));
+    }
+
+    lorieRecordVsync(stampUs);
     if (pScreenPtr) {
         QueueWorkProc(lorieRedraw, NULL, NULL);
         lorieWakeServer();
     }
+}
+
+static void lorieChoreographerFrameCallback64(int64_t frameTimeNanos, void *data) {
+    loriePostVsyncCallback((AChoreographer *) data);
+    lorieVsyncTick(frameTimeNanos > 0 ? (uint64_t) frameTimeNanos / 1000u : 0);
+}
+
+void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+    loriePostVsyncCallback(d);
+    // t is deliberately unused: it is 32 bits on the 32-bit ABIs and wraps every 4.3 seconds there.
+    lorieVsyncTick(0);
 }
 
 static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
