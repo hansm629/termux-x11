@@ -31,7 +31,13 @@ recipes = {
         + func(I, "static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {")
         + func(I, "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {")
         + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
-        + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {"),
+        + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
+        + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),
+    "t10": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
+        + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
+        + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
+        + func(I, "static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

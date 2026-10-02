@@ -51,7 +51,8 @@ static struct {
     volatile uint32_t rootHandover;
     volatile uint64_t rootBufferIds[8];
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
-             rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals; } presentStats;
+             rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
+             rootUnpublishedMaxUs; } presentStats;
 } fakeState;
 static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
@@ -156,6 +157,21 @@ int main(void) {
     }
     CHECK(stuck == 0, "continuous writer: %d of 60 publishes held back", stuck);
     CHECK(stale == 0, "continuous writer: %d slots published with an older frame", stale);
+
+#ifdef HAVE_OWED
+    /* T14 - a publish that failed once and succeeded on the next tick waited that whole interval, and the
+     * longest-wait figure must say so (it said 0 when the outstanding mark was cleared first). The redraw
+     * sets rootDirtySinceUs on the failed attempt; lorieNoteRootPublished closes it out on success. */
+    init(&priv);
+    fakeState.presentStats.rootUnpublishedMaxUs = 0;
+    fakeNow = 1000000;
+    priv.rootDirtySinceUs = 1000000;            /* t0: the attempt that failed */
+    fakeNow = 1016667;                          /* t1: the next vsync, where it succeeds */
+    lorieNoteRootPublished(&priv);
+    CHECK(fakeState.presentStats.rootUnpublishedMaxUs == 16667, "waited 16.667 ms, recorded %u us",
+          fakeState.presentStats.rootUnpublishedMaxUs);
+    CHECK(priv.rootDirtySinceUs == 0, "wait not closed out");
+#endif
 
     printf("T05/T06 root handover: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
