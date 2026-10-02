@@ -24,6 +24,14 @@ recipes = {
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {"),
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
+    "t05": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
+        + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP")
+        + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
+        + func(I, "static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {")
+        + func(I, "static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {")
+        + func(I, "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {")
+        + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
+        + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

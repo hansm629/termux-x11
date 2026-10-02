@@ -10,6 +10,15 @@ mkdir -p "$OUT"
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/gen.py" "$LORIE" "$OUT"
 CC=${CC:-cc}
 status=0
+# T05 needs pixman's region code; built from the tree's own copy with the Android build's settings.
+PIXMAN="$HERE/../../app/src/main/cpp/pixman/pixman"
+printf '#define PACKAGE "pixman"\n' > "$OUT/pixman-config.h"
+sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@PIXMAN_VERSION_MICRO@/4/g' \
+    "$PIXMAN/pixman-version.h.in" > "$OUT/pixman-version.h"   # the version recipes/pixman.cmake writes
+"$CC" -c -O1 -w -DHAVE_CONFIG_H -DTLS=__thread -I"$OUT" -I"$PIXMAN" "$PIXMAN/pixman-region16.c" -o "$OUT/region16.o"
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t05.c" "$OUT/region16.o" -o "$OUT/t05"
+"$OUT/t05" || status=1
+
 for t in t07 t19 t21 tstat ttrace; do
     "$CC" -Wall -Wno-unused-function -O2 -pthread -I"$OUT" "$HERE/$t.c" -o "$OUT/$t"
     OUT="$OUT" "$OUT/$t" || status=1
