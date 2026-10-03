@@ -23,6 +23,7 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/t25.c" "$OUT/region16.o" -o "$OUT/t25"
 "$OUT/t25" || status=1
 
+PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tanalyze.py" "$HERE/../../tools/trace/analyze.py" "$OUT" || status=1
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tpatch.py" "$HERE/../../app/src/main/cpp/xserver" \
     "$HERE/../../app/src/main/cpp/patches/xserver.patch" "$OUT" || status=1
 

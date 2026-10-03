@@ -954,10 +954,13 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
             // Remapping the root for every frame with damage: gralloc can make this a cache
             // maintenance pass over the whole buffer, on this thread, which nothing else measures.
             uint64_t remapStartUs = lorieNowUs();
+            uint32_t remapUs;
             LorieBuffer_unlock(priv->buffer);
             status = LorieBuffer_lock(priv->buffer, &priv->locked);
-            pvfb->state->presentStats.rootRemapUs += (uint32_t) (lorieNowUs() - remapStartUs);
+            remapUs = (uint32_t) (lorieNowUs() - remapStartUs);
+            pvfb->state->presentStats.rootRemapUs += remapUs;
             pvfb->state->presentStats.rootRemaps++;
+            lorieTrace(pvfb->state, LORIE_TRACE_REMAP, remapUs, 0);
             if (status)
                 FatalError("Failed to lock the surface: %d\n", status);
         }
@@ -2985,9 +2988,13 @@ static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionP
     }
 
     if (pvfb->state) {
+        uint32_t us = (uint32_t) (lorieNowUs() - startUs);
+
         pvfb->state->presentStats.rootCopyBytes += copied;
-        pvfb->state->presentStats.rootCopyUs += (uint32_t) (lorieNowUs() - startUs);
+        pvfb->state->presentStats.rootCopyUs += us;
         pvfb->state->presentStats.rootCopies++;
+        if (copied)
+            lorieTrace(pvfb->state, LORIE_TRACE_ROOTCOPY, us, copied);
     }
 }
 
@@ -3726,6 +3733,9 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         if (waitUs > pvfb->state->presentStats.xLockWaitMaxUs)
             pvfb->state->presentStats.xLockWaitMaxUs = waitUs;
         pvfb->state->presentStats.xLockWaits++;
+        if (waitUs >= LORIE_TRACE_MIN_WAIT_US)
+            lorieTrace(pvfb->state, LORIE_TRACE_XLOCK, waitUs,
+                       priv && priv->buffer ? LorieBuffer_description(priv->buffer)->id : 0);
         tookSharedLock = TRUE;
     }
 

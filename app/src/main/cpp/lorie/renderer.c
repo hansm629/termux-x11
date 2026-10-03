@@ -1753,12 +1753,16 @@ static void rendererFinishIssuedWork(int64_t *flushUs, int64_t *waitUs) {
 // measured from before the acquire, so a frame that waited 20 ms on the X server and held the lock
 // for 1 ms read the same as the reverse - and it is the reverse that says the renderer is what
 // blocks the X server.
-static void rendererNoteLock(int64_t waitUs, int64_t heldUs) {
+// gotNs is when the lock was finally taken, which is where the trace record is dated: the wait is
+// the waitUs before it, the hold the heldUs after.
+static void rendererNoteLock(int64_t waitUs, int64_t heldUs, int64_t gotNs) {
     if (!state)
         return;
     __atomic_fetch_add(&state->presentStats.lockWaitUs, (uint32_t) waitUs, __ATOMIC_RELAXED);
     LORIE_STAT_MAX(&state->presentStats.lockWaitMaxUs, (uint32_t) waitUs);
     __atomic_fetch_add(&state->presentStats.lockHeldUs, (uint32_t) heldUs, __ATOMIC_RELAXED);
+    if (waitUs >= LORIE_TRACE_MIN_WAIT_US && state->traceEnabled)
+        lorieTraceAt(state, LORIE_TRACE_RLOCK, (uint32_t) waitUs, (uint64_t) heldUs, (uint64_t) gotNs / 1000u);
 }
 
 // Standalone entry point used by the renderer thread's main loop. Used when no redraw is going to
@@ -1789,7 +1793,7 @@ static void rendererApplyPendingGpuCopies(void) {
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
     rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockWaitStartNs),
-                     rendererNsToUs(rendererNowNs() - lockHeldStartNs));
+                     rendererNsToUs(rendererNowNs() - lockHeldStartNs), lockHeldStartNs);
     __atomic_fetch_add(&state->presentStats.flushUs, (uint32_t) flushUs, __ATOMIC_RELAXED);
     __atomic_fetch_add(&state->presentStats.fenceWaitUs, (uint32_t) waitUs, __ATOMIC_RELAXED);
     LORIE_STAT_MAX(&state->presentStats.fenceWaitMaxUs, (uint32_t) waitUs);
@@ -2036,7 +2040,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // cursor alone asked for, which rendererShouldWait() refuses to coalesce.
     bool cursorOnlyFrame = state && !state->drawRequested &&
                            (state->cursor.moved || state->cursor.updated);
-    int64_t lockHeldUs = 0, lockWaitUs = 0;
+    int64_t lockHeldUs = 0, lockWaitUs = 0, lockGotNs = 0;
     bool swapOk = false, fenceWanted = false;
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
@@ -2324,6 +2328,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
     lockHeldUs = rendererNsToUs(rendererNowNs() - lockHeldStartNs);
     lockWaitUs = rendererNsToUs(lockHeldStartNs - lockStartNs);
+    lockGotNs = lockHeldStartNs;
 // Gaming fast path: submit GL commands before swap without creating or waiting on fences.
     // This keeps the no-fence fast path but avoids moving all submit work into swap.
     if (!rootFenceWaitEnabled && !deferFence) {
@@ -2396,7 +2401,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     } else
         __atomic_fetch_add(&state->presentStats.glOutputSubmitFailures, 1, __ATOMIC_RELAXED);
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
-    rendererNoteLock(lockWaitUs, lockHeldUs);
+    rendererNoteLock(lockWaitUs, lockHeldUs, lockGotNs);
     if (cursorOnlyFrame)
         __atomic_fetch_add(&state->presentStats.cursorOnlyFrames, 1, __ATOMIC_RELAXED);
 
@@ -3639,7 +3644,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         state->waitForNextFrame = true;
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockStartNs),
-                         rendererNsToUs(rendererNowNs() - lockHeldStartNs));
+                         rendererNsToUs(rendererNowNs() - lockHeldStartNs), lockHeldStartNs);
         __atomic_fetch_add(&state->presentStats.flushUs, (uint32_t) flushUs, __ATOMIC_RELAXED);
         carriedGpuCopy = gpuCopySerial != 0;
 

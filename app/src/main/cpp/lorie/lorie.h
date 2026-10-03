@@ -338,10 +338,20 @@ enum {
     LORIE_TRACE_HOLD,         /* renderer: frame held back             a = 1 incomplete, 2 no slot back, 3 lock; b = slot */
     LORIE_TRACE_CANCEL,       /* X: queued copy cancelled              a = 1 for a conflicting CPU write, b = serial */
     LORIE_TRACE_PREFLIGHT,    /* X: EXA fallback waited for the queue  a = result (below),  b = wait us */
+    LORIE_TRACE_XLOCK,        /* X: shared lock taken for a CPU access a = wait us,             b = buffer id */
+    LORIE_TRACE_ROOTCOPY,     /* X: CPU copy between root slots        a = us,                  b = bytes */
+    LORIE_TRACE_REMAP,        /* X: root buffer unlocked and relocked  a = us,                  b = 0 */
+    LORIE_TRACE_RLOCK,        /* renderer: shared lock taken (dated then) a = wait us before,   b = held us after */
 };
-/* LORIE_TRACE_PREFLIGHT results */
+/* LORIE_TRACE_PREFLIGHT results. Nothing is recorded when nothing was queued - the common case,
+ * which would otherwise fill the ring during exactly the drags being looked at. A queued copy
+ * cancelled for an overlapping write is its own event, LORIE_TRACE_CANCEL. */
 enum { LORIE_PREFLIGHT_DRAINED = 1, LORIE_PREFLIGHT_TIMEOUT = 2, LORIE_PREFLIGHT_SKIP_LOCKED = 3,
        LORIE_PREFLIGHT_SKIP_STUCK = 4, LORIE_PREFLIGHT_NO_RENDERER = 5 };
+/* Lock waits shorter than this are not recorded (XLOCK, RLOCK): there is one per CPU access to a
+ * buffer with a copy pending, and the uncontended ones would crowd everything else out of the ring.
+ * They are all still counted in presentStats. */
+#define LORIE_TRACE_MIN_WAIT_US 100
 
 #define LORIE_TRACE_RECORDS 4096
 
