@@ -102,7 +102,13 @@ static void runChecks(int force, int reusing) {
         checks[i--] = checks[--nChecks];
     }
 }
+static int cancelQueuedJob(uint64_t s) {
+    for (int j = jobHead; j < jobTail; j++)
+        if (jobs[j].serial == s && !jobs[j].cancelled) return jobs[j].cancelled = 1;
+    return 0;
+}
 static void randomized(LoriePixmapPriv *priv, uint32_t seed, int steps) {
+    harnessCancel = cancelQueuedJob;
     static const BoxRec win[3] = { { 2, 1, 30, 12 }, { 20, 4, 50, 15 }, { 0, 0, 64, 16 } };
     uint64_t serial = 0;
     uint32_t value = 1000;

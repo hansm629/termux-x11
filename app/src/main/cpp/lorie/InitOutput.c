@@ -384,6 +384,18 @@ typedef struct {
      */
     LorieRootCopyMark rootReplacing[LORIE_ROOT_REPLACEMENTS];
     int rootReplacingCount;
+    /*
+     * Copies over owed areas have been failing (set when one is found not made, cleared when one is
+     * made). A slot that goes out with such a copy pending shows its own old content if that copy
+     * fails too, so while they fail the area is brought up to date before the next copy is queued
+     * over it, and a failure then leaves the right content in place. rootCollapseWanted asks for the
+     * same once, after a publish was held for a slot it could not let go of (lorieRootPinnedSlots).
+     */
+    Bool rootRepairFirst;
+    Bool rootCollapseWanted;
+    /* Owed content no slot still had - which lorieRootPinnedSlots is there to rule out. Kept owed, so
+     * the slot is not published with it, until the block handler has the windows over it exposed. */
+    RegionRec rootLostArea;
 
     /*
      * Per slot, what rootReplacing still held when it went out: areas the slot only has if one of
@@ -417,6 +429,8 @@ static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region);
 static void lorieRootCpuDrawn(LoriePixmapPriv *priv, RegionPtr region);
 static Bool lorieRootCanQueueCopy(LoriePixmapPriv *priv);
 static void lorieRootNoteGpuCopy(LoriePixmapPriv *priv, RegionPtr r, uint64_t serial);
+static void lorieRootExposeLost(LoriePixmapPriv *priv);
+static Bool lorieRepairRootOwed(LoriePixmapPriv *priv);
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
 #define LORIE_BUFFER_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap))->buffer : NULL)
@@ -937,12 +951,15 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
         return TRUE;
 
-    nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
     priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
 
     if (!priv)
         // Impossible situation, but let's skip this step
         return TRUE;
+
+    if (priv->rootDouble && RegionNotEmpty(&priv->rootLostArea))
+        lorieRootExposeLost(priv);
+    nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
 
     if (nonEmpty && priv->buffer) {
         // We should unlock and lock buffer in order to update texture content on some devices
@@ -1120,6 +1137,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.rootOwedFromOlder = __atomic_exchange_n(&pvfb->state->presentStats.rootOwedFromOlder, 0, __ATOMIC_RELAXED);
     snap.rootOwedLost = __atomic_exchange_n(&pvfb->state->presentStats.rootOwedLost, 0, __ATOMIC_RELAXED);
     snap.rootReplacingFull = __atomic_exchange_n(&pvfb->state->presentStats.rootReplacingFull, 0, __ATOMIC_RELAXED);
+    snap.rootPublishHeldForDonor = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishHeldForDonor, 0, __ATOMIC_RELAXED);
+    snap.rootOwedExposed = __atomic_exchange_n(&pvfb->state->presentStats.rootOwedExposed, 0, __ATOMIC_RELAXED);
     snap.rootPublishAttempts = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishAttempts, 0, __ATOMIC_RELAXED);
     snap.rootPublishHeldForRepair = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishHeldForRepair, 0, __ATOMIC_RELAXED);
     snap.rootPublishNoSlot = __atomic_exchange_n(&pvfb->state->presentStats.rootPublishNoSlot, 0, __ATOMIC_RELAXED);
@@ -1309,13 +1328,17 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.rootOwedRepairs,
                 snap.rootUnpublishedMaxUs / 1000.0,
                 snap.rootUnpublishedNowMaxUs / 1000.0);
-        if (snap.rootReplacementsNotMade || snap.rootOwedFromOlder || snap.rootOwedLost || snap.rootReplacingFull)
+        if (snap.rootReplacementsNotMade || snap.rootOwedFromOlder || snap.rootOwedLost || snap.rootReplacingFull ||
+            snap.rootPublishHeldForDonor || snap.rootOwedExposed)
             log(INFO, "XlorieRootOwed: %u copies over an owed area not made, %u areas fetched from an "
-                      "older slot, %u areas no slot still had, %u copies refused with too many in flight",
+                      "older slot, %u areas no slot still had (%u exposed again), %u copies refused with too "
+                      "many in flight, %u publishes held for a slot still needed",
                 snap.rootReplacementsNotMade,
                 snap.rootOwedFromOlder,
                 snap.rootOwedLost,
-                snap.rootReplacingFull);
+                snap.rootOwedExposed,
+                snap.rootReplacingFull,
+                snap.rootPublishHeldForDonor);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms, "
                   "%u vsync times lost to backlog, vsync callback up to %.1f ms late",
             snap.rootRemapUs / 1000.0,
@@ -3038,6 +3061,7 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
                     rootPriv->rootOwedSerial = 0;
                     while (rootPriv->rootReplacingCount > 0)
                         RegionUninit(&rootPriv->rootReplacing[--rootPriv->rootReplacingCount].region);
+                    RegionUninit(&rootPriv->rootLostArea);
                 }
                 rootPriv->rootBuf[i] = NULL;
                 rootPriv->rootLocked[i] = NULL;
@@ -3158,10 +3182,13 @@ static void lorieRootSettleReplacements(LoriePixmapPriv *priv) {
             i++;
             continue;
         }
-        if (lorieGpuCopyMade(priv->rootReplacing[i].serial))
+        if (lorieGpuCopyMade(priv->rootReplacing[i].serial)) {
             RegionSubtract(&priv->rootOwed, &priv->rootOwed, &priv->rootReplacing[i].region);
-        else
+            priv->rootRepairFirst = FALSE;
+        } else {
             pvfb->state->presentStats.rootReplacementsNotMade++;
+            priv->rootRepairFirst = TRUE;
+        }
         RegionUninit(&priv->rootReplacing[i].region);
         priv->rootReplacing[i] = priv->rootReplacing[--priv->rootReplacingCount];
     }
@@ -3193,6 +3220,14 @@ static void lorieRootNoteGpuCopy(LoriePixmapPriv *priv, RegionPtr r, uint64_t se
 
     RegionNull(&over);
     RegionIntersect(&over, &priv->rootOwed, r);
+    // Nothing reads or writes the drawing slot on the GPU over this area yet - the copy is not
+    // published to the renderer until after this - so it can be brought up to date first.
+    if (RegionNotEmpty(&over) && (priv->rootRepairFirst || priv->rootCollapseWanted) &&
+        lorieGpuCopyResolved(priv->rootOwedSerial)) {
+        lorieRepairRootOwed(priv);
+        priv->rootCollapseWanted = FALSE;
+        RegionIntersect(&over, &priv->rootOwed, r);
+    }
     if (!RegionNotEmpty(&over)) {
         RegionUninit(&over);
         return;
@@ -3244,6 +3279,8 @@ static void lorieRootFetchOwed(LoriePixmapPriv *priv, RegionPtr area, int slot, 
         }
         RegionSubtract(&notMade, &notMade, &made);
         RegionIntersect(&notMade, &notMade, &want);
+        if (RegionNotEmpty(&notMade))
+            priv->rootRepairFirst = TRUE;       // a copy into a slot that went out has failed
 
         RegionSubtract(&here, &want, &notMade);
         if (RegionNotEmpty(&here)) {
@@ -3258,11 +3295,18 @@ static void lorieRootFetchOwed(LoriePixmapPriv *priv, RegionPtr area, int slot, 
         slot = priv->rootCondDonor[slot];
     }
 
-    if (RegionNotEmpty(&want))
+    // No slot still holds it. Not given up on as it is: it stays owed, so the slot is not published
+    // with it, and the block handler has the windows over it exposed - X's own way of saying a
+    // window's content is gone - which brings new content in (lorieRootExposeLost).
+    if (RegionNotEmpty(&want)) {
         pvfb->state->presentStats.rootOwedLost++;
+        RegionUnion(&priv->rootLostArea, &priv->rootLostArea, &want);
+        RegionSubtract(&here, area, &want);
+    } else
+        RegionCopy(&here, area);
 
-    RegionSubtract(&priv->rootOwed, &priv->rootOwed, area);
-    RegionSubtract(&priv->rootStale[priv->rootWrite], &priv->rootStale[priv->rootWrite], area);
+    RegionSubtract(&priv->rootOwed, &priv->rootOwed, &here);
+    RegionSubtract(&priv->rootStale[priv->rootWrite], &priv->rootStale[priv->rootWrite], &here);
     RegionUninit(&here);
     RegionUninit(&notMade);
     RegionUninit(&made);
@@ -3312,6 +3356,78 @@ static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {
     RegionUninit(&rest);
     RegionUninit(&pending);
     return clear;
+}
+
+// TraverseTree visitor: each window that is shown exposes the part of the lost area it shows.
+static int lorieExposeLostVisit(WindowPtr pWin, void *data) {
+    RegionRec r;
+
+    if (!pWin->viewable)
+        return WT_DONTWALKCHILDREN;
+    RegionNull(&r);
+    RegionIntersect(&r, &pWin->clipList, (RegionPtr) data);
+    if (RegionNotEmpty(&r))
+        (*pWin->drawable.pScreen->WindowExposures)(pWin, &r);
+    RegionUninit(&r);
+    return WT_WALKCHILDREN;
+}
+
+/*
+ * Owed content no slot still had (see lorieRootFetchOwed) - which lorieRootPinnedSlots is there to
+ * rule out. Not published as it was, and not given up on either: the windows over it are exposed,
+ * painted with their background where they have one and told to redraw. That is X's own way of
+ * saying a window's content is gone, and it brings new content in. From there the area holds what X
+ * defines it to hold until the clients redraw - background, or undefined where there is none - and
+ * nothing is owed for it. Block handler only, since exposing draws.
+ */
+static void lorieRootExposeLost(LoriePixmapPriv *priv) {
+    pvfb->state->presentStats.rootOwedExposed++;
+    if (pScreenPtr && pScreenPtr->root)
+        TraverseTree(pScreenPtr->root, lorieExposeLostVisit, &priv->rootLostArea);
+    RegionSubtract(&priv->rootOwed, &priv->rootOwed, &priv->rootLostArea);
+    RegionEmpty(&priv->rootLostArea);
+}
+
+/*
+ * The slots that must not be drawn into next: the ones the slot going out may still need content
+ * from. It goes out with copies pending over an area it owes, which become its rootCond; where they
+ * are not made, that content is wherever it was going to come from - rootOwedDonor - and where that
+ * slot went out the same way, further back still. A slot drawn into again before that is settled no
+ * longer has it, which is how content used to be lost for good (rootOwedLost).
+ */
+static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {
+    uint32_t pinned = 0, epoch;
+    int slot, steps, i;
+    Bool pending = FALSE;
+
+    for (i = 0; i < priv->rootReplacingCount && !pending; i++) {
+        RegionRec over;
+
+        RegionNull(&over);
+        RegionIntersect(&over, &priv->rootReplacing[i].region, &priv->rootOwed);
+        pending = RegionNotEmpty(&over);
+        RegionUninit(&over);
+    }
+    if (!pending)
+        return 0;
+
+    slot = priv->rootOwedDonor;
+    epoch = priv->rootOwedDonorEpoch;
+    for (steps = 0; slot >= 0 && steps < LORIE_ROOT_SLOTS; steps++) {
+        Bool further = FALSE;
+
+        if (priv->rootEpoch[slot] != epoch + (slot == priv->rootWrite))
+            break;
+        pinned |= 1u << slot;
+        // Past this slot only through a copy into it that is not known to have been made.
+        for (i = 0; i < priv->rootCondCount[slot] && !further; i++)
+            further = !lorieGpuCopyMade(priv->rootCond[slot][i].serial);
+        if (!further)
+            break;
+        epoch = priv->rootCondDonorEpoch[slot];
+        slot = priv->rootCondDonor[slot];
+    }
+    return pinned;
 }
 
 /*
@@ -3514,6 +3630,8 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     priv->rootOwedDonorEpoch = 0;
     priv->rootOwedSerial = 0;
     priv->rootReplacingCount = 0;
+    priv->rootRepairFirst = priv->rootCollapseWanted = FALSE;
+    RegionInit(&priv->rootLostArea, NULL, 0);
 
     priv->rootWrite = 1;
     priv->buffer = priv->rootBuf[1];
@@ -3580,7 +3698,8 @@ static void lorieNoteRootPublished(LoriePixmapPriv *priv) {
 // keep drawing into this one for another frame - that costs one frame of freshness and never a
 // stall.
 static Bool lorieRootHandover(LoriePixmapPriv *priv) {
-    uint32_t old, new;
+    uint32_t old, new, pinned;
+    Bool retried = FALSE;
     int drawn = priv->rootWrite, next, i;
     RegionPtr unsafe, nextPending;
     RegionRec blocked, carry;
@@ -3607,19 +3726,61 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
         return FALSE;
     }
 
+    pinned = lorieRootPinnedSlots(priv);
+    retry:
     do {
+        Bool onlyPinned = FALSE;
+
         old = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE);
 
         // Where we draw from here on: any slot other than the one we are publishing that the
-        // renderer does not still need. With three slots there is normally one; when there is not,
+        // renderer does not still need, and that does not hold content still owed (see
+        // lorieRootPinnedSlots). With three slots there is normally one; when there is not,
         // the renderer is holding both others and we are trying to publish faster than the display
         // can show it, so keep drawing into this one for another frame.
         next = -1;
         for (i = 0; i < LORIE_ROOT_SLOTS; i++)
             if (i != drawn && !(old & (1u << i))) {
+                if (pinned & (1u << i)) {
+                    onlyPinned = TRUE;
+                    continue;
+                }
                 next = i;
                 break;
             }
+        if (next < 0 && onlyPinned) {
+            /*
+             * The only slots free hold content the one going out may still need.
+             *
+             * While copies over owed areas are failing, the ones over this slot's owed area still
+             * waiting in the queue are taken back - cancelled, their presents reported as skipped,
+             * as for any cancelled copy - and the area brought up to date, after which nothing is
+             * pinned for it and the publish is tried again. Without that, a renderer running behind
+             * keeps a new copy pending over the area every time it could be repaired, and the slots
+             * stay pinned for as long as the failures go on.
+             */
+            if (priv->rootRepairFirst && !retried) {
+                int k = 0;
+
+                retried = TRUE;
+                while (k < priv->rootReplacingCount) {
+                    int count = priv->rootReplacingCount;
+
+                    lorieMarkQueuedCopySuperseded(priv->rootReplacing[k].serial);
+                    if (priv->rootReplacingCount == count)
+                        k++;                    // the renderer has it already; it stays pending
+                }
+                if (lorieRepairRootOwed(priv)) {
+                    pinned = lorieRootPinnedSlots(priv);
+                    goto retry;
+                }
+            }
+            // Held for a frame rather than drawn over - a dropped frame instead of lost pixels -
+            // and the next copy over that area brings it up to date first, so what pins them goes.
+            pvfb->state->presentStats.rootPublishHeldForDonor++;
+            priv->rootCollapseWanted = TRUE;
+            return FALSE;
+        }
         if (next < 0) {
             /*
              * Every other slot is still marked as held, so there is nowhere to draw next. That can

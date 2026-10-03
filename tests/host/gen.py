@@ -53,6 +53,8 @@ recipes = {
             + span(I, "typedef struct {\n    uint64_t serial;\n    RegionRec region;", "} LorieRootCopyMark;"),
             "#define LORIE_ROOT_REPLACEMENTS")
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
+        + "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv);\n"
+        + opt(lambda: "#define HAVE_PINS 1\n", "static uint32_t lorieRootPinnedSlots")
         + func(I, "static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {")
         + func(I, "static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {")
         + opt(lambda: func(I, "static void lorieRootCpuDrawn(LoriePixmapPriv *priv, RegionPtr region) {")
@@ -62,6 +64,8 @@ recipes = {
             + func(I, "static void lorieRootFetchOwed(LoriePixmapPriv *priv, RegionPtr area, int slot, uint32_t epoch) {"),
             "#define LORIE_ROOT_REPLACEMENTS")
         + func(I, "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {")
+        + opt(lambda: func(I, "static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {"),
+            "static uint32_t lorieRootPinnedSlots")
         + opt(lambda: func(I, "static void lorieRootKeepConditional(LoriePixmapPriv *priv, int slot) {")
             + func(I, "static void lorieRootReuseSlot(LoriePixmapPriv *priv, int slot) {")
             + func(I, "static void lorieRootCopyCancelled(uint64_t serial) {"),

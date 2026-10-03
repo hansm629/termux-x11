@@ -20,6 +20,8 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$OUT/t05" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t26.c" "$OUT/region16.o" -o "$OUT/t26"
 "$OUT/t26" || status=1
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t30.c" "$OUT/region16.o" -o "$OUT/t30"
+"$OUT/t30" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/t25.c" "$OUT/region16.o" -o "$OUT/t25"
 "$OUT/t25" || status=1
 

@@ -63,7 +63,7 @@ static struct {
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
              rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
              rootUnpublishedMaxUs, rootReplacementsNotMade, rootOwedFromOlder, rootOwedLost,
-             rootReplacingFull; } presentStats;
+             rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed; } presentStats;
 } fakeState;
 static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
@@ -76,7 +76,22 @@ static PixmapPtr fakeGetScreenPixmap(ScreenPtr s) { (void) s; return fakeRootPri
 static struct FakeScreen fakeScreen = { fakeGetScreenPixmap };
 static ScreenPtr pScreenPtr __attribute__((unused)) = &fakeScreen;
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((LoriePixmapPriv *) (p))
+/* What lorieMarkQueuedCopySuperseded does to a copy still waiting in the queue: the test's queue says
+ * whether it was (and marks it cancelled), and then the X server's bookkeeping hears of it. */
+static int (*harnessCancel)(uint64_t serial);
+static void harnessCopyCancelled(uint64_t serial);
+static void __attribute__((unused)) lorieMarkQueuedCopySuperseded(uint64_t serial) {
+    if (harnessCancel && harnessCancel(serial))
+        harnessCopyCancelled(serial);
+}
 #include "root_src.inc"
+static void harnessCopyCancelled(uint64_t serial) {
+#ifdef HAVE_REPLACING
+    lorieRootCopyCancelled(serial);
+#else
+    (void) serial;
+#endif
+}
 
 #define W 64
 #define H 16
@@ -103,6 +118,9 @@ static void init(LoriePixmapPriv *priv) {
     }
 #ifdef HAVE_OWED
     RegionNull(&priv->rootOwed); priv->rootOwedDonor = -1;
+#endif
+#ifdef HAVE_PINS
+    RegionNull(&priv->rootLostArea);
 #endif
     fakeState.rootHandover = 0; priv->rootWrite = 1; priv->rootDouble = TRUE; fakeCompleted = 0;
     published = 0; retiring = -1;
