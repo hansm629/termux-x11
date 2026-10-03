@@ -35,7 +35,15 @@ recipes = {
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
+        + opt(lambda: "#define HAVE_VSYNC_SEQ 1\n" + func(I, "static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {"),
+              "static Bool lorieReadVsyncRecord")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {"),
+    # the same, with a ring of 4 so the producer laps it all the time
+    "t29": lambda: (span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
+        + opt(lambda: "#define HAVE_VSYNC_SEQ 1\n" + func(I, "static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {"),
+              "static Bool lorieReadVsyncRecord")
+        + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {")).replace(
+            "#define LORIE_VSYNC_RECORDS 16", "#define LORIE_VSYNC_RECORDS 4"),
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
     "root": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
         + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
@@ -96,7 +104,7 @@ recipes = {
         + opt(lambda: "static uint32_t rendererSessionTag = 0;\n"
             + func(R, "static void rendererSayRetired(struct lorie_shared_server_state *st) {"),
             "static void rendererSayRetired", R),
-    "cursor": lambda: span(R, "#define LORIE_CURSOR_BUFFERS 4", "static bool cursorOverlayRenderPending = false;")
+    "cursor": lambda: opt(lambda: span(R, "#define LORIE_CURSOR_BUFFERS 4", "static bool cursorOverlayRenderPending = false;")
         + span(R, "typedef enum { LORIE_ZC_FENCE_DONE, LORIE_ZC_FENCE_WAITING, LORIE_ZC_FENCE_UNUSABLE } LorieZcFence;",
                "} LorieZcFence;")
         + func(R, "static LorieZcFence rootZcFenceState(int fd) {")
@@ -105,7 +113,7 @@ recipes = {
         + func(R, "static uint32_t cursorPoolSetOnLayer(int slot) {")
         + func(R, "static void cursorPoolReleaseReported(uint32_t seq, int fd, bool reportCarriedLayer) {")
         + func(R, "static void cursorPoolDrain(void) {")
-        + func(R, "static void cursorPoolOrphan(void) {"),
+        + func(R, "static void cursorPoolOrphan(void) {"), "#define LORIE_CURSOR_BUFFERS", R),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

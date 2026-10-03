@@ -202,8 +202,8 @@ static uint8_t lorieOutputBackend = LORIE_OUTPUT_AUTO;
 // still far closer to the vsync than asking for the time whenever the X server got round to it.
 //
 /*
- * One record per Choreographer callback, written once and never changed. Single producer (the
- * Choreographer thread), single consumer (the X server thread).
+ * One record per Choreographer callback. Single producer (the Choreographer thread), single consumer
+ * (the X server thread).
  *
  * This was a single stamp the callback overwrote. Each callback queues one lorieRedraw, so when the
  * X server fell behind, several of those ran back to back and every one of them read the newest
@@ -212,23 +212,47 @@ static uint8_t lorieOutputBackend = LORIE_OUTPUT_AUTO;
  * Present reports to a client as when its frame was shown. Clamping that to "now plus a period"
  * limited how far off it could be, not whether it was right. With a record per tick, each one
  * keeps the time it actually happened.
+ *
+ * Each record says which tick it holds (seq is the tick's number plus one, 0 while it is being
+ * written). The reader used to check, after reading a record, only whether the producer had since
+ * lapped the ring - which missed the producer being half way through writing that very slot for its
+ * next lap, and a 64-bit stamp is not even written in one go on the 32-bit ABIs. Now a record is
+ * used only if it held the tick wanted both before and after the stamp was read.
  */
 #define LORIE_VSYNC_RECORDS 16
-static volatile uint64_t lorieVsyncRecordUs[LORIE_VSYNC_RECORDS];
+static struct {
+    volatile uint32_t seq;
+    volatile uint64_t us;
+} lorieVsyncRecords[LORIE_VSYNC_RECORDS];
 static volatile uint32_t lorieVsyncProduced = 0;   // Choreographer thread only writes this
 
 // Choreographer thread.
 static void lorieRecordVsync(uint64_t stampUs) {
     uint32_t n = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_RELAXED);
+    typeof(&lorieVsyncRecords[0]) r = &lorieVsyncRecords[n % LORIE_VSYNC_RECORDS];
 
-    lorieVsyncRecordUs[n % LORIE_VSYNC_RECORDS] = stampUs;
-    __atomic_store_n(&lorieVsyncProduced, n + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&r->seq, 0u, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&r->us, stampUs, __ATOMIC_RELAXED);
+    __atomic_store_n(&r->seq, n + 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&lorieVsyncProduced, n + 1u, __ATOMIC_RELEASE);
 }
 
 // X server thread only, from lorieRedraw onwards.
 static uint32_t lorieVsyncConsumed = 0;
 static uint64_t lorieVsyncUs = 0;       // when the vsync that current_msc counts happened
 static uint64_t lorieVsyncPeriodUs = 16667;
+
+// The stamp of tick `idx`, if its record still holds that tick, whole.
+static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {
+    typeof(&lorieVsyncRecords[0]) r = &lorieVsyncRecords[idx % LORIE_VSYNC_RECORDS];
+
+    if (__atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) != idx + 1u)
+        return FALSE;
+    *us = __atomic_load_n(&r->us, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&r->seq, __ATOMIC_RELAXED) == idx + 1u;
+}
 
 /*
  * Takes the next tick, if there is one, and returns how many vsyncs current_msc has to move - 0 if
@@ -238,28 +262,22 @@ static uint64_t lorieVsyncPeriodUs = 16667;
  */
 static uint32_t lorieAdvanceVsyncClock(void) {
     uint32_t produced = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE);
-    uint32_t steps = 1, idx;
+    uint32_t steps, idx;
     uint64_t us;
 
     if (produced == lorieVsyncConsumed)
         return 0;
 
-    if (produced - lorieVsyncConsumed > LORIE_VSYNC_RECORDS) {
-        steps = produced - lorieVsyncConsumed;
-        lorieVsyncConsumed = produced - 1;
-        pvfb->state->presentStats.vsyncRecordsLost += steps - 1;
-    }
+    idx = produced - lorieVsyncConsumed > LORIE_VSYNC_RECORDS ? produced - 1u : lorieVsyncConsumed;
+    // Written over since - the producer lapped the ring while this was being decided or read. Every
+    // tick up to its newest one has happened by then; move on to that one.
+    while (!lorieReadVsyncRecord(idx, &us))
+        idx = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - 1u;
 
-    idx = lorieVsyncConsumed;
-    us = lorieVsyncRecordUs[idx % LORIE_VSYNC_RECORDS];
-    // The producer could only have overwritten this slot by lapping the whole ring while it was
-    // being read. Not a practical case, but a torn read would date a tick wrongly, so it is checked.
-    if (__atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - idx > LORIE_VSYNC_RECORDS) {
-        lorieVsyncConsumed = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - 1;
-        idx = lorieVsyncConsumed;
-        us = lorieVsyncRecordUs[idx % LORIE_VSYNC_RECORDS];
-    }
-    lorieVsyncConsumed = idx + 1;
+    steps = idx + 1u - lorieVsyncConsumed;
+    if (steps > 1)
+        pvfb->state->presentStats.vsyncRecordsLost += steps - 1;
+    lorieVsyncConsumed = idx + 1u;
 
     // Only plausible gaps feed the period estimate: a tick that was never called for stretches it.
     // 4-40 ms covers everything from 25 to 250 Hz.

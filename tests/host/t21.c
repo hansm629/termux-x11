@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+typedef int Bool;
+#define TRUE 1
+#define FALSE 0
 struct { struct { struct { uint32_t vsyncRecordsLost; } presentStats; } *state; } fakePvfb;
 static struct { struct { uint32_t vsyncRecordsLost; } presentStats; } fakeState;
 #define pvfb (&fakePvfb)
@@ -9,7 +13,11 @@ static struct { struct { uint32_t vsyncRecordsLost; } presentStats; } fakeState;
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 static void reset(void) {
+#ifdef HAVE_VSYNC_SEQ
+    memset((void *) lorieVsyncRecords, 0, sizeof lorieVsyncRecords);
+#else
     for (int i = 0; i < LORIE_VSYNC_RECORDS; i++) lorieVsyncRecordUs[i] = 0;
+#endif
     lorieVsyncProduced = 0; lorieVsyncConsumed = 0; lorieVsyncUs = 0; lorieVsyncPeriodUs = 16667;
     fakeState.presentStats.vsyncRecordsLost = 0;
 }
