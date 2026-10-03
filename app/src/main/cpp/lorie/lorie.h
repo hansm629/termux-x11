@@ -38,12 +38,13 @@ void lorieRecheckGpuCopies(void);
  * the renderer made progress - the frame after may never come. */
 void lorieReapAbandonedCopies(void);
 void lorieNoteGpuCopyRequeued(void);
-/* Both run on the X server thread, and both only change when a still-unreported copy stops being
- * worth waiting on - neither releases anything by itself, the reaper does that. A renderer
- * connecting is the answer that a broken socket is not: the process that owed the report has been
- * replaced, so its GPU work is gone with it. */
+/* Both run on the X server thread and release nothing by themselves - the reaper does that, once
+ * what is known about the session that owed a copy's report says it may (see lorieCopyResolve).
+ * Neither a broken socket nor a new connection says the old renderer's GPU work has finished: the
+ * process can outlive its socket, and the next connection can come from the same process. pid is
+ * the renderer's process, as the Binder call that asked for the connection names it; 0 if unknown. */
 void lorieNoteRendererLost(void);
-void lorieNoteRendererConnected(void);
+void lorieNoteRendererConnected(int32_t pid);
 /* So a socket error can name the session it belongs to, and a lost event that has been overtaken by
  * a new connection can be dropped instead of marking the new session's work over and tearing down
  * the buffers it has just registered. */
@@ -456,6 +457,28 @@ struct lorie_shared_server_state {
 #define LORIE_ROOT_GEN(word) ((uint32_t) (word) >> LORIE_ROOT_GEN_SHIFT)
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
+
+    /*
+     * Renderer sessions. The X server numbers each connection and writes the number here before it
+     * hands the state over; a renderer process notes it when it takes the state up.
+     *
+     * When a renderer lets go of the state - its connection broke, or it is about to take up a new
+     * one - it first waits out the GPU work it has submitted (rendererRetireFrame), and then says so
+     * in `retired`: for that session, every copy it took from the queue up to `serial` has finished
+     * on the GPU, made or not. Nothing else can tell the X server that about a renderer whose socket
+     * has gone, and that process may well still be alive. A ring with a sequence per entry, because
+     * more than one process can let go of the state before the X server looks; entries are written
+     * under `retiredClaim` and are complete once their seq is the claim number plus one.
+     */
+    volatile uint32_t sessionTag;
+#define LORIE_RETIRE_RECORDS 4
+    struct {
+        volatile uint32_t seq;
+        volatile uint32_t session;
+        volatile int32_t pid;
+        volatile uint64_t serial;
+    } retired[LORIE_RETIRE_RECORDS];
+    volatile uint32_t retiredClaim;
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
 
@@ -635,9 +658,15 @@ struct lorie_shared_server_state {
          * copies the renderer had already claimed by then (which the shared lock then waited out). */
         volatile uint32_t copyCancelledForCpuWrite;
         volatile uint32_t copyClaimedBeforeCpuWrite;
-        /* Copies let go of because the session that owed their result is gone, with nothing that
-         * says the GPU finished with them. Not a safe completion - see lorieCopySettled - so it is
-         * counted apart from the ones that were actually reported. */
+        /* How copies whose session ended were let go of, apart from the ones their own live
+         * session reported (see lorieCopyResolve):
+         *   Retired   - the renderer process said, as it let go of the state, that everything it
+         *               had taken from the queue had finished on the GPU;
+         *   Dead      - the process that could still have touched them has exited;
+         *   ForcedSettle - recovery, not completion: nothing could say whether that process was
+         *               still alive, and the bounded wait ran out. */
+        volatile uint32_t copySettledRetired;
+        volatile uint32_t copySettledProcessDead;
         volatile uint32_t copyForcedSettle;
 
         /* When client requests actually arrive, which is the one hop everything else is measured

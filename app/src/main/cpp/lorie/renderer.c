@@ -1882,6 +1882,30 @@ static uint64_t rendererClaimRootBuffer(void) {
 // before the GPU is done reading it. This cannot tear.
 static void rendererReleaseRootBuffer(void);
 
+/* The X server's number for the connection whose state this process has taken up (see sessionTag). */
+static uint32_t rendererSessionTag = 0;
+
+/*
+ * Tells the X server that every copy this renderer took from the queue of `st` has finished on the
+ * GPU, made or not: called as the state is let go of, after rendererRetireFrame() has waited out the
+ * last fence. completedSerial covers every entry drained by then - each batch is fenced inside the
+ * lock, and a deferred frame's serial is what the retire just published.
+ *
+ * Without this, a renderer whose socket has gone looks the same to the X server whether it is still
+ * reading buffers or long finished, and the X server can only guess. See lorieCopyResolve.
+ */
+static void rendererSayRetired(struct lorie_shared_server_state *st) {
+    uint32_t n = __atomic_fetch_add(&st->retiredClaim, 1, __ATOMIC_ACQ_REL);
+    typeof(&st->retired[0]) r = &st->retired[n % LORIE_RETIRE_RECORDS];
+
+    __atomic_store_n(&r->seq, 0u, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    r->session = rendererSessionTag;
+    r->pid = (int32_t) getpid();
+    r->serial = __atomic_load_n(&st->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&r->seq, n + 1u, __ATOMIC_RELEASE);
+}
+
 static EGLSync rendererPendingFence = EGL_NO_SYNC_KHR;
 static uint64_t rendererPendingGpuCopySerial = 0;
 
@@ -2518,10 +2542,17 @@ __noreturn static void* rendererThread(void) {
             struct lorie_shared_server_state* oldState = NULL;
             // Anything still in flight belongs to the state we are leaving.
             rendererRetireFrame();
+            // ...and has finished now, which the X server has no other way to learn. Said only on
+            // leaving that connection: taking the same connection's state up again would make
+            // everything it takes from then on look like copies it never took.
+            if (state && (!pendingState || pendingState->sessionTag != rendererSessionTag))
+                rendererSayRetired(state);
             if (state && pendingState != state)
                 oldState = state;
 
             state = pendingState;
+            if (state)
+                rendererSessionTag = __atomic_load_n(&state->sessionTag, __ATOMIC_ACQUIRE);
             pendingState = NULL;
             stateChanged = false;
             waitingForBuffers = false;

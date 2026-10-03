@@ -16,9 +16,15 @@ def opt(make, marker, path=I):
     return make() if marker in open(path, encoding="utf-8").read() else ""
 
 recipes = {
-    "t07": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS")
+    "t07": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + func(R, "static void rendererPublishFailedSerial(uint64_t serial) {")
+        + opt(lambda: macro(H, "LORIE_RETIRE_RECORDS") + "#define HAVE_SESSIONS 1\n"
+            + span(I, "static uint32_t lorieRendererSession;", "    lorieRetiredSeen = n;\n}"),
+            "#define LORIE_SESSIONS")
         + func(I, "static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {")
+        + opt(lambda: span(I, "static void lorieSnapshotDeadSession(LorieRendererSessionRec *s) {", "} LorieCopyResolution;")
+            + func(I, "static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {"),
+            "#define LORIE_SESSIONS")
         + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {"),
     "slots": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_NEWEST_SHIFT") + macro(H, "LORIE_ROOT_NEWEST_MASK")
@@ -67,6 +73,29 @@ recipes = {
         + func(I, "static Bool lorieEntryTouches(const LorieGpuCopyEntry *e, int16_t dx, int16_t dy, RegionPtr region) {")
         + func(I, "static void lorieCancelConflictingCopies(uint64_t bufferId, RegionPtr region) {")
         + func(R, "static bool rendererClaimEntry(uint32_t slot) {"),
+    "session": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + opt(lambda: macro(H, "LORIE_RETIRE_RECORDS") + "#define HAVE_SESSIONS 1\n"
+            + span(I, "static uint32_t lorieRendererSession;", "    lorieRetiredSeen = n;\n}"),
+            "#define LORIE_SESSIONS")
+        + opt(lambda: span(I, "static uint32_t lorieRendererSession;", "#define LORIE_LOST_SESSION_SETTLE_US (2 * 1000 * 1000ULL)"),
+            "uint64_t settleByUs;")
+        + func(I, "static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {")
+        + opt(lambda: span(I, "static void lorieSnapshotDeadSession(LorieRendererSessionRec *s) {",
+                           "} LorieCopyResolution;")
+            + func(I, "static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {"),
+            "#define LORIE_SESSIONS")
+        + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
+        + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {")
+        + func(I, "static Bool lorieCopySettled(LorieAbandonedCopy *c) {")
+        + opt(lambda: func(I, "static void lorieEndSession(LorieRendererSessionRec *s, const char *why) {"),
+            "#define LORIE_SESSIONS")
+        + opt(lambda: func(I, "static void lorieMarkSessionOver(uint32_t session, uint64_t settleByUs, const char *why) {"),
+            "uint64_t settleByUs;")
+        + func(I, "void lorieNoteRendererLost(void) {")
+        + func(I, "void lorieNoteRendererConnected(")
+        + opt(lambda: "static uint32_t rendererSessionTag = 0;\n"
+            + func(R, "static void rendererSayRetired(struct lorie_shared_server_state *st) {"),
+            "static void rendererSayRetired", R),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

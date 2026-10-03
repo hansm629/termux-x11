@@ -26,6 +26,9 @@
 #include <dlfcn.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/system_properties.h>
 #include "fb.h"
 #include "mipointer.h"
 #include "micmap.h"
@@ -1031,13 +1034,20 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
      * rather than counters are copied as they are.
      */
     __typeof__(pvfb->state->presentStats) snap;
-    int renderedFrames = __atomic_exchange_n(&pvfb->state->renderedFrames, 0, __ATOMIC_RELAXED);
+    int renderedFrames;
+
+    // With no renderer connected nothing else ticks the reaper, and copies of a connection that has
+    // gone still need asking about: whether its process has exited, whether it said it retired.
+    lorieReapAbandonedCopies();
+    renderedFrames = __atomic_exchange_n(&pvfb->state->renderedFrames, 0, __ATOMIC_RELAXED);
 
     snap.coalescedFrames = __atomic_exchange_n(&pvfb->state->presentStats.coalescedFrames, 0, __ATOMIC_RELAXED);
     snap.copyAbandons = __atomic_exchange_n(&pvfb->state->presentStats.copyAbandons, 0, __ATOMIC_RELAXED);
     snap.copyCompletions = __atomic_exchange_n(&pvfb->state->presentStats.copyCompletions, 0, __ATOMIC_RELAXED);
     snap.copyDeferrals = __atomic_exchange_n(&pvfb->state->presentStats.copyDeferrals, 0, __ATOMIC_RELAXED);
     snap.copyForcedSettle = __atomic_exchange_n(&pvfb->state->presentStats.copyForcedSettle, 0, __ATOMIC_RELAXED);
+    snap.copySettledRetired = __atomic_exchange_n(&pvfb->state->presentStats.copySettledRetired, 0, __ATOMIC_RELAXED);
+    snap.copySettledProcessDead = __atomic_exchange_n(&pvfb->state->presentStats.copySettledProcessDead, 0, __ATOMIC_RELAXED);
     snap.copyLatencyMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencyMaxUs, 0, __ATOMIC_RELAXED);
     snap.copyLatencySumUs = __atomic_exchange_n(&pvfb->state->presentStats.copyLatencySumUs, 0, __ATOMIC_RELAXED);
     snap.copyRecordExhausted = __atomic_exchange_n(&pvfb->state->presentStats.copyRecordExhausted, 0, __ATOMIC_RELAXED);
@@ -1239,12 +1249,16 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                       "drain first (%u ran out of time, %u could not wait)",
                 snap.exaPreflightWaits, snap.exaPreflightWaitUs / 1000.0,
                 snap.exaPreflightTimeouts, snap.exaPreflightSkipped);
-        if (snap.copyAbandons || snap.copyRecordExhausted ||
-            snap.copyForcedSettle)
-            log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room), "
-                      "%u let go without a result because their session ended",
+        if (snap.copyAbandons || snap.copyRecordExhausted)
+            log(INFO, "XlorieCopy: %u cancelled while still running, %u not offered (no tracking room)",
                 snap.copyAbandons,
-                snap.copyRecordExhausted,
+                snap.copyRecordExhausted);
+        if (snap.copySettledRetired || snap.copySettledProcessDead || snap.copyForcedSettle)
+            log(INFO, "XlorieSession: copies of a connection that had gone let go of: %u after its "
+                      "process said it had finished them, %u after its process exited, %u by recovery "
+                      "with nothing to say whether the GPU was done",
+                snap.copySettledRetired,
+                snap.copySettledProcessDead,
                 snap.copyForcedSettle);
 
         if (snap.copyDeferrals || snap.copyWaitHeld ||
@@ -1361,7 +1375,6 @@ typedef struct {
      * process that can be replaced while copies are outstanding - the activity is restarted, the
      * surface is lost - and nothing in a serial says whose answer it was waiting for. */
     uint32_t session;
-    uint64_t settleByUs;   /* once its session has ended: how long to hold it (see lorieCopySettled) */
 
     /* Kept here rather than in a ring keyed by the serial: the ring aliased once more serials had
      * gone by than it had slots, so a cancelled copy could pick up a later copy's start time. */
@@ -1389,16 +1402,150 @@ typedef struct {
 
 static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
 
-/* Bumped on each renderer connection, so a copy can tell whether the process that owed it an answer
- * is the one that is there now. 0 is "no renderer has ever connected". */
+/* Bumped on each renderer connection, so a copy can tell which connection owed it an answer. 0 is "no
+ * renderer has ever connected". */
 static uint32_t lorieRendererSession;
 
-/* How long a copy is held once the connection that owed it an answer has gone and nothing has taken
- * its place. The thing being waited out is GPU work that renderer already submitted and that may
- * still be reading the source pixmap; that work is bounded by the driver's own timeout, on the
- * order of a second or two. So this is a bound on the wait, not a guess that the process has
- * exited - and if a new renderer connects first, that is the real answer and this never applies. */
+/*
+ * What is known about each renderer connection that has been handed copies.
+ *
+ * What a copy holds may only be let go of once nothing can still read or write it on the GPU. For
+ * the live connection, its own watermark says so. For one that has gone, that watermark is no longer
+ * its own - the next renderer advances completedSerial over serials it never saw - and neither the
+ * socket breaking nor a new connection says the old process has stopped: it can outlive its socket,
+ * and the next connection can come from the very same process. These used to be taken as completion
+ * after a fixed wait, or at once when a new renderer connected. Each connection now keeps what can
+ * actually answer for it:
+ *
+ *   retired   the process said, as it let go of the state, that everything it had taken from the
+ *             queue up to retiredUpTo has finished on the GPU (rendererSayRetired in renderer.c);
+ *   process   whether that process is still there - a pidfd where the system allows one, which
+ *             says either way, otherwise kill(pid, 0), which can only say it is gone;
+ *   snapshot  where the queue stood when it was found gone with nobody else draining it.
+ *
+ * Kept for the last LORIE_SESSIONS connections; see lorieCopyResolve for how they are used.
+ */
+typedef enum {
+    LORIE_PROCESS_ALIVE,
+    LORIE_PROCESS_DEAD,
+    LORIE_PROCESS_UNKNOWN,
+} LorieProcessState;
+
+typedef struct {
+    uint32_t id;                    // 0: slot unused
+    int32_t pid;                    // the renderer's process; 0 if not known
+    int pidfd;                      // -1 if none
+    uint64_t firstSerial;           // the lowest serial a copy given to this connection can have
+    Bool ended;
+    uint64_t endedUs;
+    uint64_t completedAtEnd;        // completedSerial as it ended: its own reports, up to there
+    Bool retired;
+    uint64_t retiredUpTo;
+    LorieProcessState process;
+    Bool snapshot;
+    uint64_t completedAtDeath;      // its own reports, as of finding it gone
+    uint64_t drainedAtDeath;        // everything up to here it had taken, or was cancelled then
+} LorieRendererSessionRec;
+
+#define LORIE_SESSIONS 16
+static LorieRendererSessionRec lorieSessions[LORIE_SESSIONS];
+
+/* How long copies of a connection that has gone are held when nothing can tell whether its process is
+ * still alive - and only then: a process known to be alive is waited on for as long as it lives, one
+ * known to be gone needs no wait, and one that said it retired needs none either. What happens at the
+ * end of this is recovery, not completion (LORIE_COPY_RECOVERY), and is counted as such. */
 #define LORIE_LOST_SESSION_SETTLE_US (2 * 1000 * 1000ULL)
+
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+
+// Whether pidfd_open may be asked for at all: before Android 12 the app seccomp policy kills the
+// process for an unknown system call instead of failing it.
+static Bool loriePidfdAllowed(void) {
+    static int allowed = -1;
+
+    if (allowed < 0) {
+        char sdk[PROP_VALUE_MAX] = {0};
+        allowed = __system_property_get("ro.build.version.sdk", sdk) > 0 && atoi(sdk) >= 31;
+    }
+    return allowed;
+}
+
+static int lorieOpenPidfd(int32_t pid) {
+    if (pid <= 0 || !loriePidfdAllowed())
+        return -1;
+    return (int) syscall(__NR_pidfd_open, (pid_t) pid, 0);   // -1 if refused, which leaves kill()
+}
+
+static LorieProcessState lorieProcessState(LorieRendererSessionRec *s) {
+    if (s->process == LORIE_PROCESS_DEAD)
+        return s->process;                      // for good
+    if (s->pidfd >= 0) {
+        struct pollfd p = { .fd = s->pidfd, .events = POLLIN };
+
+        // Readable once that process has exited, and only then. A pidfd names the process itself,
+        // so a later one given the same number does not answer for it.
+        s->process = poll(&p, 1, 0) == 1 ? LORIE_PROCESS_DEAD : LORIE_PROCESS_ALIVE;
+    } else if (s->pid > 0)
+        // No such process means it is gone. Anything else says only that something has the number,
+        // which may be a later process - so not that it is alive.
+        s->process = kill(s->pid, 0) != 0 && errno == ESRCH ? LORIE_PROCESS_DEAD : LORIE_PROCESS_UNKNOWN;
+    else
+        s->process = LORIE_PROCESS_UNKNOWN;
+    return s->process;
+}
+
+// The connection a serial was handed to: the latest one that existed when it was given out.
+static LorieRendererSessionRec *lorieSessionOf(uint64_t serial) {
+    LorieRendererSessionRec *best = &lorieSessions[lorieRendererSession % LORIE_SESSIONS];
+    int i;
+
+    if (best->id && best->id == lorieRendererSession && best->firstSerial <= serial)
+        return best;                            // the live one, nearly always
+    best = NULL;
+    for (i = 0; i < LORIE_SESSIONS; i++) {
+        LorieRendererSessionRec *s = &lorieSessions[i];
+        if (s->id && s->firstSerial <= serial && (!best || s->id > best->id))
+            best = s;
+    }
+    return best;
+}
+
+/* Retire records not read yet start here (see `retired` in lorie.h). */
+static uint32_t lorieRetiredSeen;
+
+// Picks up what renderer processes have said as they let go of the state.
+static void lorieSessionsPoll(void) {
+    uint32_t claim, n;
+
+    if (!pvfb->state)
+        return;
+    claim = __atomic_load_n(&pvfb->state->retiredClaim, __ATOMIC_ACQUIRE);
+    if (claim - lorieRetiredSeen > LORIE_RETIRE_RECORDS)
+        lorieRetiredSeen = claim - LORIE_RETIRE_RECORDS;   // the ones before were written over unread
+    for (n = lorieRetiredSeen; n != claim; n++) {
+        typeof(&pvfb->state->retired[0]) r = &pvfb->state->retired[n % LORIE_RETIRE_RECORDS];
+        uint32_t session;
+        uint64_t serial;
+
+        if (__atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) != n + 1u)
+            break;                              // still being written; looked at again next time
+        session = r->session;
+        serial = r->serial;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&r->seq, __ATOMIC_RELAXED) != n + 1u)
+            break;                              // written over while being read
+        if (session && lorieSessions[session % LORIE_SESSIONS].id == session) {
+            LorieRendererSessionRec *s = &lorieSessions[session % LORIE_SESSIONS];
+
+            s->retired = TRUE;
+            if (serial > s->retiredUpTo)
+                s->retiredUpTo = serial;
+        }
+    }
+    lorieRetiredSeen = n;
+}
 
 // A deferred IdleNotify names the window it is owed to, and that window can be destroyed while the
 // renderer is still reading the pixmap. Forgetting it here is what keeps the pointer from dangling,
@@ -2078,29 +2225,151 @@ static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {
     return serial <= __atomic_load_n(&pvfb->state->gpuCopyQueue.failedLostUpTo, __ATOMIC_ACQUIRE);
 }
 
+static Bool lorieCancelQueuedEntry(uint32_t slot);
+static void lorieRootCopyCancelled(uint64_t serial);
+
+/*
+ * A renderer process found gone while nobody else drains the queue: what it had taken from the queue
+ * is now everything up to readIndex, and nothing can take the rest. The rest is cancelled, so a
+ * renderer that connects later skips it rather than running copies nobody is waiting for, and from
+ * then on every serial handed out so far has an answer.
+ */
+static void lorieSnapshotDeadSession(LorieRendererSessionRec *s) {
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
+
+    s->completedAtDeath = __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE);
+    for (i = readIndex; i != writeIndex; i++) {
+        uint32_t slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
+
+        if (lorieCancelQueuedEntry(slot))
+            lorieRootCopyCancelled(pvfb->state->gpuCopyQueue.entries[slot].serial);
+    }
+    s->drainedAtDeath = pvfb->gpuCopySerialCounter;
+    s->snapshot = TRUE;
+}
+
+// lorieProcessState, plus the snapshot the first time the process is found gone - if it was the last
+// renderer to connect, so that nothing else can have been draining the queue in the meantime.
+static LorieProcessState lorieSessionProcess(LorieRendererSessionRec *s) {
+    Bool wasDead = s->process == LORIE_PROCESS_DEAD;
+
+    if (lorieProcessState(s) == LORIE_PROCESS_DEAD && !wasDead) {
+        log(INFO, "renderer session %u: its process %d has exited", s->id, s->pid);
+        if (s->id == lorieRendererSession && pvfb->state)
+            lorieSnapshotDeadSession(s);
+    }
+    return s->process;
+}
+
+/*
+ * Whether the GPU is done with a copy - so what it holds may be let go of - and how that is known.
+ *
+ *   COMPLETE      the renderer that took it from the queue fenced it and reported it: the live
+ *                 connection's watermark, or a later renderer's for a copy an earlier one never took;
+ *   RETIRED       its connection has gone, but the process said as it let go of the state that it had
+ *                 finished everything it had taken up to there;
+ *   PROCESS_DEAD  the process that could still have touched it has exited;
+ *   RECOVERY      nothing can say: the connection has gone and whether its process is alive cannot be
+ *                 told, and LORIE_LOST_SESSION_SETTLE_US has passed. Not a statement that the GPU
+ *                 finished - counted apart (copyForcedSettle), and never made;
+ *   PENDING       none of the above. A connection that has gone, whose process is known to be alive
+ *                 and has not said it is done, keeps everything quarantined for as long as it lives.
+ *
+ * `made` is whether the copy is known to have landed - only ever from the reports of the renderer
+ * that took it. A copy taken by a process that then died is resolved, but not made.
+ */
+typedef enum {
+    LORIE_COPY_PENDING,
+    LORIE_COPY_COMPLETE,
+    LORIE_COPY_RETIRED,
+    LORIE_COPY_PROCESS_DEAD,
+    LORIE_COPY_RECOVERY,
+} LorieCopyResolution;
+
+static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {
+    uint64_t completed = __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE);
+    LorieRendererSessionRec *s = lorieSessionOf(serial);
+
+    *made = FALSE;
+    if (!s)
+        return LORIE_COPY_RECOVERY;             // older than every connection still on record
+
+    if (!s->ended) {
+        if (completed < serial)
+            return LORIE_COPY_PENDING;
+        *made = !lorieGpuCopyKnownNotMade(serial);
+        return LORIE_COPY_COMPLETE;
+    }
+
+    lorieSessionsPoll();
+    if (s->retired) {
+        if (serial <= s->retiredUpTo) {
+            *made = !lorieGpuCopyKnownNotMade(serial);
+            return LORIE_COPY_RETIRED;
+        }
+        // It never took this one from the queue: whichever renderer takes it answers for it.
+        if (completed < serial)
+            return LORIE_COPY_PENDING;
+        *made = !lorieGpuCopyKnownNotMade(serial);
+        return LORIE_COPY_COMPLETE;
+    }
+
+    if (lorieSessionProcess(s) == LORIE_PROCESS_DEAD) {
+        if (s->snapshot) {
+            if (serial <= s->completedAtDeath) {
+                *made = !lorieGpuCopyKnownNotMade(serial);
+                return LORIE_COPY_COMPLETE;
+            }
+            if (serial <= s->drainedAtDeath)
+                return LORIE_COPY_PROCESS_DEAD; // taken and never finished, or cancelled then
+            if (completed < serial)
+                return LORIE_COPY_PENDING;
+            *made = !lorieGpuCopyKnownNotMade(serial);
+            return LORIE_COPY_COMPLETE;
+        }
+        // Found gone after another renderer had connected, so which copies it had taken is no longer
+        // known. Its own reports up to its end stand. Past them, the watermark going by means either
+        // the other renderer finished the copy or this one took it and is gone - safe to let go of
+        // either way, but whether it was made cannot be said.
+        if (completed < serial)
+            return LORIE_COPY_PENDING;
+        *made = serial <= s->completedAtEnd && !lorieGpuCopyKnownNotMade(serial);
+        return LORIE_COPY_PROCESS_DEAD;
+    }
+
+    if (s->process == LORIE_PROCESS_UNKNOWN && lorieNowUs() - s->endedUs >= LORIE_LOST_SESSION_SETTLE_US)
+        return LORIE_COPY_RECOVERY;
+    return LORIE_COPY_PENDING;
+}
+
 // The copy landed: safe to ack it and to tell the client its frame was presented.
 Bool lorieGpuCopyMade(uint64_t serial) {
-    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial &&
-           !lorieGpuCopyKnownNotMade(serial);
+    Bool made;
+
+    return lorieCopyResolve(serial, &made) != LORIE_COPY_PENDING && made;
 }
 
 /*
  * The GPU has finished with this copy's buffers, whichever way it went - so they can be released,
  * and a present waiting on it can stop waiting. A question, not an event.
  *
- * Only the watermark answers it. This used to be "completedSerial has passed it, or it is known not
- * to have been made", and the second half is a different question: an outcome, not a statement
- * about the GPU. A skipped entry is reported as not made the moment it is drained, while earlier
- * entries of the same batch may still be running - and a serial whose failure record had been
- * overwritten counted as not made too, with nothing at all said about where the GPU was. Either one
- * released buffers the GPU could still be using.
+ * For the live connection only the watermark answers it. This used to be "completedSerial has passed
+ * it, or it is known not to have been made", and the second half is a different question: an
+ * outcome, not a statement about the GPU. A skipped entry is reported as not made the moment it is
+ * drained, while earlier entries of the same batch may still be running - and a serial whose failure
+ * record had been overwritten counted as not made too, with nothing at all said about where the GPU
+ * was. Either one released buffers the GPU could still be using.
  *
- * The renderer now advances the watermark past every entry it drains, skips included, and only
- * once the batch's fence has signalled, so the watermark alone is the complete answer. Whether the
- * copy was actually made is lorieGpuCopyMade().
+ * The renderer advances the watermark past every entry it drains, skips included, and only once the
+ * batch's fence has signalled. A copy handed to a connection that has since gone is another matter
+ * - the watermark is a later renderer's by then - and lorieCopyResolve says what does answer for it.
+ * Whether the copy was actually made is lorieGpuCopyMade().
  */
 Bool lorieGpuCopyResolved(uint64_t serial) {
-    return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
+    Bool made;
+
+    return lorieCopyResolve(serial, &made) != LORIE_COPY_PENDING;
 }
 
 // Called where a present is actually put back on the vblank queue to be asked again.
@@ -2130,41 +2399,29 @@ static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
 
 
 /*
- * Whether it is safe to let go of what this copy was using.
- *
- * The renderer having reported the serial is the only direct answer, and used to be the only one
- * asked - which left every copy of a connection that broke waiting forever for a report that could
- * not come. The other way it ends is that the process which held the imported buffers and submitted
- * the GPU work is gone, and a different renderer having connected since is exactly that: the
- * session number only moves when a connection is established.
- *
- * A socket error on its own is neither. It says the request channel is gone, not that the GPU
- * finished, and treating it as completion is what released buffers a still-living renderer could
- * still be reading. So a lost session without a replacement is held instead - for a bounded time,
- * because the records come from a small reserve and holding them all means no copy can be offered
- * at all, which is a visible slowdown rather than a corruption.
+ * Whether it is safe to let go of what this copy was using, by lorieCopyResolve - which used to be
+ * "the live renderer's watermark, or else a fixed wait once its session had ended", the wait taken as
+ * completion and a new connection ending it at once. How it was settled is counted, so a release
+ * that nothing proved safe (RECOVERY) is never mixed up with one that was.
  */
 static Bool lorieCopySettled(LorieAbandonedCopy *c) {
-    // The shared result belongs to whichever renderer is connected now, so it only answers for that
-    // renderer's work. It was consulted for every record: a new session advancing completedSerial
-    // past an old job's serial made that job look completed by a process that had never seen it.
-    if (c->session == lorieRendererSession)
-        return lorieGpuCopyResolved(c->serial);
+    Bool made;
 
-    if (!c->settleByUs || lorieNowUs() < c->settleByUs)
+    switch (lorieCopyResolve(c->serial, &made)) {
+    case LORIE_COPY_PENDING:
         return FALSE;
-
-    /*
-     * Not a statement that the GPU finished, and there is nothing available that would be one. The
-     * session that owed this answer is gone and will never give it, and the alternative is holding
-     * a live client's pixmap and its IdleNotify for the rest of the server's life.
-     *
-     * What is accepted is bounded: a renderer process that outlived its socket may still read a
-     * source the client has since written, and draw a torn frame into output that is no longer on
-     * screen. That is worse than a proof and better than hanging clients, so it is counted rather
-     * than described as safe.
-     */
-    pvfb->state->presentStats.copyForcedSettle++;
+    case LORIE_COPY_RETIRED:
+        pvfb->state->presentStats.copySettledRetired++;
+        break;
+    case LORIE_COPY_PROCESS_DEAD:
+        pvfb->state->presentStats.copySettledProcessDead++;
+        break;
+    case LORIE_COPY_RECOVERY:
+        pvfb->state->presentStats.copyForcedSettle++;
+        break;
+    case LORIE_COPY_COMPLETE:
+        break;
+    }
     return TRUE;
 }
 
@@ -2182,7 +2439,8 @@ static void lorieFinishHeldPresentResources(LorieAbandonedCopy *c) {
 }
 
 // Hands back what a still-running copy is using, once the renderer is done with it. Called every
-// frame and whenever the renderer reports progress.
+// frame, whenever the renderer reports progress, and from the periodic stats timer - which is what
+// still runs when no renderer is connected to tick frames.
 void lorieReapAbandonedCopies(void) {
     LorieAbandonedCopy *c, *tmp;
 
@@ -2371,7 +2629,7 @@ Bool lorieGpuCopyAbandon(void *token) {
     // the source it was given.
     lorieMarkQueuedCopySuperseded(c->serial);
 
-    if (lorieGpuCopyResolved(c->serial)) {
+    if (lorieCopySettled(c)) {
         lorieReleaseCopyResources(c->src, c->dst);
         lorieGiveBackCopyRecord(c);
         return FALSE;
@@ -2383,34 +2641,24 @@ Bool lorieGpuCopyAbandon(void *token) {
 }
 
 /*
- * The connection to the renderer broke. Runs on the X server thread, because settling a copy idles
- * pixmaps and touches Present state; it used to run straight from the socket error on the input
- * thread, which is not allowed to touch either.
- *
- * Nothing is released here. A broken socket says the renderer will never report these serials - it
- * does not say its GPU work finished, and the old code took it as exactly that, releasing buffers a
- * renderer process that outlived its socket could still be reading. All this does is stop waiting
- * for a report that cannot come and start the bounded wait in lorieCopySettled(); new copies are
- * already refused while there is no connection, so nothing joins them in the meantime.
+ * A connection has gone: what it was handed is answered from now on by what lorieCopyResolve can
+ * learn about it, not by the watermark, which belongs to whichever renderer comes next.
  */
-/*
- * Marks every record of the session that has just ended, so lorieCopySettled() stops asking the
- * live renderer's result about work it never saw.
- *
- * settleByUs is when to stop waiting, not when the GPU is known to be done - see lorieCopySettled.
- */
-static void lorieMarkSessionOver(uint32_t session, uint64_t settleByUs, const char *why) {
+static void lorieEndSession(LorieRendererSessionRec *s, const char *why) {
     LorieAbandonedCopy *c;
     unsigned held = 0;
 
-    xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
-        if (c->session == session && !c->settleByUs) {
-            c->settleByUs = settleByUs;
-            held++;
-        }
+    if (!s->id || s->ended)
+        return;
+    s->ended = TRUE;
+    s->endedUs = lorieNowUs();
+    s->completedAtEnd = pvfb->state ? __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) : 0;
 
+    xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
+        if (c->session == s->id)
+            held++;
     if (held)
-        log(INFO, "renderer session %u ended (%s) with %u copies unreported", session, why, held);
+        log(INFO, "renderer session %u (process %d) ended (%s) with %u copies unreported", s->id, s->pid, why, held);
 }
 
 /*
@@ -2418,30 +2666,49 @@ static void lorieMarkSessionOver(uint32_t session, uint64_t settleByUs, const ch
  * pixmaps and touches Present state; it used to run straight from the socket error on the input
  * thread, which is not allowed to touch either.
  *
- * Nothing is released here. A broken socket says the renderer will never report these serials - it
- * does not say its GPU work finished, and the old code took it as exactly that, releasing buffers a
- * renderer process that outlived its socket could still be reading. All this does is stop waiting
- * for a report that cannot come and start the bounded wait in lorieCopySettled(); new copies are
- * already refused while there is no connection, so nothing joins them in the meantime.
+ * Nothing is released here. A broken socket says the renderer will never report these serials on
+ * it - not that its GPU work finished, and not that the process has gone. New copies are already
+ * refused while there is no connection, so nothing joins them in the meantime.
  */
 void lorieNoteRendererLost(void) {
-    lorieMarkSessionOver(lorieRendererSession, lorieNowUs() + LORIE_LOST_SESSION_SETTLE_US,
-                         "socket closed");
+    if (lorieRendererSession)
+        lorieEndSession(&lorieSessions[lorieRendererSession % LORIE_SESSIONS], "socket closed");
     lorieReapAbandonedCopies();
 }
 
 /*
- * A renderer connected. Whatever the previous one had not reported, it is not going to: the process
- * that held the imported buffers and submitted the GPU work has been replaced. Those records are
- * marked over with no further wait - the wait exists for a session that has gone with nothing
- * taking its place, and that is no longer the case.
+ * A renderer connected. The previous connection, if it had not already been noted as gone, has now -
+ * which again says nothing about its process: this one may well be that same process, connecting
+ * again. Its copies stay with what can actually answer for them (lorieCopyResolve); in that case the
+ * process has said it retired before it could connect again (rendererSayRetired runs as it lets go of
+ * the old state, before it sends anything on the new socket).
+ *
+ * The number is written into the shared state before the state is handed over, so the renderer can
+ * tag what it later says about it.
  */
-void lorieNoteRendererConnected(void) {
-    uint32_t previous = lorieRendererSession;
+void lorieNoteRendererConnected(int32_t pid) {
+    LorieRendererSessionRec *s;
+
+    if (lorieRendererSession)
+        lorieEndSession(&lorieSessions[lorieRendererSession % LORIE_SESSIONS], "replaced by a new connection");
 
     lorieRendererSession++;
-    if (previous)
-        lorieMarkSessionOver(previous, lorieNowUs(), "replaced by a new renderer");
+    if (!lorieRendererSession)
+        lorieRendererSession++;                 // 0 means "none"
+    s = &lorieSessions[lorieRendererSession % LORIE_SESSIONS];
+    if (s->id && s->pidfd >= 0)
+        close(s->pidfd);
+    memset(s, 0, sizeof *s);
+    s->id = lorieRendererSession;
+    s->pid = pid;
+    s->pidfd = lorieOpenPidfd(pid);
+    s->firstSerial = pvfb->gpuCopySerialCounter + 1;
+    s->process = LORIE_PROCESS_UNKNOWN;
+    if (pvfb->state)
+        __atomic_store_n(&pvfb->state->sessionTag, s->id, __ATOMIC_RELEASE);
+    log(INFO, "renderer session %u: process %d (%s)", s->id, pid,
+        s->pidfd >= 0 ? "watched by pidfd" : pid > 0 ? "watched by kill(0)" : "not known");
+
     lorieReapAbandonedCopies();
 }
 

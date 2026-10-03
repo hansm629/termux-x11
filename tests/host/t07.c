@@ -13,16 +13,46 @@ struct fakeShared {
         volatile uint64_t failedSerials[LORIE_GPU_COPY_FAILED_SLOTS_FOR_STATE];
         volatile uint32_t failedCount;
         volatile uint64_t failedLostUpTo;
+        volatile uint32_t readIndex, writeIndex;
+        struct { uint64_t serial; } entries[8];
     } gpuCopyQueue;
+    /* what the session bookkeeping reads; these tests stay within one live connection */
+    volatile uint32_t sessionTag;
+    struct { volatile uint32_t seq, session; volatile int32_t pid; volatile uint64_t serial; } retired[4];
+    volatile uint32_t retiredClaim;
 };
 static struct fakeShared shared;
 static struct fakeShared *state = &shared;                 /* renderer's view */
-static struct { struct fakeShared *state; } fakePvfb = { &shared };
+static struct { struct fakeShared *state; uint64_t gpuCopySerialCounter; } fakePvfb = { &shared, 0 };
 #define pvfb (&fakePvfb)                                    /* X server's view */
+static uint64_t lorieNowUs(void) { return 0; }
+static Bool lorieCancelQueuedEntry(uint32_t slot) { (void) slot; return FALSE; }
+static void lorieRootCopyCancelled(uint64_t serial) { (void) serial; }
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#define log(prio, ...) ((void) 0)
+#define PROP_VALUE_MAX 92
+#define __system_property_get(name, value) 0
+#define kill(pid, sig) (-1)
+#define close(fd) ((void) 0)
 #include "t07_src.inc"
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
-static void reset(void) { __builtin_memset(&shared, 0, sizeof shared); }
+static void reset(void) {
+    __builtin_memset(&shared, 0, sizeof shared);
+#ifdef HAVE_SESSIONS
+    /* one live connection, which every serial here belongs to */
+    __builtin_memset(lorieSessions, 0, sizeof lorieSessions);
+    lorieRendererSession = 1;
+    lorieSessions[1].id = 1;
+    lorieSessions[1].firstSerial = 1;
+#endif
+}
 
 int main(void) {
     /* a. serial 7 skipped while 5 and 6 of the same batch are still on the GPU: the outcome is known

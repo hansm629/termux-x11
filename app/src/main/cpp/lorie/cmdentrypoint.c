@@ -495,11 +495,19 @@ bool lorieConnectionAlive(void) {
     return !(poll(&p, 1, 0) == 1 && (p.revents & (POLLERR | POLLNVAL | POLLRDHUP | POLLHUP)));
 }
 
+/* A new connection on its way from the Binder thread that made it to the X server thread. A few
+ * slots, taken in turn: connections are made one at a time, each picked up right after. */
+static struct { int fd; int32_t pid; } lorieNewConnections[4];
+static uint32_t lorieNewConnectionNext;
+
 static Bool addFd(__unused ClientPtr pClient, void *closure) {
-    InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, NULL);
-    conn_fd = (int) (int64_t) closure;
+    int fd = lorieNewConnections[(uintptr_t) closure].fd;
+    int32_t pid = lorieNewConnections[(uintptr_t) closure].pid;
+
+    InputThreadRegisterDev(fd, handleLorieEvents, NULL);
+    conn_fd = fd;
     // Before anything is offered to it, so every copy carries the session that owes its report.
-    lorieNoteRendererConnected();
+    lorieNoteRendererConnected(pid);
     lorieActivityConnected();
     return TRUE;
 }
@@ -551,8 +559,31 @@ Java_com_termux_x11_CmdEntryPoint_getXConnection(JNIEnv *env, __unused jobject c
     int client[2];
     jclass ParcelFileDescriptorClass = (*env)->FindClass(env, "android/os/ParcelFileDescriptor");
     jmethodID adoptFd = (*env)->GetStaticMethodID(env, ParcelFileDescriptorClass, "adoptFd", "(I)Landroid/os/ParcelFileDescriptor;");
+    /*
+     * Which process is asking: this runs inside the Binder call the renderer's activity makes, so the
+     * calling pid is the renderer's. The socket cannot say - it is a pair made here, and its peer
+     * credentials are this process's own. The X server needs it to tell, once a connection has gone,
+     * whether the process that may still be using its buffers has gone too (lorieCopyResolve).
+     */
+    jclass BinderClass = (*env)->FindClass(env, "android/os/Binder");
+    jmethodID getCallingPid = BinderClass ? (*env)->GetStaticMethodID(env, BinderClass, "getCallingPid", "()I") : NULL;
+    int32_t pid = getCallingPid ? (int32_t) (*env)->CallStaticIntMethod(env, BinderClass, getCallingPid) : 0;
+
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        pid = 0;
+    }
+    if (pid == (int32_t) getpid())
+        pid = 0;   // not a call from another process after all: nothing to watch
     socketpair(AF_UNIX, SOCK_STREAM, 0, client);
-    QueueWorkProc(addFd, NULL, (void*) (int64_t) client[1]);
+    {
+        uint32_t n = __atomic_fetch_add(&lorieNewConnectionNext, 1, __ATOMIC_RELAXED) % 4u;
+
+        lorieNewConnections[n].fd = client[1];
+        lorieNewConnections[n].pid = pid;
+        // QueueWorkProc's own locking orders these stores before the X server thread reads them.
+        QueueWorkProc(addFd, NULL, (void*) (uintptr_t) n);
+    }
     lorieWakeServer();
 
     return (*env)->CallStaticObjectMethod(env, ParcelFileDescriptorClass, adoptFd, client[0]);

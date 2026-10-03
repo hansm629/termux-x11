@@ -23,13 +23,13 @@ int main(void) {
         taken[i] = lorieTakeCopyRecord();
         CHECK(taken[i] != NULL, "record %d of %d not available", i, LORIE_COPY_RECORDS);
         for (int j = 0; j < i; j++) CHECK(taken[i] != taken[j], "record %d handed out twice", i);
-        taken[i]->serial = 1000 + i; taken[i]->settleByUs = 7; taken[i]->src = (LorieBuffer *) 1;
+        taken[i]->serial = 1000 + i; taken[i]->session = 7; taken[i]->src = (LorieBuffer *) 1;
     }
     CHECK(lorieTakeCopyRecord() == NULL, "a record handed out with the reserve exhausted - the copy would be untracked");
     lorieGiveBackCopyRecord(taken[5]);
     LorieAbandonedCopy *again = lorieTakeCopyRecord();
     CHECK(again == taken[5], "freed record not reused");
-    CHECK(again && again->serial == 0 && again->settleByUs == 0 && again->src == NULL && again->inUse,
+    CHECK(again && again->serial == 0 && again->session == 0 && again->src == NULL && again->inUse,
           "reused record still carries the previous job's state");
     CHECK(lorieTakeCopyRecord() == NULL, "reserve should be exhausted again");
     printf("T10 copy record reserve: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
