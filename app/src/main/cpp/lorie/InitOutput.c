@@ -1118,6 +1118,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.zeroCopyFenceErrors = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyFenceErrors, 0, __ATOMIC_RELAXED);
     snap.rootStaleSlotReleases = __atomic_exchange_n(&pvfb->state->presentStats.rootStaleSlotReleases, 0, __ATOMIC_RELAXED);
     snap.rootClaimsAcrossPools = __atomic_exchange_n(&pvfb->state->presentStats.rootClaimsAcrossPools, 0, __ATOMIC_RELAXED);
+    snap.cursorOverlayWaits = __atomic_exchange_n(&pvfb->state->presentStats.cursorOverlayWaits, 0, __ATOMIC_RELAXED);
     snap.zeroCopyStalls = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyStalls, 0, __ATOMIC_RELAXED);
 
 
@@ -1203,6 +1204,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 log(INFO, "XlorieBackend: %u release fences could not be waited on; those slots "
                           "stay held until the pool is replaced",
                     snap.zeroCopyFenceErrors);
+            if (snap.cursorOverlayWaits)
+                log(INFO, "XlorieCursor: %u cursor image updates put off with every cursor buffer still "
+                          "with the compositor", snap.cursorOverlayWaits);
 
             log(INFO, "XlorieBackend: asked for %s, filtering %s%s; %u direct submits, %u nothing-new, "
                       "%u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",

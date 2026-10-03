@@ -96,6 +96,16 @@ recipes = {
         + opt(lambda: "static uint32_t rendererSessionTag = 0;\n"
             + func(R, "static void rendererSayRetired(struct lorie_shared_server_state *st) {"),
             "static void rendererSayRetired", R),
+    "cursor": lambda: span(R, "#define LORIE_CURSOR_BUFFERS 4", "static bool cursorOverlayRenderPending = false;")
+        + span(R, "typedef enum { LORIE_ZC_FENCE_DONE, LORIE_ZC_FENCE_WAITING, LORIE_ZC_FENCE_UNUSABLE } LorieZcFence;",
+               "} LorieZcFence;")
+        + func(R, "static LorieZcFence rootZcFenceState(int fd) {")
+        + func(R, "static int cursorPoolTake(void) {")
+        + func(R, "static void cursorPoolHand(int slot) {")
+        + func(R, "static uint32_t cursorPoolSetOnLayer(int slot) {")
+        + func(R, "static void cursorPoolReleaseReported(uint32_t seq, int fd, bool reportCarriedLayer) {")
+        + func(R, "static void cursorPoolDrain(void) {")
+        + func(R, "static void cursorPoolOrphan(void) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

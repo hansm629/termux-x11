@@ -160,6 +160,7 @@ static void rendererRetireFrame(void);
  * whether GLES is the platform driver or ANGLE on Vulkan.
  */
 static bool cursorOverlayUsable(void);
+static void cursorPoolDrain(void);
 static void ensureCursorOverlay(void);
 static void teardownCursorOverlay(void);
 static void markCursorOverlayDirty(bool bufferMightHaveChanged);
@@ -179,14 +180,50 @@ static pthread_mutex_t cursorOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 // Guarded by cursorOverlayLock.
 static bool cursorOverlayGeometryDirty = false, cursorOverlayBufferDirty = false;
 static bool cursorOverlayCallbackArmed = false; // is a choreographer callback pending?
-static AHardwareBuffer *cursorOverlayPendingBuffer = NULL; // reference held for the overlay thread
-// Renderer thread only. Two render targets, because the compositor keeps reading the buffer it was
-// given until a later one replaces it: rendering a new cursor image into that same buffer both races
-// its reads and hands it a handle it already has, which is why a cursor change could leave the old
-// image on screen. Alternating means every update arrives as a buffer the compositor has not seen.
-static LorieBuffer *cursorOverlayRenderTarget[2] = { NULL, NULL };
-static uint32_t cursorOverlayTargetW[2] = { 0, 0 }, cursorOverlayTargetH[2] = { 0, 0 };
-static unsigned cursorOverlayTargetIndex = 0;
+/*
+ * The buffers the cursor image is rendered into and handed to the compositor.
+ *
+ * There used to be two, used in turn: each update went into the one not handed over last. That only
+ * says the compositor was given a different buffer since - not that it has finished with this one.
+ * It keeps reading a buffer until a later one is latched in its place and the release fence it then
+ * hands back has signalled, and the overlay thread can have applied a new buffer more than once in
+ * between; rendering into the older one then raced the compositor's reads.
+ *
+ * So each buffer goes round with its own state, and comes back only on the compositor's word:
+ *
+ *   FREE       nobody has it; may be rendered into, or reallocated.
+ *   HANDED     rendered, waiting for the overlay thread to apply it. A newer render takes its place
+ *              before it is applied, and then it is FREE again - the compositor never saw it.
+ *   ON_LAYER   the last buffer set on the layer.
+ *   RETIRING   replaced on the layer by a later one. The transaction that replaced it reports, on
+ *              completion, the fence that signals when the compositor has let go of it (retireSeq
+ *              matches that report to this buffer); FREE once that fence has signalled. A fence that
+ *              cannot be waited on keeps it here: time passing is not the compositor's word.
+ *   ORPHANED   it belonged to a layer that has since been torn down, which may still be showing it
+ *              and from which no further release will come. Never reused: our reference is dropped
+ *              on the renderer thread and a new buffer is made in its place.
+ *
+ * Guarded by cursorOverlayLock: the renderer renders, the overlay thread applies, and the
+ * completion arrives on a binder thread.
+ */
+#define LORIE_CURSOR_BUFFERS 4
+enum { LORIE_CURSOR_FREE, LORIE_CURSOR_HANDED, LORIE_CURSOR_ON_LAYER, LORIE_CURSOR_RETIRING, LORIE_CURSOR_ORPHANED };
+static struct {
+    LorieBuffer *buffer;
+    uint32_t w, h;
+    int state;
+    uint32_t retireSeq;
+    int fenceFd;
+    bool fenceArrived, fenceUnusable;
+} cursorPool[LORIE_CURSOR_BUFFERS];
+static int cursorPoolHandedSlot = -1;           // the one HANDED buffer, if any
+static uint32_t cursorPoolRetireSeq = 0;        // never reused, so an old layer's report matches nothing
+static bool cursorOverlayRenderPending = false; // an update found no FREE buffer and has to be redone
+static int cursorPoolTake(void);
+static void cursorPoolHand(int slot);
+static uint32_t cursorPoolSetOnLayer(int slot);
+static void cursorPoolReleaseReported(uint32_t seq, int fd, bool reportCarriedLayer);
+static void cursorPoolOrphan(void);
 static GLuint cursorOverlayFbo = 0;
 static uint32_t cursorOverlayRawW = 0, cursorOverlayRawH = 0;
 // The root buffer's size as of the last frame. The overlay thread needs it to place the cursor and
@@ -2831,22 +2868,21 @@ static void armCursorOverlayCallbackIfNeeded(void) {
 // the lock, which is the obvious way to write this, lets teardownCursorOverlay() release it from the
 // renderer thread in between. Applying a transaction is an asynchronous one-way call, so holding the
 // lock across it costs the renderer nothing worth measuring.
+static void cursorOverlayOnComplete(void *context, ASurfaceTransactionStats *stats);
+
 static void applyCursorOverlayIfDirty(void) {
     bool geometryDirty, bufferDirty, visible;
-    AHardwareBuffer *buf = NULL;
     ASurfaceTransaction *t;
     int32_t x = 0, y = 0;
     uint32_t w = 0, h = 0;
+    int slot;
 
     pthread_mutex_lock(&cursorOverlayLock);
 
     geometryDirty = cursorOverlayGeometryDirty;
     bufferDirty = cursorOverlayBufferDirty;
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
-    if (bufferDirty) {
-        buf = cursorOverlayPendingBuffer;
-        cursorOverlayPendingBuffer = NULL;
-    }
+    slot = bufferDirty ? cursorPoolHandedSlot : -1;
 
     if (cursorSurfaceControl && (geometryDirty || bufferDirty) && state) {
         visible = computeCursorOverlayRect(&x, &y, &w, &h);
@@ -2858,20 +2894,45 @@ static void applyCursorOverlayIfDirty(void) {
         scApi.txSetVisibility(t, cursorSurfaceControl, visible ? ASURFACE_TRANSACTION_VISIBILITY_SHOW
                                                               : ASURFACE_TRANSACTION_VISIBILITY_HIDE);
         scApi.txSetZOrder(t, cursorSurfaceControl, 1); // above the window's own buffer
-        if (visible) {
-            if (buf)
-                scApi.txSetBuffer(t, cursorSurfaceControl, buf, -1);
+        // Set even while hidden, so the buffer the layer has is always the one the pool says it has.
+        if (slot >= 0 && cursorPool[slot].state == LORIE_CURSOR_HANDED && cursorPool[slot].buffer &&
+            LorieBuffer_description(cursorPool[slot].buffer)->buffer) {
+            uint32_t retireSeq = cursorPoolSetOnLayer(slot);
+
+            scApi.txSetBuffer(t, cursorSurfaceControl, LorieBuffer_description(cursorPool[slot].buffer)->buffer, -1);
+            // The buffer this one replaces comes back when the compositor says so, not before.
+            if (retireSeq)
+                scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, cursorOverlayOnComplete);
+        }
+        if (visible)
             // Rendered at exactly w x h already, so the compositor never scales or filters it.
             scApi.txSetGeometry(t, cursorSurfaceControl, &src, &dst, 0);
-        }
         scApi.txApply(t);
         scApi.txDelete(t);
     }
 
     pthread_mutex_unlock(&cursorOverlayLock);
+}
 
-    if (buf)
-        AHardwareBuffer_release(buf);
+/*
+ * Binder thread: a cursor transaction that set a buffer has completed, and with it comes the fence
+ * for the buffer it replaced. Asked with the control the stats themselves carry - asking about one
+ * they do not is fatal (see rootZcOnComplete) - and every cursor transaction carries just the one.
+ */
+static void cursorOverlayOnComplete(void *context, ASurfaceTransactionStats *stats) {
+    ASurfaceControl **controls = NULL;
+    size_t count = 0;
+    int fd = -1;
+
+    scApi.statsGetControls(stats, &controls, &count);
+    if (count > 0)
+        fd = scApi.statsPrevReleaseFenceFd(stats, controls[0]);
+    if (controls)
+        scApi.statsReleaseControls(controls);
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    cursorPoolReleaseReported((uint32_t) (uintptr_t) context, fd, count > 0);
+    pthread_mutex_unlock(&cursorOverlayLock);
 }
 
 static void cursorOverlayFrameCallback(__unused long t, __unused void *data) {
@@ -2895,33 +2956,11 @@ static void *cursorOverlayThreadMain(__unused void *cookie) {
     }
 }
 
-// Hands the overlay thread a fresh reference to the render target's buffer. Used both after
-// re-rendering it and when a brand new ASurfaceControl needs one resent.
-static void resendCursorOverlayBuffer(void) {
-    LorieBuffer *target = cursorOverlayRenderTarget[cursorOverlayTargetIndex];
-    AHardwareBuffer *ahb;
-
-    if (!target)
-        return;
-
-    ahb = LorieBuffer_description(target)->buffer;
-    if (!ahb)
-        return;
-    AHardwareBuffer_acquire(ahb);
-
-    pthread_mutex_lock(&cursorOverlayLock);
-    if (cursorOverlayPendingBuffer)
-        AHardwareBuffer_release(cursorOverlayPendingBuffer);
-    cursorOverlayPendingBuffer = ahb;
-    cursorOverlayBufferDirty = true;
-    pthread_mutex_unlock(&cursorOverlayLock);
-    wakeCursorOverlayIfIdle();
-}
-
 // Renderer thread, EGL context current. Draws the cursor scaled to its destination size into an
 // AHardwareBuffer, so the compositor gets a buffer already the right size and never filters it.
 static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
-    unsigned slot = cursorOverlayTargetIndex ^ 1u; // never the one the compositor is holding
+    LorieBuffer *drop[LORIE_CURSOR_BUFFERS];
+    int slot, i, dropCount = 0;
     GLint prevViewport[4];
     EGLSync fence;
 
@@ -2929,27 +2968,53 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
         state->cursor.width > LORIE_CURSOR_TEX_SIZE || state->cursor.height > LORIE_CURSOR_TEX_SIZE)
         return;
 
-    // The overlay keeps its previous image if the lock cannot be taken.
-    if (!lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid))
+    // A buffer nobody holds: the compositor's releases are taken in first, and what a torn-down layer
+    // left behind is let go of here, where the GL context needed for that is current.
+    pthread_mutex_lock(&cursorOverlayLock);
+    cursorPoolDrain();
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++)
+        if (cursorPool[i].state == LORIE_CURSOR_ORPHANED) {
+            drop[dropCount++] = cursorPool[i].buffer;
+            cursorPool[i].buffer = NULL;
+            cursorPool[i].w = cursorPool[i].h = 0;
+            cursorPool[i].state = LORIE_CURSOR_FREE;
+        }
+    slot = cursorPoolTake();
+    // Every one is still with the compositor: the image stays as it is, and this is redone on a
+    // later frame, once one has come back. Never a buffer it may still be reading.
+    cursorOverlayRenderPending = slot < 0;
+    pthread_mutex_unlock(&cursorOverlayLock);
+    for (i = 0; i < dropCount; i++)
+        if (drop[i])
+            LorieBuffer_release(drop[i]);
+    if (slot < 0) {
+        __atomic_fetch_add(&state->presentStats.cursorOverlayWaits, 1, __ATOMIC_RELAXED);
         return;
+    }
+
+    // The overlay keeps its previous image if the lock cannot be taken.
+    if (!lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid)) {
+        cursorOverlayRenderPending = true;
+        return;
+    }
     bindTexture(cursor.id);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height,
                     GL_RGBA, GL_UNSIGNED_BYTE, (const void *) state->cursor.bits);
     lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
 
-    if (!cursorOverlayRenderTarget[slot] ||
-        cursorOverlayTargetW[slot] != destW || cursorOverlayTargetH[slot] != destH) {
-        if (cursorOverlayRenderTarget[slot])
-            LorieBuffer_release(cursorOverlayRenderTarget[slot]);
-        cursorOverlayRenderTarget[slot] = LorieBuffer_allocate((int32_t) destW, (int32_t) destH,
-                                                              AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
-                                                              LORIEBUFFER_AHARDWAREBUFFER);
-        if (cursorOverlayRenderTarget[slot])
-            LorieBuffer_attachToGL(cursorOverlayRenderTarget[slot]);
-        cursorOverlayTargetW[slot] = cursorOverlayRenderTarget[slot] ? destW : 0;
-        cursorOverlayTargetH[slot] = cursorOverlayRenderTarget[slot] ? destH : 0;
+    // FREE, so nothing else can be using it while it is rendered into or replaced.
+    if (!cursorPool[slot].buffer || cursorPool[slot].w != destW || cursorPool[slot].h != destH) {
+        if (cursorPool[slot].buffer)
+            LorieBuffer_release(cursorPool[slot].buffer);
+        cursorPool[slot].buffer = LorieBuffer_allocate((int32_t) destW, (int32_t) destH,
+                                                       AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                                       LORIEBUFFER_AHARDWAREBUFFER);
+        if (cursorPool[slot].buffer)
+            LorieBuffer_attachToGL(cursorPool[slot].buffer);
+        cursorPool[slot].w = cursorPool[slot].buffer ? destW : 0;
+        cursorPool[slot].h = cursorPool[slot].buffer ? destH : 0;
     }
-    if (!cursorOverlayRenderTarget[slot])
+    if (!cursorPool[slot].buffer)
         return;
 
     glGetIntegerv(GL_VIEWPORT, prevViewport);
@@ -2957,7 +3022,7 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
         glGenFramebuffers(1, &cursorOverlayFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, cursorOverlayFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           LorieBuffer_getGLTextureId(cursorOverlayRenderTarget[slot]), 0);
+                           LorieBuffer_getGLTextureId(cursorPool[slot].buffer), 0);
     glViewport(0, 0, (GLsizei) destW, (GLsizei) destH);
     glClearColor(0.f, 0.f, 0.f, 0.f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -2976,10 +3041,14 @@ static void renderCursorOverlayBuffer(uint32_t destW, uint32_t destH) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 
-    cursorOverlayTargetIndex = slot;
     cursorOverlayRawW = destW;
     cursorOverlayRawH = destH;
-    resendCursorOverlayBuffer();
+
+    pthread_mutex_lock(&cursorOverlayLock);
+    cursorPoolHand(slot);
+    cursorOverlayBufferDirty = true;
+    pthread_mutex_unlock(&cursorOverlayLock);
+    wakeCursorOverlayIfIdle();
 }
 
 static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
@@ -3000,7 +3069,8 @@ static void markCursorOverlayDirty(bool bufferMightHaveChanged) {
     destW = (uint32_t) wantW;
     destH = (uint32_t) wantH;
 
-    if (bufferMightHaveChanged || destW != cursorOverlayRawW || destH != cursorOverlayRawH)
+    if (bufferMightHaveChanged || cursorOverlayRenderPending ||
+        destW != cursorOverlayRawW || destH != cursorOverlayRawH)
         renderCursorOverlayBuffer(destW, destH);
 }
 
@@ -3025,10 +3095,10 @@ static void teardownCursorOverlay(void) {
     }
 
     cursorOverlayGeometryDirty = cursorOverlayBufferDirty = false;
-    if (cursorOverlayPendingBuffer) {
-        AHardwareBuffer_release(cursorOverlayPendingBuffer);
-        cursorOverlayPendingBuffer = NULL;
-    }
+    // What the old layer had, or was given last, is never rendered into again; the next layer gets
+    // the image afresh.
+    cursorPoolOrphan();
+    cursorOverlayRenderPending = true;
 
     pthread_mutex_unlock(&cursorOverlayLock);
 }
@@ -3052,6 +3122,17 @@ static void ensureCursorOverlay(void) {
         if (!cursorOverlayFeatureAvailable)
             return;
 
+        // Without a completion report there is no way to know when the compositor has let go of a
+        // cursor buffer, and so none could ever be rendered into again.
+        if (!scApi.txSetOnComplete || !scApi.statsPrevReleaseFenceFd ||
+            !scApi.statsGetControls || !scApi.statsReleaseControls) {
+            static bool said = false;
+            if (!said)
+                log("Xlorie: no SurfaceControl completion reports here, drawing the cursor in GL instead");
+            said = true;
+            return;
+        }
+
         pthread_mutex_lock(&cursorOverlayLock);
         if (!cursorSurfaceControl) {
             cursorSurfaceControl = scApi.createFromWindow(win, "lorie-cursor");
@@ -3065,7 +3146,13 @@ static void ensureCursorOverlay(void) {
         pthread_mutex_unlock(&cursorOverlayLock);
 
         if (created) {
-            resendCursorOverlayBuffer(); // a new layer starts out with no buffer of its own
+            // A new layer starts out with no buffer of its own: render the image for it on the next
+            // frame, into a buffer nothing else holds.
+            pthread_mutex_lock(&cursorOverlayLock);
+            cursorOverlayRenderPending = true;
+            pthread_mutex_unlock(&cursorOverlayLock);
+            if (state)
+                state->cursor.updated = true;
             // Erase whatever the GL path last drew into the surface: from here on frames carry no
             // cursor, and on an idle desktop nothing else would redraw over it.
             if (state)
@@ -3164,6 +3251,120 @@ static LorieZcFence rootZcFenceState(int fd) {
     if (pfd.revents & POLLIN)
         return LORIE_ZC_FENCE_DONE;
     return LORIE_ZC_FENCE_UNUSABLE;
+}
+
+/*
+ * Cursor buffer pool transitions (see cursorPool). cursorOverlayLock held for all of them.
+ */
+
+// A buffer nobody holds, for a new image; -1 when every one is still with the compositor.
+static int cursorPoolTake(void) {
+    int i;
+
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++)
+        if (cursorPool[i].state == LORIE_CURSOR_FREE)
+            return i;
+    return -1;
+}
+
+// A new image for the overlay thread. One handed over before and not applied yet goes back: the
+// compositor never saw it.
+static void cursorPoolHand(int slot) {
+    if (cursorPoolHandedSlot >= 0 && cursorPoolHandedSlot != slot &&
+        cursorPool[cursorPoolHandedSlot].state == LORIE_CURSOR_HANDED)
+        cursorPool[cursorPoolHandedSlot].state = LORIE_CURSOR_FREE;
+    cursorPool[slot].state = LORIE_CURSOR_HANDED;
+    cursorPool[slot].fenceFd = -1;   // the array starts zeroed, and 0 is a descriptor
+    cursorPool[slot].fenceArrived = cursorPool[slot].fenceUnusable = false;
+    cursorPoolHandedSlot = slot;
+}
+
+// The overlay thread puts the HANDED buffer on the layer. The one there before starts retiring, and
+// the seq returned is what the completion of this transaction has to carry to bring it back; 0 if
+// there was none.
+static uint32_t cursorPoolSetOnLayer(int slot) {
+    uint32_t seq = 0;
+    int i;
+
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++)
+        if (i != slot && cursorPool[i].state == LORIE_CURSOR_ON_LAYER) {
+            if (++cursorPoolRetireSeq == 0)
+                cursorPoolRetireSeq = 1;
+            seq = cursorPoolRetireSeq;
+            cursorPool[i].state = LORIE_CURSOR_RETIRING;
+            cursorPool[i].retireSeq = seq;
+            cursorPool[i].fenceFd = -1;
+            cursorPool[i].fenceArrived = cursorPool[i].fenceUnusable = false;
+        }
+    cursorPool[slot].state = LORIE_CURSOR_ON_LAYER;
+    if (cursorPoolHandedSlot == slot)
+        cursorPoolHandedSlot = -1;
+    return seq;
+}
+
+// A completion: the release fence for the buffer that transaction replaced. -1 from a report that
+// carried the layer means the compositor had let go of it already; a report that did not carry it
+// says nothing, and the buffer is held. A report matching no retiring buffer belongs to a layer
+// that has been torn down since - its seq was never reused - and only its fence is closed.
+static void cursorPoolReleaseReported(uint32_t seq, int fd, bool reportCarriedLayer) {
+    int i;
+
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++)
+        if (cursorPool[i].state == LORIE_CURSOR_RETIRING && cursorPool[i].retireSeq == seq &&
+            !cursorPool[i].fenceArrived) {
+            cursorPool[i].fenceArrived = true;
+            cursorPool[i].fenceFd = reportCarriedLayer ? fd : -1;
+            cursorPool[i].fenceUnusable = !reportCarriedLayer;
+            return;
+        }
+    if (fd >= 0)
+        close(fd);
+}
+
+// Takes back every retiring buffer whose release fence has signalled.
+static void cursorPoolDrain(void) {
+    int i;
+
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++) {
+        if (cursorPool[i].state != LORIE_CURSOR_RETIRING || !cursorPool[i].fenceArrived ||
+            cursorPool[i].fenceUnusable)
+            continue;
+        switch (rootZcFenceState(cursorPool[i].fenceFd)) {
+        case LORIE_ZC_FENCE_DONE:
+            if (cursorPool[i].fenceFd >= 0)
+                close(cursorPool[i].fenceFd);
+            cursorPool[i].fenceFd = -1;
+            cursorPool[i].state = LORIE_CURSOR_FREE;
+            break;
+        case LORIE_ZC_FENCE_UNUSABLE:
+            // Held until its layer goes: nothing has said the compositor is finished with it.
+            close(cursorPool[i].fenceFd);
+            cursorPool[i].fenceFd = -1;
+            cursorPool[i].fenceUnusable = true;
+            if (state)
+                __atomic_fetch_add(&state->presentStats.zeroCopyFenceErrors, 1, __ATOMIC_RELAXED);
+            break;
+        case LORIE_ZC_FENCE_WAITING:
+            break;
+        }
+    }
+}
+
+// The layer is going. What it had, or had been given, is never rendered into again; a buffer still
+// waiting for the overlay thread was never seen by the compositor and simply goes back.
+static void cursorPoolOrphan(void) {
+    int i;
+
+    for (i = 0; i < LORIE_CURSOR_BUFFERS; i++) {
+        if (cursorPool[i].state == LORIE_CURSOR_FREE)
+            continue;
+        if (cursorPool[i].fenceFd >= 0)
+            close(cursorPool[i].fenceFd);
+        cursorPool[i].fenceFd = -1;
+        cursorPool[i].state = cursorPool[i].state == LORIE_CURSOR_HANDED ? LORIE_CURSOR_FREE
+                                                                        : LORIE_CURSOR_ORPHANED;
+    }
+    cursorPoolHandedSlot = -1;
 }
 
 // Binder thread. Reports the release fence of the buffer set by the transaction before this one.

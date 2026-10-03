@@ -703,6 +703,9 @@ struct lorie_shared_server_state {
         /* Claims of a root slot made again because the X server replaced the pool while the claim
          * was being made (see rendererClaimRootBuffer). */
         volatile uint32_t rootClaimsAcrossPools;
+        /* Cursor image updates put off because every cursor buffer was still with the compositor
+         * (see cursorPool in renderer.c); each is redone on a later frame. */
+        volatile uint32_t cursorOverlayWaits;
     } presentStats;
 
     /*
