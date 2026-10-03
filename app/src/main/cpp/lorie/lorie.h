@@ -428,21 +428,32 @@ struct lorie_shared_server_state {
      *
      * rootHandover carries all of it in one word, so the handover needs no mutex:
      *
-     *   bits 0..2  one bit per slot, set while the renderer still needs that slot
-     *   bits 3..4  the slot published most recently - what the renderer takes next
-     *   bits 5..   publish counter, for debugging
+     *   bits 0..4    one bit per slot, set while the renderer still needs that slot
+     *   bits 5..7    the slot published most recently - what the renderer takes next
+     *   bits 8..15   publish counter, for debugging; wraps within its own bits
+     *   bits 16..31  which pool of buffers the rest is about - odd while the X server is replacing it
      *
      * Only the renderer writes the held bits and only the X server writes the published slot, but
      * both compare-and-swap the whole word, so neither can lose the other's update. The X server
      * publishes only when a slot is free for it to draw into next, and otherwise keeps drawing into
      * the one it has for another frame - so it never blocks, it just drops a frame the display could
      * not have shown anyway.
+     *
+     * The pool generation is in the same word for the same reason. Slots are named by index, and a
+     * replaced pool reuses the indexes: a claim or a release made against the old pool must not
+     * land on the new one. The X server marks the generation odd before it writes the new buffer
+     * ids and makes it even again with the word it resets, so the renderer can tell a claim that
+     * straddled a replacement - and a release, being a compare-and-swap of this word, cannot clear a
+     * bit in a generation it was not made in.
      */
 #define LORIE_ROOT_SLOTS 5
 #define LORIE_ROOT_HELD_MASK 0x1fu
 #define LORIE_ROOT_NEWEST_SHIFT 5
 #define LORIE_ROOT_NEWEST_MASK 0x7u
 #define LORIE_ROOT_COUNT_STEP 0x100u
+#define LORIE_ROOT_COUNT_MASK 0xff00u
+#define LORIE_ROOT_GEN_SHIFT 16
+#define LORIE_ROOT_GEN(word) ((uint32_t) (word) >> LORIE_ROOT_GEN_SHIFT)
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     volatile uint32_t rootHandover;
@@ -660,6 +671,9 @@ struct lorie_shared_server_state {
         /* Slot releases that arrived after the X server had replaced the pool, and so named an index
          * that now belongs to a different buffer. Not released - see rendererReleaseRootSlot. */
         volatile uint32_t rootStaleSlotReleases;
+        /* Claims of a root slot made again because the X server replaced the pool while the claim
+         * was being made (see rendererClaimRootBuffer). */
+        volatile uint32_t rootClaimsAcrossPools;
     } presentStats;
 
     /*

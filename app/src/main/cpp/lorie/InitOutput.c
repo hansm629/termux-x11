@@ -1107,6 +1107,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.xLockWaits = __atomic_exchange_n(&pvfb->state->presentStats.xLockWaits, 0, __ATOMIC_RELAXED);
     snap.zeroCopyFenceErrors = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyFenceErrors, 0, __ATOMIC_RELAXED);
     snap.rootStaleSlotReleases = __atomic_exchange_n(&pvfb->state->presentStats.rootStaleSlotReleases, 0, __ATOMIC_RELAXED);
+    snap.rootClaimsAcrossPools = __atomic_exchange_n(&pvfb->state->presentStats.rootClaimsAcrossPools, 0, __ATOMIC_RELAXED);
     snap.zeroCopyStalls = __atomic_exchange_n(&pvfb->state->presentStats.zeroCopyStalls, 0, __ATOMIC_RELAXED);
 
 
@@ -1183,9 +1184,11 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             const char *asked = lorieOutputBackend == LORIE_OUTPUT_ROOT_DIRECT ? "root-direct"
                               : lorieOutputBackend == LORIE_OUTPUT_GPU_COPY ? "gpu-copy" : "auto";
 
-            if (snap.rootStaleSlotReleases)
+            if (snap.rootStaleSlotReleases || snap.rootClaimsAcrossPools)
                 log(INFO, "XlorieBackend: %u slot releases arrived after their pool was replaced and were "
-                          "not applied to the new one", snap.rootStaleSlotReleases);
+                          "not applied to the new one; %u claims made again because the pool was "
+                          "replaced while they were being made",
+                    snap.rootStaleSlotReleases, snap.rootClaimsAcrossPools);
             if (snap.zeroCopyFenceErrors)
                 log(INFO, "XlorieBackend: %u release fences could not be waited on; those slots "
                           "stay held until the pool is replaced",
@@ -3071,9 +3074,31 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     }
     RegionUninit(&all);
 
-    for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
+    for (i = 0; i < LORIE_ROOT_SLOTS; i++)
         lorieRegisterBuffer(priv->rootBuf[i]);
-        pvfb->state->rootBufferIds[i] = LorieBuffer_description(priv->rootBuf[i])->id;
+
+    /*
+     * The new ids go out inside a generation change (see rootHandover in lorie.h): marked odd before
+     * the first id is written, so a claim that reads one of them can tell it straddled the change, and
+     * even again in the reset word, which publishes slot 0 with nothing held. Kept to the stores
+     * themselves - the renderer waits out an odd generation before claiming anything.
+     */
+    {
+        uint32_t old = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE), changing, gen;
+
+        do {
+            gen = LORIE_ROOT_GEN(old) | 1u;
+            changing = (old & ((1u << LORIE_ROOT_GEN_SHIFT) - 1u)) | (gen << LORIE_ROOT_GEN_SHIFT);
+        } while (!__atomic_compare_exchange_n(&pvfb->state->rootHandover, &old, changing, false,
+                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+        // Orders the mark before the ids: a claim that reads a new id then sees the mark (or later).
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        for (i = 0; i < LORIE_ROOT_SLOTS; i++)
+            __atomic_store_n(&pvfb->state->rootBufferIds[i], LorieBuffer_description(priv->rootBuf[i])->id,
+                             __ATOMIC_RELAXED);
+        // Published slot 0, none held, in the generation after the odd one.
+        __atomic_store_n(&pvfb->state->rootHandover, ((gen + 1u) & 0xffffu) << LORIE_ROOT_GEN_SHIFT,
+                         __ATOMIC_RELEASE);
     }
 
     RegionInit(&priv->rootOwed, NULL, 0);
@@ -3082,7 +3107,6 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     priv->rootOwedSerial = 0;
     priv->rootReplacingCount = 0;
 
-    __atomic_store_n(&pvfb->state->rootHandover, 0u, __ATOMIC_RELEASE); // published slot 0, none held
     priv->rootWrite = 1;
     priv->buffer = priv->rootBuf[1];
     priv->locked = priv->rootLocked[1];
@@ -3200,9 +3224,9 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
             return FALSE;
         }
 
-        new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT))
-            | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT);
-        new += LORIE_ROOT_COUNT_STEP;
+        new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT) & ~LORIE_ROOT_COUNT_MASK)
+            | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT)
+            | ((old + LORIE_ROOT_COUNT_STEP) & LORIE_ROOT_COUNT_MASK);   // never into the generation
         // Retry rather than give up: a failed swap only means the renderer took or released a slot
         // in between, which may well have freed a different one for us.
     } while (!__atomic_compare_exchange_n(&pvfb->state->rootHandover, &old, new, false,

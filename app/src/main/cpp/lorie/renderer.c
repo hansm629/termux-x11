@@ -17,6 +17,7 @@
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <limits.h>
+#include <sched.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/native_window_jni.h>
@@ -229,6 +230,7 @@ static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 // All guarded by rootOverlayLock.
 static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it
 static uint64_t rootZcDisplayedId = 0;  // which buffer that slot held then - see rendererReleaseRootSlot
+static uint32_t rootZcDisplayedGen = 0; // and the pool it belonged to
 
 /*
  * A zero-copy frame that had to be dropped has to be tried again, and nothing else will ask for it.
@@ -267,6 +269,7 @@ static struct {
     uint32_t seq;
     int64_t fenceArrivedNs;
     uint64_t bufferId;   // which buffer the slot held when it went to the compositor
+    uint32_t gen;        // and the pool it belonged to
 } rootZcRetiring[LORIE_ZC_MAX_HELD];
 static int rootZcRetiringCount = 0;
 static uint32_t rootZcRetireSeq = 0;
@@ -1805,34 +1808,66 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
 // Which slot this frame took, so releasing it clears the right bit. Renderer thread only.
 static int rendererRootSlot = -1;
 static uint64_t rendererRootSlotId = 0;   // the buffer that slot held when it was claimed
+static uint32_t rendererRootSlotGen = 0;  // and the pool it was claimed from (see rootHandover)
 
 static uint64_t rendererClaimRootBuffer(void) {
-    uint32_t old, claimed;
+    uint32_t old, claimed, now;
     int slot;
     uint64_t id;
+    int64_t waitedSinceNs = 0;
 
     if (!state->rootDoubleBuffered)
         return state->rootWindowTextureID;
 
     /*
-     * When the X server replaces the slot pool it writes the new buffer ids and then clears the whole
-     * held mask. A claim made just before that clear is wiped by it, and the id read for it may
-     * already be the replacement's - a slot sampled with no held bit, which the X server is then free
-     * to draw into. So the claim is checked to have survived, and made again if it did not. Only the
-     * renderer sets these bits, so a bit still set after the id is read is this claim's.
+     * Slots are named by index, and the X server reuses the indexes when it replaces the pool: it
+     * marks the pool generation odd, writes the new buffer ids, and then resets the whole word with
+     * the generation even again. A claim straddling that could pair an old held bit with a new id -
+     * the bit set in the old word, the new id read, the bit still there when looked at, and then
+     * wiped by the reset - and so sample a slot with no held bit, which the X server is free to draw
+     * into.
+     *
+     * So a claim counts only if the pool it was made in is still the current one after the id was
+     * read, was not being replaced, and the claim's own bit has survived; otherwise it is made again,
+     * in whatever pool is current by then. Only the renderer sets these bits, so a bit still set in
+     * the same generation is this claim's.
      */
-    do {
-        do {
-            old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
-            slot = (int) ((old >> LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_NEWEST_MASK);
-            claimed = old | (1u << slot);
-        } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, claimed, false,
-                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
-        id = state->rootBufferIds[slot];
-    } while (!(__atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE) & (1u << slot)));
+    for (;;) {
+        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+        if (LORIE_ROOT_GEN(old) & 1u) {
+            /*
+             * Being replaced: a handful of stores on the X server's side, with nothing in between.
+             * Waited out - but not for ever, because an X server that died half way through would
+             * leave it like this. Nothing claimed then, which the caller treats as a buffer that has
+             * not arrived.
+             */
+            if (!waitedSinceNs)
+                waitedSinceNs = rendererNowNs();
+            else if (rendererNowNs() - waitedSinceNs > 100000000LL) {
+                log("rendererClaimRootBuffer: the root pool stayed mid-replacement for 100 ms\n");
+                return 0;
+            }
+            sched_yield();
+            continue;
+        }
+        slot = (int) ((old >> LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_NEWEST_MASK);
+        claimed = old | (1u << slot);
+        if (!__atomic_compare_exchange_n(&state->rootHandover, &old, claimed, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        id = __atomic_load_n(&state->rootBufferIds[slot], __ATOMIC_RELAXED);
+        // Pairs with the X server's fence after it marks the generation odd: if the id read was one
+        // a replacement wrote, the word read next shows that replacement.
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        now = __atomic_load_n(&state->rootHandover, __ATOMIC_RELAXED);
+        if (LORIE_ROOT_GEN(now) == LORIE_ROOT_GEN(claimed) && (now & (1u << slot)))
+            break;
+        __atomic_fetch_add(&state->presentStats.rootClaimsAcrossPools, 1, __ATOMIC_RELAXED);
+    }
 
     rendererRootSlot = slot;
     rendererRootSlotId = id;
+    rendererRootSlotGen = LORIE_ROOT_GEN(claimed);
     return id;
 }
 
@@ -1894,19 +1929,29 @@ static void rendererRetireFrame(void) {
  * draw into it. Released by index only while that index still holds the same buffer; otherwise the
  * pool has moved on, the old bit is already gone, and there is nothing to give back.
  */
-static void rendererReleaseRootSlot(int slot, uint64_t bufferId) {
+static void rendererReleaseRootSlot(int slot, uint64_t bufferId, uint32_t gen) {
     uint32_t old, released;
 
     if (slot < 0)
         return;
 
-    if (state->rootBufferIds[slot] != bufferId) {
+    if (__atomic_load_n(&state->rootBufferIds[slot], __ATOMIC_RELAXED) != bufferId) {
         __atomic_fetch_add(&state->presentStats.rootStaleSlotReleases, 1, __ATOMIC_RELAXED);
         return;
     }
 
+    /*
+     * The id check above can pass just before a replacement begins, and the bit would then be cleared
+     * in the new pool's word - possibly one a new claim of the same index has just set. Checked again
+     * as part of the swap itself: the generation is in the word being swapped, so a release can only
+     * ever clear a bit in the pool it was claimed from, and a pool being replaced (odd) is not it.
+     */
+    old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
     do {
-        old = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+        if (LORIE_ROOT_GEN(old) != gen) {
+            __atomic_fetch_add(&state->presentStats.rootStaleSlotReleases, 1, __ATOMIC_RELAXED);
+            return;
+        }
         released = old & ~(1u << slot);
     } while (!__atomic_compare_exchange_n(&state->rootHandover, &old, released, false,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
@@ -1922,7 +1967,7 @@ static void rendererReleaseRootBuffer(void) {
         return;
 
     rendererRootSlot = -1;
-    rendererReleaseRootSlot(slot, rendererRootSlotId);
+    rendererReleaseRootSlot(slot, rendererRootSlotId, rendererRootSlotGen);
 }
 
 void rendererRedrawLocked(bool* waitingForBuffers) {
@@ -3136,6 +3181,7 @@ static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
 static bool rootZcDrainRetiring(void) {
     int freed[LORIE_ZC_MAX_HELD], freedFds[LORIE_ZC_MAX_HELD], freedCount = 0;
     uint64_t freedIds[LORIE_ZC_MAX_HELD];
+    uint32_t freedGens[LORIE_ZC_MAX_HELD];
     int i, kept = 0;
     bool room;
 
@@ -3144,13 +3190,15 @@ static bool rootZcDrainRetiring(void) {
         LorieZcFence answer = LORIE_ZC_FENCE_WAITING;
 
         /*
-         * A slot from a pool the X server has since replaced. Its held bit went when the pool did,
+         * A slot from a pool the X server has since replaced, or is replacing right now (generation
+         * changed, or odd). Its held bit went when the pool did, or goes when the replacement ends,
          * and the X server has dropped the buffer, so there is nothing to give back and nothing that
          * could draw into it - the compositor keeps its own reference for as long as it shows it.
          * This is also what finally lets go of a slot whose fence could never be waited on: it was
          * held "until its pool is replaced", and this is that.
          */
-        if (state->rootBufferIds[rootZcRetiring[i].slot] != rootZcRetiring[i].bufferId) {
+        if (state->rootBufferIds[rootZcRetiring[i].slot] != rootZcRetiring[i].bufferId ||
+            LORIE_ROOT_GEN(__atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE)) != rootZcRetiring[i].gen) {
             if (rootZcRetiring[i].fenceFd >= 0)
                 close(rootZcRetiring[i].fenceFd);
             if (rootZcRetiring[i].fenceUnusable)
@@ -3166,6 +3214,7 @@ static bool rootZcDrainRetiring(void) {
         if (answer == LORIE_ZC_FENCE_DONE) {
             freedFds[freedCount] = rootZcRetiring[i].fenceFd;
             freedIds[freedCount] = rootZcRetiring[i].bufferId;
+            freedGens[freedCount] = rootZcRetiring[i].gen;
             freed[freedCount++] = rootZcRetiring[i].slot;
             continue;
         }
@@ -3195,7 +3244,7 @@ static bool rootZcDrainRetiring(void) {
         if (freedFds[i] >= 0)
             close(freedFds[i]);
         lorieTrace(state, LORIE_TRACE_RELEASE, freed[i], freedIds[i]);
-        rendererReleaseRootSlot(freed[i], freedIds[i]);
+        rendererReleaseRootSlot(freed[i], freedIds[i], freedGens[i]);
     }
     return room;
 }
@@ -3229,6 +3278,7 @@ static void rootZcStopPresenting(void) {
             retireSeq = rootZcRetireSeq;
             rootZcRetiring[rootZcRetiringCount].slot = rootZcDisplayedSlot;
             rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
+            rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
             rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
             rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
             rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
@@ -3423,6 +3473,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
             rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
             rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
             rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
+            rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
             rootZcRetiringCount++;
         } else
             // rootZcDrainRetiring() leaves room for two before this is reached, so there is no
@@ -3434,6 +3485,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     }
     rootZcDisplayedSlot = slot;
     rootZcDisplayedId = rendererRootSlotId;
+    rootZcDisplayedGen = rendererRootSlotGen;
 
     ARect src = { 0, 0, desc->width, desc->height };
     ARect dst = { viewportX, viewportY, viewportX + viewportW, viewportY + viewportH };

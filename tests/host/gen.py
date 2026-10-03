@@ -21,16 +21,19 @@ recipes = {
         + func(I, "static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {"),
-    "t19": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_NEWEST_SHIFT") + macro(H, "LORIE_ROOT_NEWEST_MASK")
+    "slots": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_NEWEST_SHIFT") + macro(H, "LORIE_ROOT_NEWEST_MASK")
+        + opt(lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN"), "#define LORIE_ROOT_GEN_SHIFT", H)
         + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
+        + "static uint32_t rendererRootSlotGen __attribute__((unused)) = 0;\n"
         + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
-        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId) {")
+        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {"),
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
     "root": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
         + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + opt(lambda: macro(H, "LORIE_ROOT_COUNT_MASK"), "#define LORIE_ROOT_COUNT_MASK", H)
         + opt(lambda: macro(I, "LORIE_ROOT_REPLACEMENTS") + "#define HAVE_REPLACING 1\n"
             + span(I, "typedef struct {\n    uint64_t serial;\n    RegionRec region;", "} LorieRootCopyMark;"),
             "#define LORIE_ROOT_REPLACEMENTS")
