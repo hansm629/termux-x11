@@ -10,6 +10,11 @@ from extract import func, macro, span
 L, OUT = sys.argv[1], sys.argv[2]
 I, R, H = L + "/InitOutput.c", L + "/renderer.c", L + "/lorie.h"
 
+def opt(make, marker, path=I):
+    """What make() extracts, if the sources have `marker` - so a recipe also builds against code from
+    before a function existed, which is how a test is shown to fail there."""
+    return make() if marker in open(path, encoding="utf-8").read() else ""
+
 recipes = {
     "t07": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS")
         + func(R, "static void rendererPublishFailedSerial(uint64_t serial) {")
@@ -24,12 +29,25 @@ recipes = {
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {"),
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
-    "t05": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
-        + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP")
+    "root": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
+        + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + opt(lambda: macro(I, "LORIE_ROOT_REPLACEMENTS") + "#define HAVE_REPLACING 1\n"
+            + span(I, "typedef struct {\n    uint64_t serial;\n    RegionRec region;", "} LorieRootCopyMark;"),
+            "#define LORIE_ROOT_REPLACEMENTS")
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + func(I, "static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {")
         + func(I, "static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {")
+        + opt(lambda: func(I, "static void lorieRootCpuDrawn(LoriePixmapPriv *priv, RegionPtr region) {")
+            + func(I, "static void lorieRootSettleReplacements(LoriePixmapPriv *priv) {")
+            + func(I, "static Bool lorieRootCanQueueCopy(LoriePixmapPriv *priv) {")
+            + func(I, "static void lorieRootNoteGpuCopy(LoriePixmapPriv *priv, RegionPtr r, uint64_t serial) {")
+            + func(I, "static void lorieRootFetchOwed(LoriePixmapPriv *priv, RegionPtr area, int slot, uint32_t epoch) {"),
+            "#define LORIE_ROOT_REPLACEMENTS")
         + func(I, "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {")
+        + opt(lambda: func(I, "static void lorieRootKeepConditional(LoriePixmapPriv *priv, int slot) {")
+            + func(I, "static void lorieRootReuseSlot(LoriePixmapPriv *priv, int slot) {")
+            + func(I, "static void lorieRootCopyCancelled(uint64_t serial) {"),
+            "#define LORIE_ROOT_REPLACEMENTS")
         + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
         + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),

@@ -18,6 +18,8 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$CC" -c -O1 -w -DHAVE_CONFIG_H -DTLS=__thread -I"$OUT" -I"$PIXMAN" "$PIXMAN/pixman-region16.c" -o "$OUT/region16.o"
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t05.c" "$OUT/region16.o" -o "$OUT/t05"
 "$OUT/t05" || status=1
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t26.c" "$OUT/region16.o" -o "$OUT/t26"
+"$OUT/t26" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/t25.c" "$OUT/region16.o" -o "$OUT/t25"
 "$OUT/t25" || status=1
 

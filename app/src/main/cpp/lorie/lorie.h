@@ -551,6 +551,17 @@ struct lorie_shared_server_state {
          * is those areas being brought across. */
         volatile uint32_t rootPublishHeldForRepair;
         volatile uint32_t rootOwedRepairs;
+        /* Copies queued into the drawing slot over an area it still owed. Queuing one used to take
+         * the area out of the obligation, and one that then failed left it old for good. Now the
+         * area stays owed until the copy is known to have been made: NotMade are those that were
+         * not, and their area came from the donor after all. FromOlder is owed content fetched from
+         * a slot further back, because the donor had gone out before its own copy over that area
+         * failed. Lost is content no slot still held, which then stays as the drawing slot had it.
+         * ReplacingFull is copies refused - drawn by the CPU instead - with too many in flight. */
+        volatile uint32_t rootReplacementsNotMade;
+        volatile uint32_t rootOwedFromOlder;
+        volatile uint32_t rootOwedLost;
+        volatile uint32_t rootReplacingFull;
         /* Waits that finished, measured where they ended, and the worst one still running. Sampling
          * a running wait once per vsync missed the stretch that mattered, because a handover that
          * succeeded cleared the outstanding mark first - so a publish one tick after a failed

@@ -456,7 +456,7 @@
 +         * when the window sat at the origin with no offset. */
 +        RegionTranslate(&region, vblank->x_off + window->drawable.x,
 +                                 vblank->y_off + window->drawable.y);
-+        DamageDamageRegion(&window->drawable, &region);
++        lorieDamageGpuCopy(&window->drawable, &region);
 +    }
 +
 +    RegionUninit(&region);
@@ -570,7 +570,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,50 @@
+@@ -90,8 +91,51 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -593,6 +593,7 @@
 +/* lorie: Made is "it landed, ack it"; Resolved is "the GPU is finished with its buffers, whichever
 + * way it went". They are separate because an outcome can be known while the GPU is still running
 + * the batch it was part of - see lorieGpuCopyResolved(). */
++extern void lorieDamageGpuCopy(DrawablePtr pDrawable, RegionPtr pRegion);
 +extern Bool lorieGpuCopyMade(uint64_t serial);
 +extern Bool lorieGpuCopyResolved(uint64_t serial);
 +extern void lorieNoteGpuCopyRequeued(void);

@@ -34,6 +34,9 @@ static struct fakeShared shared;
 static struct fakeShared *state = &shared;                  /* renderer's view */
 static struct { struct fakeShared *state; } fakePvfb = { &shared };
 #define pvfb (&fakePvfb)                                     /* X server's view */
+/* what a cancel does to the root's owed area is T26's subject; here only the cancel itself matters */
+static int rootCopiesCancelled = 0;
+static void lorieRootCopyCancelled(uint64_t serial) { (void) serial; rootCopiesCancelled++; }
 #include "t25_src_funcs.inc"
 
 #define W 64
