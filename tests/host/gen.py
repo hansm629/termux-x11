@@ -18,13 +18,14 @@ def opt(make, marker, path=I):
 recipes = {
     "t07": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + func(R, "static void rendererPublishFailedSerial(uint64_t serial) {")
+        + opt(lambda: "#define HAVE_SESSION_LIST 1\n", "static void lorieSessionsReclaim")
         + opt(lambda: macro(H, "LORIE_RETIRE_RECORDS") + "#define HAVE_SESSIONS 1\n"
             + span(I, "static uint32_t lorieRendererSession;", "    lorieRetiredSeen = n;\n}"),
-            "#define LORIE_SESSIONS")
+            "LorieRendererSessionRec")
         + func(I, "static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {")
         + opt(lambda: span(I, "static void lorieSnapshotDeadSession(LorieRendererSessionRec *s) {", "} LorieCopyResolution;")
             + func(I, "static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {"),
-            "#define LORIE_SESSIONS")
+            "LorieRendererSessionRec")
         + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {"),
     "slots": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_NEWEST_SHIFT") + macro(H, "LORIE_ROOT_NEWEST_MASK")
@@ -84,19 +85,23 @@ recipes = {
     "session": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + opt(lambda: macro(H, "LORIE_RETIRE_RECORDS") + "#define HAVE_SESSIONS 1\n"
             + span(I, "static uint32_t lorieRendererSession;", "    lorieRetiredSeen = n;\n}"),
-            "#define LORIE_SESSIONS")
+            "LorieRendererSessionRec")
         + opt(lambda: span(I, "static uint32_t lorieRendererSession;", "#define LORIE_LOST_SESSION_SETTLE_US (2 * 1000 * 1000ULL)"),
             "uint64_t settleByUs;")
         + func(I, "static Bool lorieGpuCopyKnownNotMade(uint64_t serial) {")
         + opt(lambda: span(I, "static void lorieSnapshotDeadSession(LorieRendererSessionRec *s) {",
                            "} LorieCopyResolution;")
             + func(I, "static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {"),
-            "#define LORIE_SESSIONS")
+            "LorieRendererSessionRec")
         + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {")
         + func(I, "static Bool lorieCopySettled(LorieAbandonedCopy *c) {")
         + opt(lambda: func(I, "static void lorieEndSession(LorieRendererSessionRec *s, const char *why) {"),
-            "#define LORIE_SESSIONS")
+            "static void lorieEndSession")
+        + opt(lambda: "#define HAVE_SESSION_LIST 1\n" + func(I, "static Bool lorieRememberUnmade(uint64_t from, uint64_t to) {")
+            + func(I, "static void lorieSessionsReclaim(void) {")
+            + func(I, "static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {"),
+            "static void lorieSessionsReclaim")
         + opt(lambda: func(I, "static void lorieMarkSessionOver(uint32_t session, uint64_t settleByUs, const char *why) {"),
             "uint64_t settleByUs;")
         + func(I, "void lorieNoteRendererLost(void) {")

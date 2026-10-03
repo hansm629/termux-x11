@@ -26,7 +26,7 @@ struct xorg_list { struct xorg_list *next, *prev; };
 static void xorg_list_add(struct xorg_list *e, struct xorg_list *head) {
     e->next = head->next; e->prev = head; head->next->prev = e; head->next = e;
 }
-typedef struct { struct xorg_list link; uint32_t session; uint64_t serial; uint64_t settleByUs; } LorieAbandonedCopy;
+typedef struct { struct xorg_list link; Bool inUse; uint32_t session; uint64_t serial; uint64_t settleByUs; } LorieAbandonedCopy;
 static struct xorg_list lorieAbandonedCopies = { &lorieAbandonedCopies, &lorieAbandonedCopies };
 
 #define CAP 8
@@ -52,6 +52,7 @@ static struct { struct lorie_shared_server_state *state; uint64_t gpuCopySerialC
 static uint64_t fakeNow = 1000000;
 static uint64_t lorieNowUs(void) { return fakeNow; }
 #define log(prio, ...) ((void) 0)
+#define FatalError(...) abort()
 static void lorieReapAbandonedCopies(void) {}
 static Bool lorieCancelQueuedEntry(uint32_t slot) {
     uint32_t expected = 0;
@@ -68,10 +69,13 @@ static int pidfdAllowed = 1;
 static int fakeRendererPid;
 #define PROP_VALUE_MAX 92
 #define __system_property_get(name, value) (strcpy(value, pidfdAllowed ? "35" : "29"), 2)
-#define syscall(nr, pid, flags) (pidfdAllowed ? 1000 + (int) (pid) : -1)
+static int pidfdsOpen;                /* pidfds handed out and not closed yet */
+static int fakePidfdOpen(int pid) { if (!pidfdAllowed) return -1; pidfdsOpen++; return 1000 + pid; }
+static void fakeClose(int fd) { if (fd >= 1000) pidfdsOpen--; }
+#define syscall(nr, pid, flags) fakePidfdOpen((int) (pid))
 #define poll(p, n, t) (alive[(p)->fd - 1000] ? 0 : 1)
 #define kill(pid, sig) (errno = alive[pid] ? EPERM : ESRCH, -1)
-#define close(fd) ((void) 0)
+#define close(fd) fakeClose(fd)
 #define getpid() fakeRendererPid
 #include "session_src.inc"
 #undef poll
@@ -88,10 +92,21 @@ static void reset(void) {
     lorieAbandonedCopies.next = lorieAbandonedCopies.prev = &lorieAbandonedCopies;
     fakePvfb.gpuCopySerialCounter = 0;
     lorieRendererSession = 0;
-#ifdef HAVE_SESSIONS
+#ifdef HAVE_SESSION_LIST
+    while (lorieSessions) {
+        LorieRendererSessionRec *next = lorieSessions->next;
+        free(lorieSessions);
+        lorieSessions = next;
+    }
+    free(lorieUnmade);
+    lorieUnmade = NULL;
+    lorieUnmadeCount = lorieUnmadeSize = 0;
+    lorieRetiredSeen = 0;
+#elif defined(HAVE_SESSIONS)
     memset(lorieSessions, 0, sizeof lorieSessions);
     lorieRetiredSeen = 0;
 #endif
+    pidfdsOpen = 0;
     memset(alive, 0, sizeof alive);
     memset(tagOf, 0, sizeof tagOf);
     pidfdAllowed = 1;
@@ -131,13 +146,40 @@ static void retire(int pid) {
     (void) pid;
 #endif
 }
-/* what a cancelled present leaves behind while its copy may still run */
+/* the copy record a copy holds from enqueue until it is settled; the X server counts it against its
+ * connection when it takes it (lorieTryScheduleGpuCopy) */
 static LorieAbandonedCopy *hold(uint64_t serial) {
     LorieAbandonedCopy *c = calloc(1, sizeof *c);
     c->serial = serial;
     c->session = lorieRendererSession;
+    c->inUse = TRUE;
+#ifdef HAVE_SESSION_LIST
+    if (lorieSessionById(lorieRendererSession))
+        lorieSessionById(lorieRendererSession)->outstanding++;
+#endif
     xorg_list_add(&c->link, &lorieAbandonedCopies);
     return c;
+}
+/* the reaper settling it and giving the record back, then letting go of what nothing needs */
+static void giveBack(LorieAbandonedCopy *c) {
+    c->link.prev->next = c->link.next;
+    c->link.next->prev = c->link.prev;
+#ifdef HAVE_SESSION_LIST
+    lorieGiveBackCopyRecord(c);
+    lorieSessionsReclaim();
+#endif
+}
+static int sessionsKept(void) {
+    int n = 0;
+#ifdef HAVE_SESSION_LIST
+    for (LorieRendererSessionRec *s = lorieSessions; s; s = s->next) n++;
+#endif
+    return n;
+}
+static void reclaim(void) {
+#ifdef HAVE_SESSION_LIST
+    lorieSessionsReclaim();
+#endif
 }
 static uint32_t forced(void) { return shared.presentStats.copyForcedSettle; }
 
@@ -255,6 +297,66 @@ int main(void) {
     take(1); report(s1);
     CHECK(lorieCopySettled(c1) && lorieGpuCopyMade(s1), "never taken by the old renderer: the new one's report not taken");
 
+    /* 9. Reported by its own renderer while the connection was live: the connection ending, with the
+     *    process alive and silent, does not take that back. */
+    reset();
+    connectRenderer(111);
+    s1 = enqueue(); take(1); report(s1);
+    c1 = hold(s1);
+    lorieNoteRendererLost();
+    CHECK(lorieCopySettled(c1) && lorieGpuCopyMade(s1),
+          "a copy its own renderer had reported went back to pending when the connection ended");
+
+    int sessionFails = fails;
     printf("session lifetime (tsession): %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
+
+    /* T31: connections replaced over and over while one old copy is still out. Its connection's record
+     *    must outlive all of them; nothing but that process's own word or its exit settles the copy;
+     *    once everything is done the records go, with their pidfds, and what they answered stays. */
+    for (int how = 0; how < 2; how++) {
+        reset();
+        connectRenderer(200);
+        s1 = enqueue(); take(1);
+        c1 = hold(s1);
+        uint32_t first = lorieRendererSession;
+        for (int k = 2; k <= 20; k++) {
+            int pid = 300 + (k % 3);              /* three processes, each connecting several times */
+            if (k > 2)
+                retire(300 + ((k - 1) % 3));      /* the previous one lets go of the state first */
+            connectRenderer(pid);
+            s2 = enqueue(); take(1); report(s2);
+            c2 = hold(s2);
+            giveBack(c2);                         /* its present completed */
+        }
+        CHECK(shared.gpuCopyQueue.completedSerial > s1, "setup");
+        CHECK(!lorieCopySettled(c1) && !lorieGpuCopyResolved(s1),
+              "T31: after 19 reconnects the first connection's copy settled with its process still alive");
+        fakeNow += 10 * 1000 * 1000;
+        reclaim();
+        CHECK(!lorieCopySettled(c1), "T31: the first connection's copy settled on time passing");
+#ifdef HAVE_SESSION_LIST
+        CHECK(lorieSessionById(first) != NULL, "T31: the first connection's record was let go of with a copy out");
+#endif
+        before = forced();
+        if (how == 0)
+            alive[200] = 0;                       /* its process exits */
+        else
+            retire(200);                          /* or says it finished */
+        CHECK(lorieCopySettled(c1), "T31: %s, the copy still held", how ? "after its retire" : "after its process exited");
+        CHECK(forced() == before, "T31: settled as recovery");
+        CHECK(how ? lorieGpuCopyMade(s1) : !lorieGpuCopyMade(s1), "T31: made %d, want %d", lorieGpuCopyMade(s1), how);
+        Bool madeBefore = lorieGpuCopyMade(s1), made2Before = lorieGpuCopyMade(s2);
+        giveBack(c1);
+        lorieNoteRendererLost();                  /* the last one goes too */
+        retire(300 + (20 % 3));
+        reclaim();
+        CHECK(sessionsKept() == 0, "T31: %d records kept with nothing left that needs them", sessionsKept());
+        CHECK(pidfdsOpen == 0, "T31: %d pidfds left open", pidfdsOpen);
+        CHECK(lorieGpuCopyResolved(s1) && lorieGpuCopyMade(s1) == madeBefore &&
+              lorieGpuCopyMade(s2) == made2Before, "T31: answers changed once the records were let go of");
+    }
+
+    printf("T31 session records across reconnects: %s (%d failures)\n", fails > sessionFails ? "FAIL" : "PASS",
+           fails - sessionFails);
     return fails != 0;
 }

@@ -14,6 +14,8 @@ typedef struct _LorieBuffer LorieBuffer;
 typedef struct _Pixmap *PixmapPtr;
 typedef struct _Window *WindowPtr;
 struct present_fence;
+/* giving a record back also lets its connection's record count one copy fewer (T31's subject) */
+static void lorieSessionCopyEnded(uint32_t id) { (void) id; }
 #include "t10_src.inc"
 int main(void) {
     int fails = 0;

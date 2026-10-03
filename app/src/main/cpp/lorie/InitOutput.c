@@ -1448,7 +1448,13 @@ static uint32_t lorieRendererSession;
  *             says either way, otherwise kill(pid, 0), which can only say it is gone;
  *   snapshot  where the queue stood when it was found gone with nobody else draining it.
  *
- * Kept for the last LORIE_SESSIONS connections; see lorieCopyResolve for how they are used.
+ * A record lives as long as anything can still need it: its connection has ended, none of its copies
+ * still holds a copy record, and the last serial it was handed has resolved. They were kept in a
+ * fixed ring of 16, and a record overwritten there while a copy of its connection was still
+ * unresolved turned that copy's answer into recovery - a release with no proof the GPU was done,
+ * brought on by nothing more than reconnecting often. When a record does go, what it would have
+ * answered is kept: every serial it covered has resolved by then, so all that is left to remember is
+ * which of them were not made (lorieUnmade). See lorieCopyResolve for how the records are used.
  */
 typedef enum {
     LORIE_PROCESS_ALIVE,
@@ -1456,11 +1462,14 @@ typedef enum {
     LORIE_PROCESS_UNKNOWN,
 } LorieProcessState;
 
-typedef struct {
-    uint32_t id;                    // 0: slot unused
+typedef struct LorieRendererSessionRec {
+    struct LorieRendererSessionRec *next;   // older connections follow
+    uint32_t id;
     int32_t pid;                    // the renderer's process; 0 if not known
     int pidfd;                      // -1 if none
     uint64_t firstSerial;           // the lowest serial a copy given to this connection can have
+    uint64_t lastSerial;            // and the highest, once it has ended
+    uint32_t outstanding;           // copy records of its copies still in use
     Bool ended;
     uint64_t endedUs;
     uint64_t completedAtEnd;        // completedSerial as it ended: its own reports, up to there
@@ -1472,8 +1481,11 @@ typedef struct {
     uint64_t drainedAtDeath;        // everything up to here it had taken, or was cancelled then
 } LorieRendererSessionRec;
 
-#define LORIE_SESSIONS 16
-static LorieRendererSessionRec lorieSessions[LORIE_SESSIONS];
+static LorieRendererSessionRec *lorieSessions;   // newest first
+
+/* Serial ranges of connections whose records have gone, where the answer was "resolved, not made". */
+static struct { uint64_t from, to; } *lorieUnmade;
+static size_t lorieUnmadeCount, lorieUnmadeSize;
 
 /* How long copies of a connection that has gone are held when nothing can tell whether its process is
  * still alive - and only then: a process known to be alive is waited on for as long as it lives, one
@@ -1521,20 +1533,40 @@ static LorieProcessState lorieProcessState(LorieRendererSessionRec *s) {
     return s->process;
 }
 
-// The connection a serial was handed to: the latest one that existed when it was given out.
+// The connection a serial was handed to, if its record is still kept.
 static LorieRendererSessionRec *lorieSessionOf(uint64_t serial) {
-    LorieRendererSessionRec *best = &lorieSessions[lorieRendererSession % LORIE_SESSIONS];
-    int i;
+    LorieRendererSessionRec *s;
 
-    if (best->id && best->id == lorieRendererSession && best->firstSerial <= serial)
-        return best;                            // the live one, nearly always
-    best = NULL;
-    for (i = 0; i < LORIE_SESSIONS; i++) {
-        LorieRendererSessionRec *s = &lorieSessions[i];
-        if (s->id && s->firstSerial <= serial && (!best || s->id > best->id))
-            best = s;
-    }
-    return best;
+    for (s = lorieSessions; s; s = s->next)
+        if (s->firstSerial <= serial && (!s->ended || serial <= s->lastSerial))
+            return s;
+    return NULL;
+}
+
+static LorieRendererSessionRec *lorieSessionById(uint32_t id) {
+    LorieRendererSessionRec *s;
+
+    for (s = lorieSessions; s; s = s->next)
+        if (s->id == id)
+            return s;
+    return NULL;
+}
+
+static Bool lorieInUnmade(uint64_t serial) {
+    size_t i;
+
+    for (i = 0; i < lorieUnmadeCount; i++)
+        if (serial >= lorieUnmade[i].from && serial <= lorieUnmade[i].to)
+            return TRUE;
+    return FALSE;
+}
+
+// A copy record of this connection's has been given back.
+static void lorieSessionCopyEnded(uint32_t id) {
+    LorieRendererSessionRec *s = id ? lorieSessionById(id) : NULL;
+
+    if (s && s->outstanding)
+        s->outstanding--;
 }
 
 /* Retire records not read yet start here (see `retired` in lorie.h). */
@@ -1561,12 +1593,14 @@ static void lorieSessionsPoll(void) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&r->seq, __ATOMIC_RELAXED) != n + 1u)
             break;                              // written over while being read
-        if (session && lorieSessions[session % LORIE_SESSIONS].id == session) {
-            LorieRendererSessionRec *s = &lorieSessions[session % LORIE_SESSIONS];
+        if (session) {
+            LorieRendererSessionRec *s = lorieSessionById(session);
 
-            s->retired = TRUE;
-            if (serial > s->retiredUpTo)
-                s->retiredUpTo = serial;
+            if (s) {
+                s->retired = TRUE;
+                if (serial > s->retiredUpTo)
+                    s->retiredUpTo = serial;
+            }
         }
     }
     lorieRetiredSeen = n;
@@ -2034,6 +2068,7 @@ static LorieAbandonedCopy *lorieTakeCopyRecord(void) {
 }
 
 static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {
+    lorieSessionCopyEnded(c->session);
     c->inUse = FALSE;
 }
 
@@ -2215,6 +2250,11 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 
     record->serial = entry->serial;
     record->session = lorieRendererSession;
+    {
+        LorieRendererSessionRec *live = lorieSessionById(lorieRendererSession);
+        if (live)
+            live->outstanding++;
+    }
     lorieTrace(pvfb->state, LORIE_TRACE_ENQUEUE, dstIsRoot ? 1 : 0, entry->serial);
     record->startUs = lorieNowUs();
     *out_serial = entry->serial;
@@ -2310,6 +2350,8 @@ typedef enum {
     LORIE_COPY_RETIRED,
     LORIE_COPY_PROCESS_DEAD,
     LORIE_COPY_RECOVERY,
+    LORIE_COPY_SETTLED_EARLIER,     // its connection's record has gone, which it only does once every
+                                    // serial it covered had one of the answers above (lorieUnmade)
 } LorieCopyResolution;
 
 static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {
@@ -2317,10 +2359,15 @@ static LorieCopyResolution lorieCopyResolve(uint64_t serial, Bool *made) {
     LorieRendererSessionRec *s = lorieSessionOf(serial);
 
     *made = FALSE;
-    if (!s)
-        return LORIE_COPY_RECOVERY;             // older than every connection still on record
+    if (!s) {
+        // Its connection's record has been let go of, which happens only after every serial it
+        // covered had resolved; which of them were not made is what was kept.
+        *made = !lorieInUnmade(serial) && !lorieGpuCopyKnownNotMade(serial);
+        return LORIE_COPY_SETTLED_EARLIER;
+    }
 
-    if (!s->ended) {
+    // Reported by its own renderer, before or after its connection ended: that report stands.
+    if (!s->ended || serial <= s->completedAtEnd) {
         if (completed < serial)
             return LORIE_COPY_PENDING;
         *made = !lorieGpuCopyKnownNotMade(serial);
@@ -2445,6 +2492,7 @@ static Bool lorieCopySettled(LorieAbandonedCopy *c) {
         pvfb->state->presentStats.copyForcedSettle++;
         break;
     case LORIE_COPY_COMPLETE:
+    case LORIE_COPY_SETTLED_EARLIER:
         break;
     }
     return TRUE;
@@ -2463,6 +2511,67 @@ static void lorieFinishHeldPresentResources(LorieAbandonedCopy *c) {
         dixDestroyPixmap(c->heldPixmap, c->heldPixmap->drawable.id);
 }
 
+static Bool lorieRememberUnmade(uint64_t from, uint64_t to) {
+    if (lorieUnmadeCount == lorieUnmadeSize) {
+        size_t size = lorieUnmadeSize ? lorieUnmadeSize * 2 : 8;
+        void *grown = realloc(lorieUnmade, size * sizeof *lorieUnmade);
+
+        if (!grown)
+            return FALSE;
+        lorieUnmade = grown;
+        lorieUnmadeSize = size;
+    }
+    lorieUnmade[lorieUnmadeCount].from = from;
+    lorieUnmade[lorieUnmadeCount].to = to;
+    lorieUnmadeCount++;
+    return TRUE;
+}
+
+/*
+ * Lets go of the records of connections nothing can need any more: ended, no copy record of theirs
+ * still in use, and the last serial they were handed resolved - which, the answers building on one
+ * another, means every serial they covered has. What a record would still answer for its serials
+ * is kept in lorieUnmade first; if that cannot be kept, neither is the record let go of.
+ */
+static void lorieSessionsReclaim(void) {
+    LorieRendererSessionRec **link = &lorieSessions, *s;
+
+    while ((s = *link)) {
+        Bool made;
+
+        if (!s->ended || s->outstanding ||
+            (s->lastSerial >= s->firstSerial && lorieCopyResolve(s->lastSerial, &made) == LORIE_COPY_PENDING)) {
+            link = &s->next;
+            continue;
+        }
+
+        // Its own reports, and whatever it said it retired, were made unless the failure list says
+        // otherwise - which stays true without the record. What it took and never finished, or what
+        // was let go of by recovery, was not.
+        if (!s->retired && s->lastSerial > s->completedAtEnd) {
+            uint64_t from = s->completedAtEnd + 1, to = s->lastSerial;
+
+            if (s->process == LORIE_PROCESS_DEAD && s->snapshot) {
+                if (s->completedAtDeath + 1 > from)
+                    from = s->completedAtDeath + 1;
+                if (s->drainedAtDeath < to)
+                    to = s->drainedAtDeath;
+            }
+            if (from < s->firstSerial)
+                from = s->firstSerial;
+            if (from <= to && !lorieRememberUnmade(from, to)) {
+                link = &s->next;
+                continue;
+            }
+        }
+
+        *link = s->next;
+        if (s->pidfd >= 0)
+            close(s->pidfd);
+        free(s);
+    }
+}
+
 // Hands back what a still-running copy is using, once the renderer is done with it. Called every
 // frame, whenever the renderer reports progress, and from the periodic stats timer - which is what
 // still runs when no renderer is connected to tick frames.
@@ -2479,6 +2588,7 @@ void lorieReapAbandonedCopies(void) {
 
         lorieGiveBackCopyRecord(c);
     }
+    lorieSessionsReclaim();
 }
 
 /*
@@ -2673,10 +2783,11 @@ static void lorieEndSession(LorieRendererSessionRec *s, const char *why) {
     LorieAbandonedCopy *c;
     unsigned held = 0;
 
-    if (!s->id || s->ended)
+    if (!s || s->ended)
         return;
     s->ended = TRUE;
     s->endedUs = lorieNowUs();
+    s->lastSerial = pvfb->gpuCopySerialCounter;     // no copy is offered without a connection
     s->completedAtEnd = pvfb->state ? __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) : 0;
 
     xorg_list_for_each_entry(c, &lorieAbandonedCopies, link)
@@ -2697,7 +2808,7 @@ static void lorieEndSession(LorieRendererSessionRec *s, const char *why) {
  */
 void lorieNoteRendererLost(void) {
     if (lorieRendererSession)
-        lorieEndSession(&lorieSessions[lorieRendererSession % LORIE_SESSIONS], "socket closed");
+        lorieEndSession(lorieSessionById(lorieRendererSession), "socket closed");
     lorieReapAbandonedCopies();
 }
 
@@ -2715,15 +2826,16 @@ void lorieNoteRendererConnected(int32_t pid) {
     LorieRendererSessionRec *s;
 
     if (lorieRendererSession)
-        lorieEndSession(&lorieSessions[lorieRendererSession % LORIE_SESSIONS], "replaced by a new connection");
+        lorieEndSession(lorieSessionById(lorieRendererSession), "replaced by a new connection");
 
     lorieRendererSession++;
     if (!lorieRendererSession)
         lorieRendererSession++;                 // 0 means "none"
-    s = &lorieSessions[lorieRendererSession % LORIE_SESSIONS];
-    if (s->id && s->pidfd >= 0)
-        close(s->pidfd);
-    memset(s, 0, sizeof *s);
+    s = calloc(1, sizeof *s);
+    if (!s)
+        FatalError("out of memory for a renderer session record\n");
+    s->next = lorieSessions;
+    lorieSessions = s;
     s->id = lorieRendererSession;
     s->pid = pid;
     s->pidfd = lorieOpenPidfd(pid);

@@ -47,10 +47,19 @@ static void reset(void) {
     __builtin_memset(&shared, 0, sizeof shared);
 #ifdef HAVE_SESSIONS
     /* one live connection, which every serial here belongs to */
-    __builtin_memset(lorieSessions, 0, sizeof lorieSessions);
     lorieRendererSession = 1;
+#ifdef HAVE_SESSION_LIST
+    static LorieRendererSessionRec live;
+    __builtin_memset(&live, 0, sizeof live);
+    live.id = 1;
+    live.firstSerial = 1;
+    lorieSessions = &live;
+    (void) lorieUnmadeSize;
+#else
+    __builtin_memset(lorieSessions, 0, sizeof lorieSessions);
     lorieSessions[1].id = 1;
     lorieSessions[1].firstSerial = 1;
+#endif
 #endif
 }
 
