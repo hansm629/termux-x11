@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract import func, macro, span
 
 L, OUT = sys.argv[1], sys.argv[2]
-I, R, H = L + "/InitOutput.c", L + "/renderer.c", L + "/lorie.h"
+I, R, H, C = L + "/InitOutput.c", L + "/renderer.c", L + "/lorie.h", L + "/cmdentrypoint.c"
 
 def opt(make, marker, path=I):
     """What make() extracts, if the sources have `marker` - so a recipe also builds against code from
@@ -123,6 +123,40 @@ recipes = {
         + func(R, "static void cursorPoolReleaseReported(uint32_t seq, int fd, bool reportCarriedLayer) {")
         + func(R, "static void cursorPoolDrain(void) {")
         + func(R, "static void cursorPoolOrphan(void) {"), "#define LORIE_CURSOR_BUFFERS", R),
+    "t32_types": lambda: span(H, "typedef enum {\n    EVENT_UNKNOWN", "} lorieEvent;"),
+    "t32": lambda: opt(lambda: span(C, "static struct LorieConnection {", "} lorieConnections[8];")
+        + func(C, "static struct LorieConnection *lorieConnectionOf(uint32_t session) {")
+        + func(C, "static void lorieForgetRegisteredBuffers(void) {")
+        + func(C, "static void lorieConnectionClose(struct LorieConnection *c) {")
+        + func(C, "static Bool handleRendererLostEvent(__unused ClientPtr pClient, void *closure) {")
+        + func(C, "static void lorieConnectionHungUp(int fd, void *session) {")
+        + span(C, "static struct { int fd; int32_t pid; } lorieNewConnections[4];", "static uint32_t lorieNewConnectionNext;")
+        + func(C, "void lorieSendSharedServerState(int memfd) {")
+        + func(C, "void lorieRegisterBuffer(LorieBuffer* buffer) {")
+        + func(C, "void lorieUnregisterBuffer(LorieBuffer* buffer) {")
+        + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
+        + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
+        + func(I, "static void lorieRegisterQueuedCopyBuffers(void) {")
+        + func(I, "void lorieActivityConnected(void) {")
+        + func(C, "static Bool addFd(__unused ClientPtr pClient, void *closure) {"),
+        "static struct LorieConnection", C)
+        # code from before the connection table: the hangup was handled inline in handleLorieEvents
+        + opt(lambda: "#define HAVE_OLD_CONNECTIONS 1\n"
+            + func(C, "static Bool handleRendererLostEvent(__unused ClientPtr pClient, void *closure) {")
+            + "static void lorieConnectionHungUp(int fd, void *data) {\n    int ready = X_NOTIFY_ERROR;\n    (void) data;\n"
+            + span(C, "    if (ready & X_NOTIFY_ERROR) {", "        return;\n    }") + "}\n"
+            + span(C, "static struct { int fd; int32_t pid; } lorieNewConnections[4];", "static uint32_t lorieNewConnectionNext;")
+            + func(C, "void lorieSendSharedServerState(int memfd) {")
+            + func(C, "void lorieRegisterBuffer(LorieBuffer* buffer) {")
+            + func(C, "void lorieUnregisterBuffer(LorieBuffer* buffer) {")
+            + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
+            + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
+            + func(I, "void lorieActivityConnected(void) {")
+            + func(C, "static Bool addFd(__unused ClientPtr pClient, void *closure) {")
+            if "static struct LorieConnection" not in open(C, encoding="utf-8").read() else "",
+            "lorieNewConnections", C)
+        + opt(lambda: func(I, "static void lorieReleaseCopyBuffer(LorieBuffer *buffer) {"), "static void lorieReleaseCopyBuffer")
+        + func(I, "static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

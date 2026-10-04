@@ -508,12 +508,25 @@ void lorieSetRendererWakeupCond(int fd) {
     lorieWakeServer();
 }
 
+static void lorieRegisterQueuedCopyBuffers(void);
+
+/*
+ * A renderer has just connected, with none of the buffers it needs: a renderer connecting afresh -
+ * the app restarted while this server kept running - has no handle the previous one was sent, and
+ * the list of what was sent is emptied with each new connection (registeredBuffers). So everything
+ * it may be asked to show or to copy is sent now: the root and every slot of it, the pixmap the root
+ * window shows (a client's own while it flips), and the source and destination of every copy still
+ * in the queue or still running, which it will take up next.
+ */
 void lorieActivityConnected(void) {
     LoriePixmapPriv *rootPriv = pScreenPtr ? LORIE_PIXMAP_PRIV_FROM_PIXMAP((PixmapPtr) pScreenPtr->devPrivate) : NULL;
+    PixmapPtr shown = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
     pvfb->state->drawRequested = pvfb->state->cursor.updated = true;
     lorieSendSharedServerState(pvfb->stateFd);
     lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+    if (shown && LORIE_PIXMAP_PRIV_FROM_PIXMAP(shown) && LORIE_BUFFER_FROM_PIXMAP(shown))
+        lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(shown));
 
     /*
      * Every slot of a double-buffered root, not just the one being drawn into. The slots are only
@@ -529,6 +542,7 @@ void lorieActivityConnected(void) {
         for (i = 0; i < LORIE_ROOT_SLOTS; i++)
             lorieRegisterBuffer(rootPriv->rootBuf[i]);
     }
+    lorieRegisterQueuedCopyBuffers();
 }
 
 static LoriePixmapPriv* lorieRootWindowPixmapPriv(void) {
@@ -2077,6 +2091,20 @@ bool lorieRendererAvailable(void) {
  * cannot be tracked is simply not offered to the GPU, and the CPU path takes it. */
 #define LORIE_COPY_RECORDS (LORIE_GPU_COPY_QUEUE_CAPACITY * 2)
 static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];
+
+// Every copy still in the queue or still running holds a record, and the record holds the buffers it
+// was given. Sent to a renderer that has just connected (see lorieActivityConnected).
+static void lorieRegisterQueuedCopyBuffers(void) {
+    int i;
+
+    for (i = 0; i < LORIE_COPY_RECORDS; i++)
+        if (lorieCopyRecords[i].inUse) {
+            if (lorieCopyRecords[i].src)
+                lorieRegisterBuffer(lorieCopyRecords[i].src);
+            if (lorieCopyRecords[i].dst)
+                lorieRegisterBuffer(lorieCopyRecords[i].dst);
+        }
+}
 
 static LorieAbandonedCopy *lorieTakeCopyRecord(void) {
     int i;

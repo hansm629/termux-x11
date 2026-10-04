@@ -39,7 +39,25 @@ void lorieKeysymKeyboardEvent(KeySym keysym, int down);
 char *xtrans_unix_path_x11 = NULL;
 char *xtrans_unix_dir_x11 = NULL;
 
+/* The buffers whose handles have been sent to the renderer on the current connection - which a renderer
+ * connecting afresh has none of. Emptied whenever a connection is made or the current one is lost. */
 struct xorg_list registeredBuffers;
+
+/*
+ * Renderer connections, X server thread only. A connection is its socket and the session it was opened
+ * as, and it is closed exactly once, by whichever comes first: its own hangup or a newer connection
+ * replacing it.
+ *
+ * The hangup used to be handled with whatever conn_fd and session were current when it got to run.
+ * The input thread set conn_fd to -1 and named lorieRendererSessionId() as the session lost - so the
+ * old renderer's socket going away after a new renderer had connected cut the new one off and marked
+ * its session over, leaving it with the shared state and none of the buffers.
+ */
+static struct LorieConnection {
+    uint32_t session;
+    int fd;
+    Bool open;
+} lorieConnections[8];
 
 static void* startServer(__unused void* cookie) {
     char* envp[] = { NULL };
@@ -242,19 +260,55 @@ static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *c
     return TRUE;
 }
 
-static Bool handleRendererLostEvent(__unused ClientPtr pClient, void *closure) {
-    uint32_t session = (uint32_t) (uintptr_t) closure;
+static struct LorieConnection *lorieConnectionOf(uint32_t session) {
+    size_t i;
+
+    for (i = 0; i < sizeof(lorieConnections) / sizeof(lorieConnections[0]); i++)
+        if (lorieConnections[i].session == session && session)
+            return &lorieConnections[i];
+    return NULL;
+}
+
+static void lorieForgetRegisteredBuffers(void) {
     LorieBuffer* buf;
 
-    // A new renderer may have connected while this was queued. Acting on it then would mark the new
-    // session's outstanding work as over and unregister the buffers it has just been given.
-    if (!lorieRendererSessionIsCurrent(session))
-        return TRUE;
-
-    // This must be done only on X server thread.
-    lorieNoteRendererLost();
     while ((buf = LorieBufferList_first(&registeredBuffers)))
         LorieBuffer_removeFromList(buf);
+}
+
+// Closes one connection, once. The input thread may already have stopped watching it on hangup;
+// asking again is harmless.
+static void lorieConnectionClose(struct LorieConnection *c) {
+    if (!c || !c->open)
+        return;
+    c->open = FALSE;
+    InputThreadUnregisterDev(c->fd);
+    if (conn_fd == c->fd)
+        conn_fd = -1;
+    close(c->fd);
+}
+
+/*
+ * A connection hung up. Runs on the X server thread with the session the connection was opened as,
+ * which the input thread kept with the socket. Only if that is the current connection is anything of
+ * the current state touched; an older one that a newer connection has since replaced was closed then
+ * and its session ended with it, so all that can be left is its socket, if not closed already.
+ */
+static Bool handleRendererLostEvent(__unused ClientPtr pClient, void *closure) {
+    uint32_t session = (uint32_t) (uintptr_t) closure;
+    struct LorieConnection *c = lorieConnectionOf(session);
+    Bool current = c && c->open && lorieRendererSessionIsCurrent(session) && conn_fd == c->fd;
+
+    lorieConnectionClose(c);
+    if (!current) {
+        log(INFO, "renderer connection of session %u hung up after being replaced; the current one is kept", session);
+        return TRUE;
+    }
+
+    log(INFO, "renderer connection of session %u hung up", session);
+    lorieEnableClipboardSync(FALSE);
+    lorieNoteRendererLost();
+    lorieForgetRegisteredBuffers();
     return TRUE;
 }
 
@@ -308,22 +362,26 @@ static Bool handleTouchEvent(__unused ClientPtr pClient, void *closure) {
     return TRUE;
 }
 
-void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
+/*
+ * Input thread: the connection on `fd`, opened as `session`, hung up. It stops being watched, and
+ * nothing else happens here: the socket, conn_fd, the session and the buffer list are the X server
+ * thread's, and which connection this was - by the session it was opened as, not whichever is current
+ * by the time that thread gets to it - is all it needs to sort out the rest.
+ */
+static void lorieConnectionHungUp(int fd, void *session) {
+    InputThreadUnregisterDev(fd);
+    QueueWorkProc(handleRendererLostEvent, NULL, session);
+    lorieWakeServer();
+}
+
+// Input thread. `data` is the session the connection on `fd` was opened as (addFd).
+void handleLorieEvents(int fd, __unused int ready, void *data) {
     ValuatorMask mask;
     lorieEvent e = {0};
     valuator_mask_zero(&mask);
 
     if (ready & X_NOTIFY_ERROR) {
-        InputThreadUnregisterDev(fd);
-        close(fd);
-        conn_fd = -1;
-        lorieEnableClipboardSync(FALSE);
-        // The rest is the X server's state, and this is the input thread. Unregistering the buffers
-        // and settling the copies that were waiting on this renderer both ran here, which is not
-        // allowed to touch either: the copies idle pixmaps and read Present's queues, and the
-        // buffer list is otherwise only ever changed while registering from the server thread.
-        QueueWorkProc(handleRendererLostEvent, NULL, (void *) (uintptr_t) lorieRendererSessionId());
-        lorieWakeServer();
+        lorieConnectionHungUp(fd, data);
         return;
     }
 
@@ -446,7 +504,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             case EVENT_CLIPBOARD_SEND: {
                 char *data = calloc(1, e.clipboardSend.count + 1);
-                read(conn_fd, data, e.clipboardSend.count);
+                read(fd, data, e.clipboardSend.count);
                 data[e.clipboardSend.count] = 0;
                 QueueWorkProc(handleClipboardData, NULL, data);
                 lorieWakeServer();
@@ -503,11 +561,32 @@ static uint32_t lorieNewConnectionNext;
 static Bool addFd(__unused ClientPtr pClient, void *closure) {
     int fd = lorieNewConnections[(uintptr_t) closure].fd;
     int32_t pid = lorieNewConnections[(uintptr_t) closure].pid;
+    struct LorieConnection *c = NULL;
+    uint32_t session;
+    size_t i;
 
-    InputThreadRegisterDev(fd, handleLorieEvents, NULL);
-    conn_fd = fd;
+    // A connection still open is being replaced: closed now, so the renderer at its other end lets go
+    // of the state, and so its hangup, whenever that arrives, finds nothing left of it to act on.
+    lorieConnectionClose(lorieConnectionOf(lorieRendererSessionId()));
+    // What was sent on it is not something this renderer has.
+    lorieForgetRegisteredBuffers();
+
     // Before anything is offered to it, so every copy carries the session that owes its report.
     lorieNoteRendererConnected(pid);
+    session = lorieRendererSessionId();
+
+    for (i = 0; i < sizeof(lorieConnections) / sizeof(lorieConnections[0]) && !c; i++)
+        if (!lorieConnections[i].open)
+            c = &lorieConnections[i];
+    if (!c)
+        FatalError("more renderer connections open at once than there is room for\n");
+    c->session = session;
+    c->fd = fd;
+    c->open = TRUE;
+    log(INFO, "renderer connection of session %u: fd %d", session, fd);
+
+    InputThreadRegisterDev(fd, handleLorieEvents, (void *) (uintptr_t) session);
+    conn_fd = fd;
     lorieActivityConnected();
     return TRUE;
 }
