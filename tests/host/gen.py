@@ -157,6 +157,7 @@ recipes = {
             "lorieNewConnections", C)
         + opt(lambda: func(I, "static void lorieReleaseCopyBuffer(LorieBuffer *buffer) {"), "static void lorieReleaseCopyBuffer")
         + func(I, "static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {"),
+    "tlogcat": lambda: func(C, "void* logcatThread(void *arg) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

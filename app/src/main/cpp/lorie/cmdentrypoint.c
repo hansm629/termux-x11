@@ -668,11 +668,15 @@ Java_com_termux_x11_CmdEntryPoint_getXConnection(JNIEnv *env, __unused jobject c
     return (*env)->CallStaticObjectMethod(env, ParcelFileDescriptorClass, adoptFd, client[0]);
 }
 
+// Forwards the app's logcat (TERMUX_X11_DEBUG=1) until the app's end is closed: its logcat exits with
+// the app process. len was a size_t, never below 0, so that end of file spun this thread on zero-byte
+// reads for the rest of the server's life - one more such thread for every time the app went away.
 void* logcatThread(void *arg) {
     char buffer[4096];
-    size_t len;
-    while((len = read((int) (int64_t) arg, buffer, 4096)) >=0)
-        write(2, buffer, len);
+    ssize_t len;
+    while ((len = read((int) (int64_t) arg, buffer, sizeof(buffer))) > 0 || (len < 0 && errno == EINTR))
+        if (len > 0)
+            write(2, buffer, len);
     close((int) (int64_t) arg);
     return NULL;
 }
@@ -687,7 +691,8 @@ Java_com_termux_x11_CmdEntryPoint_getLogcatOutput(JNIEnv *env, __unused jobject 
         int p[2];
         pipe(p);
         fchmod(p[1], 0777);
-        pthread_create(&t, NULL, logcatThread, (void*) (uint64_t) p[0]);
+        if (!pthread_create(&t, NULL, logcatThread, (void*) (uint64_t) p[0]))
+            pthread_detach(t);
         return (*env)->CallStaticObjectMethod(env, ParcelFileDescriptorClass, adoptFd, p[1]);
     }
     return NULL;
