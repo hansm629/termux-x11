@@ -87,6 +87,8 @@ static void __attribute__((unused)) lorieMarkQueuedCopySuperseded(uint64_t seria
     if (harnessCancel && harnessCancel(serial))
         harnessCopyCancelled(serial);
 }
+/* Where the root's CPU copies are counted (lorieCountCpuCopy): just the site, here. */
+static void __attribute__((unused)) lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes) { *site += bytes; }
 #include "root_src.inc"
 #ifdef HAVE_CARRY
 /* Whether the GPU takes a handover's carry, and what queuing one of its copies does - a test that wants

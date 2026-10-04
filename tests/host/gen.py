@@ -185,8 +185,15 @@ recipes = {
         + func(I, "static Bool lorieRootCarryAllowed(int entries) {")
         + func(I, "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {")
         + func(I, "static Bool lorieQueueHoldsOnlyCarries(void) {"),
+    "tcorecopy_types": lambda: span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback",
+                                    "#define LORIE_COPY_CTX_UNFLIP  3          /* a flipped client buffer back into the root as the flip ends */"),
+    "tcorecopy_funcs": lambda: func(I, "static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes) {")
+        + span(I, "static int lorieCopyCtx = LORIE_COPY_CTX_NONE;", "static int lorieCopyCtx = LORIE_COPY_CTX_NONE;")
+        + func(I, "void lorieCopyContext(int ctx) {")
+        + func(I, "uint64_t lorieCoreCopyBegin(void) {")
+        + func(I, "void lorieNoteCoreCopy(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,"),
     "tcpucopy_types": lambda: span(H, "/* Why a present was drawn by the CPU", "    LORIE_CPU_PRESENT_REASONS\n};"),
-    "tcpucopy_funcs": lambda: func(I, "static Bool lorieCpuPresent(int why, PixmapPtr pixmap, RegionPtr update) {"),
+    "tcpucopy_funcs": lambda: func(I, "static Bool lorieCpuPresent(int why, __unused PixmapPtr pixmap, __unused RegionPtr update) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

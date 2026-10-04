@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Static check of the xserver.patch hooks the GPU copy ordering depends on.
+"""Static check of the xserver.patch hooks.
 
-Applies the patch's exa/ sections to the tree's own exa sources and checks that every way EXA writes a
-pixmap reaches lorieExaAccess() as a write, before the access is prepared. A write that never does is
-one a queued GPU copy can land on top of afterwards (see lorieExaAccess in lorie/InitOutput.c).
+Applies the patch's exa/ and present/ sections to the tree's own sources and checks:
+  - every way EXA writes a pixmap reaches lorieExaAccess() as a write, before the access is prepared. A
+    write that never does is one a queued GPU copy can land on top of afterwards (see lorieExaAccess in
+    lorie/InitOutput.c);
+  - every copy an EXA fallback makes with the CPU is timed from before it and counted after it
+    (lorieNoteCoreCopy), and the present and flip-end copies are counted as theirs (lorieCopyContext),
+    with the constants the patch repeats matching lorie/lorie.h.
 
 usage: tpatch.py <xserver source dir> <xserver.patch> <scratch dir>
 """
@@ -14,17 +18,18 @@ work = os.path.join(OUT, "tpatch")
 shutil.rmtree(work, ignore_errors=True)
 os.makedirs(work)
 shutil.copytree(os.path.join(XS, "exa"), os.path.join(work, "exa"))
+shutil.copytree(os.path.join(XS, "present"), os.path.join(work, "present"))
 
-# Only the exa/ sections; the patch has no "---" lines, each file starts at its "+++ ./path".
+# Only the exa/ and present/ sections; the patch has no "---" lines, each file starts at its "+++ ./path".
 sections = re.split(r"(?m)^(?=\+\+\+ )", open(PATCH).read())
-exa = "".join(s for s in sections if s.startswith("+++ ./exa/"))
+exa = "".join(s for s in sections if s.startswith("+++ ./exa/") or s.startswith("+++ ./present/"))
 r = subprocess.run(["patch", "-p1", "-N", "-s", "-d", work], input=exa, text=True, capture_output=True)
 if r.returncode != 0 or "fuzz" in r.stdout + r.stderr:
     print("patch hooks: FAIL (exa sections do not apply cleanly)\n" + r.stdout + r.stderr)
     sys.exit(1)
 
 def body(path, signature):
-    src = open(os.path.join(work, "exa", path)).read()
+    src = open(os.path.join(work, path if "/" in path else os.path.join("exa", path))).read()
     start = src.index(signature)
     depth, i = 0, src.index("{", start)
     for j in range(i, len(src)):
@@ -56,5 +61,46 @@ check(before(f, "lorieExaAccess(pDrawable, pScreen->GetWindowPixmap(pWin), EXA_P
              "EXA_PREPARE_SRC"),
       "ExaCheckCopyWindow: its write is never reported as one before the source is prepared")
 
-print("patch hooks (exa write paths reach lorieExaAccess): %s (%d failures)" % ("FAIL" if fails else "PASS", fails))
+# Every CPU copy an EXA fallback makes: timed from before the copy, counted after it.
+def counted(path, signature, call, kind):
+    f = body(path, signature)
+    check(before(f, "lorieCoreCopyBegin()", call) and before(f, call, "lorieNoteCoreCopy(" + kind),
+          signature.strip().split("(")[0] + ": its CPU copy is not timed from before it and counted after it")
+counted("exa_unaccel.c", "\nExaCheckCopyNtoN(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,", "pGC->ops->CopyArea(pSrc, pDst",
+        "LORIE_CORE_COPY_AREA")
+counted("exa_unaccel.c", "\nExaCheckCopyArea(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,", "ret = pGC->ops->CopyArea(",
+        "LORIE_CORE_COPY_AREA")
+counted("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)",
+        "pScreen->CopyWindow(pWin, ptOldOrg, prgnSrc);", "LORIE_CORE_COPY_WINDOW")
+f = body("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)")
+check(before(f, "RegionCopy(&lorieDst, prgnSrc);", "pScreen->CopyWindow(pWin, ptOldOrg, prgnSrc);"),
+      "ExaCheckCopyWindow: what it writes is taken from prgnSrc after fbCopyWindow has moved it")
+
+# The copies that are a framebuffer copy of their own, counted as that and the context ended after.
+def context(path, signature, call, ctx):
+    f = body(path, signature)
+    check(before(f, "lorieCopyContext(" + ctx + ");", call) and
+          before(f[f.find(call):], call, "lorieCopyContext(LORIE_COPY_CTX_NONE);"),
+          signature.strip().split("(")[0] + ": its copy is not counted under " + ctx)
+context("present/present_execute.c", "\npresent_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)",
+        "present_copy_region(&window->drawable, vblank->pixmap", "LORIE_COPY_CTX_PRESENT")
+context("present/present_scmd.c", "\npresent_restore_screen_pixmap(ScreenPtr screen)",
+        "present_copy_region(&screen_pixmap->drawable, flip_pixmap", "LORIE_COPY_CTX_UNFLIP")
+
+# The constants the patch repeats, because it cannot include lorie.h.
+lorie_h = open(os.path.join(os.path.dirname(os.path.abspath(PATCH)), "..", "lorie", "lorie.h")).read()
+def defined(text, name):
+    m = re.search(r"#define " + name + r"\s+(\d+)", text)
+    return m and int(m.group(1))
+enum = re.search(r"enum \{\s*LORIE_CORE_COPY_WINDOW,[^}]*\}", lorie_h).group(0)
+order = re.findall(r"(LORIE_CORE_COPY_\w+)", enum)
+for name, text in (("LORIE_CORE_COPY_WINDOW", open(os.path.join(work, "exa/exa_priv.h")).read()),
+                   ("LORIE_CORE_COPY_AREA", open(os.path.join(work, "exa/exa_priv.h")).read())):
+    check(defined(text, name) == order.index(name), "%s in exa_priv.h is not lorie.h's" % name)
+priv = open(os.path.join(work, "present/present_priv.h")).read()
+for name in ("LORIE_COPY_CTX_NONE", "LORIE_COPY_CTX_PRESENT", "LORIE_COPY_CTX_UNFLIP"):
+    check(defined(priv, name) is not None and defined(priv, name) == defined(lorie_h, name),
+          "%s in present_priv.h is not lorie.h's" % name)
+
+print("patch hooks (exa write paths reach lorieExaAccess, CPU copies counted): %s (%d failures)" % ("FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

@@ -435,6 +435,7 @@ typedef struct {
 } LoriePixmapPriv;
 
 static size_t lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region);
+static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes);
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
 static Bool lorieRootHandover(LoriePixmapPriv *priv);
 static void lorieNoteRootPublished(LoriePixmapPriv *priv);
@@ -462,7 +463,7 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
             // The whole pixmap, moved by the CPU into the new buffer.
             if (pvfb->state) {
                 pvfb->state->presentStats.cpuConverts++;
-                pvfb->state->presentStats.cpuConvertBytes += (uint64_t) desc->width * desc->height * 4;
+                lorieCountCpuCopy(&pvfb->state->presentStats.cpuConvertBytes, (uint64_t) desc->width * desc->height * 4);
             }
             // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
@@ -1200,6 +1201,18 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.cpuConvertBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuConvertBytes, 0, __ATOMIC_RELAXED);
     snap.cpuConverts = __atomic_exchange_n(&pvfb->state->presentStats.cpuConverts, 0, __ATOMIC_RELAXED);
     snap.cpuPresentBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresentBytes, 0, __ATOMIC_RELAXED);
+    snap.cpuUnflipBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuUnflipBytes, 0, __ATOMIC_RELAXED);
+    snap.cpuTotalBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuTotalBytes, 0, __ATOMIC_RELAXED);
+    snap.cpuDegradedBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuDegradedBytes, 0, __ATOMIC_RELAXED);
+    for (int kind = 0; kind < LORIE_CORE_COPY_KINDS; kind++) {
+        snap.coreCopyCalls[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyCalls[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopyBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyBytes[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopyUs[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyUs[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopyMaxUs[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyMaxUs[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopyRootBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyRootBytes[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopySameBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopySameBytes[kind], 0, __ATOMIC_RELAXED);
+        snap.coreCopyOverlapBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyOverlapBytes[kind], 0, __ATOMIC_RELAXED);
+    }
     for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
         snap.cpuPresents[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresents[why], 0, __ATOMIC_RELAXED);
     snap.gpuCarryJobs = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryJobs, 0, __ATOMIC_RELAXED);
@@ -1407,18 +1420,24 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
         for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
             cpuPresents += snap.cpuPresents[why];
-        if (snap.cpuCarryBytes || snap.cpuOwedFetchBytes || snap.cpuSeedBytes || snap.cpuResizeBytes ||
-            snap.cpuConverts || cpuPresents)
-            log(INFO, "XlorieCpuCopy: root carried forward %.1f MB, owed areas fetched %.1f MB, slots seeded "
-                      "%.1f MB, resize %.1f MB, %u pixmaps moved into GPU buffers %.1f MB, %u presents drawn by "
-                      "the CPU %.1f MB (GPU path off %u, no renderer %u, not GPU-readable %u, too many rects "
-                      "%u, queue full %u, owed-area records full %u, no copy record %u)",
+        if (snap.cpuTotalBytes || snap.cpuDegradedBytes || cpuPresents || snap.cpuConverts)
+            log(INFO, "XlorieCpuCopy: total %.1f MB copied by the CPU with a renderer there (%.1f MB more with "
+                      "none, or the GPU path off) = root carried forward %.1f MB, owed areas fetched %.1f MB, slots "
+                      "seeded %.1f MB, resize %.1f MB, flip ended %.1f MB, %u pixmaps moved into GPU buffers %.1f "
+                      "MB, CopyWindow %.1f MB, CopyArea %.1f MB, %u presents drawn by the CPU %.1f MB (GPU path "
+                      "off %u, no renderer %u, not GPU-readable %u, too many rects %u, queue full %u, owed-area "
+                      "records full %u, no copy record %u)",
+                snap.cpuTotalBytes / 1048576.0,
+                snap.cpuDegradedBytes / 1048576.0,
                 snap.cpuCarryBytes / 1048576.0,
                 snap.cpuOwedFetchBytes / 1048576.0,
                 snap.cpuSeedBytes / 1048576.0,
                 snap.cpuResizeBytes / 1048576.0,
+                snap.cpuUnflipBytes / 1048576.0,
                 snap.cpuConverts,
                 snap.cpuConvertBytes / 1048576.0,
+                snap.coreCopyBytes[LORIE_CORE_COPY_WINDOW] / 1048576.0,
+                snap.coreCopyBytes[LORIE_CORE_COPY_AREA] / 1048576.0,
                 cpuPresents,
                 snap.cpuPresentBytes / 1048576.0,
                 snap.cpuPresents[LORIE_CPU_PRESENT_DISABLED],
@@ -1428,6 +1447,18 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_QUEUE_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD]);
+        for (int kind = 0; kind < LORIE_CORE_COPY_KINDS; kind++)
+            if (snap.coreCopyCalls[kind])
+                log(INFO, "XlorieCoreCopy: %s %u by the CPU, %.1f MB in %.1f ms (longest %.2f ms); %.1f MB into the "
+                          "root, %.1f MB within one buffer, %.1f MB of it overlapping",
+                    kind == LORIE_CORE_COPY_WINDOW ? "CopyWindow" : "CopyArea",
+                    snap.coreCopyCalls[kind],
+                    snap.coreCopyBytes[kind] / 1048576.0,
+                    snap.coreCopyUs[kind] / 1000.0,
+                    snap.coreCopyMaxUs[kind] / 1000.0,
+                    snap.coreCopyRootBytes[kind] / 1048576.0,
+                    snap.coreCopySameBytes[kind] / 1048576.0,
+                    snap.coreCopyOverlapBytes[kind] / 1048576.0);
         if (snap.gpuCarryJobs || snap.gpuCarryTakenBack || snap.gpuCarryNotMade || snap.cpuCarryKept[LORIE_CARRY_KEPT_OFF] ||
             snap.cpuCarryKept[LORIE_CARRY_KEPT_NO_RENDERER] || snap.cpuCarryKept[LORIE_CARRY_KEPT_BUSY] ||
             snap.cpuCarryKept[LORIE_CARRY_KEPT_RECTS])
@@ -1812,11 +1843,10 @@ static Bool lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height,
         GCPtr gc = GetScratchGC(newPixmap->drawable.depth, pScreen);
         if (gc) {
             ValidateGC(&newPixmap->drawable, gc);
+            lorieCopyContext(LORIE_COPY_CTX_RESIZE);
             gc->ops->CopyArea(&oldPixmap->drawable, &newPixmap->drawable, gc, 0, 0, min(oldPixmap->drawable.width, newPixmap->drawable.width), min(oldPixmap->drawable.height, newPixmap->drawable.height), 0, 0);
+            lorieCopyContext(LORIE_COPY_CTX_NONE);
             FreeScratchGC(gc);
-            if (pvfb->state)
-                pvfb->state->presentStats.cpuResizeBytes += (uint64_t) min(oldPixmap->drawable.width, newPixmap->drawable.width) *
-                                                            min(oldPixmap->drawable.height, newPixmap->drawable.height) * 4;
         }
         TraverseTree(pScreen->root, lorieSetPixmapVisitWindow, oldPixmap);
         pScreen->DestroyPixmap(oldPixmap);
@@ -2159,6 +2189,94 @@ bool lorieRendererAvailable(void) {
     return pvfb->state->surfaceAvailable;
 }
 
+/*
+ * Every CPU framebuffer copy is counted here, with its bytes: against what it was for (`site`), and into
+ * one of two totals. cpuTotalBytes is what the CPU copied while a renderer was there to do it instead
+ * and the GPU path was on - the number Phase 1 has to take to 0. With no renderer connected, no surface
+ * to draw into, or GPU copies turned off, nothing but the CPU can copy, and that goes to
+ * cpuDegradedBytes instead.
+ */
+static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes) {
+    if (!pvfb->state || !bytes)
+        return;
+    *site += bytes;
+    if (!lorieConnectionAlive() || !lorieRendererAvailable() || pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing)
+        pvfb->state->presentStats.cpuDegradedBytes += bytes;
+    else
+        pvfb->state->presentStats.cpuTotalBytes += bytes;
+}
+
+/*
+ * What the CPU copies X core rendering makes are part of (LORIE_COPY_CTX_*). Set around the callers
+ * that copy a framebuffer through it - a present drawn by the CPU, a resize, the end of a flip - so
+ * their bytes are counted as theirs, and once, rather than as a client's CopyArea as well.
+ */
+static int lorieCopyCtx = LORIE_COPY_CTX_NONE;
+
+void lorieCopyContext(int ctx) {
+    lorieCopyCtx = ctx;
+}
+
+// When an EXA fallback copy starts, for lorieNoteCoreCopy (the xserver patch has no clock of its own).
+uint64_t lorieCoreCopyBegin(void) {
+    return lorieNowUs();
+}
+
+/*
+ * A copy X core rendering just made with the CPU, from the EXA fallback that made it (xserver.patch:
+ * ExaCheckCopyNtoN, ExaCheckCopyArea, ExaCheckCopyWindow) - EXA accelerates no copies here. `dstRegion`
+ * is what was written, in the destination pixmap's coordinates; the source is that region moved by
+ * (sdx, sdy) in the source pixmap.
+ */
+void lorieNoteCoreCopy(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,
+                       uint64_t startUs) {
+    int i, n;
+    BoxPtr b;
+    uint64_t pixels = 0, bytes;
+    uint32_t us;
+
+    if (!pvfb->state || kind < 0 || kind >= LORIE_CORE_COPY_KINDS || !dstRegion)
+        return;
+    us = (uint32_t) (lorieNowUs() - startUs);
+    n = RegionNumRects(dstRegion);
+    b = RegionRects(dstRegion);
+    for (i = 0; i < n; i++)
+        pixels += (uint64_t) (b[i].x2 - b[i].x1) * (b[i].y2 - b[i].y1);
+    bytes = pixels * (uint64_t) bpp / 8;
+
+    switch (lorieCopyCtx) {
+    case LORIE_COPY_CTX_PRESENT:
+        lorieCountCpuCopy(&pvfb->state->presentStats.cpuPresentBytes, bytes);
+        return;
+    case LORIE_COPY_CTX_RESIZE:
+        lorieCountCpuCopy(&pvfb->state->presentStats.cpuResizeBytes, bytes);
+        return;
+    case LORIE_COPY_CTX_UNFLIP:
+        lorieCountCpuCopy(&pvfb->state->presentStats.cpuUnflipBytes, bytes);
+        return;
+    }
+
+    lorieCountCpuCopy(&pvfb->state->presentStats.coreCopyBytes[kind], bytes);
+    pvfb->state->presentStats.coreCopyCalls[kind]++;
+    pvfb->state->presentStats.coreCopyUs[kind] += us;
+    if (us > pvfb->state->presentStats.coreCopyMaxUs[kind])
+        pvfb->state->presentStats.coreCopyMaxUs[kind] = us;
+    if (pScreenPtr && dst == (*pScreenPtr->GetScreenPixmap)(pScreenPtr))
+        pvfb->state->presentStats.coreCopyRootBytes[kind] += bytes;
+    if (src == dst) {
+        RegionRec from;
+
+        pvfb->state->presentStats.coreCopySameBytes[kind] += bytes;
+        RegionNull(&from);
+        RegionCopy(&from, dstRegion);
+        RegionTranslate(&from, sdx, sdy);
+        RegionIntersect(&from, &from, dstRegion);
+        if (RegionNotEmpty(&from))
+            pvfb->state->presentStats.coreCopyOverlapBytes[kind] += bytes;
+        RegionUninit(&from);
+    }
+}
+
 // Tries to offload a Present "copy" operation (present_execute_copy) to the renderer's GPU
 // context instead of doing a CPU CopyArea here. dst is whatever GetWindowPixmap(window) is - root
 // for a plain window, or a Composite-redirected window's own backing pixmap. Returns FALSE
@@ -2204,22 +2322,11 @@ static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {
 }
 
 // A present the GPU path turned down, which present_execute_copy() then has the CPU draw
-// (present_copy_region). Counted by why, with what it costs the CPU; returns FALSE for the caller.
-static Bool lorieCpuPresent(int why, PixmapPtr pixmap, RegionPtr update) {
-    uint64_t pixels = 0;
-
-    if (pvfb->state) {
-        if (update) {
-            int i, n = RegionNumRects(update);
-            BoxPtr b = RegionRects(update);
-
-            for (i = 0; i < n; i++)
-                pixels += (uint64_t) (b[i].x2 - b[i].x1) * (b[i].y2 - b[i].y1);
-        } else
-            pixels = (uint64_t) pixmap->drawable.width * pixmap->drawable.height;
+// (present_copy_region). Counted by why; the bytes are counted where the CPU copies them, under
+// LORIE_COPY_CTX_PRESENT (lorieNoteCoreCopy). Returns FALSE for the caller.
+static Bool lorieCpuPresent(int why, __unused PixmapPtr pixmap, __unused RegionPtr update) {
+    if (pvfb->state)
         pvfb->state->presentStats.cpuPresents[why]++;
-        pvfb->state->presentStats.cpuPresentBytes += pixels * 4;
-    }
     gpuCopyAttempts++;
     return FALSE;
 }
@@ -3420,7 +3527,8 @@ static void lorieRootFetchOwed(LoriePixmapPriv *priv, RegionPtr area, int slot, 
         RegionSubtract(&here, &want, &notMade);
         if (RegionNotEmpty(&here)) {
             if (slot != priv->rootWrite)
-                pvfb->state->presentStats.cpuOwedFetchBytes += lorieCopyRootRegion(priv, slot, priv->rootWrite, &here);
+                lorieCountCpuCopy(&pvfb->state->presentStats.cpuOwedFetchBytes,
+                                  lorieCopyRootRegion(priv, slot, priv->rootWrite, &here));
             if (steps)
                 pvfb->state->presentStats.rootOwedFromOlder++;
         }
@@ -3750,7 +3858,7 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         if (src && dst) {
             for (y = 0; y < h; y++)
                 memcpy(dst + (size_t) y * dstStride, src + (size_t) y * srcStride, row);
-            pvfb->state->presentStats.cpuSeedBytes += (uint64_t) h * row;
+            lorieCountCpuCopy(&pvfb->state->presentStats.cpuSeedBytes, (uint64_t) h * row);
         }
     }
 
@@ -3766,7 +3874,7 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         priv->rootCondDonorEpoch[i] = 0;
         priv->rootEpoch[i] = 0;
         if (i)
-            pvfb->state->presentStats.cpuSeedBytes += lorieCopyRootRegion(priv, 0, i, &all);
+            lorieCountCpuCopy(&pvfb->state->presentStats.cpuSeedBytes, lorieCopyRootRegion(priv, 0, i, &all));
     }
     RegionUninit(&all);
 
@@ -4154,7 +4262,7 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     RegionNull(&queued);
     lorieRootCarryOnGpu(priv, drawn, next, &carry, &queued);
     RegionSubtract(&carry, &carry, &queued);
-    pvfb->state->presentStats.cpuCarryBytes += lorieCopyRootRegion(priv, drawn, next, &carry);
+    lorieCountCpuCopy(&pvfb->state->presentStats.cpuCarryBytes, lorieCopyRootRegion(priv, drawn, next, &carry));
     RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], &blocked);
 
     // What `next` still lacks, `drawn` has - `drawn` owed nothing outside copies in flight into it,

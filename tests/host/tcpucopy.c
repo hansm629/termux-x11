@@ -1,5 +1,5 @@
-/* Presents the GPU path turned down are counted by why, with the bytes the CPU then copies
- * (lorieCpuPresent and LORIE_CPU_PRESENT_*, extracted by gen.py). */
+/* Presents the GPU path turned down are counted by why (lorieCpuPresent and LORIE_CPU_PRESENT_*, extracted
+ * by gen.py). Their bytes are counted where the CPU copies them (tcorecopy), not here. */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -10,6 +10,7 @@ typedef struct { int n; BoxRec *rects; } RegionRec, *RegionPtr;
 static int RegionNumRects(RegionPtr r) { return r->n; }
 static BoxPtr RegionRects(RegionPtr r) { return r->rects; }
 typedef struct { struct { int width, height; } drawable; } PixmapRec, *PixmapPtr;
+#define __unused __attribute__((unused))
 #include "tcpucopy_types.inc"
 static struct { struct { uint64_t cpuPresentBytes; uint32_t cpuPresents[LORIE_CPU_PRESENT_REASONS]; } presentStats; } fakeState;
 static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
@@ -27,11 +28,10 @@ int main(void) {
 
     CHECK(!lorieCpuPresent(LORIE_CPU_PRESENT_QUEUE_FULL, &pix, &update), "said the GPU took it");
     CHECK(fakeState.presentStats.cpuPresents[LORIE_CPU_PRESENT_QUEUE_FULL] == 1, "not counted under its reason");
-    CHECK(fakeState.presentStats.cpuPresentBytes == 300 * 4, "%llu bytes for 300 pixels",
-          (unsigned long long) fakeState.presentStats.cpuPresentBytes);
-    lorieCpuPresent(LORIE_CPU_PRESENT_NO_RENDERER, &pix, NULL);   /* no update region: the whole pixmap */
+    lorieCpuPresent(LORIE_CPU_PRESENT_NO_RENDERER, &pix, NULL);
     CHECK(fakeState.presentStats.cpuPresents[LORIE_CPU_PRESENT_NO_RENDERER] == 1, "not counted under its reason");
-    CHECK(fakeState.presentStats.cpuPresentBytes == (300 + 5000) * 4, "%llu bytes after the whole 100 x 50 pixmap",
+    CHECK(fakeState.presentStats.cpuPresentBytes == 0,
+          "%llu bytes counted at the decision - they are counted where the CPU copies them, and would be twice",
           (unsigned long long) fakeState.presentStats.cpuPresentBytes);
     CHECK(gpuCopyAttempts == 2, "%d attempts counted, 2 made", gpuCopyAttempts);
     uint32_t others = 0;

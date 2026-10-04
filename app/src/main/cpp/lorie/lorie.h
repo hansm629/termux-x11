@@ -67,6 +67,7 @@ void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
 void lorieUnregisterBuffer(LorieBuffer* buffer);
 bool lorieConnectionAlive(void);
+void lorieCopyContext(int ctx);
 extern bool lorieDebugEnabled; // Set in activity.c's startLogcat, only called when TERMUX_X11_DEBUG=1.
 void lorieSetRendererWakeupCond(int fd);
 int rendererGetWakeupCondFd(void);
@@ -304,6 +305,20 @@ enum {
     LORIE_CPU_PRESENT_NO_RECORD,      /* no room to keep track of it */
     LORIE_CPU_PRESENT_REASONS
 };
+
+/* The copies X core rendering makes with the CPU, by the EXA fallback that made them (lorieNoteCoreCopy). */
+enum {
+    LORIE_CORE_COPY_WINDOW,           /* CopyWindow: a window moved */
+    LORIE_CORE_COPY_AREA,             /* CopyArea between drawables, and what is built on it */
+    LORIE_CORE_COPY_KINDS
+};
+/* What a CPU copy made through X core rendering is a part of, set around the callers whose copy is a
+ * framebuffer copy of its own (lorieCopyContext). The values are also used by the xserver patch
+ * (present_priv.h), which cannot include this header. */
+#define LORIE_COPY_CTX_NONE    0
+#define LORIE_COPY_CTX_PRESENT 1          /* a present the CPU draws because the GPU path turned it down */
+#define LORIE_COPY_CTX_RESIZE  2          /* the old root into a resized one */
+#define LORIE_COPY_CTX_UNFLIP  3          /* a flipped client buffer back into the root as the flip ends */
 
 /* Why a handover's carry stayed with the CPU instead of going to the GPU (presentStats.cpuCarryKept). */
 enum {
@@ -612,6 +627,21 @@ struct lorie_shared_server_state {
         volatile uint32_t cpuConverts;
         volatile uint64_t cpuPresentBytes;
         volatile uint32_t cpuPresents[LORIE_CPU_PRESENT_REASONS];
+        volatile uint64_t cpuUnflipBytes;
+        /* Every byte above and below, once: with a renderer there and the GPU path on - what has to
+         * reach 0 - and apart from that, with no renderer to copy anything or GPU copies turned off. */
+        volatile uint64_t cpuTotalBytes;
+        volatile uint64_t cpuDegradedBytes;
+        /* The copies X core rendering makes with the CPU (EXA accelerates none), outside the contexts
+         * above: calls, bytes, time and the longest, and of the bytes those written into the root,
+         * those copied within one buffer, and those whose source and destination overlap. */
+        volatile uint32_t coreCopyCalls[LORIE_CORE_COPY_KINDS];
+        volatile uint64_t coreCopyBytes[LORIE_CORE_COPY_KINDS];
+        volatile uint32_t coreCopyUs[LORIE_CORE_COPY_KINDS];
+        volatile uint32_t coreCopyMaxUs[LORIE_CORE_COPY_KINDS];
+        volatile uint64_t coreCopyRootBytes[LORIE_CORE_COPY_KINDS];
+        volatile uint64_t coreCopySameBytes[LORIE_CORE_COPY_KINDS];
+        volatile uint64_t coreCopyOverlapBytes[LORIE_CORE_COPY_KINDS];
         /* The carry the GPU did instead (lorieRootCarryOnGpu): copies queued and their bytes, the ones
          * a CPU access took back before the renderer got to them - the CPU then fetched the area, which
          * is in cpuOwedFetchBytes - and the ones not made. cpuCarryKept is a handover whose carry
