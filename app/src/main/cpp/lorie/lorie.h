@@ -305,6 +305,15 @@ enum {
     LORIE_CPU_PRESENT_REASONS
 };
 
+/* Why a handover's carry stayed with the CPU instead of going to the GPU (presentStats.cpuCarryKept). */
+enum {
+    LORIE_CARRY_KEPT_OFF,             /* TERMUX_X11_ROOT_GPU_CARRY=0, GPU presents off, or legacy drawing */
+    LORIE_CARRY_KEPT_NO_RENDERER,     /* no renderer connected, or it has no surface */
+    LORIE_CARRY_KEPT_BUSY,            /* the queue or the copy records are half taken already */
+    LORIE_CARRY_KEPT_RECTS,           /* more rectangles than its queue entries hold */
+    LORIE_CARRY_KEPT_REASONS
+};
+
 typedef struct {
     uint64_t serial;
     uint64_t srcBufferId;
@@ -337,7 +346,8 @@ typedef struct {
 
 enum {
     LORIE_TRACE_REQUEST = 1,  /* X: client present request arrived    a = target - crtc msc, b = crtc msc */
-    LORIE_TRACE_ENQUEUE,      /* X: copy offloaded to the renderer     a = 1 if into the root,  b = serial */
+    LORIE_TRACE_ENQUEUE,      /* X: copy offloaded to the renderer     a = 1 if into the root, 2 if a
+                               *    handover's carry,             b = serial */
     LORIE_TRACE_RESOLVED,     /* X: copy finished at the X server      a = 1 if made,           b = serial */
     LORIE_TRACE_PUBLISH,      /* X: root slot handed on                a = slot,                b = buffer id */
     LORIE_TRACE_TICK,         /* X: vsync redraw                       a = steps,               b = msc */
@@ -602,6 +612,15 @@ struct lorie_shared_server_state {
         volatile uint32_t cpuConverts;
         volatile uint64_t cpuPresentBytes;
         volatile uint32_t cpuPresents[LORIE_CPU_PRESENT_REASONS];
+        /* The carry the GPU did instead (lorieRootCarryOnGpu): copies queued and their bytes, the ones
+         * a CPU access took back before the renderer got to them - the CPU then fetched the area, which
+         * is in cpuOwedFetchBytes - and the ones not made. cpuCarryKept is a handover whose carry
+         * stayed with the CPU, by why (LORIE_CARRY_KEPT_*). */
+        volatile uint32_t gpuCarryJobs;
+        volatile uint64_t gpuCarryBytes;
+        volatile uint32_t gpuCarryTakenBack;
+        volatile uint32_t gpuCarryNotMade;
+        volatile uint32_t cpuCarryKept[LORIE_CARRY_KEPT_REASONS];
         /* Handovers that could not copy the whole stale area forward, because a queued GPU copy
          * had not written part of it yet; that part stays owed to the slot and goes across on a
          * later handover. It replaces a count of publishes held back entirely, which is what the

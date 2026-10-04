@@ -64,7 +64,9 @@ static struct {
              rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
              rootUnpublishedMaxUs, rootReplacementsNotMade, rootOwedFromOlder, rootOwedLost,
              rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed;
-             uint64_t cpuCarryBytes, cpuOwedFetchBytes; } presentStats;
+             uint64_t cpuCarryBytes, cpuOwedFetchBytes;
+             uint32_t gpuCarryJobs, gpuCarryTakenBack, gpuCarryNotMade, cpuCarryKept[8];
+             uint64_t gpuCarryBytes; } presentStats;
 } fakeState;
 static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
@@ -86,6 +88,19 @@ static void __attribute__((unused)) lorieMarkQueuedCopySuperseded(uint64_t seria
         harnessCopyCancelled(serial);
 }
 #include "root_src.inc"
+#ifdef HAVE_CARRY
+/* Whether the GPU takes a handover's carry, and what queuing one of its copies does - a test that wants
+ * carries on the GPU sets both. Left alone, every carry is the CPU's, as it was before there were any. */
+static int harnessCarryOn;
+static uint64_t (*harnessQueueCarry)(int from, int to, BoxPtr box, int n);
+static Bool lorieRootCarryAllowed(int entries) { (void) entries; return harnessCarryOn && harnessQueueCarry; }
+static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {
+    (void) priv;
+    return harnessQueueCarry(from, to, box, n);
+}
+#endif
+/* What the shared lock waits out once a PrepareAccess takes it: copies the renderer had claimed. */
+static void (*harnessLockWait)(void);
 static void harnessCopyCancelled(uint64_t serial) {
 #ifdef HAVE_REPLACING
     lorieRootCopyCancelled(serial);
@@ -119,6 +134,9 @@ static void init(LoriePixmapPriv *priv) {
     }
 #ifdef HAVE_OWED
     RegionNull(&priv->rootOwed); priv->rootOwedDonor = -1;
+#endif
+#ifdef HAVE_CARRY
+    RegionNull(&priv->rootOwedNow);
 #endif
 #ifdef HAVE_PINS
     RegionNull(&priv->rootLostArea);
@@ -168,10 +186,22 @@ static void xCancel(uint64_t serial) {
 /* the X server drawing with the CPU into the slot it draws into: PrepareAccess brings the slot up to
  * date first (loriePrepareAccess), and the damage reported after the operation marks the other slots
  * stale and takes the drawn area out of what is owed */
+/* A PrepareAccess on the drawing slot, as loriePrepareAccess does it: queued carries taken back, the
+ * slot brought up to date where it can be, then the shared lock, which waits out claimed copies. */
+static void xPrepare(LoriePixmapPriv *priv) {
+#ifdef HAVE_CARRY
+    lorieRootTakeBackCarries(priv);
+#endif
+#ifdef HAVE_OWED
+    lorieRepairRootOwed(priv);
+#endif
+    if (harnessLockWait)
+        harnessLockWait();
+}
 static void xDraw(LoriePixmapPriv *priv, BoxRec b, uint32_t v) {
     RegionRec r; RegionInit(&r, &b, 1);
 #ifdef HAVE_REPLACING
-    lorieRepairRootOwed(priv);
+    xPrepare(priv);
     fill(priv->rootWrite, b, v);
     lorieMarkRootStale(priv, &r);
     lorieRootCpuDrawn(priv, &r);

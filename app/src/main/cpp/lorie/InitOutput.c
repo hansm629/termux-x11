@@ -314,9 +314,12 @@ static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
 #define LORIE_ROOT_REPLACEMENTS (2 * LORIE_GPU_COPY_QUEUE_CAPACITY)
 
 // A copy into a root slot over an area that slot owed, and that area (see rootReplacing, rootCond).
+// `carry` marks one a handover queued to bring the slot up to date (lorieRootCarryOnGpu) rather than
+// a client's present.
 typedef struct {
     uint64_t serial;
     RegionRec region;
+    Bool carry;
 } LorieRootCopyMark;
 
 typedef struct {
@@ -368,6 +371,17 @@ typedef struct {
     int rootOwedDonor;
     uint32_t rootOwedDonorEpoch;
     uint64_t rootOwedSerial;
+    /*
+     * The part of rootOwed that waits for nothing: what the handover gave the GPU as its carry
+     * (lorieRootCarryOnGpu). A carry never covers an area a copy was still pending over, so where its
+     * copies are taken back or not made, the CPU fetches the area from the donor at once rather than
+     * after rootOwedSerial.
+     */
+    RegionRec rootOwedNow;
+    /* Per slot, the last carry copy that reads it (lorieRootCarryOnGpu). Until that has resolved the
+     * slot is not drawn into: the copy would carry the new drawing instead, and the GPU would be
+     * reading the slot while the CPU wrote it (lorieRootPinnedSlots). */
+    uint64_t rootCarrySrcSerial[LORIE_ROOT_SLOTS];
 
     /*
      * Copies queued into the drawing slot over an area it still owes, by serial.
@@ -1188,6 +1202,12 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.cpuPresentBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresentBytes, 0, __ATOMIC_RELAXED);
     for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
         snap.cpuPresents[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresents[why], 0, __ATOMIC_RELAXED);
+    snap.gpuCarryJobs = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryJobs, 0, __ATOMIC_RELAXED);
+    snap.gpuCarryBytes = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryBytes, 0, __ATOMIC_RELAXED);
+    snap.gpuCarryTakenBack = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryTakenBack, 0, __ATOMIC_RELAXED);
+    snap.gpuCarryNotMade = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryNotMade, 0, __ATOMIC_RELAXED);
+    for (int why = 0; why < LORIE_CARRY_KEPT_REASONS; why++)
+        snap.cpuCarryKept[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuCarryKept[why], 0, __ATOMIC_RELAXED);
 
 
     if (!driverLogged && pvfb->state->rendererDriver[0]) {
@@ -1408,6 +1428,20 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_QUEUE_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD]);
+        if (snap.gpuCarryJobs || snap.gpuCarryTakenBack || snap.gpuCarryNotMade || snap.cpuCarryKept[LORIE_CARRY_KEPT_OFF] ||
+            snap.cpuCarryKept[LORIE_CARRY_KEPT_NO_RENDERER] || snap.cpuCarryKept[LORIE_CARRY_KEPT_BUSY] ||
+            snap.cpuCarryKept[LORIE_CARRY_KEPT_RECTS])
+            log(INFO, "XlorieCarry: %u carry copies given to the GPU, %.1f MB; %u taken back by the CPU, %u not "
+                      "made; carries kept on the CPU: GPU carry off %u, no renderer %u, queue busy %u, too many "
+                      "rects %u",
+                snap.gpuCarryJobs,
+                snap.gpuCarryBytes / 1048576.0,
+                snap.gpuCarryTakenBack,
+                snap.gpuCarryNotMade,
+                snap.cpuCarryKept[LORIE_CARRY_KEPT_OFF],
+                snap.cpuCarryKept[LORIE_CARRY_KEPT_NO_RENDERER],
+                snap.cpuCarryKept[LORIE_CARRY_KEPT_BUSY],
+                snap.cpuCarryKept[LORIE_CARRY_KEPT_RECTS]);
     }
 
     gpuCopyAttempts = gpuCopyOffloads = 0;
@@ -2753,9 +2787,12 @@ static void lorieRootCopyCancelled(uint64_t serial) {
         return;
     for (i = 0; i < priv->rootReplacingCount; i++)
         if (priv->rootReplacing[i].serial == serial) {
+            if (priv->rootReplacing[i].carry)
+                pvfb->state->presentStats.gpuCarryTakenBack++;
+            else
+                pvfb->state->presentStats.rootReplacementsNotMade++;
             RegionUninit(&priv->rootReplacing[i].region);
             priv->rootReplacing[i] = priv->rootReplacing[--priv->rootReplacingCount];
-            pvfb->state->presentStats.rootReplacementsNotMade++;
             return;
         }
 }
@@ -3147,6 +3184,7 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
                 rootPriv->rootCondDonor[i] = -1;
                 if (i == 0) {
                     RegionUninit(&rootPriv->rootOwed);
+                    RegionUninit(&rootPriv->rootOwedNow);
                     rootPriv->rootOwedDonor = -1;
                     rootPriv->rootOwedSerial = 0;
                     while (rootPriv->rootReplacingCount > 0)
@@ -3274,10 +3312,14 @@ static void lorieRootSettleReplacements(LoriePixmapPriv *priv) {
             i++;
             continue;
         }
+        // A carry says nothing about whether clients' copies are failing, so it leaves that alone.
         if (lorieGpuCopyMade(priv->rootReplacing[i].serial)) {
             RegionSubtract(&priv->rootOwed, &priv->rootOwed, &priv->rootReplacing[i].region);
-            priv->rootRepairFirst = FALSE;
-        } else {
+            if (!priv->rootReplacing[i].carry)
+                priv->rootRepairFirst = FALSE;
+        } else if (priv->rootReplacing[i].carry)
+            pvfb->state->presentStats.gpuCarryNotMade++;
+        else {
             pvfb->state->presentStats.rootReplacementsNotMade++;
             priv->rootRepairFirst = TRUE;
         }
@@ -3326,6 +3368,7 @@ static void lorieRootNoteGpuCopy(LoriePixmapPriv *priv, RegionPtr r, uint64_t se
     }
     priv->rootReplacing[priv->rootReplacingCount].serial = serial;
     priv->rootReplacing[priv->rootReplacingCount].region = over;   // the record owns it from here
+    priv->rootReplacing[priv->rootReplacingCount].carry = FALSE;
     priv->rootReplacingCount++;
 }
 
@@ -3429,6 +3472,7 @@ static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {
 
     if (priv->rootOwedDonor < 0 || priv->rootOwedDonor == priv->rootWrite) {
         RegionEmpty(&priv->rootOwed);
+        RegionEmpty(&priv->rootOwedNow);
         return TRUE;
     }
 
@@ -3438,16 +3482,40 @@ static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {
 
     RegionNull(&rest);
     RegionSubtract(&rest, &priv->rootOwed, &pending);
-    if (RegionNotEmpty(&rest) && lorieGpuCopyResolved(priv->rootOwedSerial)) {
+    // All of it once the donor's own copies have landed; until then only what waits for none of them.
+    if (RegionNotEmpty(&rest) && !lorieGpuCopyResolved(priv->rootOwedSerial))
+        RegionIntersect(&rest, &rest, &priv->rootOwedNow);
+    if (RegionNotEmpty(&rest)) {
         lorieRootFetchOwed(priv, &rest, priv->rootOwedDonor, priv->rootOwedDonorEpoch);
         pvfb->state->presentStats.rootOwedRepairs++;
-        RegionSubtract(&rest, &priv->rootOwed, &pending);
     }
+    RegionSubtract(&rest, &priv->rootOwed, &pending);
     clear = !RegionNotEmpty(&rest);
 
     RegionUninit(&rest);
     RegionUninit(&pending);
     return clear;
+}
+
+/*
+ * The CPU is about to touch the drawing slot while copies of its carry may still be queued: one would
+ * land after the CPU had drawn, over the newer pixels, and whatever the CPU read before it landed would
+ * be the slot's older content. The renderer has not got to those, so they are taken back and the area
+ * is fetched by the CPU instead (lorieRepairRootOwed, next) - waiting for the renderer from a
+ * PrepareAccess is what must not happen. A copy the renderer has already claimed is running under the
+ * shared lock, which the access takes before it touches anything (lorieNeedsGpuLock).
+ */
+static void lorieRootTakeBackCarries(LoriePixmapPriv *priv) {
+    int i = 0;
+
+    while (i < priv->rootReplacingCount) {
+        int count = priv->rootReplacingCount;
+
+        if (priv->rootReplacing[i].carry)
+            lorieMarkQueuedCopySuperseded(priv->rootReplacing[i].serial);
+        if (priv->rootReplacingCount == count)
+            i++;                        // not a carry, or the renderer has it already
+    }
 }
 
 // TraverseTree visitor: each window that is shown exposes the part of the lost area it shows.
@@ -3486,11 +3554,19 @@ static void lorieRootExposeLost(LoriePixmapPriv *priv) {
  * are not made, that content is wherever it was going to come from - rootOwedDonor - and where that
  * slot went out the same way, further back still. A slot drawn into again before that is settled no
  * longer has it, which is how content used to be lost for good (rootOwedLost).
+ *
+ * And any slot a carry copy has yet to read (rootCarrySrcSerial): unlike a present, which reads a
+ * client's pixmap, a carry reads a slot, and that slot drawn into first is new content carried where
+ * the old belonged - into a slot that may have gone out already.
  */
 static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {
     uint32_t pinned = 0, epoch;
     int slot, steps, i;
     Bool pending = FALSE;
+
+    for (slot = 0; slot < LORIE_ROOT_SLOTS; slot++)
+        if (priv->rootCarrySrcSerial[slot] && !lorieGpuCopyResolved(priv->rootCarrySrcSerial[slot]))
+            pinned |= 1u << slot;
 
     for (i = 0; i < priv->rootReplacingCount && !pending; i++) {
         RegionRec over;
@@ -3501,7 +3577,7 @@ static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {
         RegionUninit(&over);
     }
     if (!pending)
-        return 0;
+        return pinned;
 
     slot = priv->rootOwedDonor;
     epoch = priv->rootOwedDonorEpoch;
@@ -3545,6 +3621,7 @@ static void lorieRootKeepConditional(LoriePixmapPriv *priv, int slot) {
     priv->rootCondDonorEpoch[slot] = priv->rootOwedDonorEpoch;
     priv->rootReplacingCount = 0;
     RegionEmpty(&priv->rootOwed);
+    RegionEmpty(&priv->rootOwedNow);
 }
 
 /*
@@ -3683,6 +3760,7 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         RegionInit(&priv->rootStale[i], NULL, 0);
         RegionInit(&priv->rootGpuPending[i], NULL, 0);
         priv->rootGpuPendingSerial[i] = 0;
+        priv->rootCarrySrcSerial[i] = 0;
         priv->rootCondCount[i] = 0;
         priv->rootCondDonor[i] = -1;
         priv->rootCondDonorEpoch[i] = 0;
@@ -3720,6 +3798,7 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     }
 
     RegionInit(&priv->rootOwed, NULL, 0);
+    RegionInit(&priv->rootOwedNow, NULL, 0);
     priv->rootOwedDonor = -1;
     priv->rootOwedDonorEpoch = 0;
     priv->rootOwedSerial = 0;
@@ -3791,12 +3870,154 @@ static void lorieNoteRootPublished(LoriePixmapPriv *priv) {
 // nothing at all while the renderer is still sampling every other slot, in which case we simply
 // keep drawing into this one for another frame - that costs one frame of freshness and never a
 // stall.
+/*
+ * Whether a handover's carry may go to the GPU, `entries` queue entries of it. Only while a renderer is
+ * there to run it, and only into the first half of the queue and of the copy records: the rest is
+ * kept for clients' presents, which are never turned down for a carry - a carry the GPU cannot take
+ * is copied by the CPU, as it always was. TERMUX_X11_ROOT_GPU_CARRY=0 keeps every carry on the CPU.
+ */
+static Bool lorieRootCarryAllowed(int entries) {
+    static int enabled = -1;
+    uint32_t used;
+    int i, freeRecords = 0;
+
+    if (enabled < 0) {
+        const char *e = getenv("TERMUX_X11_ROOT_GPU_CARRY");
+        enabled = !(e && !strcmp(e, "0"));
+    }
+    if (!enabled || pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing) {
+        pvfb->state->presentStats.cpuCarryKept[LORIE_CARRY_KEPT_OFF]++;
+        return FALSE;
+    }
+    if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
+        pvfb->state->presentStats.cpuCarryKept[LORIE_CARRY_KEPT_NO_RENDERER]++;
+        return FALSE;
+    }
+    used = pvfb->state->gpuCopyQueue.writeIndex - __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    for (i = 0; i < LORIE_COPY_RECORDS; i++)
+        if (!lorieCopyRecords[i].inUse)
+            freeRecords++;
+    if (used + (uint32_t) entries > LORIE_GPU_COPY_QUEUE_CAPACITY / 2 || freeRecords < entries + LORIE_COPY_RECORDS / 2) {
+        pvfb->state->presentStats.cpuCarryKept[LORIE_CARRY_KEPT_BUSY]++;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/*
+ * Queues one GPU copy of `n` rects from root slot `from` into slot `to`, at the same place, and returns
+ * its serial - 0 if there was no room after all. The renderer's ordinary copy path runs it; nothing on
+ * that side knows it from a present. Nobody acks it either, so its record goes straight to the ones
+ * let go of once settled (lorieReapAbandonedCopies), holding both slots until the renderer is done.
+ */
+static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {
+    LorieBuffer *src = priv->rootBuf[from], *dst = priv->rootBuf[to];
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex;
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    LorieAbandonedCopy *record;
+    LorieRendererSessionRec *live;
+    LorieGpuCopyEntry *entry;
+    uint64_t serial;
+    int i;
+
+    if (!src || !dst || n <= 0 || n > LORIE_GPU_COPY_MAX_RECTS ||
+        writeIndex - readIndex >= LORIE_GPU_COPY_QUEUE_CAPACITY || !(record = lorieTakeCopyRecord()))
+        return 0;
+
+    LorieBuffer_acquire(src);
+    LorieBuffer_gpuCopyPendingInc(src);
+    LorieBuffer_acquire(dst);
+    LorieBuffer_gpuCopyPendingInc(dst);
+    record->src = src;
+    record->dst = dst;
+
+    serial = ++pvfb->gpuCopySerialCounter;
+    entry = &pvfb->state->gpuCopyQueue.entries[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
+    entry->serial = serial;
+    entry->srcBufferId = LorieBuffer_description(src)->id;
+    entry->dstBufferId = LorieBuffer_description(dst)->id;
+    entry->xOff = 0;
+    entry->yOff = 0;
+    entry->numRects = (uint16_t) n;
+    // As lorieTryScheduleGpuCopy does: queued before the release below publishes the entry.
+    __atomic_store_n(&pvfb->state->gpuCopyQueue.entryState[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY],
+                     (uint32_t) LORIE_JOB_QUEUED, __ATOMIC_RELAXED);
+    for (i = 0; i < n; i++)
+        entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
+    __atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE);
+    pthread_cond_signal(rendererCond);
+
+    record->serial = serial;
+    record->session = lorieRendererSession;
+    if ((live = lorieSessionById(lorieRendererSession)))
+        live->outstanding++;
+    record->startUs = lorieNowUs();
+    xorg_list_add(&record->link, &lorieAbandonedCopies);
+    lorieTrace(pvfb->state, LORIE_TRACE_ENQUEUE, 2, serial);
+    return serial;
+}
+
+/*
+ * Gives a handover's carry - `carry`, from slot `from` into `to`, the next drawing slot - to the GPU
+ * instead of copying it with the CPU, as far as it can, and says in `queued` what it gave. Each copy
+ * queued is a replacement over the area `to` is about to owe from `from` (rootReplacing, marked as a
+ * carry): made, the area is no longer owed; not made, or taken back because the CPU got to the slot
+ * first (lorieRootTakeBackCarries), the CPU fetches it from `from` after all - which the pins keep
+ * until then, as they do for any donor. Called by the handover once the slots are settled and before
+ * `to` becomes the drawing slot, with rootReplacing empty.
+ */
+#define LORIE_ROOT_CARRY_ENTRIES 2
+static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued) {
+    int n = RegionNumRects(carry), entries, e, i;
+    BoxPtr box = RegionRects(carry);
+
+    RegionEmpty(queued);
+    if (n <= 0)
+        return;
+    entries = (n + LORIE_GPU_COPY_MAX_RECTS - 1) / LORIE_GPU_COPY_MAX_RECTS;
+    if (entries > LORIE_ROOT_CARRY_ENTRIES) {
+        pvfb->state->presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS]++;
+        return;
+    }
+    if (priv->rootReplacingCount + entries > LORIE_ROOT_REPLACEMENTS || !lorieRootCarryAllowed(entries))
+        return;
+
+    for (e = 0; e < entries; e++) {
+        int first = e * LORIE_GPU_COPY_MAX_RECTS, count = min(LORIE_GPU_COPY_MAX_RECTS, n - first);
+        uint64_t serial = lorieQueueRootSlotCopy(priv, from, to, box + first, count), bytes = 0;
+        LorieRootCopyMark *mark;
+        RegionRec one;
+
+        if (!serial)
+            break;      // the rest stays with the CPU
+        mark = &priv->rootReplacing[priv->rootReplacingCount++];
+        mark->serial = serial;
+        mark->carry = TRUE;
+        RegionNull(&mark->region);
+        for (i = first; i < first + count; i++) {
+            RegionInit(&one, &box[i], 1);
+            RegionUnion(&mark->region, &mark->region, &one);
+            RegionUninit(&one);
+            bytes += (uint64_t) (box[i].x2 - box[i].x1) * (box[i].y2 - box[i].y1) * 4;
+        }
+        RegionUnion(queued, queued, &mark->region);
+        // Pending into `to` like any copy into it: should it go out before this lands, the next
+        // handover must not read the area from it yet. And `from` is not drawn into until it has.
+        RegionUnion(&priv->rootGpuPending[to], &priv->rootGpuPending[to], &mark->region);
+        priv->rootGpuPendingSerial[to] = serial;
+        priv->rootCarrySrcSerial[from] = serial;
+        pvfb->state->presentStats.gpuCarryJobs++;
+        pvfb->state->presentStats.gpuCarryBytes += bytes;
+    }
+}
+
 static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     uint32_t old, new, pinned;
     Bool retried = FALSE;
     int drawn = priv->rootWrite, next, i;
     RegionPtr unsafe, nextPending;
-    RegionRec blocked, carry;
+    RegionRec blocked, carry, queued;
+    uint64_t waitFor;
 
     if (!priv->rootDouble)
         return FALSE;
@@ -3925,22 +4146,32 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     pvfb->state->presentStats.rootPublishes++;
     lorieTrace(pvfb->state, LORIE_TRACE_PUBLISH, drawn, pvfb->state->rootBufferIds[drawn]);
 
+    // What the area left behind waits for: copies pending into the two slots now, before the carry
+    // below adds its own to `next`.
+    waitFor = max(priv->rootGpuPendingSerial[drawn], priv->rootGpuPendingSerial[next]);
+
+    // The GPU takes what it can of the carry; the CPU copies the rest now, as it always did.
+    RegionNull(&queued);
+    lorieRootCarryOnGpu(priv, drawn, next, &carry, &queued);
+    RegionSubtract(&carry, &carry, &queued);
     pvfb->state->presentStats.cpuCarryBytes += lorieCopyRootRegion(priv, drawn, next, &carry);
     RegionIntersect(&priv->rootStale[next], &priv->rootStale[next], &blocked);
 
     // What `next` still lacks, `drawn` has - `drawn` owed nothing outside copies in flight into it,
     // or it would not have been published above, and for those rootCond[drawn] says where the content
-    // is instead - so record where it is and what has to land before it can be copied.
-    if (RegionNotEmpty(&priv->rootStale[next])) {
-        uint64_t waitFor = max(priv->rootGpuPendingSerial[drawn], priv->rootGpuPendingSerial[next]);
-
-        RegionCopy(&priv->rootOwed, &priv->rootStale[next]);
+    // is instead - so record where it is and what has to land before it can be copied. What the GPU
+    // took is owed from `drawn` too, until its copies are made, and waits for nothing.
+    if (RegionNotEmpty(&priv->rootStale[next]) || RegionNotEmpty(&queued)) {
+        RegionUnion(&priv->rootOwed, &priv->rootStale[next], &queued);
+        RegionCopy(&priv->rootOwedNow, &queued);
         priv->rootOwedDonor = drawn;
         priv->rootOwedDonorEpoch = priv->rootEpoch[drawn];
         priv->rootOwedSerial = waitFor;
-        pvfb->state->presentStats.rootStalePostponed++;
+        if (RegionNotEmpty(&priv->rootStale[next]))
+            pvfb->state->presentStats.rootStalePostponed++;
     }
 
+    RegionUninit(&queued);
     RegionUninit(&carry);
     RegionUninit(&blocked);
 
@@ -3992,6 +4223,33 @@ static int lorieSharedLockHeld = 0;
  * reported, and TERMUX_X11_EXA_PREFLIGHT=0 turns it off for comparison.
  */
 #define LORIE_PREFLIGHT_MAX_US 20000ULL
+
+// Whether everything still queued is a handover's carry - a copy from one root slot to another - which
+// the fallback does not wait for: an access to the drawing slot takes back the ones the renderer has
+// not got to (lorieRootTakeBackCarries), which costs a CPU copy, where waiting would cost a wait on the
+// renderer every frame.
+static Bool lorieQueueHoldsOnlyCarries(void) {
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
+    int k;
+
+    if (!pvfb->state->rootDoubleBuffered)
+        return FALSE;
+    for (i = readIndex; i != writeIndex; i++) {
+        uint32_t slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
+        uint64_t src = pvfb->state->gpuCopyQueue.entries[slot].srcBufferId;
+        Bool carry = FALSE;
+
+        if (__atomic_load_n(&pvfb->state->gpuCopyQueue.entryState[slot], __ATOMIC_ACQUIRE) == LORIE_JOB_CANCELLED)
+            continue;
+        for (k = 0; k < LORIE_ROOT_SLOTS && !carry; k++)
+            carry = pvfb->state->rootBufferIds[k] == src;
+        if (!carry)
+            return FALSE;
+    }
+    return TRUE;
+}
+
 void lorieExaFallbackBegin(void) {
     static int enabled = -1;
     static uint64_t stuckSerial = 0;
@@ -4008,6 +4266,8 @@ void lorieExaFallbackBegin(void) {
     target = pvfb->state->gpuCopyQueue.writeIndex;
     if (__atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) == target)
         return;   // nothing queued: the common case, two loads
+    if (lorieQueueHoldsOnlyCarries())
+        return;
 
     // Holding the lock already - an access opened outside a fallback - means the renderer cannot
     // drain until it is released. Waiting would only run out the clock.
@@ -4076,8 +4336,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     // date here if the content has landed, before anything reads the old pixels. If it has not, the
     // access goes ahead: waiting here is waiting on the renderer from inside a PrepareAccess, which
     // can deadlock, and the handover still will not publish the slot until it is repaired.
-    if (priv && priv->rootDouble)
+    if (priv && priv->rootDouble) {
+        lorieRootTakeBackCarries(priv);
         lorieRepairRootOwed(priv);
+    }
 
     if (lorieNeedsGpuLock(pPix, priv, index)) {
         /*

@@ -22,6 +22,8 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$OUT/t26" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t30.c" "$OUT/region16.o" -o "$OUT/t30"
 "$OUT/t30" || status=1
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t33.c" "$OUT/region16.o" -o "$OUT/t33"
+"$OUT/t33" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/t25.c" "$OUT/region16.o" -o "$OUT/t25"
 "$OUT/t25" || status=1
 
@@ -29,7 +31,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tanalyze.py" "$HERE/../../tools/trace/a
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tpatch.py" "$HERE/../../app/src/main/cpp/xserver" \
     "$HERE/../../app/src/main/cpp/patches/xserver.patch" "$OUT" || status=1
 
-for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy t21 t29 tstat ttrace; do
+for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy tcarryq t21 t29 tstat ttrace; do
     "$CC" -Wall -Wno-unused-function -O2 -pthread -I"$OUT" "$HERE/$t.c" -o "$OUT/$t"
     OUT="$OUT" "$OUT/$t" || status=1
 done

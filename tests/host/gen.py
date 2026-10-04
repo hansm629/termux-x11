@@ -49,11 +49,17 @@ recipes = {
     "root": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
         + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + opt(lambda: macro(H, "LORIE_ROOT_COUNT_MASK"), "#define LORIE_ROOT_COUNT_MASK", H)
+        + opt(lambda: "#define HAVE_CARRY 1\n" + macro(H, "LORIE_GPU_COPY_MAX_RECTS")
+            + span(H, "/* Why a handover's carry stayed with the CPU", "    LORIE_CARRY_KEPT_REASONS\n};"),
+            "LORIE_CARRY_KEPT_REASONS", H)
         + opt(lambda: macro(I, "LORIE_ROOT_REPLACEMENTS") + "#define HAVE_REPLACING 1\n"
             + span(I, "typedef struct {\n    uint64_t serial;\n    RegionRec region;", "} LorieRootCopyMark;"),
             "#define LORIE_ROOT_REPLACEMENTS")
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv);\n"
+        + opt(lambda: "static Bool lorieRootCarryAllowed(int entries);\n"
+                      "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n);\n",
+              "static void lorieRootCarryOnGpu")
         + opt(lambda: "#define HAVE_PINS 1\n", "static uint32_t lorieRootPinnedSlots")
         + opt(lambda: "#define HAVE_CPU_COPY_STATS 1\n"
                   + func(I, "static size_t lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {"),
@@ -74,7 +80,12 @@ recipes = {
             + func(I, "static void lorieRootReuseSlot(LoriePixmapPriv *priv, int slot) {")
             + func(I, "static void lorieRootCopyCancelled(uint64_t serial) {"),
             "#define LORIE_ROOT_REPLACEMENTS")
+        + opt(lambda: func(I, "static void lorieRootTakeBackCarries(LoriePixmapPriv *priv) {"),
+              "static void lorieRootTakeBackCarries")
         + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
+        + opt(lambda: macro(I, "LORIE_ROOT_CARRY_ENTRIES")
+                      + func(I, "static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued) {"),
+              "static void lorieRootCarryOnGpu")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
         + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),
     "t10": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
@@ -162,6 +173,18 @@ recipes = {
         + opt(lambda: func(I, "static void lorieReleaseCopyBuffer(LorieBuffer *buffer) {"), "static void lorieReleaseCopyBuffer")
         + func(I, "static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {"),
     "tlogcat": lambda: func(C, "void* logcatThread(void *arg) {"),
+    "tcarryq_types": lambda: macro(H, "LORIE_GPU_COPY_MAX_RECTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + macro(H, "LORIE_ROOT_SLOTS")
+        + span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyRect;")
+        + span(H, "typedef struct {\n    uint64_t serial;\n    uint64_t srcBufferId;", "} LorieGpuCopyEntry;")
+        + span(H, "enum { LORIE_JOB_QUEUED = 0", "};")
+        + span(H, "/* Why a handover's carry stayed with the CPU", "    LORIE_CARRY_KEPT_REASONS\n};"),
+    "tcarryq_funcs": lambda: span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
+        + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
+        + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
+        + func(I, "static Bool lorieRootCarryAllowed(int entries) {")
+        + func(I, "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {")
+        + func(I, "static Bool lorieQueueHoldsOnlyCarries(void) {"),
     "tcpucopy_types": lambda: span(H, "/* Why a present was drawn by the CPU", "    LORIE_CPU_PRESENT_REASONS\n};"),
     "tcpucopy_funcs": lambda: func(I, "static Bool lorieCpuPresent(int why, PixmapPtr pixmap, RegionPtr update) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
