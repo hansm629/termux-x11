@@ -55,7 +55,11 @@ recipes = {
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv);\n"
         + opt(lambda: "#define HAVE_PINS 1\n", "static uint32_t lorieRootPinnedSlots")
-        + func(I, "static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {")
+        + opt(lambda: "#define HAVE_CPU_COPY_STATS 1\n"
+                  + func(I, "static size_t lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {"),
+              "static size_t lorieCopyRootRegion(")
+        + opt(lambda: func(I, "static void lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region) {"),
+              "static void lorieCopyRootRegion(")
         + func(I, "static void lorieMarkRootStale(LoriePixmapPriv *priv, RegionPtr region) {")
         + opt(lambda: func(I, "static void lorieRootCpuDrawn(LoriePixmapPriv *priv, RegionPtr region) {")
             + func(I, "static void lorieRootSettleReplacements(LoriePixmapPriv *priv) {")
@@ -158,6 +162,8 @@ recipes = {
         + opt(lambda: func(I, "static void lorieReleaseCopyBuffer(LorieBuffer *buffer) {"), "static void lorieReleaseCopyBuffer")
         + func(I, "static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {"),
     "tlogcat": lambda: func(C, "void* logcatThread(void *arg) {"),
+    "tcpucopy_types": lambda: span(H, "/* Why a present was drawn by the CPU", "    LORIE_CPU_PRESENT_REASONS\n};"),
+    "tcpucopy_funcs": lambda: func(I, "static Bool lorieCpuPresent(int why, PixmapPtr pixmap, RegionPtr update) {"),
     "ttrace_src_types": lambda: span(H, "typedef struct {\n    volatile uint64_t seq;", "#define LORIE_TRACE_RECORDS 4096")
         + "struct lorie_shared_server_state { volatile uint8_t traceEnabled; volatile uint64_t traceHead;"
           " volatile uint64_t traceTail; volatile uint32_t traceDropped; LorieTraceRecord trace[LORIE_TRACE_RECORDS]; };\n"

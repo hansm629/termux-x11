@@ -63,7 +63,8 @@ static struct {
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
              rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
              rootUnpublishedMaxUs, rootReplacementsNotMade, rootOwedFromOlder, rootOwedLost,
-             rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed; } presentStats;
+             rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed;
+             uint64_t cpuCarryBytes, cpuOwedFetchBytes; } presentStats;
 } fakeState;
 static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)

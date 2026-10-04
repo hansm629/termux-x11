@@ -53,6 +53,28 @@ int main(void) {
     CHECK(priv.rootDirtySinceUs == 0, "wait not closed out");
 #endif
 
+#ifdef HAVE_CPU_COPY_STATS
+    /* T05c - what the CPU copies is counted against what it was for, by the bytes it moved: Q carried
+     * forward by each handover, R fetched into the drawing slot once its copy had landed in the donor. */
+    init(&priv);
+    fakeState.presentStats.cpuCarryBytes = fakeState.presentStats.cpuOwedFetchBytes = 0;
+    xDraw(&priv, Q, 5);                                     /* Q is 16 x 8 */
+    CHECK(handover(&priv), "accounting: first publish");
+    CHECK(fakeState.presentStats.cpuCarryBytes == 16 * 8 * 4, "accounting: %llu bytes carried for Q, not %d",
+          (unsigned long long) fakeState.presentStats.cpuCarryBytes, 16 * 8 * 4);
+    A = priv.rootWrite;
+    enqueueRootCopy(&priv, R, 1);                           /* R is 16 x 8, pending into A */
+    CHECK(handover(&priv), "accounting: second publish");
+    CHECK(fakeState.presentStats.cpuCarryBytes == 2 * 16 * 8 * 4,
+          "accounting: %llu bytes carried after the second handover, not Q twice (%d) - R was still pending",
+          (unsigned long long) fakeState.presentStats.cpuCarryBytes, 2 * 16 * 8 * 4);
+    CHECK(fakeState.presentStats.cpuOwedFetchBytes == 0, "accounting: R fetched before its copy had landed");
+    gpuLands(A, R, 1, 1);
+    xDraw(&priv, Q, 6);                                     /* its PrepareAccess fetches R */
+    CHECK(fakeState.presentStats.cpuOwedFetchBytes == 16 * 8 * 4, "accounting: %llu bytes fetched for R, not %d",
+          (unsigned long long) fakeState.presentStats.cpuOwedFetchBytes, 16 * 8 * 4);
+#endif
+
     printf("T05/T06 root handover: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
 }

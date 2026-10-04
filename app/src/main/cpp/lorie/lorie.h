@@ -293,6 +293,18 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
 
+/* Why a present was drawn by the CPU instead of being copied by the GPU (presentStats.cpuPresents). */
+enum {
+    LORIE_CPU_PRESENT_DISABLED,       /* GPU presents turned off, or legacy drawing */
+    LORIE_CPU_PRESENT_NO_RENDERER,    /* no renderer connected, or it has no surface */
+    LORIE_CPU_PRESENT_NOT_SAMPLEABLE, /* source or destination not in a buffer the GPU can use */
+    LORIE_CPU_PRESENT_RECTS,          /* more rectangles than one queue entry holds */
+    LORIE_CPU_PRESENT_QUEUE_FULL,
+    LORIE_CPU_PRESENT_REPLACING_FULL, /* too many copies in flight over owed root areas */
+    LORIE_CPU_PRESENT_NO_RECORD,      /* no room to keep track of it */
+    LORIE_CPU_PRESENT_REASONS
+};
+
 typedef struct {
     uint64_t serial;
     uint64_t srcBufferId;
@@ -576,6 +588,20 @@ struct lorie_shared_server_state {
         volatile uint64_t rootCopyBytes;
         volatile uint32_t rootCopyUs;
         volatile uint32_t rootCopies;
+        /* Every CPU framebuffer copy, by where it comes from - what there is to replace. The root
+         * ones split rootCopyBytes: a handover carrying the drawing slot forward, an owed area
+         * fetched into it later, the slots filled when the root becomes double buffered. The rest:
+         * the old root copied into a resized one, a pixmap's memory moved into a buffer the GPU can
+         * read, and presents the CPU drew because the GPU copy was turned down, by why
+         * (LORIE_CPU_PRESENT_*). In bytes the CPU moved. */
+        volatile uint64_t cpuCarryBytes;
+        volatile uint64_t cpuOwedFetchBytes;
+        volatile uint64_t cpuSeedBytes;
+        volatile uint64_t cpuResizeBytes;
+        volatile uint64_t cpuConvertBytes;
+        volatile uint32_t cpuConverts;
+        volatile uint64_t cpuPresentBytes;
+        volatile uint32_t cpuPresents[LORIE_CPU_PRESENT_REASONS];
         /* Handovers that could not copy the whole stale area forward, because a queued GPU copy
          * had not written part of it yet; that part stays owed to the slot and goes across on a
          * later handover. It replaces a count of publishes held back entirely, which is what the
