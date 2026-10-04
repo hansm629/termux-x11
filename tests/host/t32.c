@@ -247,6 +247,27 @@ int main(void) {
     for (int i = 0; i < LORIE_ROOT_SLOTS; i++)
         CHECK(received[b][rootPrivRec.rootBuf[i]->desc.id], "slot %d's buffer never sent to the new renderer", i);
 
+    /* G. a copy outliving its source's pixmap across the reconnect. The pixmap was destroyed while the copy
+     *    was out, and the old renderer told then to let go of the buffer; the new one is sent it for the
+     *    copy, and has to be told to let go of it when the copy gives up the last reference - or it keeps
+     *    it for as long as it stays connected. */
+    reset();
+    a = connectApp(100); runAll();
+    lorieRegisterBuffer(&bufs[31]);
+    bufs[31].refs = bufs[5].refs = 2;
+    lorieCopyRecords[1].inUse = TRUE; lorieCopyRecords[1].src = &bufs[31]; lorieCopyRecords[1].dst = &bufs[5];
+    lorieUnregisterBuffer(&bufs[31]); LorieBuffer_release(&bufs[31]);       /* lorieDestroyPixmap */
+    CHECK(!received[a][31], "G: the old renderer not told to let go of the destroyed pixmap's buffer");
+    b = connectApp(200); runAll();
+    hangUp(a); runAll();
+    healthy(b, 2, "G");
+    CHECK(received[b][31], "G: the copy's source, its pixmap gone, not sent to the new renderer");
+    lorieCopyRecords[1].inUse = FALSE;
+    lorieReleaseCopyResources(lorieCopyRecords[1].src, lorieCopyRecords[1].dst);
+    CHECK(bufs[31].freed && !received[b][31], "G: the copy's source freed with the new renderer never told (kept there)");
+    CHECK(!bufs[5].freed && received[b][5], "G: the slot the copy wrote into taken from the new renderer");
+    CHECK(!bufs[31].listed, "G: a freed buffer left on the registered list");
+
     /* F. twenty reconnects in a row, the old hangup each time handled before the new connection, queued
      *    before it, arriving after it, or not until all of them are done */
     reset();

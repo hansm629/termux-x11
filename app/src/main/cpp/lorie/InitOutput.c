@@ -2509,15 +2509,21 @@ void lorieNoteGpuCopyRequeued(void) {
  * was counted as one that had reached the screen. Cancelling a request says nothing about whether
  * the GPU has finished with the buffers it was given.
  */
+static void lorieReleaseCopyBuffer(LorieBuffer *buffer) {
+    LorieBuffer_gpuCopyPendingDec(buffer);
+    // A copy can outlive the buffer's pixmap - destroyed, or given a new buffer on resize, while the
+    // copy was out - and the renderer was told then to let go of the buffer. One that has connected
+    // since was sent it again (lorieRegisterQueuedCopyBuffers), and nothing else would tell that one.
+    if (LorieBuffer_isLastReference(buffer))
+        lorieUnregisterBuffer(buffer);
+    LorieBuffer_release(buffer);
+}
+
 static void lorieReleaseCopyResources(LorieBuffer *src, LorieBuffer *dst) {
-    if (src) {
-        LorieBuffer_gpuCopyPendingDec(src);
-        LorieBuffer_release(src);
-    }
-    if (dst) {
-        LorieBuffer_gpuCopyPendingDec(dst);
-        LorieBuffer_release(dst);
-    }
+    if (src)
+        lorieReleaseCopyBuffer(src);
+    if (dst)
+        lorieReleaseCopyBuffer(dst);
 }
 
 

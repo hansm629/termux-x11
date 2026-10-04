@@ -111,6 +111,17 @@ STATIC_INLINE void LorieBuffer_release(LorieBuffer* _Nullable buffer) {
 }
 
 /**
+ * Whether the caller's reference is the only one left, so that LorieBuffer_release() frees the buffer.
+ * Only meaningful where nothing else takes or drops a reference meanwhile (the X server thread, for the
+ * X server's buffers).
+ *
+ * @param buffer the buffer
+ */
+STATIC_INLINE bool LorieBuffer_isLastReference(LorieBuffer* _Nullable buffer) {
+    return buffer && __atomic_load_n((int16_t*) buffer, __ATOMIC_ACQUIRE) == 1; // refcount is the first object in the struct
+}
+
+/**
  * Mark/unmark the buffer as the source or destination of a GPU copy scheduled with
  * lorieTryScheduleGpuCopy() but not yet completed. Only ever called from the X server thread.
  *
