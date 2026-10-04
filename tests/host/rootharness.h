@@ -38,8 +38,13 @@ int pixman_image_get_height(pixman_image_t *i) { (void) i; return 0; }
 int pixman_image_get_stride(pixman_image_t *i) { (void) i; return 0; }
 uint32_t *pixman_image_get_data(pixman_image_t *i) { (void) i; return NULL; }
 
-typedef struct { int32_t width, stride, height; uint64_t id; } LorieBuffer_Desc;
-typedef struct { LorieBuffer_Desc desc; } LorieBuffer;
+typedef struct { int32_t width, stride, height; uint64_t id; int format, type; } LorieBuffer_Desc;
+typedef struct { LorieBuffer_Desc desc; void *mem; int locked, refs, registered; } LorieBuffer;
+#define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
+#define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
+#define LORIEBUFFER_REGULAR 0
+#define LORIEBUFFER_FD 1
+#define LORIEBUFFER_AHARDWAREBUFFER 2
 static const LorieBuffer_Desc *LorieBuffer_description(LorieBuffer *b) { return &b->desc; }
 #define LORIE_TRACE_PUBLISH 0
 #define lorieTrace(...) do {} while (0)
@@ -59,6 +64,7 @@ static LorieBuffer bufs[8];
 static Bool LorieBuffer_hasGpuCopyPending(LorieBuffer *b) { return slotPendingSerial[b - bufs] > fakeCompleted; }
 static struct {
     volatile uint32_t rootHandover;
+    volatile uint8_t rootDoubleBuffered;
     volatile uint64_t rootBufferIds[8];
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
              rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
@@ -66,17 +72,24 @@ static struct {
              rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed;
              uint64_t cpuCarryBytes, cpuOwedFetchBytes;
              uint32_t gpuCarryJobs, gpuCarryTakenBack, gpuCarryNotMade, cpuCarryKept[8];
-             uint64_t gpuCarryBytes; } presentStats;
+             uint64_t gpuCarryBytes, cpuSeedBytes; } presentStats;
 } fakeState;
-static struct { typeof(fakeState) *state; } fakePvfb = { &fakeState };
+static struct { typeof(fakeState) *state; struct { Bool legacyDrawing; } root; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
 /* what lorieRootCopyCancelled looks the root up through */
 typedef void *PixmapPtr;
 typedef struct FakeScreen *ScreenPtr;
-struct FakeScreen { PixmapPtr (*GetScreenPixmap)(ScreenPtr); };
+struct FakeScreen { PixmapPtr (*GetScreenPixmap)(ScreenPtr);
+                   Bool (*ModifyPixmapHeader)(PixmapPtr, int, int, int, int, int, void *); };
 static void *fakeRootPriv;
 static PixmapPtr fakeGetScreenPixmap(ScreenPtr s) { (void) s; return fakeRootPriv; }
-static struct FakeScreen fakeScreen = { fakeGetScreenPixmap };
+static int fakeHeaderPitch;
+static Bool fakeModifyPixmapHeader(PixmapPtr p, int w, int h, int d, int b, int pitch, void *data) {
+    (void) p; (void) w; (void) h; (void) d; (void) b; (void) data;
+    fakeHeaderPitch = pitch;
+    return TRUE;
+}
+static struct FakeScreen fakeScreen = { fakeGetScreenPixmap, fakeModifyPixmapHeader };
 static ScreenPtr pScreenPtr __attribute__((unused)) = &fakeScreen;
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((LoriePixmapPriv *) (p))
 /* What lorieMarkQueuedCopySuperseded does to a copy still waiting in the queue: the test's queue says

@@ -88,6 +88,12 @@ recipes = {
               "static void lorieRootCarryOnGpu")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
         + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),
+    "rootseed": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN")
+        + span(I, "static Bool lorieSingleRootBuffer = FALSE;", "static Bool lorieSingleRootBuffer = FALSE;")
+        + opt(lambda: func(I, "static Bool lorieRootOverlayAsked(void) {")
+                      + func(I, "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {"),
+              "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {")
+        + func(I, "static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {"),
     "t10": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
         + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")

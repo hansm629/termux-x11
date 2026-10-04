@@ -325,6 +325,7 @@ typedef struct {
 typedef struct {
     LorieBuffer *buffer;
     bool flipped, wasLocked, imported;
+    bool overlayGranted;            // root only: allocated with COMPOSER_OVERLAY usage (lorieAllocateRootBuffer)
     void *locked;
     void *mem;
 
@@ -436,6 +437,8 @@ typedef struct {
 
 static size_t lorieCopyRootRegion(LoriePixmapPriv *priv, int from, int to, RegionPtr region);
 static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes);
+static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted);
+static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued);
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
 static Bool lorieRootHandover(LoriePixmapPriv *priv);
 static void lorieNoteRootPublished(LoriePixmapPriv *priv);
@@ -3260,7 +3263,12 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
         return priv;
 
     uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
-    priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
+    // The root's own buffer is allocated like every slot it will rotate through, so it can be the
+    // first of them as it is (lorieEnsureRootDoubleBuffer).
+    if (type == LORIEBUFFER_AHARDWAREBUFFER)
+        priv->buffer = lorieAllocateRootBuffer(width, height, &priv->overlayGranted);
+    else
+        priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
     *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
 
     LorieBuffer_lock(priv->buffer, &priv->locked);
@@ -3756,17 +3764,46 @@ static void lorieRootReuseSlot(LoriePixmapPriv *priv, int slot) {
     priv->rootEpoch[slot]++;
 }
 
-// Allocates the second root buffer. Failing is not fatal, it just leaves the old single-buffered
-// behaviour (where every X server drawing operation waits for the renderer's fence) in place.
+/*
+ * The root's buffers: the one the screen pixmap is created with and every slot it rotates through, all
+ * alike - so the one it starts with becomes its first slot as it is (lorieEnsureRootDoubleBuffer), where it
+ * used to be copied into a new one and dropped.
+ *
+ * BGRA, which is what the X server writes. Declaring RGBX and letting the GL path swizzle worked while
+ * that shader was the only reader, but the compositor reads a buffer by its declared format and has no
+ * equivalent - red and blue came out exchanged. The shader follows the format, so GL stops swizzling
+ * when the declaration is right.
+ *
+ * TERMUX_X11_ROOT_OVERLAY_USAGE=1 asks for COMPOSER_OVERLAY usage as well, so the compositor may put the
+ * root straight on a hardware plane. Off unless asked for, because the allocator may then choose memory
+ * that is slower for the CPU to write, and the X server draws the root with the CPU - whether that costs
+ * more than it saves is for an A/B on the device to say. `granted` says what was actually given.
+ */
+static Bool lorieRootOverlayAsked(void) {
+    static int asked = -1;
+
+    if (asked < 0) {
+        const char *overlay = getenv("TERMUX_X11_ROOT_OVERLAY_USAGE");
+        asked = overlay && !strcmp(overlay, "1");
+    }
+    return asked;
+}
+
+static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {
+    *granted = false;
+    if (lorieRootOverlayAsked())
+        return LorieBuffer_allocateForComposer(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, granted);
+    return LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, LORIEBUFFER_AHARDWAREBUFFER);
+}
+
+// Makes the root rotate through LORIE_ROOT_SLOTS buffers. Failing is not fatal, it just leaves the old
+// single-buffered behaviour (where every X server drawing operation waits for the renderer's fence).
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(root);
     const LorieBuffer_Desc *desc;
-    LorieBuffer *orig;
-    void *origLocked;
-    RegionRec all;
+    RegionRec all, queued;
     BoxRec box;
     int i, allocated, w, h, overlayGranted = 0;
-    Bool overlayAsked;
 
     if (lorieSingleRootBuffer || !priv || priv->rootDouble || !priv->buffer || priv->mem || pvfb->root.legacyDrawing)
         return;
@@ -3782,49 +3819,35 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     if (!pScreenPtr || root != (*pScreenPtr->GetScreenPixmap)(pScreenPtr))
         return;
 
-    orig = priv->buffer;
-    origLocked = priv->locked;
+    /*
+     * The buffer the root already has is slot 0, as it is: it holds what the root shows, so nothing is
+     * copied into it. One that was not allocated like a slot (lorieAllocateRootBuffer) is not one to
+     * rotate with, and the root stays single buffered rather than have it copied.
+     */
+    if (desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM) {
+        log(ERROR, "The root buffer is not BGRA (format %d), keeping the single buffered root", desc->format);
+        lorieSingleRootBuffer = TRUE;
+        return;
+    }
+    if (!priv->locked && (LorieBuffer_lock(priv->buffer, &priv->locked) || !priv->locked)) {
+        log(ERROR, "Failed to lock the root buffer, keeping the single buffered root");
+        return;
+    }
     w = (int) desc->width;
     h = (int) desc->height;
+    priv->rootBuf[0] = priv->buffer;
+    priv->rootLocked[0] = priv->locked;
+    overlayGranted = priv->overlayGranted;
 
-    /*
-     * Every slot is allocated fresh, and as BGRA rather than the RGBX the root started out with.
-     *
-     * The X server writes BGRA. Declaring the buffer RGBX and letting the GL path make up the
-     * difference with a swizzling shader worked as long as the only consumer was that shader, but
-     * the compositor reads a buffer by its declared format and has no equivalent - the colours come
-     * out with red and blue exchanged. Declaring what is actually in there fixes both at once,
-     * since the shader selection follows the format: GL stops swizzling at the same moment.
-     *
-     * LorieBuffer_convert() cannot do this, it only converts CPU-backed buffers, so the original is
-     * copied into the new slots and dropped.
-     */
-    /*
-     * TERMUX_X11_ROOT_OVERLAY_USAGE=1 asks for the slots to be allocated with COMPOSER_OVERLAY usage
-     * as well, so the compositor may put the root straight on a hardware plane. Off unless asked for,
-     * because the allocator may then choose memory that is slower for the CPU to write, and the X
-     * server draws the root with the CPU - whether that costs more than it saves is for an A/B on the
-     * device to say. What was actually granted is logged with the slot count below.
-     */
-    {
-        const char *overlay = getenv("TERMUX_X11_ROOT_OVERLAY_USAGE");
-        overlayAsked = overlay && !strcmp(overlay, "1");
-    }
+    for (allocated = 1; allocated < LORIE_ROOT_SLOTS; allocated++) {
+        bool granted = false;
 
-    for (allocated = 0; allocated < LORIE_ROOT_SLOTS; allocated++) {
-        if (overlayAsked) {
-            bool granted = false;
-
-            priv->rootBuf[allocated] = LorieBuffer_allocateForComposer(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, &granted);
-            if (granted)
-                overlayGranted++;
-        } else
-            priv->rootBuf[allocated] = LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
-                                                            LORIEBUFFER_AHARDWAREBUFFER);
+        priv->rootBuf[allocated] = lorieAllocateRootBuffer(w, h, &granted);
         if (!priv->rootBuf[allocated]) {
             log(ERROR, "Failed to allocate root buffer %d, keeping the single buffered root", allocated);
             break;
         }
+        overlayGranted += granted;
         if (LorieBuffer_lock(priv->rootBuf[allocated], &priv->rootLocked[allocated]) ||
             !priv->rootLocked[allocated]) {
             log(ERROR, "Failed to lock root buffer %d, keeping the single buffered root", allocated);
@@ -3837,35 +3860,27 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
 
     if (allocated < LORIE_ROOT_SLOTS) {
         // All or nothing: a partial set would mean the slot count had to be dynamic everywhere else.
-        for (i = 0; i < allocated; i++) {
+        // Slot 0 is the root's own buffer and stays with it.
+        for (i = 1; i < allocated; i++) {
             LorieBuffer_unlock(priv->rootBuf[i]);
             LorieBuffer_release(priv->rootBuf[i]);
             priv->rootBuf[i] = NULL;
             priv->rootLocked[i] = NULL;
         }
+        priv->rootBuf[0] = NULL;
+        priv->rootLocked[0] = NULL;
         return;
-    }
-
-    // Carry the pixels the root already had into slot 0, then make every other slot match it.
-    {
-        const LorieBuffer_Desc *d0 = LorieBuffer_description(priv->rootBuf[0]);
-        const char *src = origLocked;
-        char *dst = priv->rootLocked[0];
-        size_t srcStride = (size_t) desc->stride * 4, dstStride = (size_t) d0->stride * 4;
-        size_t row = (size_t) w * 4;
-        int y;
-
-        if (src && dst) {
-            for (y = 0; y < h; y++)
-                memcpy(dst + (size_t) y * dstStride, src + (size_t) y * srcStride, row);
-            lorieCountCpuCopy(&pvfb->state->presentStats.cpuSeedBytes, (uint64_t) h * row);
-        }
     }
 
     box = (BoxRec) { 0, 0, (short) w, (short) h };
     RegionInit(&all, &box, 1);
     for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
-        RegionInit(&priv->rootStale[i], NULL, 0);
+        // The new slots lack everything until a handover brings them up to date - from a slot that
+        // has it, on the GPU (lorieRootCarryOnGpu). Slot 1, drawn into next, is done below.
+        if (i >= 2)
+            RegionInit(&priv->rootStale[i], &box, 1);
+        else
+            RegionInit(&priv->rootStale[i], NULL, 0);
         RegionInit(&priv->rootGpuPending[i], NULL, 0);
         priv->rootGpuPendingSerial[i] = 0;
         priv->rootCarrySrcSerial[i] = 0;
@@ -3873,10 +3888,7 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
         priv->rootCondDonor[i] = -1;
         priv->rootCondDonorEpoch[i] = 0;
         priv->rootEpoch[i] = 0;
-        if (i)
-            lorieCountCpuCopy(&pvfb->state->presentStats.cpuSeedBytes, lorieCopyRootRegion(priv, 0, i, &all));
     }
-    RegionUninit(&all);
 
     for (i = 0; i < LORIE_ROOT_SLOTS; i++)
         lorieRegisterBuffer(priv->rootBuf[i]);
@@ -3914,6 +3926,24 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     priv->rootRepairFirst = priv->rootCollapseWanted = FALSE;
     RegionInit(&priv->rootLostArea, NULL, 0);
 
+    /*
+     * Slot 1 is drawn into next, and is brought up to date from slot 0 the way a handover brings the next
+     * slot up to date: given to the GPU, and owed from slot 0 until that copy is made (see
+     * lorieRootCarryOnGpu) - or copied by the CPU now, only if the GPU cannot take it.
+     */
+    RegionNull(&queued);
+    lorieRootCarryOnGpu(priv, 0, 1, &all, &queued);
+    RegionSubtract(&all, &all, &queued);
+    lorieCountCpuCopy(&pvfb->state->presentStats.cpuSeedBytes, lorieCopyRootRegion(priv, 0, 1, &all));
+    if (RegionNotEmpty(&queued)) {
+        RegionCopy(&priv->rootOwed, &queued);
+        RegionCopy(&priv->rootOwedNow, &queued);
+        priv->rootOwedDonor = 0;
+        priv->rootOwedDonorEpoch = priv->rootEpoch[0];
+    }
+    RegionUninit(&queued);
+    RegionUninit(&all);
+
     priv->rootWrite = 1;
     priv->buffer = priv->rootBuf[1];
     priv->locked = priv->rootLocked[1];
@@ -3924,17 +3954,11 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     pScreenPtr->ModifyPixmapHeader(root, 0, 0, 0, 0,
                                    LorieBuffer_description(priv->rootBuf[1])->stride * 4, NULL);
 
-    // The root no longer has anything to do with the buffer it was created with.
-    if (origLocked)
-        LorieBuffer_unlock(orig);
-    lorieUnregisterBuffer(orig);
-    LorieBuffer_release(orig);
-
     log(INFO, "Root window has %d BGRA buffers (%dx%d, composer overlay usage %s), first id %llu",
         LORIE_ROOT_SLOTS, w, h,
-        !overlayAsked ? "not asked for" : overlayGranted == LORIE_ROOT_SLOTS ? "granted"
-                      : overlayGranted ? "granted for some" : "not supported",
-        (unsigned long long) pvfb->state->rootBufferIds[0]);
+        !lorieRootOverlayAsked() ? "not asked for" : overlayGranted == LORIE_ROOT_SLOTS ? "granted"
+                                 : overlayGranted ? "granted for some" : "not supported",
+        (unsigned long long) LorieBuffer_description(priv->rootBuf[0])->id);
 }
 
 /*
