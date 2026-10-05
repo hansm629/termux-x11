@@ -5,6 +5,7 @@
  *     held and marked busy, the record handed to the reaper, the session owing its answer;
  *   lorieQueueHoldsOnlyCarries - what lets an EXA fallback skip waiting on the renderer. */
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,7 +85,7 @@ int main(void) {
     CHECK(!lorieRootCarryAllowed(1), "allowed with GPU presents turned off");
     CHECK(fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_OFF] == 1, "off not counted as why");
     fakePvfb.gpuPresentDisabled = FALSE;
-    fakeState.gpuCopyQueue.writeIndex = 3;                        /* three presents queued */
+    fakeState.gpuCopyQueue.writeIndex = LORIE_GPU_COPY_QUEUE_CAPACITY / 2 - 1;   /* presents queued */
     CHECK(lorieRootCarryAllowed(1), "one more into half the queue refused");
     CHECK(!lorieRootCarryAllowed(2), "allowed past half the queue - a present could be turned down for it");
     CHECK(fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_BUSY] == 1, "busy not counted as why");
@@ -138,6 +139,16 @@ int main(void) {
     CHECK(!lorieQueueHoldsOnlyCarries(), "a claimed present not waited for");
     fakeState.rootDoubleBuffered = 0;
     CHECK(!lorieQueueHoldsOnlyCarries(), "single-buffered root: there are no carries");
+    fakeState.rootDoubleBuffered = 1;
+
+    /* how long a fallback waits: the carry wait for carries alone, as long as ever with a present queued */
+    fakeState.gpuCopyQueue.entryState[2] = LORIE_JOB_CANCELLED;
+    CHECK(lorieFallbackWaitUs() == LORIE_CARRY_WAIT_DEFAULT_US, "carries alone: waits %llu us",
+          (unsigned long long) lorieFallbackWaitUs());
+    fakeState.gpuCopyQueue.entryState[2] = LORIE_JOB_QUEUED;
+    CHECK(lorieFallbackWaitUs() == LORIE_PREFLIGHT_MAX_US, "a present queued: waits %llu us, not the full wait",
+          (unsigned long long) lorieFallbackWaitUs());
+    CHECK(LORIE_CARRY_WAIT_DEFAULT_US < LORIE_PREFLIGHT_MAX_US, "the carry wait is no shorter than a present's");
 
     printf("carry queue (allowed, queued, only carries): %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;

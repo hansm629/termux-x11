@@ -100,6 +100,35 @@ static void claimSome(void) {
     }
 }
 static void lockWait(void) { while (jobHead < jobTail && jobs[jobHead].claimed) renderOne(); }
+/* An EXA fallback beginning (lorieExaFallbackBegin): what the drawing slot can have now goes to the GPU
+ * (lorieRootRepairOnGpu), then the queue is waited for - drained in time, or not; drained, what became
+ * fetchable as it drained goes to the GPU as well, and is waited for in turn. */
+static int preflights, healthy;
+static void preflight(LoriePixmapPriv *priv) {
+    V("preflight\n");
+#ifdef HAVE_GPU_REPAIR
+    lorieRootRepairOnGpu(priv);
+#else
+    (void) priv;
+#endif
+    preflights++;
+    for (int round = 0; round < 4; round++) {
+        int before = jobTail;
+#ifdef HAVE_GPU_REPAIR
+        if (round)
+            lorieRootRepairOnGpu(priv);
+#endif
+        if (round && jobTail == before)
+            break;
+        if (healthy || rnd(4))
+            renderAll();
+        else {
+            for (int n = rnd(3); n > 0 && jobHead < jobTail; n--)
+                renderOne();
+            break;                                     /* the wait ran out */
+        }
+    }
+}
 static int cancelJob(uint64_t s) {
     for (int j = jobHead; j < jobTail; j++)
         if (jobs[j].serial == s)
@@ -135,6 +164,8 @@ static void reference(uint32_t *ref, int upTo, uint8_t *unknown) {
 /* CPU drawing, as it reaches the root: queued copies into the drawing slot it would draw over are
  * cancelled (lorieExaAccess), then PrepareAccess (xDraw: carries taken back, repair, lock), then it draws */
 static void cpuDrawAt(LoriePixmapPriv *priv, BoxRec b, uint32_t v, int mayClaim) {
+    if (mayClaim && (healthy || rnd(2) == 0))
+        preflight(priv);
     if (mayClaim && rnd(3) == 0)
         claimSome();
     V("draw %u [%d,%d %d,%d] into %d\n", v, b.x1, b.y1, b.x2, b.y2, priv->rootWrite);
@@ -159,6 +190,8 @@ static void xRead(LoriePixmapPriv *priv, BoxRec b, const char *what) {
     static uint8_t unknown[W * H];
     RegionRec waiting;
 
+    if (healthy || rnd(2) == 0)
+        preflight(priv);
     if (rnd(3) == 0)
         claimSome();
     V("read [%d,%d %d,%d] of %d\n", b.x1, b.y1, b.x2, b.y2, priv->rootWrite);
@@ -248,6 +281,9 @@ static void reset(LoriePixmapPriv *priv) {
     memset(&fakeState.presentStats, 0, sizeof fakeState.presentStats);
 }
 static Bool present(LoriePixmapPriv *priv, BoxRec b) {
+#ifdef HAVE_GPU_REPAIR
+    lorieRootRepairOnGpu(priv);                        /* lorieTryScheduleGpuCopy, before the queue */
+#endif
     uint64_t s = ++serial;
     if (!enqueueRootCopy(priv, b, s)) {
         serial--;
@@ -260,35 +296,54 @@ static Bool present(LoriePixmapPriv *priv, BoxRec b) {
     return TRUE;
 }
 
+static uint64_t lastCpu;
+static void watchCpu(const char *where) {
+    uint64_t now = fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes;
+    if (now != lastCpu)
+        V("  CPU copied %llu bytes in %s (kept on the CPU so far: rects %u)\n", (unsigned long long) (now - lastCpu),
+          where, fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS]);
+    lastCpu = now;
+}
 static void randomized(LoriePixmapPriv *priv, uint32_t seed, int steps) {
     static const BoxRec win[3] = { { 2, 1, 30, 12 }, { 20, 4, 50, 15 }, { 0, 0, 64, 16 } };
     reset(priv);
     rng = seedNow = seed;
-    failCarries = 8;
-    failPresents = 4;
+    failCarries = healthy ? 0 : 8;
+    failPresents = healthy ? 0 : 4;
     for (int s = 0; s < steps && nev < MAXEV - 8 && jobTail < MAXJ - 8 && serial < FAKE_SERIALS - 8; s++) {
         uint32_t a = rnd(100);
-        if (a < 25)
+        lastCpu = fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes;
+        if (a < 25) {
             present(priv, rbox(win[rnd(2)]));
-        else if (a < 40)
+            watchCpu("present");
+        } else if (a < 40) {
             cpuDraw(priv, rbox(win[2]), ++value);
-        else if (a < 50)
+            watchCpu("draw");
+        } else if (a < 50) {
             xRead(priv, win[2], "randomized");
+            watchCpu("read");
+        }
         else if (a < 75) {
             for (int n = rnd(4); n > 0 && jobHead < jobTail; n--)
                 renderOne();
         } else {
             int drawn = priv->rootWrite;
-            harnessCarryOn = rnd(5) != 0 && !getenv("T33_NO_CARRY");   /* now and then the GPU cannot take it */
+            /* now and then the GPU cannot take the carry - never, with a healthy renderer */
+            harnessCarryOn = (healthy || rnd(5) != 0) && !getenv("T33_NO_CARRY");
             runChecks(0, -1);
             V("handover from %d%s\n", drawn, harnessCarryOn ? "" : " (carry on the CPU)");
-            if (handover(priv)) {
+            int ok = handover(priv);
+            watchCpu("handover");
+            if (ok) {
                 V("  published %d, drawing into %d\n", drawn, priv->rootWrite);
                 notePublished(drawn);
                 runChecks(0, priv->rootWrite);
             }
         }
     }
+    /* a renderer that gives nothing up from here, and everything resolved: the next two slots out must
+     * match exactly - including what the handover itself gives the GPU on the way (lorieRootRepairOnGpu) */
+    failCarries = failPresents = 0;
     renderAll();
     runChecks(0, -1);
     xRead(priv, win[2], "randomized, all resolved");
@@ -305,6 +360,7 @@ int main(int argc, char **argv) {
     LoriePixmapPriv priv;
     if (argc > 1) {                         /* t33 SEED: that run, step by step */
         verbose = 1;
+        healthy = getenv("T33_HEALTHY") != NULL;
         randomized(&priv, (uint32_t) atoi(argv[1]), 600);
         return fails != 0;
     }
@@ -398,20 +454,64 @@ int main(int argc, char **argv) {
     CHECK(fakeState.presentStats.rootOwedLost == 0, "not made: Q lost track of");
     (void) A; (void) B;
 
-    /* More rects than two queue entries hold: kept on the CPU, counted as such. 20 rects take two. */
+#ifdef HAVE_GPU_REPAIR
+    /* The GPU cannot take the carry at the handover - the queue busy - and can by the next EXA fallback:
+     * the carry is not copied by the CPU there and then, but owed, and given to the GPU then. */
+    reset(&priv);
+    draw(&priv, Q, 5);
+    harnessCarryOn = 0;
+    CHECK(handover(&priv), "busy: no publish");
+    B = priv.rootWrite;
+    CHECK(fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes == 0,
+          "busy: the CPU copied the carry at the handover");
+    harnessCarryOn = 1;
+    lorieRootRepairOnGpu(&priv);                       /* an EXA fallback begins ... */
+    renderAll();                                       /* ... and the renderer drains in time */
+    draw(&priv, P, 6);
+    CHECK(fakeState.presentStats.gpuOwedRepairs == 1 && fakeState.presentStats.cpuCarryBytes +
+          fakeState.presentStats.cpuOwedFetchBytes == 0, "busy: not given to the GPU by the next fallback (%u, %llu "
+          "bytes by the CPU)", fakeState.presentStats.gpuOwedRepairs,
+          (unsigned long long) (fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes));
+    CHECK(areaIs(B, Q, 5) && areaIs(B, P, 6), "busy: the drawing slot lacks Q or P");
+
+    /* An area a handover had to leave behind - a present still in flight into the slot going out - given
+     * to the GPU once that present has landed, rather than fetched by the CPU when the slot is next
+     * touched. */
+    reset(&priv);
+    A = priv.rootWrite;
+    present(&priv, R);
+    CHECK(handover(&priv), "owed by GPU: no publish");
+    B = priv.rootWrite;
+    renderAll();                                       /* the present lands in A; R is owed to B from A */
+    lorieRootRepairOnGpu(&priv);                       /* an EXA fallback begins ... */
+    renderAll();                                       /* ... and the renderer drains in time */
+    draw(&priv, P, 6);
+    CHECK(fakeState.presentStats.gpuOwedRepairs >= 1, "owed by GPU: the area was not given to the GPU");
+    CHECK(fakeState.presentStats.cpuOwedFetchBytes == 0, "owed by GPU: the CPU fetched %llu bytes",
+          (unsigned long long) fakeState.presentStats.cpuOwedFetchBytes);
+    CHECK(areaIs(B, R, jobs[0].v), "owed by GPU: B lacks the present");
+    CHECK(handover(&priv) && areaIs(B, R, jobs[0].v), "owed by GPU: B went out without the present");
+#endif
+
+    /* Many rects: widened to their extents only past what the queue entries for a carry hold; up to that,
+     * as many entries as they take. */
     reset(&priv);
     for (int k = 0; k < 40; k++)
         draw(&priv, (BoxRec) { (short) (k % 20 * 3), (short) (k / 20 * 4), (short) (k % 20 * 3 + 1), (short) (k / 20 * 4 + 1) }, 50 + k);
+    B = priv.rootWrite;
     CHECK(handover(&priv), "rects: no publish");
-    CHECK(fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS] == 1 && fakeState.presentStats.gpuCarryJobs == 0,
+    CHECK(fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS] == 0 && fakeState.presentStats.gpuCarryJobs == 1,
           "rects: 40 rects - kept %u, given to the GPU %u", fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS],
           fakeState.presentStats.gpuCarryJobs);
-    CHECK(fakeState.presentStats.cpuCarryBytes == 40 * 4, "rects: the CPU carried %llu bytes, not 40 pixels",
-          (unsigned long long) fakeState.presentStats.cpuCarryBytes);
+    renderAll();
+    xRead(&priv, (BoxRec) { 0, 0, 64, 16 }, "rects widened");
+    CHECK(fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes == 0,
+          "rects: the CPU copied %llu bytes", (unsigned long long) (fakeState.presentStats.cpuCarryBytes +
+                                                                    fakeState.presentStats.cpuOwedFetchBytes));
+    (void) B;
     reset(&priv);
-    for (int k = 0; k < 20; k++)
-        draw(&priv, (BoxRec) { (short) (k % 20 * 3), 0, (short) (k % 20 * 3 + 1), 1 }, 50 + k);
-    draw(&priv, R, 9);
+    for (int k = 0; k < 70; k++)                       /* more rects than one queue entry holds */
+        draw(&priv, (BoxRec) { (short) (k % 32 * 2), (short) (k / 32 * 3), (short) (k % 32 * 2 + 1), (short) (k / 32 * 3 + 1) }, 50 + k);
     CHECK(handover(&priv), "two entries: no publish");
     CHECK(fakeState.presentStats.gpuCarryJobs == 2, "two entries: %u carry copies", fakeState.presentStats.gpuCarryJobs);
     renderAll();
@@ -422,7 +522,7 @@ int main(int argc, char **argv) {
      * cannot take. */
     int before = fails;
     checked = unchecked = mismatched = readsBad = readsChecked = 0;
-    uint64_t gpuBytes = 0, takenBack = 0, notMade = 0, lost = 0;
+    uint64_t gpuBytes = 0, takenBack = 0, notMade = 0, lost = 0, repairs = 0, cpuBytes = 0;
     uint32_t seeds = getenv("T33_SEEDS") ? (uint32_t) atoi(getenv("T33_SEEDS")) : 300;
     for (uint32_t seed = 1; seed <= seeds; seed++) {
         randomized(&priv, seed, 600);
@@ -430,15 +530,35 @@ int main(int argc, char **argv) {
         takenBack += fakeState.presentStats.gpuCarryTakenBack;
         notMade += fakeState.presentStats.gpuCarryNotMade;
         lost += fakeState.presentStats.rootOwedLost;
+        repairs += fakeState.presentStats.gpuOwedRepairs;
+        cpuBytes += fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes;
     }
     printf("T33 randomized: %d published slots checked (%d skipped), %d differed; %d reads checked, %d wrong; "
-           "carries: %.1f KB on the GPU, %llu taken back, %llu not made; %llu areas lost\n", checked, unchecked,
-           mismatched, readsChecked, readsBad, gpuBytes / 1024.0, (unsigned long long) takenBack,
-           (unsigned long long) notMade, (unsigned long long) lost);
+           "carries: %.1f KB on the GPU (%llu owed areas), %llu taken back, %llu not made; %.1f KB copied by the CPU; "
+           "%llu areas lost\n", checked, unchecked, mismatched, readsChecked, readsBad, gpuBytes / 1024.0,
+           (unsigned long long) repairs, (unsigned long long) takenBack, (unsigned long long) notMade,
+           cpuBytes / 1024.0, (unsigned long long) lost);
     CHECK(checked > 1000 && readsChecked > 1000, "randomized: too little checked (%d slots, %d reads)", checked, readsChecked);
     CHECK(gpuBytes > 0 && takenBack > 0 && notMade > 0, "randomized: some carry outcome never happened");
     CHECK(lost == 0, "randomized: %llu areas lost track of", (unsigned long long) lost);
     (void) before;
+
+    /* A healthy renderer: it gives nothing up, takes every carry, and has the queue drained by the time
+     * each EXA fallback's wait ends. Then the CPU copies nothing at all - not a carry, not an owed area. */
+    healthy = 1;
+    checked = unchecked = mismatched = readsBad = readsChecked = 0;
+    uint64_t healthyCpu = 0, healthyGpu = 0;
+    for (uint32_t seed = 1; seed <= seeds; seed++) {
+        randomized(&priv, seed, 600);
+        healthyCpu += fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes;
+        healthyGpu += fakeState.presentStats.gpuCarryBytes;
+    }
+    healthy = 0;
+    printf("T33 healthy renderer: %d published slots checked, %d differed; %d reads checked, %d wrong; %.1f KB on "
+           "the GPU, %.1f KB copied by the CPU\n", checked, mismatched, readsChecked, readsBad, healthyGpu / 1024.0,
+           healthyCpu / 1024.0);
+    CHECK(healthyCpu == 0, "healthy renderer: the CPU copied %llu bytes", (unsigned long long) healthyCpu);
+    CHECK(checked > 1000 && readsChecked > 1000, "healthy renderer: too little checked");
 
     printf("T33 root carry on the GPU: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;

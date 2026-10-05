@@ -26,6 +26,8 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$OUT/t33" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/tseed.c" "$OUT/region16.o" -o "$OUT/tseed"
 "$OUT/tseed" || status=1
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/twiden.c" "$OUT/region16.o" -o "$OUT/twiden"
+"$OUT/twiden" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/t25.c" "$OUT/region16.o" -o "$OUT/t25"
 "$OUT/t25" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -I"$OUT" -I"$PIXMAN" "$HERE/tcorecopy.c" "$OUT/region16.o" -o "$OUT/tcorecopy"

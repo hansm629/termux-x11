@@ -154,13 +154,17 @@ int main(void) {
     CHECK(matches(1), "taken back: the cancelled copy landed after the drawing");
     publishAll("taken back");
 
-    /* no renderer: one CPU copy, into slot 1 only - not one per slot */
+    /* no renderer: nothing copied there and then; slot 1 owes it, and the CPU fetches it once, when slot 1
+     * is first touched - not one copy per slot */
     singleRoot(AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, 0);
     lorieEnsureRootDoubleBuffer((PixmapPtr) &priv);
-    CHECK(priv.rootDouble && fakeState.presentStats.cpuSeedBytes == W * H * 4 && jobTail == 0,
+    CHECK(priv.rootDouble && fakeState.presentStats.cpuSeedBytes == 0 && jobTail == 0,
           "no renderer: %llu bytes copied into the slots, %d copies queued",
           (unsigned long long) fakeState.presentStats.cpuSeedBytes, jobTail);
-    CHECK(matches(1), "no renderer: slot 1 lacks the picture");
+    xDraw(&priv, P, 6); refFill(P, 6);
+    CHECK(matches(1) && fakeState.presentStats.cpuOwedFetchBytes == W * H * 4,
+          "no renderer: slot 1 lacks the picture, or was fetched other than once (%llu bytes)",
+          (unsigned long long) fakeState.presentStats.cpuOwedFetchBytes);
     publishAll("no renderer");
 
     /* a root buffer that cannot be a slot: left single buffered, nothing copied */

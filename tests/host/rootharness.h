@@ -31,6 +31,7 @@ static inline Bool RegionNotEmpty(RegionPtr r) { return pixman_region_not_empty(
 static inline void RegionEmpty(RegionPtr r) { pixman_region_clear(r); }
 static inline int RegionNumRects(RegionPtr r) { return pixman_region_n_rects(r); }
 static inline BoxPtr RegionRects(RegionPtr r) { return pixman_region_rectangles(r, NULL); }
+static inline BoxPtr RegionExtents(RegionPtr r) { return pixman_region_extents(r); }
 /* pixman's region code links against these for region_init_from_image and logging */
 void _pixman_log_error(const char *f, const char *m) { (void) f; (void) m; }
 int pixman_image_get_width(pixman_image_t *i) { (void) i; return 0; }
@@ -72,7 +73,8 @@ static struct {
              rootReplacingFull, rootPublishHeldForDonor, rootOwedExposed;
              uint64_t cpuCarryBytes, cpuOwedFetchBytes;
              uint32_t gpuCarryJobs, gpuCarryTakenBack, gpuCarryNotMade, cpuCarryKept[8];
-             uint64_t gpuCarryBytes, cpuSeedBytes; } presentStats;
+             uint64_t gpuCarryBytes, cpuSeedBytes;
+             uint32_t gpuOwedRepairs; } presentStats;
 } fakeState;
 static struct { typeof(fakeState) *state; struct { Bool legacyDrawing; } root; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
@@ -124,8 +126,12 @@ static void harnessCopyCancelled(uint64_t serial) {
 #endif
 }
 
+#ifndef W
 #define W 64
+#endif
+#ifndef H
 #define H 16
+#endif
 static uint32_t pixels[LORIE_ROOT_SLOTS][W * H];
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)

@@ -291,8 +291,11 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 /* Two 60Hz frames: a gap this long is a hitch a user can see, not just a missed vsync. */
 #define LORIE_LONG_FRAME_US 33000
 
-#define LORIE_GPU_COPY_MAX_RECTS 16
-#define LORIE_GPU_COPY_QUEUE_CAPACITY 8
+/* Rects per queued copy, and copies the queue holds (a power of two: indices wrap at 2^32). Sized so a
+ * handover's carry and a client's presents fit side by side, rather than either being turned over to
+ * the CPU for want of room (cpuCarryKept, cpuPresents). */
+#define LORIE_GPU_COPY_MAX_RECTS 64
+#define LORIE_GPU_COPY_QUEUE_CAPACITY 32
 
 /* Why a present was drawn by the CPU instead of being copied by the GPU (presentStats.cpuPresents). */
 enum {
@@ -632,6 +635,9 @@ struct lorie_shared_server_state {
          * reach 0 - and apart from that, with no renderer to copy anything or GPU copies turned off. */
         volatile uint64_t cpuTotalBytes;
         volatile uint64_t cpuDegradedBytes;
+        /* Of cpuTotalBytes, what the CPU copied with the renderer behind - the copy queue at least half
+         * full, so the GPU could not be given it (cpuCarryKept BUSY) - rather than with nothing in its way. */
+        volatile uint64_t cpuBehindBytes;
         /* The copies X core rendering makes with the CPU (EXA accelerates none), outside the contexts
          * above: calls, bytes, time and the longest, and of the bytes those written into the root,
          * those copied within one buffer, and those whose source and destination overlap. */
@@ -651,6 +657,13 @@ struct lorie_shared_server_state {
         volatile uint32_t gpuCarryTakenBack;
         volatile uint32_t gpuCarryNotMade;
         volatile uint32_t cpuCarryKept[LORIE_CARRY_KEPT_REASONS];
+        /* Owed areas given to the GPU instead of fetched by the CPU (lorieRootRepairOnGpu), and the EXA
+         * fallbacks that waited for a queue holding only carries to drain - how long in total, and how
+         * many ran out of time, after which the CPU takes the carries back. */
+        volatile uint32_t gpuOwedRepairs;
+        volatile uint32_t carryWaits;
+        volatile uint32_t carryWaitUs;
+        volatile uint32_t carryWaitTimeouts;
         /* Handovers that could not copy the whole stale area forward, because a queued GPU copy
          * had not written part of it yet; that part stays owed to the slot and goes across on a
          * later handover. It replaces a count of publishes held back entirely, which is what the

@@ -10,6 +10,14 @@ from extract import func, macro, span
 L, OUT = sys.argv[1], sys.argv[2]
 I, R, H, C = L + "/InitOutput.c", L + "/renderer.c", L + "/lorie.h", L + "/cmdentrypoint.c"
 
+# lorieRootCarryOnGpu as it is in the sources: with the region a widened carry stays out of, or, before
+# that, without - so the root tests still build against older code for a negative control.
+def carry_sig():
+    new = ("static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued,\n"
+           "                                RegionPtr exclude) {")
+    old = "static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued) {"
+    return new if new in open(I, encoding="utf-8").read() else old
+
 def opt(make, marker, path=I):
     """What make() extracts, if the sources have `marker` - so a recipe also builds against code from
     before a function existed, which is how a test is shown to fail there."""
@@ -58,7 +66,9 @@ recipes = {
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv);\n"
         + opt(lambda: "static Bool lorieRootCarryAllowed(int entries);\n"
-                      "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n);\n",
+                      "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n);\n"
+                      + carry_sig()[:-2] + ";\n"
+                      "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot);\n",
               "static void lorieRootCarryOnGpu")
         + opt(lambda: "#define HAVE_PINS 1\n", "static uint32_t lorieRootPinnedSlots")
         + opt(lambda: "#define HAVE_CPU_COPY_STATS 1\n"
@@ -82,9 +92,10 @@ recipes = {
             "#define LORIE_ROOT_REPLACEMENTS")
         + opt(lambda: func(I, "static void lorieRootTakeBackCarries(LoriePixmapPriv *priv) {"),
               "static void lorieRootTakeBackCarries")
+        + opt(lambda: "#define HAVE_GPU_REPAIR 1\n" + func(I, "static void lorieRootRepairOnGpu(LoriePixmapPriv *priv) {"),
+              "static void lorieRootRepairOnGpu")
         + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
-        + opt(lambda: macro(I, "LORIE_ROOT_CARRY_ENTRIES")
-                      + func(I, "static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued) {"),
+        + opt(lambda: macro(I, "LORIE_ROOT_CARRY_ENTRIES") + func(I, carry_sig()),
               "static void lorieRootCarryOnGpu")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
         + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),
@@ -190,8 +201,11 @@ recipes = {
         + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
         + func(I, "static Bool lorieRootCarryAllowed(int entries) {")
         + func(I, "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {")
-        + func(I, "static Bool lorieQueueHoldsOnlyCarries(void) {"),
-    "tcorecopy_types": lambda: span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback",
+        + func(I, "static Bool lorieQueueHoldsOnlyCarries(void) {")
+        + opt(lambda: macro(I, "LORIE_PREFLIGHT_MAX_US") + macro(I, "LORIE_CARRY_WAIT_DEFAULT_US")
+                      + func(I, "static uint64_t lorieFallbackWaitUs(void) {"), "static uint64_t lorieFallbackWaitUs(void) {"),
+    "tcorecopy_types": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback",
                                     "#define LORIE_COPY_CTX_UNFLIP  3          /* a flipped client buffer back into the root as the flip ends */"),
     "tcorecopy_funcs": lambda: func(I, "static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes) {")
         + span(I, "static int lorieCopyCtx = LORIE_COPY_CTX_NONE;", "static int lorieCopyCtx = LORIE_COPY_CTX_NONE;")

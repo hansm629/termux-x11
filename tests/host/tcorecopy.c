@@ -41,7 +41,8 @@ static struct FakeScreen screen = { getScreenPixmap };
 static ScreenPtr pScreenPtr = &screen;
 #include "tcorecopy_types.inc"
 static struct {
-    struct { uint64_t cpuPresentBytes, cpuResizeBytes, cpuUnflipBytes, cpuTotalBytes, cpuDegradedBytes;
+    struct { uint32_t writeIndex, readIndex; } gpuCopyQueue;
+    struct { uint64_t cpuPresentBytes, cpuResizeBytes, cpuUnflipBytes, cpuTotalBytes, cpuDegradedBytes, cpuBehindBytes;
              uint32_t coreCopyCalls[LORIE_CORE_COPY_KINDS], coreCopyUs[LORIE_CORE_COPY_KINDS], coreCopyMaxUs[LORIE_CORE_COPY_KINDS];
              uint64_t coreCopyBytes[LORIE_CORE_COPY_KINDS], coreCopyRootBytes[LORIE_CORE_COPY_KINDS],
                       coreCopySameBytes[LORIE_CORE_COPY_KINDS], coreCopyOverlapBytes[LORIE_CORE_COPY_KINDS]; } presentStats;
@@ -133,6 +134,13 @@ int main(void) {
     uint64_t sum = S.coreCopyBytes[0] + S.coreCopyBytes[1] + S.cpuPresentBytes + S.cpuResizeBytes + S.cpuUnflipBytes;
     CHECK(S.cpuTotalBytes == sum, "total %llu, the sites add up to %llu", (unsigned long long) S.cpuTotalBytes,
           (unsigned long long) sum);
+
+    /* with the renderer behind - the queue half full - still in the total, and counted as that */
+    fakeState.gpuCopyQueue.writeIndex = 16; fakeState.gpuCopyQueue.readIndex = 0;
+    copy(LORIE_CORE_COPY_WINDOW, &rootPix, &rootPix, &moved, 1, -10, -5, 32, 1);
+    CHECK(S.cpuBehindBytes == 20000 && S.cpuTotalBytes == sum + 20000, "behind: %llu behind, total %llu",
+          (unsigned long long) S.cpuBehindBytes, (unsigned long long) S.cpuTotalBytes);
+    fakeState.gpuCopyQueue.writeIndex = 0;
 
     /* with no renderer, or the GPU path off, nothing else could have copied it: kept apart */
     uint64_t total = S.cpuTotalBytes;
