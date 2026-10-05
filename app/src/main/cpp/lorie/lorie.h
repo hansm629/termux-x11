@@ -319,7 +319,7 @@ enum {
 enum {
     LORIE_CORE_KEPT_OFF,              /* TERMUX_X11_CORE_GPU_COPY=0, GPU presents off, or legacy drawing */
     LORIE_CORE_KEPT_NO_RENDERER,      /* no renderer connected, or it has no surface */
-    LORIE_CORE_KEPT_OP,               /* not a plain copy: a raster op, a plane mask, a bit plane, not 32 bpp */
+    LORIE_CORE_KEPT_OP,               /* not a plain copy: a raster op, a plane mask, a bit plane, not depth 24 */
     LORIE_CORE_KEPT_NOT_GPU,          /* source or destination not in a buffer the GPU can use */
     LORIE_CORE_KEPT_SAME_PIXMAP,      /* within one pixmap other than the root: nothing to stage it through */
     LORIE_CORE_KEPT_NO_SLOT,          /* within the root, and no slot free to stage it through */

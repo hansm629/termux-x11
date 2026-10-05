@@ -164,7 +164,7 @@
 +extern uint64_t lorieCoreCopyBegin(void);
 +/* lorie: lorie/InitOutput.c - the same copy made by the GPU instead, if it can be; TRUE if it was, and the
 + * fallback then copies nothing. Called before the copy's accesses are opened. */
-+extern Bool lorieCoreCopyOnGpu(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,
++extern Bool lorieCoreCopyOnGpu(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int depth,
 +                               Bool plain);
 +extern void lorieNoteCoreCopy(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,
 +                              uint64_t startUs);
@@ -206,7 +206,7 @@
 +            RegionNull(&lorieDst);
 +        RegionTranslate(&lorieDst, lorieDx, lorieDy);
 +        lorieDone = lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, lorieSrcPix, lorieDstPix, &lorieDst,
-+                                       dx + lorieSx - lorieDx, dy + lorieSy - lorieDy, pDst->bitsPerPixel,
++                                       dx + lorieSx - lorieDx, dy + lorieSy - lorieDy, pDst->depth,
 +                                       !bitplane && pGC->alu == GXcopy && EXA_PM_IS_SOLID(pDst, pGC->planemask));
 +        RegionUninit(&lorieDst);
 +        if (lorieDone) {
@@ -307,7 +307,7 @@
 +        exaGetDrawableDeltas(&pWin->drawable, loriePix, &lorieXoff, &lorieYoff);
 +        RegionTranslate(&lorieDst, lorieXoff, lorieYoff);
 +        lorieDone = lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, loriePix, loriePix, &lorieDst, lorieDx, lorieDy,
-+                                       pDrawable->bitsPerPixel, TRUE);
++                                       pDrawable->depth, TRUE);
 +        RegionUninit(&lorieDst);
 +        if (lorieDone) {
 +            EXA_POST_FALLBACK(pScreen);

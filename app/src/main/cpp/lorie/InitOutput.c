@@ -4944,7 +4944,8 @@ static Bool lorieCoreKept(int why) {
  * A copy X core rendering is about to make with the CPU (the EXA fallbacks for CopyArea and CopyWindow,
  * see xserver.patch), made by the GPU instead if it can be - TRUE if it was, and the caller then copies
  * nothing. `dstRegion` is what it writes, in `dst`'s coordinates; the source is that moved by
- * (sdx, sdy) in `src`. `plain` says it is a straight copy: GXcopy, every plane, no bit plane.
+ * (sdx, sdy) in `src`; `depth` is theirs. `plain` says it is a straight copy: GXcopy, every plane, no
+ * bit plane.
  *
  * Called before the copy's accesses are opened, so with the shared lock free, and waits for what it
  * queued (lorieAwaitCopies): to everything after it, the copy has happened, exactly as the CPU's would
@@ -4956,7 +4957,7 @@ static Bool lorieCoreKept(int why) {
  * through a slot nothing needs (lorieRootTempSlot) - into it, then back at the destination, the second
  * step a single entry, so it runs whole or not at all. Within any other pixmap it stays with the CPU.
  */
-Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int bpp,
+Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int depth,
                         Bool plain) {
     static int enabled = -1;
     LoriePixmapPriv *srcPriv, *dstPriv, *rootPriv = NULL;
@@ -4976,7 +4977,9 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
     }
     if (!enabled || pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing)
         return lorieCoreKept(LORIE_CORE_KEPT_OFF);
-    if (!plain || bpp != 32)
+    // Depth 24 alone: the GPU copies by sampling, and a buffer allocated without alpha reads back opaque,
+    // so a depth 32 pixmap's alpha would not survive it.
+    if (!plain || depth != 24)
         return lorieCoreKept(LORIE_CORE_KEPT_OP);
     if (!lorieConnectionAlive() || !lorieRendererAvailable())
         return lorieCoreKept(LORIE_CORE_KEPT_NO_RENDERER);

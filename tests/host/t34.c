@@ -281,7 +281,7 @@ static int copyInto(int kind, BoxRec b, int sdx, int sdy, BoxRec *extra) {
     if (!noPreflight && (healthy || rnd(2))) preflight();
     RegionInit(&r, &b, 1);
     int done = lorieCoreCopyOnGpu(kind == MOVE ? LORIE_CORE_COPY_WINDOW : LORIE_CORE_COPY_AREA,
-                                  kind == MOVE ? ROOT : (PixmapPtr) &clientPriv, ROOT, &r, sdx, sdy, 32, TRUE);
+                                  kind == MOVE ? ROOT : (PixmapPtr) &clientPriv, ROOT, &r, sdx, sdy, 24, TRUE);
     if (done)
         lorieRootCpuDrawn(&priv, &r);
     RegionUninit(&r);
@@ -300,7 +300,7 @@ static void copyOut(BoxRec b, int sdx, int sdy) {
     RegionRec r;
     if (healthy || rnd(2)) preflight();
     RegionInit(&r, &b, 1);
-    int done = lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, ROOT, (PixmapPtr) &outPriv, &r, sdx, sdy, 32, TRUE);
+    int done = lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, ROOT, (PixmapPtr) &outPriv, &r, sdx, sdy, 24, TRUE);
     RegionUninit(&r);
     if (!done) {
         xPrepare(&priv);
@@ -670,13 +670,15 @@ int main(int argc, char **argv) {
         RegionRec r;
         BoxRec b = { 0, 0, 8, 8 };
         RegionInit(&r, &b, 1);
-        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &regularPriv, ROOT, &r, 1, 1, 32, TRUE) &&
+        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &regularPriv, ROOT, &r, 1, 1, 24, TRUE) &&
               fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_NOT_GPU] == 1, "plain memory: given to the GPU");
-        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &clientPriv, &r, 1, 1, 32, TRUE) &&
+        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &clientPriv, &r, 1, 1, 24, TRUE) &&
               fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP] == 1, "within a client pixmap: given to the GPU");
-        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, ROOT, &r, 1, 1, 32, FALSE) &&
+        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, ROOT, &r, 1, 1, 24, FALSE) &&
               !lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, ROOT, &r, 1, 1, 16, TRUE) &&
-              fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_OP] == 2, "not a plain 32 bpp copy: given to the GPU");
+              !lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &outPriv, &r, 1, 1, 32, TRUE) &&
+              fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_OP] == 3,
+              "not a plain depth 24 copy - a raster op, 16 bits, or with alpha the GPU would not keep: given to the GPU");
         RegionUninit(&r);
         RegionNull(&r);
         for (int k = 0; k < 70; k++) {
@@ -684,7 +686,7 @@ int main(int argc, char **argv) {
             BoxRec px = { (short) (k % 32 * 2), (short) (k / 32 * 3), (short) (k % 32 * 2 + 1), (short) (k / 32 * 3 + 1) };
             RegionInit(&one, &px, 1); RegionUnion(&r, &r, &one); RegionUninit(&one);
         }
-        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, ROOT, ROOT, &r, 1, 0, 32, TRUE) &&
+        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, ROOT, ROOT, &r, 1, 0, 24, TRUE) &&
               fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_RECTS] == 1, "70 rects within the root: given to the GPU");
         RegionUninit(&r);
     }

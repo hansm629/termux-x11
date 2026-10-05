@@ -98,6 +98,12 @@ gpu_first("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptO
 f = body("exa_unaccel.c", "\nExaCheckCopyNtoN(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,")
 check("!bitplane && pGC->alu == GXcopy && EXA_PM_IS_SOLID(pDst, pGC->planemask)" in f,
       "ExaCheckCopyNtoN: the GPU is offered copies that are not plain (a bit plane, a raster op, a plane mask)")
+# with the depth, which is what says whether there is alpha the GPU's copy would not keep
+for sig, arg in (("\nExaCheckCopyNtoN(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,", "pDst->depth,"),
+                 ("\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)", "pDrawable->depth,")):
+    f = body("exa_unaccel.c", sig)
+    call = f[f.find("lorieCoreCopyOnGpu("):]
+    check(arg in call[:call.find(";")], sig.strip().split("(")[0] + ": the GPU is not told the copy's depth")
 f = body("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)")
 check(before(f, "RegionIntersect(&lorieDst, &lorieDst, &pWin->borderClip);", "lorieCoreCopyOnGpu(") and
       before(f, "exaGetDrawableDeltas(&pWin->drawable, loriePix", "lorieCoreCopyOnGpu("),
