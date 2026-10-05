@@ -1,5 +1,6 @@
 /* T34: the copies X core rendering makes - a window moved within the root, a client's pixmap copied into
- * it, the root copied out to a pixmap - made by the GPU (lorieCoreCopyOnGpu) instead of the CPU. Against
+ * it, the root copied out to a pixmap - made by the GPU (lorieCoreCopyOnGpu) instead of the CPU, and the
+ * old root copied into a resized one (lorieResizeCopyOnGpu). Against
  * the real handover, carry, repair and staging code (rootharness.h, extracted by gen.py), with the renderer
  * and its queue simulated, including running out of time with a copy half done.
  *
@@ -43,9 +44,12 @@ static uint32_t rnd(uint32_t n) { rng = rng * 1103515245u + 12345u; return (rng 
 static int meets(BoxRec a, BoxRec b) { return a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2; }
 
 static void stagedThrough(int slot);
+static int outRegisteredAtQueue;
 static uint64_t queueJob(int src, int dst, BoxPtr box, int n, int xOff, int yOff, int carry) {
     if (!carry && dst < LORIE_ROOT_SLOTS)
         stagedThrough(dst);
+    if (dst == 7)
+        outRegisteredAtQueue = bufs[dst].registered;
     Job *j = &jobs[jobTail++];
     memset(j, 0, sizeof *j);
     j->serial = ++serial; j->src = src; j->dst = dst; j->n = n; j->xOff = xOff; j->yOff = yOff; j->carry = carry;
@@ -140,7 +144,7 @@ static int harnessNap(void) {
     return 0;
 }
 #define nanosleep(t, rem) ((void) (t), harnessNap())
-static void lorieRegisterBuffer(LorieBuffer *b) { (void) b; }
+static void lorieRegisterBuffer(LorieBuffer *b) { b->registered = 1; }
 static Bool lorieConnectionAlive(void) { return TRUE; }
 static Bool lorieRendererAvailable(void) { return TRUE; }
 static int lorieSharedLockHeld;
@@ -690,6 +694,44 @@ int main(int argc, char **argv) {
               fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_RECTS] == 1, "70 rects within the root: given to the GPU");
         RegionUninit(&r);
     }
+
+#ifdef HAVE_RESIZE_GPU
+    /* the screen resized: the old root's drawing slot into the new root by the GPU, the part both have -
+     * what it owes settled first, the new buffer sent to the renderer before the copy naming it; with the
+     * renderer stuck over an owed area, a buffer the GPU cannot use, or out of time, left to the CPU */
+    for (int variant = 0; variant < 5; variant++) {
+        static const char *names[] = { "resize", "resize over an owed area", "resize, renderer stuck",
+                                       "resize, not GPU buffers", "resize, out of time" };
+        static const int kept[] = { -1, -1, LORIE_CORE_KEPT_OWED, LORIE_CORE_KEPT_NOT_GPU, LORIE_CORE_KEPT_TIMEOUT };
+        static uint32_t ref[W * H];
+        reset(); rng = 11; picture();
+        if (variant == 1 || variant == 2) {
+            presentPending((BoxRec) { 12, 6, 30, 10 }, 79);
+            CHECK(handover(&priv), "%s: no publish", names[variant]);
+        }
+        if (variant == 3)
+            bufs[OUT].desc.type = LORIEBUFFER_REGULAR;
+        bufs[OUT].registered = 0;
+        outRegisteredAtQueue = 0;
+        forceTimeout = variant == 2 || variant == 4;
+        healthy = variant <= 1;
+        int w = W - 9, h = H - 3, bad = 0;
+        int done = lorieResizeCopyOnGpu(ROOT, (PixmapPtr) &outPriv, w, h);
+        forceTimeout = healthy = 0;
+        if (kept[variant] >= 0) {
+            CHECK(!done && fakeState.presentStats.resizeGpuKept[kept[variant]] == 1 && fakeState.presentStats.resizeGpuBytes == 0,
+                  "%s: not left to the CPU, or not counted as why", names[variant]);
+            continue;
+        }
+        replay(ref, nev);
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                bad += outPixels[y * W + x] != (x < w && y < h ? ref[y * W + x] : 0);
+        CHECK(done && outRegisteredAtQueue && fakeState.presentStats.resizeGpuBytes == (uint64_t) w * h * 4,
+              "%s: not by the GPU, or the renderer not sent the new root before the copy", names[variant]);
+        CHECK(bad == 0, "%s: the new root holds %d pixels other than the old one's", names[variant], bad);
+    }
+#endif
 
     /* randomized: moves, copies in and out, drawing, handovers and the renderer at its own pace, running out
      * of time and giving carries up; then a healthy renderer, with which the CPU copies nothing */

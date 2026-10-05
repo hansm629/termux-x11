@@ -451,6 +451,7 @@ static RegionPtr lorieRootPendingPresentRegion(LoriePixmapPriv *priv, int slot);
 static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued,
                                 RegionPtr exclude);
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
+static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int h);
 static Bool lorieRootHandover(LoriePixmapPriv *priv);
 static void lorieNoteRootPublished(LoriePixmapPriv *priv);
 static inline int lorieRootSampledIndex(void);
@@ -1224,6 +1225,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.cpuTotalBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuTotalBytes, 0, __ATOMIC_RELAXED);
     snap.cpuDegradedBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuDegradedBytes, 0, __ATOMIC_RELAXED);
     snap.cpuBehindBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuBehindBytes, 0, __ATOMIC_RELAXED);
+    snap.resizeGpuBytes = __atomic_exchange_n(&pvfb->state->presentStats.resizeGpuBytes, 0, __ATOMIC_RELAXED);
+    for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
+        snap.resizeGpuKept[why] = __atomic_exchange_n(&pvfb->state->presentStats.resizeGpuKept[why], 0, __ATOMIC_RELAXED);
     snap.coreGpuWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitUs, 0, __ATOMIC_RELAXED);
     snap.coreGpuWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitMaxUs, 0, __ATOMIC_RELAXED);
     for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
@@ -1497,6 +1501,17 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                     snap.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP], snap.coreGpuKept[LORIE_CORE_KEPT_NO_SLOT],
                     snap.coreGpuKept[LORIE_CORE_KEPT_RECTS], snap.coreGpuKept[LORIE_CORE_KEPT_OWED],
                     snap.coreGpuKept[LORIE_CORE_KEPT_BUSY], snap.coreGpuKept[LORIE_CORE_KEPT_TIMEOUT]);
+            kept = 0;
+            for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
+                kept += snap.resizeGpuKept[why];
+            if (snap.resizeGpuBytes || kept)
+                log(INFO, "XlorieResizeGpu: old root into the resized one by the GPU %.1f MB; kept on the CPU: off "
+                          "%u, no renderer %u, not GPU buffers %u, root not up to date %u, queue busy %u, not done in "
+                          "time %u",
+                    snap.resizeGpuBytes / 1048576.0, snap.resizeGpuKept[LORIE_CORE_KEPT_OFF],
+                    snap.resizeGpuKept[LORIE_CORE_KEPT_NO_RENDERER], snap.resizeGpuKept[LORIE_CORE_KEPT_NOT_GPU],
+                    snap.resizeGpuKept[LORIE_CORE_KEPT_OWED], snap.resizeGpuKept[LORIE_CORE_KEPT_BUSY],
+                    snap.resizeGpuKept[LORIE_CORE_KEPT_TIMEOUT]);
         }
         for (int kind = 0; kind < LORIE_CORE_COPY_KINDS; kind++)
             if (snap.coreCopyCalls[kind])
@@ -1895,13 +1910,26 @@ static Bool lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height,
     pvfb->damage = lorieCreateRootDamage(pScreen, newPixmap);
 
     if (oldPixmap) {
-        GCPtr gc = GetScratchGC(newPixmap->drawable.depth, pScreen);
-        if (gc) {
-            ValidateGC(&newPixmap->drawable, gc);
-            lorieCopyContext(LORIE_COPY_CTX_RESIZE);
-            gc->ops->CopyArea(&oldPixmap->drawable, &newPixmap->drawable, gc, 0, 0, min(oldPixmap->drawable.width, newPixmap->drawable.width), min(oldPixmap->drawable.height, newPixmap->drawable.height), 0, 0);
-            lorieCopyContext(LORIE_COPY_CTX_NONE);
-            FreeScratchGC(gc);
+        int w = min(oldPixmap->drawable.width, newPixmap->drawable.width);
+        int h = min(oldPixmap->drawable.height, newPixmap->drawable.height);
+
+        if (lorieResizeCopyOnGpu(oldPixmap, newPixmap, w, h)) {
+            // What the CopyArea below would have reported: the new root holds something now.
+            BoxRec copied = { 0, 0, w, h };
+            RegionRec r;
+
+            RegionInit(&r, &copied, 1);
+            DamageDamageRegion(&newPixmap->drawable, &r);
+            RegionUninit(&r);
+        } else {
+            GCPtr gc = GetScratchGC(newPixmap->drawable.depth, pScreen);
+            if (gc) {
+                ValidateGC(&newPixmap->drawable, gc);
+                lorieCopyContext(LORIE_COPY_CTX_RESIZE);
+                gc->ops->CopyArea(&oldPixmap->drawable, &newPixmap->drawable, gc, 0, 0, w, h, 0, 0);
+                lorieCopyContext(LORIE_COPY_CTX_NONE);
+                FreeScratchGC(gc);
+            }
         }
         TraverseTree(pScreen->root, lorieSetPixmapVisitWindow, oldPixmap);
         pScreen->DestroyPixmap(oldPixmap);
@@ -5085,6 +5113,61 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
         return lorieCoreKept(LORIE_CORE_KEPT_TIMEOUT);
     pvfb->state->presentStats.coreGpuCopies[kind]++;
     pvfb->state->presentStats.coreGpuBytes[kind] += pixels * 4;
+    return TRUE;
+}
+
+static Bool lorieResizeKept(int why) {
+    pvfb->state->presentStats.resizeGpuKept[why]++;
+    return FALSE;
+}
+
+/*
+ * The old root's content, `w` x `h` of it, into the resized one (lorieRRScreenSetSize), made by the GPU -
+ * TRUE if it was, and the CopyArea that would make it with the CPU is not needed. The new root is shown to
+ * nothing yet - the renderer is sent it only now - so nothing else reads or writes it; the old one's
+ * drawing slot first owes nothing (lorieRootOwedSettled), as a CPU access's prepare would have it. Waited
+ * for like a core copy (lorieAwaitCopies): by the time the old root is destroyed and the new one drawn
+ * into, the copy has happened, and the copy's record holds both buffers until the renderer is done.
+ */
+static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int h) {
+    static int enabled = -1;
+    LoriePixmapPriv *oldPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(oldPix), *newPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(newPix);
+    BoxRec box = { 0, 0, (short) w, (short) h };
+    uint64_t startUs = lorieNowUs(), serial;
+    LorieBuffer *src;
+    uint32_t used;
+
+    if (!pvfb->state || !oldPriv || !newPriv || w <= 0 || h <= 0)
+        return FALSE;
+    if (enabled < 0) {
+        const char *e = getenv("TERMUX_X11_CORE_GPU_COPY");
+        enabled = !(e && !strcmp(e, "0"));
+    }
+    if (!enabled || pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing)
+        return lorieResizeKept(LORIE_CORE_KEPT_OFF);
+    if (!lorieConnectionAlive() || !lorieRendererAvailable())
+        return lorieResizeKept(LORIE_CORE_KEPT_NO_RENDERER);
+    if (lorieSharedLockHeld > 0)
+        return lorieResizeKept(LORIE_CORE_KEPT_BUSY);
+    src = oldPriv->rootDouble ? oldPriv->rootBuf[oldPriv->rootWrite] : oldPriv->buffer;
+    if (oldPriv->mem || newPriv->mem || !src || !newPriv->buffer ||
+        LorieBuffer_description(src)->type != LORIEBUFFER_AHARDWAREBUFFER ||
+        LorieBuffer_description(newPriv->buffer)->type != LORIEBUFFER_AHARDWAREBUFFER)
+        return lorieResizeKept(LORIE_CORE_KEPT_NOT_GPU);
+    if (oldPriv->rootDouble && !lorieRootOwedSettled(oldPriv, startUs))
+        return lorieResizeKept(LORIE_CORE_KEPT_OWED);
+    used = pvfb->state->gpuCopyQueue.writeIndex - __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    if (used >= LORIE_GPU_COPY_QUEUE_CAPACITY)
+        return lorieResizeKept(LORIE_CORE_KEPT_BUSY);
+
+    // The renderer has to have the new buffer before it reads the entry naming it.
+    lorieRegisterBuffer(src);
+    lorieRegisterBuffer(newPriv->buffer);
+    if (!(serial = lorieQueueBufferCopy(src, newPriv->buffer, &box, 1, 0, 0, 3)))
+        return lorieResizeKept(LORIE_CORE_KEPT_BUSY);
+    if (!lorieAwaitCopies(serial, serial, 0, startUs))
+        return lorieResizeKept(LORIE_CORE_KEPT_TIMEOUT);
+    pvfb->state->presentStats.resizeGpuBytes += (uint64_t) w * h * 4;
     return TRUE;
 }
 

@@ -671,6 +671,10 @@ struct lorie_shared_server_state {
         volatile uint32_t coreGpuWaitUs;
         volatile uint32_t coreGpuWaitMaxUs;
         volatile uint32_t coreGpuKept[LORIE_CORE_KEPT_REASONS];
+        /* The old root copied into a resized one by the GPU instead (lorieResizeCopyOnGpu): its bytes, and
+         * the times it stayed with the CPU (cpuResizeBytes), by why (LORIE_CORE_KEPT_*). */
+        volatile uint64_t resizeGpuBytes;
+        volatile uint32_t resizeGpuKept[LORIE_CORE_KEPT_REASONS];
         /* The carry the GPU did instead (lorieRootCarryOnGpu): copies queued and their bytes, the ones
          * a CPU access took back before the renderer got to them - the CPU then fetched the area, which
          * is in cpuOwedFetchBytes - and the ones not made. cpuCarryKept is a handover whose carry

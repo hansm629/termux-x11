@@ -126,7 +126,10 @@ recipes = {
             + func(I, "static Bool lorieRootOwedSettled(LoriePixmapPriv *priv, uint64_t startUs) {")
             + macro(I, "LORIE_CORE_COPY_HARD_WAIT_US")
             + func(I, "static Bool lorieAwaitCopies(uint64_t first, uint64_t last, uint64_t whole, uint64_t startUs) {")
-            + func(I, "Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int depth,"),
+            + func(I, "Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int depth,")
+            + opt(lambda: "#define HAVE_RESIZE_GPU 1\n" + func(I, "static Bool lorieResizeKept(int why) {")
+                + func(I, "static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int h) {"),
+                "static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int h) {"),
             "Bool lorieCoreCopyOnGpu("),
     "t10": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
