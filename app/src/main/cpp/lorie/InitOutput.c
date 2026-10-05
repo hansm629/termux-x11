@@ -1228,6 +1228,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.resizeGpuBytes = __atomic_exchange_n(&pvfb->state->presentStats.resizeGpuBytes, 0, __ATOMIC_RELAXED);
     for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
         snap.resizeGpuKept[why] = __atomic_exchange_n(&pvfb->state->presentStats.resizeGpuKept[why], 0, __ATOMIC_RELAXED);
+    snap.coreGpuRemaps = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuRemaps, 0, __ATOMIC_RELAXED);
+    snap.coreGpuRemapUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuRemapUs, 0, __ATOMIC_RELAXED);
     snap.coreGpuWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitUs, 0, __ATOMIC_RELAXED);
     snap.coreGpuWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitMaxUs, 0, __ATOMIC_RELAXED);
     for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
@@ -1499,12 +1501,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 kept += snap.coreGpuKept[why];
             if (snap.coreGpuCopies[LORIE_CORE_COPY_WINDOW] || snap.coreGpuCopies[LORIE_CORE_COPY_AREA] || kept)
                 log(INFO, "XlorieCoreGpu: CopyWindow %u by the GPU %.1f MB, CopyArea %u by the GPU %.1f MB; waited "
-                          "%.1f ms (longest %.2f ms); kept on the CPU: off %u, no renderer %u, not a plain copy %u, not "
+                          "%.1f ms (longest %.2f ms); %u remaps %.1f ms; kept on the CPU: off %u, no renderer %u, not a "
+                          "plain copy %u, not "
                           "GPU buffers %u, within one pixmap %u, no slot to stage through %u, too many rects %u, root "
                           "not up to date %u, queue busy %u, not done in time %u",
                     snap.coreGpuCopies[LORIE_CORE_COPY_WINDOW], snap.coreGpuBytes[LORIE_CORE_COPY_WINDOW] / 1048576.0,
                     snap.coreGpuCopies[LORIE_CORE_COPY_AREA], snap.coreGpuBytes[LORIE_CORE_COPY_AREA] / 1048576.0,
                     snap.coreGpuWaitUs / 1000.0, snap.coreGpuWaitMaxUs / 1000.0,
+                    snap.coreGpuRemaps, snap.coreGpuRemapUs / 1000.0,
                     snap.coreGpuKept[LORIE_CORE_KEPT_OFF], snap.coreGpuKept[LORIE_CORE_KEPT_NO_RENDERER],
                     snap.coreGpuKept[LORIE_CORE_KEPT_OP], snap.coreGpuKept[LORIE_CORE_KEPT_NOT_GPU],
                     snap.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP], snap.coreGpuKept[LORIE_CORE_KEPT_NO_SLOT],
@@ -5096,6 +5100,46 @@ static Bool lorieAwaitCopies(uint64_t first, uint64_t last, uint64_t whole, uint
     return TRUE;
 }
 
+/*
+ * How a copy given to the GPU in place of the CPU's (lorieCoreCopyOnGpu, lorieResizeCopyOnGpu) keeps the
+ * CPU's mappings of its buffers in step with the GPU, per AHardwareBuffer's contract: the mapping let go
+ * of and taken again (lorieRemapForGpu), as the frame's remap does for the root and lorieTryScheduleGpuCopy
+ * for a present's source. 1, the default, does it before the copy, as presents do: what the CPU wrote is
+ * then there for the GPU to read, and nothing the CPU still holds lands on what the GPU writes. 2 also
+ * after it, for the CPU to read what the GPU wrote rather than what it held before. 0 not at all, for a
+ * device that keeps them coherent anyway. TERMUX_X11_CORE_GPU_REMAP sets it.
+ */
+static int lorieCoreRemapMode(void) {
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *e = getenv("TERMUX_X11_CORE_GPU_REMAP");
+        mode = e ? atoi(e) : 1;
+        if (mode < 0 || mode > 2)
+            mode = 1;
+    }
+    return mode;
+}
+
+// Lets go of the CPU's mapping of `priv`'s buffer and takes it again, if the CPU has it mapped; for the
+// root, that is its drawing slot, whose mapping the slot bookkeeping keeps as well (rootLocked).
+static void lorieRemapForGpu(LoriePixmapPriv *priv) {
+    uint64_t startUs;
+    int status;
+
+    if (!priv || !priv->locked || priv->mem || !priv->buffer)
+        return;
+    startUs = lorieNowUs();
+    LorieBuffer_unlock(priv->buffer);
+    status = LorieBuffer_lock(priv->buffer, &priv->locked);
+    if (status)
+        FatalError("Failed to lock the surface: %d\n", status);
+    if (priv->rootDouble)
+        priv->rootLocked[priv->rootWrite] = priv->locked;
+    pvfb->state->presentStats.coreGpuRemaps++;
+    pvfb->state->presentStats.coreGpuRemapUs += (uint32_t) (lorieNowUs() - startUs);
+}
+
 static Bool lorieCoreKept(int why) {
     pvfb->state->presentStats.coreGpuKept[why]++;
     return FALSE;
@@ -5192,6 +5236,12 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
         return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
     }
 
+    if (lorieCoreRemapMode() >= 1) {
+        lorieRemapForGpu(srcPriv);
+        if (dstPriv != srcPriv)
+            lorieRemapForGpu(dstPriv);
+    }
+
     if (srcPix == dstPix) {
         int w = rootPriv->rootWrite;
 
@@ -5244,6 +5294,8 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
 
     if (!lorieAwaitCopies(first, last, whole, startUs))
         return lorieCoreKept(LORIE_CORE_KEPT_TIMEOUT);
+    if (lorieCoreRemapMode() >= 2)
+        lorieRemapForGpu(dstPriv);
     pvfb->state->presentStats.coreGpuCopies[kind]++;
     pvfb->state->presentStats.coreGpuBytes[kind] += pixels * 4;
     return TRUE;
@@ -5293,6 +5345,10 @@ static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int 
     if (used >= LORIE_GPU_COPY_QUEUE_CAPACITY)
         return lorieResizeKept(LORIE_CORE_KEPT_BUSY);
 
+    if (lorieCoreRemapMode() >= 1) {
+        lorieRemapForGpu(oldPriv);
+        lorieRemapForGpu(newPriv);
+    }
     // The renderer has to have the new buffer before it reads the entry naming it.
     lorieRegisterBuffer(src);
     lorieRegisterBuffer(newPriv->buffer);
@@ -5300,6 +5356,8 @@ static Bool lorieResizeCopyOnGpu(PixmapPtr oldPix, PixmapPtr newPix, int w, int 
         return lorieResizeKept(LORIE_CORE_KEPT_BUSY);
     if (!lorieAwaitCopies(serial, serial, 0, startUs))
         return lorieResizeKept(LORIE_CORE_KEPT_TIMEOUT);
+    if (lorieCoreRemapMode() >= 2)
+        lorieRemapForGpu(newPriv);
     pvfb->state->presentStats.resizeGpuBytes += (uint64_t) w * h * 4;
     return TRUE;
 }

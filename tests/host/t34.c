@@ -65,6 +65,9 @@ static uint64_t lorieQueueBufferCopy(LorieBuffer *src, LorieBuffer *dst, BoxPtr 
     (void) traceKind;
     return queueJob((int) (src - bufs), (int) (dst - bufs), box, n, xOff, yOff, 0);
 }
+/* what the CPU drew into each buffer, and how much of it a remap had let go of (see LorieBuffer_unlock) */
+static uint32_t cpuWrites[8], flushedAt[8];
+static int unflushedReads;
 /* lateReport: the renderer reports what it ran only a while after letting go of the lock (1), or not
  * within the X server's hard wait at all (2) */
 static int lateReport;
@@ -78,6 +81,13 @@ static void renderOne(void) {
         gpuFails(j->serial);
         return;
     }
+    if (!j->present && cpuWrites[j->src] != flushedAt[j->src] && unflushedReads++ < 3)
+        printf("  FAIL seed %u: the GPU read %s %d, which the CPU had drawn into and not let go of\n", seedNow,
+               j->src < LORIE_ROOT_SLOTS ? "slot" : "buffer", j->src);
+    /* a core copy writing a buffer the CPU still holds lines of: written back later, they land on it */
+    if (!j->present && !j->carry && cpuWrites[j->dst] != flushedAt[j->dst] && unflushedReads++ < 3)
+        printf("  FAIL seed %u: the GPU wrote %s %d, which the CPU had drawn into and not let go of\n", seedNow,
+               j->dst < LORIE_ROOT_SLOTS ? "slot" : "buffer", j->dst);
     if (j->present)
         fill(j->dst, j->pb, j->v);
     else
@@ -145,6 +155,18 @@ static int harnessNap(void) {
 }
 #define nanosleep(t, rem) ((void) (t), harnessNap())
 static void lorieRegisterBuffer(LorieBuffer *b) { b->registered = 1; }
+/* The CPU's mapping of a buffer, let go of and taken again (lorieRemapForGpu): what the CPU had written
+ * into it is there for the GPU from then on. cpuWrites counts what the CPU drew into each buffer,
+ * flushedAt how much of that a remap had let go of; the GPU reading a buffer the CPU wrote since is a
+ * read of what may not be there yet (checked in renderOne). The frame's remap of the drawing slot as it
+ * is published (the block handler's) is modelled in publish(). */
+static int LorieBuffer_unlock(LorieBuffer *b) { flushedAt[b - bufs] = cpuWrites[b - bufs]; return 0; }
+static int LorieBuffer_lock(LorieBuffer *b, void **out) {
+    int i = (int) (b - bufs);
+    *out = i < LORIE_ROOT_SLOTS ? (void *) pixels[i] : (void *) mem(i);
+    return 0;
+}
+#define FatalError(...) (printf(__VA_ARGS__), abort())
 static Bool lorieConnectionAlive(void) { return TRUE; }
 static Bool lorieRendererAvailable(void) { return TRUE; }
 static int lorieSharedLockHeld;
@@ -236,6 +258,7 @@ static void cpuWrite(BoxRec b, int kind, int sdx, int sdy, uint32_t v) {
     RegionRec r;
     cancelOver(b);
     xPrepare(&priv);
+    cpuWrites[priv.rootWrite]++;
     if (kind == MOVE)
         cpuReads(b, sdx, sdy);
     memcpy(snap, pixels[priv.rootWrite], sizeof snap);
@@ -309,6 +332,7 @@ static void copyOut(BoxRec b, int sdx, int sdy) {
     if (!done) {
         xPrepare(&priv);
         cpuReads(b, sdx, sdy);
+        cpuWrites[OUT]++;
         for (int y = b.y1; y < b.y2; y++)
             for (int x = b.x1; x < b.x2; x++)
                 outPixels[y * W + x] = pixels[priv.rootWrite][(y + sdy) * W + x + sdx];
@@ -383,11 +407,16 @@ static void rendererTakes(void) {
         fakeState.rootHandover |= 1u << untaken;
     untaken = -1;
 }
+/* a handover as the block handler makes it: the slot going out remapped first (the frame's remap) */
+static Bool remappedHandover(void) {
+    flushedAt[priv.rootWrite] = cpuWrites[priv.rootWrite];
+    return handover(&priv);
+}
 static int publish(void) {
     int drawn = priv.rootWrite;
     runChecks(0);
     rendererTakes();
-    if (!handover(&priv))
+    if (!remappedHandover())
         return 0;
     if (lagTake && rnd(2)) {
         fakeState.rootHandover &= ~(1u << drawn);
@@ -405,6 +434,10 @@ static int publish(void) {
 
 static void reset(void) {
     init(&priv);
+    priv.buffer = &bufs[priv.rootWrite];
+    priv.locked = pixels[priv.rootWrite];
+    memset(cpuWrites, 0, sizeof cpuWrites);
+    memset(flushedAt, 0, sizeof flushedAt);
     memset(&fakeState.presentStats, 0, sizeof fakeState.presentStats);
     cpuEarlyReads = 0;
     jobHead = jobTail = 0; fakeState.gpuCopyQueue.writeIndex = fakeState.gpuCopyQueue.readIndex = 0; serial = 0; nev = 0; nChecks = 0; value = 1000; cpuCoreBytes = 0;
@@ -415,7 +448,7 @@ static void reset(void) {
     bufs[OUT].desc = (LorieBuffer_Desc) { W, W, H, 202, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, LORIEBUFFER_AHARDWAREBUFFER };
     memset(&clientPriv, 0, sizeof clientPriv); clientPriv.buffer = &bufs[CLIENT];
     memset(&regularPriv, 0, sizeof regularPriv); regularPriv.buffer = &bufs[REGULAR];
-    memset(&outPriv, 0, sizeof outPriv); outPriv.buffer = &bufs[OUT];
+    memset(&outPriv, 0, sizeof outPriv); outPriv.buffer = &bufs[OUT]; outPriv.locked = outPixels;
     for (int k = 0; k < W * H; k++) { clientPixels[k] = 500000 + k; regularPixels[k] = 600000 + k; outPixels[k] = 0; }
 }
 /* a picture in the root, published and carried into every slot */
@@ -493,7 +526,7 @@ static void randomized(uint32_t seed, int steps) {
     runChecks(0);
     for (int k = 0; k < 2; k++) {
         int drawn = priv.rootWrite;
-        CHECK(handover(&priv), "seed %u: no publish once everything had resolved", seed);
+        CHECK(remappedHandover(), "seed %u: no publish once everything had resolved", seed);
         renderAll();
         checks[nChecks++] = (Check) { drawn, nev, serial, 0, { 0 } };
         runChecks(1);
@@ -629,7 +662,7 @@ int main(int argc, char **argv) {
     for (int stuck = 0; stuck < 2; stuck++) {
         reset(); rng = 5; picture();
         presentPending((BoxRec) { 12, 6, 30, 10 }, 77);
-        CHECK(handover(&priv), "waiting source: no publish");
+        CHECK(remappedHandover(), "waiting source: no publish");
         forceTimeout = stuck;
         noPreflight = 1;
         int done = copyInto(MOVE, (BoxRec) { 40, 6, 58, 10 }, -28, 0, NULL);
@@ -649,7 +682,7 @@ int main(int argc, char **argv) {
      * with the old content */
     reset(); rng = 9; picture();
     presentPending((BoxRec) { 12, 6, 30, 10 }, 78);
-    CHECK(handover(&priv), "damage beyond: no publish");
+    CHECK(remappedHandover(), "damage beyond: no publish");
     noPreflight = 1;
     CHECK(copyInto(COPYIN, (BoxRec) { 0, 12, 10, 16 }, 3, -5, &(BoxRec) { 0, 6, 40, 16 }),
           "damage beyond: not by the GPU");
@@ -707,7 +740,7 @@ int main(int argc, char **argv) {
         reset(); rng = 11; picture();
         if (variant == 1 || variant == 2) {
             presentPending((BoxRec) { 12, 6, 30, 10 }, 79);
-            CHECK(handover(&priv), "%s: no publish", names[variant]);
+            CHECK(remappedHandover(), "%s: no publish", names[variant]);
         }
         if (variant == 3)
             bufs[OUT].desc.type = LORIEBUFFER_REGULAR;
@@ -773,6 +806,7 @@ int main(int argc, char **argv) {
     CHECK(cpu == 0 && rootCpu == 0, "healthy renderer: the CPU copied %llu bytes of core copies, %llu of the root's",
           (unsigned long long) cpu, (unsigned long long) rootCpu);
 
+    CHECK(unflushedReads == 0, "the GPU read %d times what the CPU had drawn and not let go of", unflushedReads);
     printf("T34 core copies on the GPU: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
 }

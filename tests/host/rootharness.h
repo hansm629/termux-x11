@@ -72,7 +72,7 @@ static struct {
              uint32_t gpuCarryJobs, gpuCarryTakenBack, gpuCarryNotMade, cpuCarryKept[8];
              uint64_t gpuCarryBytes, cpuSeedBytes;
              uint32_t gpuOwedRepairs;
-             uint32_t coreGpuCopies[2], coreGpuKept[16], coreGpuWaitUs, coreGpuWaitMaxUs;
+             uint32_t coreGpuCopies[2], coreGpuKept[16], coreGpuWaitUs, coreGpuWaitMaxUs, coreGpuRemaps, coreGpuRemapUs;
              uint64_t coreGpuBytes[2];
              uint64_t resizeGpuBytes; uint32_t resizeGpuKept[16];
              uint32_t presentsWidened; } presentStats;

@@ -678,6 +678,10 @@ struct lorie_shared_server_state {
         volatile uint32_t coreGpuWaitUs;
         volatile uint32_t coreGpuWaitMaxUs;
         volatile uint32_t coreGpuKept[LORIE_CORE_KEPT_REASONS];
+        /* The CPU's mappings of the buffers those copies touched, let go of and taken again
+         * (lorieRemapForGpu): how many times, and how long it took. */
+        volatile uint32_t coreGpuRemaps;
+        volatile uint32_t coreGpuRemapUs;
         /* The old root copied into a resized one by the GPU instead (lorieResizeCopyOnGpu): its bytes, and
          * the times it stayed with the CPU (cpuResizeBytes), by why (LORIE_CORE_KEPT_*). */
         volatile uint64_t resizeGpuBytes;
