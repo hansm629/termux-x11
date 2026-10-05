@@ -5148,6 +5148,35 @@ static Bool lorieAwaitCopies(uint64_t first, uint64_t last, uint64_t whole, uint
 }
 
 /*
+ * A buffer to stage a copy within one pixmap through (lorieCoreCopyOnGpu) - one GPU copy cannot read and
+ * write the same buffer - where no root slot is free for it (lorieRootTempSlot), or the pixmap is not the
+ * root. Kept from one copy to the next, each of which is over by the time the next asks for it; grown
+ * when one needs more, rounded up so a window growing a little at a time is not a new allocation every
+ * time. NULL if it cannot be had.
+ */
+#define LORIE_SCRATCH_ROUND 256
+static LorieBuffer *lorieScratchBuffer(int w, int h) {
+    static LorieBuffer *scratch = NULL;
+    const LorieBuffer_Desc *d = scratch ? LorieBuffer_description(scratch) : NULL;
+    LorieBuffer *grown;
+
+    if (d && d->width >= w && d->height >= h)
+        return scratch;
+    w = (max(w, d ? d->width : 0) + LORIE_SCRATCH_ROUND - 1) / LORIE_SCRATCH_ROUND * LORIE_SCRATCH_ROUND;
+    h = (max(h, d ? d->height : 0) + LORIE_SCRATCH_ROUND - 1) / LORIE_SCRATCH_ROUND * LORIE_SCRATCH_ROUND;
+    if (!(grown = LorieBuffer_allocate(w, h, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, LORIEBUFFER_AHARDWAREBUFFER)))
+        return NULL;
+    // Nothing still in the queue reads it: a copy the renderer had claimed is over once lorieAwaitCopies
+    // returned, and a cancelled one is skipped without its buffers being looked up.
+    if (scratch) {
+        lorieUnregisterBuffer(scratch);
+        LorieBuffer_release(scratch);
+    }
+    log(INFO, "XlorieCoreGpu: copies within one pixmap staged through a %dx%d buffer", w, h);
+    return scratch = grown;
+}
+
+/*
  * How a copy given to the GPU in place of the CPU's (lorieCoreCopyOnGpu, lorieResizeCopyOnGpu) keeps the
  * CPU's mappings of its buffers in step with the GPU, per AHardwareBuffer's contract: the mapping let go
  * of and taken again (lorieRemapForGpu), as the frame's remap does for the root and lorieTryScheduleGpuCopy
@@ -5204,10 +5233,11 @@ static Bool lorieCoreKept(int why) {
  * have - nothing has to be ordered against it later. Out of time, it is taken back and the CPU makes it.
  * The root, read or written, owes nothing first (lorieRootOwedSettled), as after a CPU access's prepare.
  *
- * Both buffers have to be ones the GPU reads and writes (AHardwareBuffers). Within the root, source and
- * destination are the drawing slot itself, which one copy cannot both read and write: it is staged
- * through a slot nothing needs (lorieRootTempSlot) - into it, then back at the destination, the second
- * step a single entry, so it runs whole or not at all. Within any other pixmap it stays with the CPU.
+ * Both buffers have to be ones the GPU reads and writes (AHardwareBuffers). Within one pixmap, source and
+ * destination are the same buffer, which one copy cannot both read and write: it is staged - through a
+ * root slot nothing needs (lorieRootTempSlot) within the root, otherwise through a scratch buffer
+ * (lorieScratchBuffer) - into it, then back at the destination, the second step a single entry, so it
+ * runs whole or not at all.
  */
 Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int depth,
                         Bool plain) {
@@ -5217,6 +5247,7 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
     RegionRec srcRegion;
     BoxPtr box;
     uint64_t first = 0, last = 0, whole = 0, s, pixels = 0, startUs = lorieNowUs();
+    LorieBuffer *scratch = NULL;
     uint32_t used;
     int n, i, temp = -1, entries;
 
@@ -5252,8 +5283,6 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
         if (!rootPriv || !rootPriv->rootDouble)
             return lorieCoreKept(LORIE_CORE_KEPT_NO_SLOT);
     }
-    if (srcPix == dstPix && srcPix != screenPix)
-        return lorieCoreKept(LORIE_CORE_KEPT_SAME_PIXMAP);
 
     RegionNull(&srcRegion);
     RegionCopy(&srcRegion, dstRegion);
@@ -5270,9 +5299,14 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
             RegionUninit(&srcRegion);
             return lorieCoreKept(LORIE_CORE_KEPT_RECTS);
         }
-        if ((temp = lorieRootTempSlot(rootPriv)) < 0) {
-            RegionUninit(&srcRegion);
-            return lorieCoreKept(LORIE_CORE_KEPT_NO_SLOT);
+        temp = rootPriv ? lorieRootTempSlot(rootPriv) : -1;
+        if (temp < 0) {
+            BoxPtr ext = RegionExtents(&srcRegion);
+
+            if (!(scratch = lorieScratchBuffer(ext->x2 - ext->x1, ext->y2 - ext->y1))) {
+                RegionUninit(&srcRegion);
+                return lorieCoreKept(rootPriv ? LORIE_CORE_KEPT_NO_SLOT : LORIE_CORE_KEPT_SAME_PIXMAP);
+            }
         }
         entries = 2;
     } else
@@ -5289,7 +5323,29 @@ Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr 
             lorieRemapForGpu(dstPriv);
     }
 
-    if (srcPix == dstPix) {
+    if (srcPix == dstPix && temp < 0) {
+        // Through the scratch buffer, at the region's own corner there: in, then back out at the destination.
+        LorieBuffer *buffer = rootPriv ? rootPriv->rootBuf[rootPriv->rootWrite] : srcPriv->buffer;
+        BoxRec ext = *RegionExtents(&srcRegion);
+        RegionRec staged;
+
+        lorieRegisterBuffer(scratch);
+        if (!rootPriv)
+            lorieRegisterBuffer(buffer);
+        first = lorieQueueBufferCopy(buffer, scratch, box, n, -ext.x1, -ext.y1, 3);
+        RegionNull(&staged);
+        RegionCopy(&staged, &srcRegion);
+        RegionTranslate(&staged, -ext.x1, -ext.y1);
+        if (first)
+            whole = last = lorieQueueBufferCopy(scratch, buffer, RegionRects(&staged), n, ext.x1 - sdx, ext.y1 - sdy, 3);
+        RegionUninit(&staged);
+        if (!first || !last) {
+            if (first)
+                lorieCancelSerial(first);
+            RegionUninit(&srcRegion);
+            return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
+        }
+    } else if (srcPix == dstPix) {
         int w = rootPriv->rootWrite;
 
         first = lorieQueueBufferCopy(rootPriv->rootBuf[w], rootPriv->rootBuf[temp], box, n, 0, 0, 3);

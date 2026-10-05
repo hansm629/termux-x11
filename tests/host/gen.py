@@ -133,6 +133,7 @@ recipes = {
             + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback that made them",
                    "    LORIE_CORE_COPY_KINDS\n};")
             + span(H, "/* Why a copy X core rendering makes stayed with the CPU", "    LORIE_CORE_KEPT_REASONS\n};")
+            + macro(I, "LORIE_SCRATCH_ROUND") + func(I, "static LorieBuffer *lorieScratchBuffer(int w, int h) {")
             + func(I, "static int lorieCoreRemapMode(void) {")
             + func(I, "static void lorieRemapForGpu(LoriePixmapPriv *priv) {")
             + func(I, "static Bool lorieCoreKept(int why) {")

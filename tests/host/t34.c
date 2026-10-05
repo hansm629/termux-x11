@@ -23,10 +23,13 @@ static int verbose;
 #define CLIENT 5
 #define REGULAR 6
 #define OUT 7
-static uint32_t clientPixels[W * H], regularPixels[W * H], outPixels[W * H];
+#define SCRATCH 8      /* what lorieScratchBuffer allocates */
+static uint32_t clientPixels[W * H], regularPixels[W * H], outPixels[W * H], scratchPixels[512 * 512];
 static uint32_t *mem(int b) {
-    return b < LORIE_ROOT_SLOTS ? pixels[b] : b == CLIENT ? clientPixels : b == REGULAR ? regularPixels : outPixels;
+    return b < LORIE_ROOT_SLOTS ? pixels[b] : b == CLIENT ? clientPixels : b == REGULAR ? regularPixels
+         : b == SCRATCH ? scratchPixels : outPixels;
 }
+static int stride(int b) { return bufs[b].desc.stride; }
 
 typedef struct {
     uint64_t serial;
@@ -48,7 +51,7 @@ static int outRegisteredAtQueue;
 static uint64_t queueJob(int src, int dst, BoxPtr box, int n, int xOff, int yOff, int carry) {
     if (!carry && dst < LORIE_ROOT_SLOTS)
         stagedThrough(dst);
-    if (dst == 7)
+    if (dst == OUT)
         outRegisteredAtQueue = bufs[dst].registered;
     Job *j = &jobs[jobTail++];
     memset(j, 0, sizeof *j);
@@ -66,7 +69,7 @@ static uint64_t lorieQueueBufferCopy(LorieBuffer *src, LorieBuffer *dst, BoxPtr 
     return queueJob((int) (src - bufs), (int) (dst - bufs), box, n, xOff, yOff, 0);
 }
 /* what the CPU drew into each buffer, and how much of it a remap had let go of (see LorieBuffer_unlock) */
-static uint32_t cpuWrites[8], flushedAt[8];
+static uint32_t cpuWrites[10], flushedAt[10];
 static int unflushedReads;
 /* lateReport: the renderer reports what it ran only a while after letting go of the lock (1), or not
  * within the X server's hard wait at all (2) */
@@ -94,7 +97,7 @@ static void renderOne(void) {
         for (int k = 0; k < j->n; k++)
             for (int y = j->boxes[k].y1; y < j->boxes[k].y2; y++)
                 for (int x = j->boxes[k].x1; x < j->boxes[k].x2; x++)
-                    mem(j->dst)[(y + j->yOff) * W + x + j->xOff] = mem(j->src)[y * W + x];
+                    mem(j->dst)[(y + j->yOff) * stride(j->dst) + x + j->xOff] = mem(j->src)[y * stride(j->src) + x];
     if (lateReport)
         unreported = j->serial;
     else
@@ -167,6 +170,19 @@ static int LorieBuffer_lock(LorieBuffer *b, void **out) {
     return 0;
 }
 #define FatalError(...) (printf(__VA_ARGS__), abort())
+/* the scratch buffer staged copies go through (lorieScratchBuffer): one, grown in place */
+static int failScratch, scratchAllocs;
+static LorieBuffer *LorieBuffer_allocate(int w, int h, int format, int type) {
+    if (failScratch || (long) w * h > 512 * 512)
+        return NULL;
+    scratchAllocs++;
+    bufs[SCRATCH].desc = (LorieBuffer_Desc) { w, w, h, 300 + scratchAllocs, format, type };
+    return &bufs[SCRATCH];
+}
+static void LorieBuffer_release(LorieBuffer *b) { (void) b; }
+static void lorieUnregisterBuffer(LorieBuffer *b) { b->registered = 0; }
+#define INFO 0
+#define log(level, ...) ((void) (level))
 static Bool lorieConnectionAlive(void) { return TRUE; }
 static Bool lorieRendererAvailable(void) { return TRUE; }
 static int lorieSharedLockHeld;
@@ -649,13 +665,78 @@ int main(int argc, char **argv) {
         CHECK(x >= 0 && (rule ? got == -1 : got == x), "staging slot: with the only candidate %s, got %d", rules[rule], got);
     }
 
-    /* no slot to stage through: every other one held, pinned, or about to be shown */
+    /* no slot to stage through - every other one held, pinned, or about to be shown: through the scratch
+     * buffer instead, in every direction; and with that not to be had either, the CPU's */
     reset(); rng = 4; picture();
     for (int i = 0; i < LORIE_ROOT_SLOTS; i++)
-        if (i != priv.rootWrite) priv.rootCarrySrcSerial[i] = fakeCompleted + 1000;   /* a carry still to read it */
-    CHECK(!copyInto(MOVE, (BoxRec) { 10, 4, 40, 12 }, 3, 2, NULL), "no slot: said made");
-    CHECK(fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_NO_SLOT] == 1, "no slot: not counted as that");
-    CHECK(sameAsRef(priv.rootWrite, nev, &fx, &fy), "no slot: the CPU's copy is wrong at %d,%d", fx, fy);
+        if (i != priv.rootWrite) priv.rootCarrySrcSerial[i] = fakeCompleted + 1000;
+    failScratch = 1;         /* before the scratch buffer has been had: once it has, it is kept */
+    CHECK(!copyInto(MOVE, (BoxRec) { 10, 4, 40, 12 }, 3, 2, NULL), "no slot, no scratch: said made");
+    CHECK(fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_NO_SLOT] == 1, "no slot, no scratch: not counted as that");
+    CHECK(sameAsRef(priv.rootWrite, nev, &fx, &fy), "no slot, no scratch: the CPU's copy is wrong at %d,%d", fx, fy);
+    {
+        RegionRec r;
+        BoxRec b = { 0, 0, 8, 8 };
+        RegionInit(&r, &b, 1);
+        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &clientPriv, &r, 1, 1, 24, TRUE) &&
+              fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP] == 1,
+              "within a client pixmap, no scratch buffer: given to the GPU");
+        RegionUninit(&r);
+    }
+    failScratch = 0;
+    for (unsigned d = 0; d < sizeof dirs / sizeof dirs[0]; d++) {
+        reset(); rng = 4; picture();
+        for (int i = 0; i < LORIE_ROOT_SLOTS; i++)
+            if (i != priv.rootWrite) priv.rootCarrySrcSerial[i] = fakeCompleted + 1000;   /* a carry still to read it */
+        CHECK(copyInto(MOVE, (BoxRec) { 10, 4, 40, 12 }, dirs[d][0], dirs[d][1], NULL) && cpuCoreBytes == 0 &&
+              bufs[SCRATCH].registered, "no slot, %+d,%+d: not through the scratch buffer, or it was not sent first",
+              dirs[d][0], dirs[d][1]);
+        CHECK(sameAsRef(priv.rootWrite, nev, &fx, &fy), "no slot, %+d,%+d: the drawing slot differs at %d,%d", dirs[d][0],
+              dirs[d][1], fx, fy);
+    }
+
+    /* within one pixmap other than the root - a redirected window scrolled - staged through the scratch
+     * buffer, exactly as the CPU's overlapping copy, in every direction */
+    for (unsigned d = 0; d < sizeof dirs / sizeof dirs[0]; d++) {
+        static uint32_t want[W * H];
+        RegionRec r;
+        BoxRec b = { 10, 4, 40, 12 };
+        reset(); rng = 12;
+        for (int k = 0; k < W * H; k++) outPixels[k] = want[k] = 700000 + k;
+        for (int y = b.y1; y < b.y2; y++)
+            for (int x = b.x1; x < b.x2; x++)
+                want[y * W + x] = 700000 + (y + dirs[d][1]) * W + x + dirs[d][0];
+        RegionInit(&r, &b, 1);
+        CHECK(lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, (PixmapPtr) &outPriv, (PixmapPtr) &outPriv, &r, dirs[d][0],
+                                 dirs[d][1], 24, TRUE), "within a pixmap, %+d,%+d: not by the GPU", dirs[d][0], dirs[d][1]);
+        RegionUninit(&r);
+        CHECK(!memcmp(outPixels, want, sizeof want), "within a pixmap, %+d,%+d: not the CPU's overlapping copy",
+              dirs[d][0], dirs[d][1]);
+    }
+    /* ... out of time with the second step not claimed: nothing written back, the CPU's to make; already
+     * running: waited out and made */
+    for (int running = 0; running < 2; running++) {
+        static uint32_t before[W * H], want[W * H];
+        RegionRec r;
+        BoxRec b = { 10, 4, 40, 12 };
+        reset(); rng = 13;
+        for (int k = 0; k < W * H; k++) outPixels[k] = before[k] = want[k] = 800000 + k;
+        for (int y = b.y1; y < b.y2; y++)
+            for (int x = b.x1; x < b.x2; x++)
+                want[y * W + x] = 800000 + (y - 2) * W + x - 3;
+        RegionInit(&r, &b, 1);
+        forceTimeout = 1;
+        forceRunning = running;
+        Bool done = lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, (PixmapPtr) &outPriv, (PixmapPtr) &outPriv, &r, -3, -2, 24, TRUE);
+        forceTimeout = forceRunning = 0;
+        RegionUninit(&r);
+        renderAll();
+        if (running)
+            CHECK(done && !memcmp(outPixels, want, sizeof want), "within a pixmap, running when out of time: not made");
+        else
+            CHECK(!done && !memcmp(outPixels, before, sizeof before),
+                  "within a pixmap, out of time: said made, or written back though taken back");
+    }
 
     /* reading an area the drawing slot owes from the slot that went out, whose present there has not
      * landed: waited for, then repaired and read by the GPU - or, with the renderer stuck, the CPU's */
@@ -694,6 +775,19 @@ int main(int argc, char **argv) {
         CHECK(sameAsRef(drawn, nev, &fx, &fy), "damage beyond: went out with the old content at %d,%d", fx, fy);
     }
 
+    /* the scratch buffer grown for a bigger copy: rounded up, the one it replaces withdrawn from the
+     * renderer; asked again for less, the same one */
+    {
+        LorieBuffer *small = lorieScratchBuffer(10, 10);
+        int allocs = scratchAllocs;
+        small->registered = 1;
+        LorieBuffer *big = lorieScratchBuffer(300, 10);
+        CHECK(big && big->desc.width == 512 && big->desc.height >= 256 && scratchAllocs == allocs + 1 && !small->registered,
+              "scratch grown: %dx%d, or the old one still with the renderer", big ? big->desc.width : 0,
+              big ? big->desc.height : 0);
+        CHECK(lorieScratchBuffer(20, 20) == big && scratchAllocs == allocs + 1, "scratch: reallocated for less");
+    }
+
     /* between pixmaps: a client's AHB pixmap into the root, the root out into one; not one in plain
      * memory, not within one other than the root, not more rects than an entry within the root, not a
      * raster op, not 16 bpp */
@@ -709,8 +803,6 @@ int main(int argc, char **argv) {
         RegionInit(&r, &b, 1);
         CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &regularPriv, ROOT, &r, 1, 1, 24, TRUE) &&
               fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_NOT_GPU] == 1, "plain memory: given to the GPU");
-        CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &clientPriv, &r, 1, 1, 24, TRUE) &&
-              fakeState.presentStats.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP] == 1, "within a client pixmap: given to the GPU");
         CHECK(!lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, ROOT, &r, 1, 1, 24, FALSE) &&
               !lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, ROOT, &r, 1, 1, 16, TRUE) &&
               !lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, (PixmapPtr) &clientPriv, (PixmapPtr) &outPriv, &r, 1, 1, 32, TRUE) &&

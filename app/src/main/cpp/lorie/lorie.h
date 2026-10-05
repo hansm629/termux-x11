@@ -321,8 +321,8 @@ enum {
     LORIE_CORE_KEPT_NO_RENDERER,      /* no renderer connected, or it has no surface */
     LORIE_CORE_KEPT_OP,               /* not a plain copy: a raster op, a plane mask, a bit plane, not depth 24 */
     LORIE_CORE_KEPT_NOT_GPU,          /* source or destination not in a buffer the GPU can use */
-    LORIE_CORE_KEPT_SAME_PIXMAP,      /* within one pixmap other than the root: nothing to stage it through */
-    LORIE_CORE_KEPT_NO_SLOT,          /* within the root, and no slot free to stage it through */
+    LORIE_CORE_KEPT_SAME_PIXMAP,      /* within one pixmap other than the root, and no scratch buffer to stage it through */
+    LORIE_CORE_KEPT_NO_SLOT,          /* within the root, and neither a slot free nor a scratch buffer to stage it through */
     LORIE_CORE_KEPT_RECTS,            /* within the root, more rects than one queue entry holds */
     LORIE_CORE_KEPT_OWED,             /* the root's drawing slot still owes an area, not had in time */
     LORIE_CORE_KEPT_BUSY,             /* no room in the queue, or the shared lock already held */

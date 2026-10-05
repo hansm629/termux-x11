@@ -56,8 +56,8 @@ static uint64_t fakeNow = 1;
 #define FAKE_SERIALS 4096
 static uint8_t fakeFailed[FAKE_SERIALS];
 static uint64_t lorieNowUs(void) { return fakeNow++; }
-static uint64_t slotPendingSerial[8];
-static LorieBuffer bufs[8];
+static uint64_t slotPendingSerial[10];
+static LorieBuffer bufs[10];
 static struct {
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
