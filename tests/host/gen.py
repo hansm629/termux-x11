@@ -92,9 +92,17 @@ recipes = {
             "#define LORIE_ROOT_REPLACEMENTS")
         + opt(lambda: func(I, "static void lorieRootTakeBackCarries(LoriePixmapPriv *priv) {"),
               "static void lorieRootTakeBackCarries")
+        + opt(lambda: "#define HAVE_FETCH_THROUGH 1\n"
+                      "static RegionPtr lorieRootPendingPresentRegion(LoriePixmapPriv *priv, int slot);\n"
+                      "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot);\n"
+                      + func(I, "static void lorieRootFetchThroughCarries(LoriePixmapPriv *priv) {"),
+              "static void lorieRootFetchThroughCarries")
         + opt(lambda: "#define HAVE_GPU_REPAIR 1\n" + func(I, "static void lorieRootRepairOnGpu(LoriePixmapPriv *priv) {"),
               "static void lorieRootRepairOnGpu")
         + func(I, "static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {")
+        + opt(lambda: "#define HAVE_PRESENT_PENDING 1\n"
+                      + func(I, "static RegionPtr lorieRootPendingPresentRegion(LoriePixmapPriv *priv, int slot) {"),
+              "static RegionPtr lorieRootPendingPresentRegion")
         + opt(lambda: macro(I, "LORIE_ROOT_CARRY_ENTRIES") + func(I, carry_sig()),
               "static void lorieRootCarryOnGpu")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")

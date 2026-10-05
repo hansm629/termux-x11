@@ -353,6 +353,13 @@ typedef struct {
      */
     RegionRec rootGpuPending[LORIE_ROOT_SLOTS];
     uint64_t rootGpuPendingSerial[LORIE_ROOT_SLOTS];
+    /*
+     * The part of rootGpuPending that is clients' presents, which only the client's pixmap holds the
+     * content of until they land - unlike a copy from another slot (a carry, a repair), whose content
+     * that slot already has. A handover waits on these alone.
+     */
+    RegionRec rootPresentPending[LORIE_ROOT_SLOTS];
+    uint64_t rootPresentPendingSerial[LORIE_ROOT_SLOTS];
 
     /*
      * What the slot being drawn into still lacks, and where to get it. A handover that could not copy
@@ -440,6 +447,7 @@ static void lorieCountCpuCopy(volatile uint64_t *site, uint64_t bytes);
 static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted);
 static void lorieRootRepairOnGpu(LoriePixmapPriv *priv);
 static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot);
+static RegionPtr lorieRootPendingPresentRegion(LoriePixmapPriv *priv, int slot);
 static void lorieRootCarryOnGpu(LoriePixmapPriv *priv, int from, int to, RegionPtr carry, RegionPtr queued,
                                 RegionPtr exclude);
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root);
@@ -3327,6 +3335,8 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
                 RegionUninit(&rootPriv->rootStale[i]);
                 RegionUninit(&rootPriv->rootGpuPending[i]);
                 rootPriv->rootGpuPendingSerial[i] = 0;
+                RegionUninit(&rootPriv->rootPresentPending[i]);
+                rootPriv->rootPresentPendingSerial[i] = 0;
                 while (rootPriv->rootCondCount[i] > 0)
                     RegionUninit(&rootPriv->rootCond[i][--rootPriv->rootCondCount[i]].region);
                 rootPriv->rootCondDonor[i] = -1;
@@ -3496,6 +3506,8 @@ static void lorieRootNoteGpuCopy(LoriePixmapPriv *priv, RegionPtr r, uint64_t se
     lorieMarkRootStale(priv, r);
     RegionUnion(&priv->rootGpuPending[w], &priv->rootGpuPending[w], r);
     priv->rootGpuPendingSerial[w] = serial;
+    RegionUnion(&priv->rootPresentPending[w], &priv->rootPresentPending[w], r);
+    priv->rootPresentPendingSerial[w] = serial;
 
     if (!RegionNotEmpty(&priv->rootOwed))
         return;
@@ -3644,6 +3656,39 @@ static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {
     RegionUninit(&rest);
     RegionUninit(&pending);
     return clear;
+}
+
+/*
+ * For an access about to touch the drawing slot with the CPU: what it owes only because a copy from
+ * another slot - a carry, a repair - into its donor has not landed yet is fetched now, from the slot that
+ * copy reads; the donor's rootCond leads there (lorieRootFetchOwed). The ordinary repair waits for that
+ * copy (rootOwedSerial), and the access would otherwise go ahead over the old content. A present still
+ * pending into the donor is another matter - nobody has its content yet - and stays waited for. Only
+ * here: the handover and the repair on the GPU wait for the copy to land and take the area from the donor.
+ */
+static void lorieRootFetchThroughCarries(LoriePixmapPriv *priv) {
+    int donor = priv->rootOwedDonor, i;
+    Bool repairFirst = priv->rootRepairFirst;
+    RegionRec area;
+
+    if (!priv->rootDouble || donor < 0 || donor == priv->rootWrite || !RegionNotEmpty(&priv->rootOwed) ||
+        lorieGpuCopyResolved(priv->rootOwedSerial))
+        return;     // nothing left behind, or all of it fetchable by the ordinary repair
+    RegionNull(&area);
+    for (i = 0; i < priv->rootCondCount[donor]; i++)
+        if (priv->rootCond[donor][i].carry && !lorieGpuCopyResolved(priv->rootCond[donor][i].serial))
+            RegionUnion(&area, &area, &priv->rootCond[donor][i].region);
+    RegionIntersect(&area, &area, &priv->rootOwed);
+    RegionSubtract(&area, &area, lorieRootPendingPresentRegion(priv, donor));
+    RegionSubtract(&area, &area, lorieRootPendingGpuRegion(priv, priv->rootWrite));
+    for (i = 0; i < priv->rootReplacingCount; i++)
+        RegionSubtract(&area, &area, &priv->rootReplacing[i].region);
+    if (RegionNotEmpty(&area)) {
+        lorieRootFetchOwed(priv, &area, donor, priv->rootOwedDonorEpoch);
+        // A copy still in flight is not one that failed, which is what the fetch takes it for.
+        priv->rootRepairFirst = repairFirst;
+    }
+    RegionUninit(&area);
 }
 
 /*
@@ -3974,6 +4019,8 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
             RegionInit(&priv->rootStale[i], NULL, 0);
         RegionInit(&priv->rootGpuPending[i], NULL, 0);
         priv->rootGpuPendingSerial[i] = 0;
+        RegionInit(&priv->rootPresentPending[i], NULL, 0);
+        priv->rootPresentPendingSerial[i] = 0;
         priv->rootCarrySrcSerial[i] = 0;
         priv->rootCondCount[i] = 0;
         priv->rootCondDonor[i] = -1;
@@ -4065,6 +4112,16 @@ static RegionPtr lorieRootPendingGpuRegion(LoriePixmapPriv *priv, int slot) {
         priv->rootGpuPendingSerial[slot] = 0;
     }
     return &priv->rootGpuPending[slot];
+}
+
+// The same for clients' presents alone (rootPresentPending).
+static RegionPtr lorieRootPendingPresentRegion(LoriePixmapPriv *priv, int slot) {
+    if (priv->rootPresentPendingSerial[slot] &&
+        lorieGpuCopyResolved(priv->rootPresentPendingSerial[slot])) {
+        RegionEmpty(&priv->rootPresentPending[slot]);
+        priv->rootPresentPendingSerial[slot] = 0;
+    }
+    return &priv->rootPresentPending[slot];
 }
 
 /*
@@ -4389,7 +4446,8 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
     lorieTrace(pvfb->state, LORIE_TRACE_PUBLISH, drawn, pvfb->state->rootBufferIds[drawn]);
 
     // What the area left behind waits for: copies pending into the two slots now, before the carry
-    // below adds its own to `next`.
+    // below adds its own to `next`. A CPU access that cannot wait for a carry among them goes around it
+    // (lorieRootFetchThroughCarries).
     waitFor = max(priv->rootGpuPendingSerial[drawn], priv->rootGpuPendingSerial[next]);
 
     /*
@@ -4652,6 +4710,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     // can deadlock, and the handover still will not publish the slot until it is repaired.
     if (priv && priv->rootDouble) {
         lorieRootTakeBackCarries(priv);
+        lorieRootFetchThroughCarries(priv);
         lorieRepairRootOwed(priv);
     }
 

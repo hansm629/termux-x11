@@ -10,7 +10,8 @@
 #define H 64
 #include "rootharness.h"
 
-typedef struct { uint64_t serial; int from, to, n, cancelled; BoxRec boxes[LORIE_GPU_COPY_MAX_RECTS]; } Job;
+typedef struct { uint64_t serial; int from, to, n, cancelled; BoxRec boxes[LORIE_GPU_COPY_MAX_RECTS];
+                 int present; RegionRec region; uint32_t v; } Job;   /* a present fills `region` with v */
 static Job jobs[4096];
 static int jobHead, jobTail;
 static uint64_t serial;
@@ -25,6 +26,17 @@ static void renderAll(void) {
     while (jobHead < jobTail) {
         Job *j = &jobs[jobHead++];
         if (j->cancelled) { gpuFails(j->serial); continue; }
+        if (j->present) {
+            int nr = RegionNumRects(&j->region);
+            BoxPtr b = RegionRects(&j->region);
+            for (int k = 0; k < nr; k++)
+                for (int y = b[k].y1; y < b[k].y2; y++)
+                    for (int x = b[k].x1; x < b[k].x2; x++)
+                        pixels[j->to][y * W + x] = j->v;
+            RegionUninit(&j->region);
+            fakeCompleted = j->serial;
+            continue;
+        }
         for (int k = 0; k < j->n; k++)
             for (int y = j->boxes[k].y1; y < j->boxes[k].y2; y++)
                 for (int x = j->boxes[k].x1; x < j->boxes[k].x2; x++)
@@ -54,6 +66,36 @@ static void draw(BoxRec b, uint32_t v) {
 }
 static void pixel(int x, int y, uint32_t v) { draw((BoxRec) { (short) x, (short) y, (short) (x + 1), (short) (y + 1) }, v); }
 static int matches(int slot) { return !memcmp(pixels[slot], ref, sizeof ref); }
+/* 2048 isolated pixels (every 4th of every other row), or a checkerboard */
+static RegionRec scatterRegion;
+static RegionPtr scatter(int checkerboard) {
+    RegionRec one;
+    pixman_region_fini(&scatterRegion);
+    RegionNull(&scatterRegion);
+    for (int y = 0; y < H; y += checkerboard ? 1 : 2)
+        for (int x = checkerboard ? (y & 1) : 0; x < W; x += checkerboard ? 2 : 4) {
+            BoxRec b = { (short) x, (short) y, (short) (x + 1), (short) (y + 1) };
+            RegionInit(&one, &b, 1);
+            RegionUnion(&scatterRegion, &scatterRegion, &one);
+            RegionUninit(&one);
+        }
+    return &scatterRegion;
+}
+/* a client's present into the drawing slot over `r`, as lorieTryScheduleGpuCopy books it */
+static void present(RegionPtr r, uint32_t v) {
+    Job *j = &jobs[jobTail++];
+    memset(j, 0, sizeof *j);
+    j->serial = ++serial; j->to = priv.rootWrite; j->present = 1; j->v = v;
+    RegionNull(&j->region);
+    RegionCopy(&j->region, r);
+    lorieRootNoteGpuCopy(&priv, r, j->serial);
+    int n = RegionNumRects(r);
+    BoxPtr b = RegionRects(r);
+    for (int k = 0; k < n; k++)
+        for (int y = b[k].y1; y < b[k].y2; y++)
+            for (int x = b[k].x1; x < b[k].x2; x++)
+                ref[y * W + x] = v;
+}
 static uint64_t cpu(void) { return fakeState.presentStats.cpuCarryBytes + fakeState.presentStats.cpuOwedFetchBytes; }
 /* rounds of repair on the GPU and the renderer running them, as EXA fallbacks begin, until nothing new */
 static int repairRounds(void) {
@@ -72,6 +114,7 @@ int main(void) {
     const int limit = LORIE_ROOT_CARRY_ENTRIES * LORIE_GPU_COPY_MAX_RECTS;
 
     /* a handover's carry of 2048 isolated pixels: widened to one rect, one copy */
+    RegionNull(&scatterRegion);
     reset();
     for (int y = 0; y < H; y += 2)
         for (int x = 0; x < W; x += 4)
@@ -87,25 +130,22 @@ int main(void) {
     CHECK(cpu() == 0, "carry: the CPU copied %llu bytes", (unsigned long long) cpu());
 
     /*
-     * An owed area of 2048 rects that becomes fetchable only after the drawing slot has been drawn into:
-     * left behind by a handover because the copy carrying it into the slot going out had not landed, the
-     * X server draws in between, then that copy lands. Repaired on the GPU, widened around what was drawn
-     * meanwhile - which it must not cover.
+     * An owed area of 2048 rects that can be had only after the drawing slot has been drawn into: a
+     * client's present into the slot going out, over 2048 pixels, still in flight at the handover - its
+     * content nobody has until it lands. The X server draws in between; then it lands. Repaired on the
+     * GPU, widened around what was drawn meanwhile - which it must not cover.
      */
     reset();
-    for (int y = 0; y < H; y += 2)
-        for (int x = 0; x < W; x += 4)
-            pixel(x, y, 1000 + y * W + x);
-    CHECK(handover(&priv), "repair: first publish");      /* carried on the GPU into A, not landed */
     A = priv.rootWrite;
-    CHECK(handover(&priv), "repair: A not published with its carry in flight");
-    B = priv.rootWrite;                                  /* owes the pixels from A, once A has them */
+    present(scatter(0), 5);
+    CHECK(handover(&priv), "repair: A not published with its present in flight");
+    B = priv.rootWrite;                                  /* owes those pixels from A, once A has them */
     uint64_t before = fakeState.presentStats.gpuOwedRepairs;
     draw((BoxRec) { 10, 10, 50, 30 }, 7);                /* drawn into B meanwhile, over a part of them */
     draw((BoxRec) { 100, 0, 101, 64 }, 8);
     draw((BoxRec) { 200, 40, 256, 41 }, 9);
     CHECK(cpu() == 0, "repair: the CPU fetched before the area could be had");
-    renderAll();                                         /* A's carry lands */
+    renderAll();                                         /* the present lands in A */
     int rounds = repairRounds();
     CHECK(rounds >= 1 && fakeState.presentStats.gpuOwedRepairs > before, "repair: not given to the GPU");
     CHECK(fakeState.presentStats.cpuCarryKept[LORIE_CARRY_KEPT_RECTS] == 0, "repair: not widened (%u kept)",
@@ -116,19 +156,18 @@ int main(void) {
     CHECK(handover(&priv), "repair: B not published");
     renderAll();
     CHECK(matches(B), "repair: B went out wrong");
+    (void) A;
 
-    /* the same with what is drawn meanwhile a checkerboard between the owed pixels: nothing to widen over;
-     * the entries take it as far as they go each round, and the rounds take the rest */
+    /* the same with the present a checkerboard and what is drawn meanwhile the other half of it: nothing
+     * to widen over; the entries take it as far as they go each round, and the rounds take the rest */
     reset();
-    for (int y = 0; y < H; y++)
-        for (int x = (y & 1); x < W; x += 2)
-            pixel(x, y, 2000 + y * W + x);
-    CHECK(handover(&priv), "checkerboard: first publish");
-    CHECK(handover(&priv), "checkerboard: second publish");
+    present(scatter(1), 6);
+    CHECK(handover(&priv), "checkerboard: no publish");
     B = priv.rootWrite;
     for (int y = 0; y < H; y++)
         for (int x = 1 - (y & 1); x < W; x += 2)
             pixel(x, y, 9);
+    CHECK(cpu() == 0, "checkerboard: the CPU fetched before the area could be had");
     renderAll();
     rounds = repairRounds();
     CHECK(rounds >= (W * H / 2) / limit, "checkerboard: %d rounds for %d rects at %d a round", rounds, W * H / 2, limit);

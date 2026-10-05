@@ -198,6 +198,9 @@ static void xRead(LoriePixmapPriv *priv, BoxRec b, const char *what) {
     /* xPrepare, a step at a time: what is still owed from a donor whose copies have not landed is what
      * the repair left, before the lock waited out whatever the renderer had claimed */
     lorieRootTakeBackCarries(priv);
+#ifdef HAVE_FETCH_THROUGH
+    lorieRootFetchThroughCarries(priv);
+#endif
     lorieRepairRootOwed(priv);
     RegionNull(&waiting);
     if (!lorieGpuCopyResolved(priv->rootOwedSerial))
@@ -453,6 +456,23 @@ int main(int argc, char **argv) {
           fakeState.presentStats.cpuOwedFetchBytes > 0, "not made: Q never fetched");
     CHECK(fakeState.presentStats.rootOwedLost == 0, "not made: Q lost track of");
     (void) A; (void) B;
+
+    /* A read of the next slot through a carry still in flight into the slot that went out: what it lacks
+     * there is not in that slot yet, but it is in the slot the carry reads, and has to be read from there
+     * - not left as the old content, as if it were a present nobody can have yet. */
+    reset(&priv);
+    draw(&priv, Q, 5);
+    A = priv.rootWrite;
+    CHECK(handover(&priv), "through a carry: first publish");      /* Q carried A -> B, not landed */
+    B = priv.rootWrite;
+    CHECK(handover(&priv), "through a carry: B not published with its carry in flight");
+    C = priv.rootWrite;
+    xPrepare(&priv);                                              /* a PrepareAccess on C, nothing drained */
+    CHECK(areaIs(C, Q, 5), "through a carry: C read with Q old while B's carry from A was in flight");
+    CHECK(handover(&priv), "through a carry: C not published");
+    renderAll();
+    CHECK(areaIs(C, Q, 5), "through a carry: C went out without Q");
+    (void) A;
 
 #ifdef HAVE_GPU_REPAIR
     /* The GPU cannot take the carry at the handover - the queue busy - and can by the next EXA fallback:

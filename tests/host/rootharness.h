@@ -147,6 +147,9 @@ static void init(LoriePixmapPriv *priv) {
 #ifdef HAVE_GPU_PENDING
         RegionNull(&priv->rootGpuPending[i]);
 #endif
+#ifdef HAVE_PRESENT_PENDING
+        RegionNull(&priv->rootPresentPending[i]);
+#endif
 #ifdef HAVE_REPLACING
         priv->rootCondDonor[i] = -1;
 #endif
@@ -212,6 +215,9 @@ static void xCancel(uint64_t serial) {
 static void xPrepare(LoriePixmapPriv *priv) {
 #ifdef HAVE_CARRY
     lorieRootTakeBackCarries(priv);
+#endif
+#ifdef HAVE_FETCH_THROUGH
+    lorieRootFetchThroughCarries(priv);
 #endif
 #ifdef HAVE_OWED
     lorieRepairRootOwed(priv);
