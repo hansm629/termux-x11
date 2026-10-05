@@ -66,6 +66,15 @@ recipes = {
         + func(R, "static int64_t rootZcFenceSignalledNs(int fd) {")
         + func(R, "static void rootZcFlushDisplayStats(void) {")
         + func(R, "static void rootZcNoteApplied(uint32_t seq) {"),
+    # the renderer's claim and its "published since the claim", to run against the real handover - tsinceclaim.c
+    "sinceclaim": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN")
+        + macro(R, "LORIE_ZC_MAX_HELD")
+        + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
+        + "static uint32_t rendererRootSlotGen = 0;\nstatic uint32_t rendererRootSlotWord = 0;\n"
+        + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
+        + func(R, "static bool rootZcPublishedSinceClaim(void) {")
+        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + func(R, "static void rendererReleaseRootBuffer(void) {"),
     "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
         + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
         + func(R, "static void rootZcNothingNewDone(void) {")

@@ -510,7 +510,7 @@ struct lorie_shared_server_state {
      *
      *   bits 0..4    one bit per slot, set while the renderer still needs that slot
      *   bits 5..7    the slot published most recently - what the renderer takes next
-     *   bits 8..15   publish counter, for debugging; wraps within its own bits
+     *   bits 8..15   publish counter, for debugging only - it wraps, so nothing may decide on it
      *   bits 16..31  which pool of buffers the rest is about - odd while the X server is replacing it
      *
      * Only the renderer writes the held bits and only the X server writes the published slot, but

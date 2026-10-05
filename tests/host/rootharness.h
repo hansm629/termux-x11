@@ -63,6 +63,7 @@ static struct {
     volatile uint8_t rootDoubleBuffered;
     volatile uint64_t rootBufferIds[8];
     volatile uint32_t rootPublishSeq[8];
+    volatile uint64_t rootWindowTextureID;       /* the renderer's claim reads these (tsinceclaim.c) */
     /* as many apart as are queued; the watermark is the renderer's, below */
     struct { volatile uint32_t writeIndex, readIndex; volatile uint64_t completedSerial; } gpuCopyQueue;
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
@@ -77,7 +78,8 @@ static struct {
              uint64_t coreGpuBytes[2];
              uint64_t resizeGpuBytes; uint32_t resizeGpuKept[16];
              uint32_t presentsWidened;
-             uint32_t ahbPixmaps, ahbPixmapFailures, ahbPixmapAllocUs; } presentStats;
+             uint32_t ahbPixmaps, ahbPixmapFailures, ahbPixmapAllocUs;
+             uint32_t rootClaimsAcrossPools, rootStaleSlotReleases; } presentStats;
 } fakeState;
 /* The renderer's two answers about a serial (lorieGpuCopyResolved, lorieGpuCopyMade): it passes them
  * in order, so a watermark says which have been dealt with, and a set says which of those failed. */

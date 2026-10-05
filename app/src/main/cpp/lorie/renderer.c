@@ -1870,7 +1870,7 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
 static int rendererRootSlot = -1;
 static uint64_t rendererRootSlotId = 0;   // the buffer that slot held when it was claimed
 static uint32_t rendererRootSlotGen = 0;  // and the pool it was claimed from (see rootHandover)
-static uint32_t rendererRootSlotWord = 0; // the whole word it was claimed in: its publish count says what was newest then
+static uint32_t rendererRootSlotWord = 0; // the whole word it was claimed in: the newest slot and the pool then
 
 static uint64_t rendererClaimRootBuffer(void) {
     uint32_t old, claimed, now;
@@ -1936,16 +1936,26 @@ static uint64_t rendererClaimRootBuffer(void) {
 
 /*
  * Whether the X server has published again since this frame claimed its slot (rendererRootSlotWord): the
- * publish count, or the pool, has moved. What the frame looked at is then not the newest content there
- * is. The fence orders the frame's own clearing of drawRequested before this look, so a publish it does
- * not see is one whose drawRequested lands after that clearing, and survives it.
+ * newest slot, or the pool, has moved. What the frame looked at is then not the newest content there is.
+ *
+ * The claimed slot is held from the claim on, and the X server only ever publishes the slot it draws
+ * into, which is never a held one - so it cannot publish the claimed slot again, and any publish since
+ * the claim has made some other slot the newest. A replaced pool changes the generation. This used to
+ * compare the publish count instead, which is 8 bits: a claim can outlive any number of publishes (with
+ * one slot held the X server can go back and forth between two free ones for as long as it likes), and
+ * after 256 of them the count is back where it was and a publish went unseen. The count is left for
+ * debugging only.
+ *
+ * Asked only while the claimed slot is still held: on screen, or just submitted. The fence orders the
+ * frame's own clearing of drawRequested before this look, so a publish it does not see is one whose
+ * drawRequested lands after that clearing, and survives it.
  */
 static bool rootZcPublishedSinceClaim(void) {
     uint32_t now;
 
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     now = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
-    return ((now ^ rendererRootSlotWord) & LORIE_ROOT_COUNT_MASK) ||
+    return ((now ^ rendererRootSlotWord) & ((uint32_t) LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT)) ||
            LORIE_ROOT_GEN(now) != LORIE_ROOT_GEN(rendererRootSlotWord);
 }
 
