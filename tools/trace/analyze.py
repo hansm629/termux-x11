@@ -12,7 +12,9 @@ from collections import defaultdict
 
 KIND = {1: "REQUEST", 2: "ENQUEUE", 3: "RESOLVED", 4: "PUBLISH", 5: "TICK", 6: "INPUT",
         7: "DRAIN", 8: "FENCE", 9: "DIRECT", 10: "GLSWAP", 11: "RELEASE", 12: "HOLD",
-        13: "CANCEL", 14: "PREFLIGHT", 15: "XLOCK", 16: "ROOTCOPY", 17: "REMAP", 18: "RLOCK"}
+        13: "CANCEL", 14: "PREFLIGHT", 15: "XLOCK", 16: "ROOTCOPY", 17: "REMAP", 18: "RLOCK",
+        19: "VSYNC", 20: "PUBSEQ", 21: "ZCCLAIM", 22: "ZCBATCH", 23: "ZCFENCE", 24: "ZCAPPLY", 25: "SFDONE",
+        26: "SFPRESENT"}
 HOLD = {1: "frame incomplete", 2: "no slot back from compositor", 3: "shared lock unusable"}
 PREFLIGHT = {1: "drained", 2: "timed out", 3: "skipped, lock already held", 4: "skipped, head stuck",
              5: "skipped, no renderer"}

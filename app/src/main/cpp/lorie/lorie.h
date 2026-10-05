@@ -397,6 +397,20 @@ enum {
     LORIE_TRACE_ROOTCOPY,     /* X: CPU copy between root slots        a = us,                  b = bytes */
     LORIE_TRACE_REMAP,        /* X: root buffer unlocked and relocked  a = us,                  b = 0 */
     LORIE_TRACE_RLOCK,        /* renderer: shared lock taken (dated then) a = wait us before,   b = held us after */
+    /* One ROOT_DIRECT frame from the X server's tick to the compositor's latch, joined by sequence
+     * numbers: the publish's (rootPublishSeq), the renderer's frame's, and the applied transaction's. */
+    LORIE_TRACE_VSYNC,        /* X: the tick's vsync                   a = steps,               b = vsync time us */
+    LORIE_TRACE_PUBSEQ,       /* X: root slot handed on                a = publish seq,         b = slot */
+    LORIE_TRACE_ZCCLAIM,      /* renderer: ROOT_DIRECT frame claimed   a = frame seq,           b = publish seq,
+                               *    with bit 32 set if it was already on screen */
+    LORIE_TRACE_ZCBATCH,      /* renderer: its queue drained           a = frame seq,           b = kilopixels into
+                               *    the claimed slot << 32 | kilopixels into anything else */
+    LORIE_TRACE_ZCFENCE,      /* renderer: its copies finished         a = frame seq,           b = fence wait us */
+    LORIE_TRACE_ZCAPPLY,      /* renderer: transaction applied         a = frame seq,           b = apply seq */
+    LORIE_TRACE_SFDONE,       /* compositor: completion callback, dated when it came
+                               *                                       a = apply seq,           b = latch time ns, 0 none */
+    LORIE_TRACE_SFPRESENT,    /* compositor: present fence signalled, dated by the fence
+                               *                                       a = apply seq,           b = 0 */
 };
 /* LORIE_TRACE_PREFLIGHT results. Nothing is recorded when nothing was queued - the common case,
  * which would otherwise fill the ring during exactly the drags being looked at. A queued copy
@@ -522,6 +536,9 @@ struct lorie_shared_server_state {
 #define LORIE_ROOT_GEN(word) ((uint32_t) (word) >> LORIE_ROOT_GEN_SHIFT)
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
+    /* The X server's publish count, in full, for each slot as it was last handed on - written before
+     * the publish that hands it on, so a claim sees it. Never reused: 8 bits of it are in rootHandover. */
+    volatile uint32_t rootPublishSeq[LORIE_ROOT_SLOTS];
 
     /*
      * Renderer sessions. The X server numbers each connection and writes the number here before it
@@ -839,8 +856,11 @@ struct lorie_shared_server_state {
         volatile uint32_t directPublishedDuringNothingNew;
         /* A newer slot published while one was being submitted, asked for at the next vsync. */
         volatile uint32_t directPublishedDuringSubmit;
-        /* Published slots never submitted: replaced by a newer one before a frame took them. */
+        /* Published slots never submitted: replaced by a newer one before a frame took them (counted
+         * from rootPublishSeq). And one submitted again - back on screen after the root left the
+         * compositor - which is not new content. */
         volatile uint32_t directPublishesSkipped;
+        volatile uint32_t directReapplied;
         /* What the compositor did with the root's transactions (renderer.c, rootZcFlushDisplayStats):
          * their completion callbacks; latch times not seen before, and ones equal to the one before;
          * gaps of over 1.5 refresh periods between latches, and the longest; present fences signalled,
@@ -856,6 +876,8 @@ struct lorie_shared_server_state {
         volatile uint32_t sfPresentGapMaxUs;
         volatile uint32_t sfStatsLost;
         volatile uint32_t sfStatsMissing;
+        /* Completions whose present fence call gave nothing (-1): the call exists, the fence did not. */
+        volatile uint32_t sfNoPresentFence;
         volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
         /* A frame not submitted because a copy into its own slot was still queued behind one the
          * drain had to wait on. What was on screen stays, and it is tried again next vsync. */

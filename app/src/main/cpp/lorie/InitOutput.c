@@ -13,6 +13,8 @@
 #endif
 
 #include <time.h>
+#include <limits.h>
+#include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/errno.h>
 #include <libxcvt/libxcvt.h>
@@ -896,21 +898,40 @@ static void loriePerformVblanks(void);
  */
 static FILE *lorieTraceFile = NULL;
 
+/*
+ * Where the trace goes: TERMUX_X11_TRACE, or - so that a trace can be taken without touching how the X
+ * server is started - $HOME/termux-x11-trace.ltr while a file $HOME/.termux-x11-trace exists when it
+ * starts. Neither, no trace.
+ */
+static const char *lorieTracePath(void) {
+    static char path[PATH_MAX];
+    const char *env = getenv("TERMUX_X11_TRACE"), *home = getenv("HOME");
+
+    if (env && *env)
+        return env;
+    if (!home || !*home || snprintf(path, sizeof path, "%s/.termux-x11-trace", home) >= (int) sizeof path ||
+        access(path, F_OK) != 0)
+        return NULL;
+    if (snprintf(path, sizeof path, "%s/termux-x11-trace.ltr", home) >= (int) sizeof path)
+        return NULL;
+    return path;
+}
+
 static void lorieTraceOpen(void) {
-    const char *path = getenv("TERMUX_X11_TRACE");
+    const char *path = lorieTracePath();
     struct { char magic[4]; uint32_t recordSize; uint64_t startUs; } header = { {'L', 'T', 'R', '1'}, 24, 0 };
 
     if (!path || !*path || !pvfb->state)
         return;
     if (!(lorieTraceFile = fopen(path, "wb"))) {
-        log(ERROR, "TERMUX_X11_TRACE: cannot open %s: %s", path, strerror(errno));
+        log(ERROR, "trace: cannot open %s: %s", path, strerror(errno));
         return;
     }
     header.startUs = lorieTraceNowUs();
     fwrite(&header, sizeof(header), 1, lorieTraceFile);
     pvfb->state->traceTail = __atomic_load_n(&pvfb->state->traceHead, __ATOMIC_ACQUIRE);
     __atomic_store_n(&pvfb->state->traceEnabled, 1, __ATOMIC_RELEASE);
-    log(INFO, "TERMUX_X11_TRACE: recording to %s", path);
+    log(INFO, "trace: recording to %s", path);
 }
 
 static void lorieTraceFlush(Bool force) {
@@ -990,6 +1011,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         // Only a tick moves the counter. It moved once per call, and a call is not a vsync.
         if (steps) {
             pvfb->current_msc += steps;
+            lorieTrace(pvfb->state, LORIE_TRACE_VSYNC, steps, lorieVsyncUs);
             lorieTrace(pvfb->state, LORIE_TRACE_TICK, steps, pvfb->current_msc);
             lorieTraceFlush(FALSE);
             loriePerformVblanks();
@@ -1162,6 +1184,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.directPublishedDuringNothingNew = __atomic_exchange_n(&pvfb->state->presentStats.directPublishedDuringNothingNew, 0, __ATOMIC_RELAXED);
     snap.directPublishedDuringSubmit = __atomic_exchange_n(&pvfb->state->presentStats.directPublishedDuringSubmit, 0, __ATOMIC_RELAXED);
     snap.directPublishesSkipped = __atomic_exchange_n(&pvfb->state->presentStats.directPublishesSkipped, 0, __ATOMIC_RELAXED);
+    snap.directReapplied = __atomic_exchange_n(&pvfb->state->presentStats.directReapplied, 0, __ATOMIC_RELAXED);
+    snap.sfNoPresentFence = __atomic_exchange_n(&pvfb->state->presentStats.sfNoPresentFence, 0, __ATOMIC_RELAXED);
     snap.sfCompletions = __atomic_exchange_n(&pvfb->state->presentStats.sfCompletions, 0, __ATOMIC_RELAXED);
     snap.sfLatches = __atomic_exchange_n(&pvfb->state->presentStats.sfLatches, 0, __ATOMIC_RELAXED);
     snap.sfSameLatch = __atomic_exchange_n(&pvfb->state->presentStats.sfSameLatch, 0, __ATOMIC_RELAXED);
@@ -1391,17 +1415,19 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             uint32_t missing = pvfb->state->presentStats.sfStatsMissing;
 
             log(INFO, "XlorieDisplay: %u client presents submitted, %u copies completed, %u root slots published, "
-                      "%u applied to the compositor (%u published slots never applied; %u frames found nothing newer, "
+                      "%u applied to the compositor (%u published slots never applied, %u applied again; %u frames found nothing newer, "
                       "%u of them took a slot published meanwhile in the same vsync; %u published during a submit, "
                       "taken at the next vsync); compositor: %u transactions completed, %u latched%s (%u with the same "
                       "latch time as the one before, %u latch gaps over 1.5 refresh periods, longest %.1f ms), %u "
-                      "presented%s (%u present gaps over 1.5 refresh periods, longest %.1f ms); %u not recorded or read",
+                      "presented%s (%u completions came without a present fence; %u present gaps over 1.5 refresh "
+                      "periods, longest %.1f ms); %u not recorded or read",
                 snap.presentSubmits, snap.copyCompletions, snap.rootPublishes, snap.directBufferSubmits,
-                snap.directPublishesSkipped, snap.directReuseNoSubmit, snap.directPublishedDuringNothingNew,
+                snap.directPublishesSkipped, snap.directReapplied, snap.directReuseNoSubmit, snap.directPublishedDuringNothingNew,
                 snap.directPublishedDuringSubmit, snap.sfCompletions, snap.sfLatches,
                 missing & 1 ? " (latch times unavailable on this device)" : "", snap.sfSameLatch,
                 snap.sfLatchLateGaps, snap.sfLatchGapMaxUs / 1000.0, snap.sfPresents,
-                missing & 2 ? " (present fences unavailable on this device)" : "", snap.sfPresentLateGaps,
+                missing & 2 ? " (present fences unavailable on this device)" : "", snap.sfNoPresentFence,
+                snap.sfPresentLateGaps,
                 snap.sfPresentGapMaxUs / 1000.0, snap.sfStatsLost);
         }
         if (snap.requests)
@@ -4129,6 +4155,9 @@ static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {
 
 // Makes the root rotate through LORIE_ROOT_SLOTS buffers. Failing is not fatal, it just leaves the old
 // single-buffered behaviour (where every X server drawing operation waits for the renderer's fence).
+// How many times a root slot has been handed on, in full (rootPublishSeq in lorie.h).
+static uint32_t lorieRootPublishSeq = 0;
+
 static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(root);
     const LorieBuffer_Desc *desc;
@@ -4242,9 +4271,11 @@ static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {
                                               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
         // Orders the mark before the ids: a claim that reads a new id then sees the mark (or later).
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        for (i = 0; i < LORIE_ROOT_SLOTS; i++)
+        for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
             __atomic_store_n(&pvfb->state->rootBufferIds[i], LorieBuffer_description(priv->rootBuf[i])->id,
                              __ATOMIC_RELAXED);
+            __atomic_store_n(&pvfb->state->rootPublishSeq[i], lorieRootPublishSeq, __ATOMIC_RELAXED);
+        }
         // Published slot 0, none held, in the generation after the odd one.
         __atomic_store_n(&pvfb->state->rootHandover, ((gen + 1u) & 0xffffu) << LORIE_ROOT_GEN_SHIFT,
                          __ATOMIC_RELEASE);
@@ -4608,6 +4639,9 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
             return FALSE;
         }
 
+        // This publish's count in full, for whoever claims the slot (rootPublishSeq): before the swap
+        // that publishes it, which is what a claim synchronises with.
+        __atomic_store_n(&pvfb->state->rootPublishSeq[drawn], lorieRootPublishSeq + 1u, __ATOMIC_RELAXED);
         new = (old & ~(LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT) & ~LORIE_ROOT_COUNT_MASK)
             | ((uint32_t) drawn << LORIE_ROOT_NEWEST_SHIFT)
             | ((old + LORIE_ROOT_COUNT_STEP) & LORIE_ROOT_COUNT_MASK);   // never into the generation
@@ -4615,6 +4649,8 @@ static Bool lorieRootHandover(LoriePixmapPriv *priv) {
         // in between, which may well have freed a different one for us.
     } while (!__atomic_compare_exchange_n(&pvfb->state->rootHandover, &old, new, false,
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    lorieRootPublishSeq++;
+    lorieTrace(pvfb->state, LORIE_TRACE_PUBSEQ, lorieRootPublishSeq, drawn);
 
     // `drawn` is out, possibly with copies still in flight over an area it owed; `next` is about to be
     // drawn into again, and what it went out with that did not happen is stale in it from here.

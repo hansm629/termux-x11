@@ -1549,6 +1549,10 @@ static int rendererRootSlotForBufferId(uint64_t id) {
  * left the X server to find out on a later poll. And whether to wait for a fence at all depends only
  * on whether anything was drawn, which a serial cannot say.
  */
+/* What the last drain drew, in pixels: into the slot the frame was taking (safeSlot), and into anything
+ * else - the X server's next drawing slot, a redirected window's pixmap. For the frame trace only. */
+static uint64_t rendererDrainPixelsSafe, rendererDrainPixelsOther;
+
 static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkIssued) {
     bool fboSetUp = false;
     uint64_t lastSerial = 0;
@@ -1556,6 +1560,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
     GLint prevViewport[4];
 
     *gpuWorkIssued = false;
+    rendererDrainPixelsSafe = rendererDrainPixelsOther = 0;
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return 0;
 
@@ -1701,6 +1706,10 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(int safeSlot, bool *gpuWorkI
                 // Only swap channels if src/dst storage formats actually differ.
                 uint8_t needsSwizzle = LorieBuffer_isRgba(src) != LorieBuffer_isRgba(dst);
                 drawRegion(0, x0, y0, x1, y1, u0, v0, u1, v1, needsSwizzle);
+                if (dstSlot >= 0 && dstSlot == safeSlot)
+                    rendererDrainPixelsSafe += (uint64_t) (r.x2 - r.x1) * (uint64_t) (r.y2 - r.y1);
+                else
+                    rendererDrainPixelsOther += (uint64_t) (r.x2 - r.x1) * (uint64_t) (r.y2 - r.y1);
             }
         }
 
@@ -3453,31 +3462,33 @@ static void cursorPoolOrphan(void) {
  */
 #define LORIE_ZC_SEEN 16
 static struct {
-    uint32_t completions, lost;
-    int64_t latchNs[LORIE_ZC_SEEN];
-    int latchCount, fences[LORIE_ZC_SEEN], fenceCount;
+    uint32_t completions, lost, noPresentFence;
+    struct { uint32_t seq; int64_t callbackNs, latchNs; int fence; } seen[LORIE_ZC_SEEN];
+    int count;
 } rootZcSeen;
 
-// Binder thread, at the start of every root transaction's completion callback.
-static void rootZcNoteCompletion(ASurfaceTransactionStats *stats) {
+// Binder thread, at the start of every root transaction's completion callback; `seq` is the
+// transaction's number (rootZcPresent's applySeq).
+static void rootZcNoteCompletion(uint32_t seq, ASurfaceTransactionStats *stats) {
+    int64_t nowNs = rendererNowNs();
     int64_t latchNs = scApi.statsLatchTime ? scApi.statsLatchTime(stats) : -1;
     int fd = scApi.statsPresentFenceFd ? scApi.statsPresentFenceFd(stats) : -1, unkept = -1;
 
     pthread_mutex_lock(&rootOverlayLock);
     rootZcSeen.completions++;
-    if (latchNs > 0) {
-        if (rootZcSeen.latchCount < LORIE_ZC_SEEN)
-            rootZcSeen.latchNs[rootZcSeen.latchCount++] = latchNs;
-        else
-            rootZcSeen.lost++;
-    }
-    if (fd >= 0) {
-        if (rootZcSeen.fenceCount < LORIE_ZC_SEEN)
-            rootZcSeen.fences[rootZcSeen.fenceCount++] = fd;
-        else {
-            rootZcSeen.lost++;
-            unkept = fd;
-        }
+    // The call is there and gave nothing: this device does not hand present fences out, or not for
+    // this transaction. Counted, so that "nothing presented" is not read as a measurement.
+    if (scApi.statsPresentFenceFd && fd < 0)
+        rootZcSeen.noPresentFence++;
+    if (rootZcSeen.count < LORIE_ZC_SEEN) {
+        rootZcSeen.seen[rootZcSeen.count].seq = seq;
+        rootZcSeen.seen[rootZcSeen.count].callbackNs = nowNs;
+        rootZcSeen.seen[rootZcSeen.count].latchNs = latchNs;
+        rootZcSeen.seen[rootZcSeen.count].fence = fd;
+        rootZcSeen.count++;
+    } else {
+        rootZcSeen.lost++;
+        unkept = fd;
     }
     pthread_mutex_unlock(&rootOverlayLock);
     if (unkept >= 0)
@@ -3512,13 +3523,16 @@ static int64_t rootZcFenceSignalledNs(int fd) {
     return latest > 0 ? latest : -1;
 }
 
-// Renderer thread: what the callbacks recorded taken out under the lock, everything else after it.
+// Renderer thread: what the callbacks recorded taken out under the lock, everything else after it -
+// the gaps, the fences asked when they signalled, and the frame trace's records of both.
 static void rootZcFlushDisplayStats(void) {
     static int64_t lastLatchNs = 0, lastPresentNs = 0;
-    static int pending[LORIE_ZC_SEEN * 2], pendingCount = 0;
-    int64_t latchNs[LORIE_ZC_SEEN], lateNs;
-    int fences[LORIE_ZC_SEEN], latchCount, fenceCount, i;
-    uint32_t completions, lost, latches = 0, sameLatch = 0, latchLate = 0, latchGapMaxUs = 0;
+    static struct { uint32_t seq; int fence; } pending[LORIE_ZC_SEEN * 2];
+    static int pendingCount = 0;
+    struct { uint32_t seq; int64_t callbackNs, latchNs; int fence; } seen[LORIE_ZC_SEEN];
+    int64_t lateNs;
+    int count, i;
+    uint32_t completions, lost, noPresentFence, latches = 0, sameLatch = 0, latchLate = 0, latchGapMaxUs = 0;
     uint32_t presents = 0, presentLate = 0, presentGapMaxUs = 0, unusable = 0;
 
     if (!state)
@@ -3526,42 +3540,49 @@ static void rootZcFlushDisplayStats(void) {
     pthread_mutex_lock(&rootOverlayLock);
     completions = rootZcSeen.completions;
     lost = rootZcSeen.lost;
-    latchCount = rootZcSeen.latchCount;
-    fenceCount = rootZcSeen.fenceCount;
-    memcpy(latchNs, rootZcSeen.latchNs, sizeof(int64_t) * (size_t) latchCount);
-    memcpy(fences, rootZcSeen.fences, sizeof(int) * (size_t) fenceCount);
-    rootZcSeen.completions = rootZcSeen.lost = 0;
-    rootZcSeen.latchCount = rootZcSeen.fenceCount = 0;
+    noPresentFence = rootZcSeen.noPresentFence;
+    count = rootZcSeen.count;
+    memcpy(seen, rootZcSeen.seen, sizeof(seen[0]) * (size_t) count);
+    rootZcSeen.completions = rootZcSeen.lost = rootZcSeen.noPresentFence = 0;
+    rootZcSeen.count = 0;
     pthread_mutex_unlock(&rootOverlayLock);
 
     lateNs = __atomic_load_n(&rendererDisplayPeriodNs, __ATOMIC_RELAXED) * 3 / 2;
-    for (i = 0; i < latchCount; i++) {
-        if (latchNs[i] == lastLatchNs) {
+    for (i = 0; i < count; i++) {
+        int64_t latchNs = seen[i].latchNs;
+
+        if (state->traceEnabled)
+            lorieTraceAt(state, LORIE_TRACE_SFDONE, seen[i].seq, latchNs > 0 ? (uint64_t) latchNs : 0,
+                         (uint64_t) seen[i].callbackNs / 1000);
+        if (seen[i].fence >= 0) {
+            if (pendingCount < (int) (sizeof pending / sizeof pending[0])) {
+                pending[pendingCount].seq = seen[i].seq;
+                pending[pendingCount++].fence = seen[i].fence;
+            } else {
+                close(seen[i].fence);
+                lost++;
+            }
+        }
+        if (latchNs <= 0)
+            continue;
+        if (latchNs == lastLatchNs) {
             sameLatch++;
             continue;
         }
-        if (lastLatchNs > 0 && latchNs[i] > lastLatchNs) {
-            int64_t gapNs = latchNs[i] - lastLatchNs;
+        if (lastLatchNs > 0 && latchNs > lastLatchNs) {
+            int64_t gapNs = latchNs - lastLatchNs;
 
             if (gapNs > lateNs)
                 latchLate++;
             if ((uint64_t) gapNs / 1000 > latchGapMaxUs)
                 latchGapMaxUs = (uint32_t) (gapNs / 1000);
         }
-        lastLatchNs = latchNs[i];
+        lastLatchNs = latchNs;
         latches++;
-    }
-    for (i = 0; i < fenceCount; i++) {
-        if (pendingCount < (int) (sizeof pending / sizeof pending[0]))
-            pending[pendingCount++] = fences[i];
-        else {
-            close(fences[i]);
-            lost++;
-        }
     }
     i = 0;
     while (i < pendingCount) {
-        int64_t ns = rootZcFenceSignalledNs(pending[i]);
+        int64_t ns = rootZcFenceSignalledNs(pending[i].fence);
 
         if (ns == 0) {
             i++;
@@ -3569,19 +3590,23 @@ static void rootZcFlushDisplayStats(void) {
         }
         if (ns < 0)
             unusable++;
-        else if (ns > lastPresentNs) {
-            if (lastPresentNs > 0) {
-                int64_t gapNs = ns - lastPresentNs;
+        else {
+            if (state->traceEnabled)
+                lorieTraceAt(state, LORIE_TRACE_SFPRESENT, pending[i].seq, 0, (uint64_t) ns / 1000);
+            if (ns > lastPresentNs) {
+                if (lastPresentNs > 0) {
+                    int64_t gapNs = ns - lastPresentNs;
 
-                if (gapNs > lateNs)
-                    presentLate++;
-                if ((uint64_t) gapNs / 1000 > presentGapMaxUs)
-                    presentGapMaxUs = (uint32_t) (gapNs / 1000);
+                    if (gapNs > lateNs)
+                        presentLate++;
+                    if ((uint64_t) gapNs / 1000 > presentGapMaxUs)
+                        presentGapMaxUs = (uint32_t) (gapNs / 1000);
+                }
+                lastPresentNs = ns;
+                presents++;
             }
-            lastPresentNs = ns;
-            presents++;
         }
-        close(pending[i]);
+        close(pending[i].fence);
         pending[i] = pending[--pendingCount];
     }
 
@@ -3595,6 +3620,7 @@ static void rootZcFlushDisplayStats(void) {
     __atomic_fetch_add(&state->presentStats.sfPresents, presents, __ATOMIC_RELAXED);
     __atomic_fetch_add(&state->presentStats.sfPresentLateGaps, presentLate, __ATOMIC_RELAXED);
     LORIE_STAT_MAX(&state->presentStats.sfPresentGapMaxUs, presentGapMaxUs);
+    __atomic_fetch_add(&state->presentStats.sfNoPresentFence, noPresentFence, __ATOMIC_RELAXED);
     __atomic_fetch_add(&state->presentStats.sfStatsLost, lost + unusable, __ATOMIC_RELAXED);
 }
 
@@ -3603,7 +3629,7 @@ static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
     uint32_t seq = (uint32_t) (uintptr_t) context;
     int i;
 
-    rootZcNoteCompletion(stats);
+    rootZcNoteCompletion(seq, stats);
     if (!seq)
         return;   // the transaction it belongs to retired nothing
 
@@ -3801,11 +3827,34 @@ static void rootZcClearLetterbox(int surfaceW, int surfaceH) {
     eglSwapBuffers(egl_display, sfc);
 }
 
+/*
+ * What applying publish `seq` (rootPublishSeq: the X server's count, in full, so nothing here wraps) says
+ * about the ones before it. Published after the one applied last and never applied themselves - a newer
+ * one replaced them before a frame took them - they are skipped. The same one again, put back on screen
+ * after the root left the compositor and came back, is not new content and is counted apart.
+ */
+static void rootZcNoteApplied(uint32_t seq) {
+    static uint32_t lastSeq = 0;
+    static bool haveLast = false;
+
+    if (haveLast) {
+        int32_t ahead = (int32_t) (seq - lastSeq);
+
+        if (ahead > 1)
+            __atomic_fetch_add(&state->presentStats.directPublishesSkipped, (uint32_t) (ahead - 1), __ATOMIC_RELAXED);
+        else if (ahead <= 0)
+            __atomic_fetch_add(&state->presentStats.directReapplied, 1, __ATOMIC_RELAXED);
+    }
+    lastSeq = seq;
+    haveLast = true;
+}
+
 // Returns true when the frame has been dealt with and the GL path should be skipped.
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs) {
     AHardwareBuffer *ahb = desc->buffer;
+    static uint32_t frameSeq = 0;
     int slot = rendererRootSlot, retiring;
-    uint32_t retireSeq;
+    uint32_t applySeq, publishSeq;
     int64_t fenceWaitUs = 0;
     uint64_t gpuCopySerial;
     bool carriedGpuCopy = false, alreadyOnScreen, gpuWorkIssued, frameIncomplete = false;
@@ -3826,6 +3875,9 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     // and taking it for the one on screen would leave the new frame unsubmitted.
     alreadyOnScreen = slot == rootZcDisplayedSlot && rendererRootSlotId == rootZcDisplayedId;
     pthread_mutex_unlock(&rootOverlayLock);
+    // Which publish the claim took: written by the X server before the publish this claim saw.
+    publishSeq = __atomic_load_n(&state->rootPublishSeq[slot], __ATOMIC_ACQUIRE);
+    lorieTrace(state, LORIE_TRACE_ZCCLAIM, ++frameSeq, publishSeq | ((uint64_t) alreadyOnScreen << 32));
 
     /*
      * Anything the X server asked us to blit into the root still has to happen, and has to be
@@ -3864,11 +3916,14 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         }
         lockHeldStartNs = rendererNowNs();
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot, &gpuWorkIssued);
+        lorieTrace(state, LORIE_TRACE_ZCBATCH, frameSeq,
+                   (min(rendererDrainPixelsSafe >> 10, 0xffffffffULL) << 32) | min(rendererDrainPixelsOther >> 10, 0xffffffffULL));
         // Checked under the same lock as the drain, so the answer describes the queue it just left.
         frameIncomplete = !alreadyOnScreen && rendererBufferHasQueuedCopies(desc->id);
         rootZcFrameBegun();
         if (gpuWorkIssued)
             rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
+        lorieTrace(state, LORIE_TRACE_ZCFENCE, frameSeq, (uint64_t) fenceWaitUs);
         // Only a frame that has something newer to show takes the vsync: see the alreadyOnScreen case
         // below for why one with nothing newer must not.
         rootZcFrameDrained(alreadyOnScreen);
@@ -3932,39 +3987,27 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         return true;
     }
 
-    // Slots the X server published since the last one submitted that were never submitted themselves:
-    // replaced by a newer one before a frame took them, so what they held never reached the compositor.
-    {
-        static uint32_t lastSubmittedWord = 0;
-        static bool haveLast = false;
+    rootZcNoteApplied(publishSeq);
 
-        if (haveLast && LORIE_ROOT_GEN(lastSubmittedWord) == LORIE_ROOT_GEN(rendererRootSlotWord)) {
-            uint32_t published = ((rendererRootSlotWord - lastSubmittedWord) & LORIE_ROOT_COUNT_MASK) / LORIE_ROOT_COUNT_STEP;
-
-            if (published > 1)
-                __atomic_fetch_add(&state->presentStats.directPublishesSkipped, published - 1, __ATOMIC_RELAXED);
-        }
-        lastSubmittedWord = rendererRootSlotWord;
-        haveLast = true;
-    }
-
+    /*
+     * Every transaction is numbered, and its completion callback is handed the number: never zero, and
+     * not reused until 2^32 transactions later - by which time no entry from back then can still be
+     * retiring - so a callback from a pool that has since been replaced matches nothing instead of
+     * matching by slot index. The retiring entry also carries its buffer id, which
+     * rendererReleaseRootSlot checks independently of this. The frame trace joins on it too.
+     */
+    if (++rootZcRetireSeq == 0)
+        rootZcRetireSeq = 1;
+    applySeq = rootZcRetireSeq;
     retiring = rootZcDisplayedSlot;
-    retireSeq = 0;
     if (retiring >= 0) {
         if (rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
-            // Never zero, and not reused until 2^32 handovers later - by which time no entry from
-            // back then can still be retiring - so a callback from a pool that has since been
-            // replaced matches nothing instead of matching by slot index. The entry also carries
-            // its buffer id, which rendererReleaseRootSlot checks independently of this.
-            if (++rootZcRetireSeq == 0)
-                rootZcRetireSeq = 1;
-            retireSeq = rootZcRetireSeq;
             rootZcRetiring[rootZcRetiringCount].slot = retiring;
             rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
             rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
             rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
             rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
-            rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
+            rootZcRetiring[rootZcRetiringCount].seq = applySeq;
             rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
             rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
             rootZcRetiringCount++;
@@ -4004,9 +4047,10 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         scApi.txSetBufferTransparency(t, rootSurfaceControl, LORIE_SC_TRANSPARENCY_OPAQUE);
     scApi.txSetGeometry(t, rootSurfaceControl, &src, &dst, 0);
     if (scApi.txSetOnComplete)
-        scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
+        scApi.txSetOnComplete(t, (void *) (uintptr_t) applySeq, rootZcOnComplete);
     scApi.txApply(t);
     scApi.txDelete(t);
+    lorieTrace(state, LORIE_TRACE_ZCAPPLY, frameSeq, applySeq);
 
     pthread_mutex_unlock(&rootOverlayLock);
 

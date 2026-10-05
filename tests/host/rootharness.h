@@ -62,6 +62,7 @@ static struct {
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
     volatile uint64_t rootBufferIds[8];
+    volatile uint32_t rootPublishSeq[8];
     /* as many apart as are queued; the watermark is the renderer's, below */
     struct { volatile uint32_t writeIndex, readIndex; volatile uint64_t completedSerial; } gpuCopyQueue;
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,

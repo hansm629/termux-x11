@@ -58,6 +58,14 @@ recipes = {
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
         + func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {"),
+    # what the renderer records of the compositor's answers, and of the publishes it applied - tsfstats.c
+    "sfstats": lambda: span(R, "static struct {\n    ASurfaceControl *(*createFromWindow)(ANativeWindow *, const char *);", "} scApi;")
+        + macro(R, "LORIE_ZC_SEEN")
+        + span(R, "static struct {\n    uint32_t completions, lost, noPresentFence;", "} rootZcSeen;")
+        + func(R, "static void rootZcNoteCompletion(uint32_t seq, ASurfaceTransactionStats *stats) {")
+        + func(R, "static int64_t rootZcFenceSignalledNs(int fd) {")
+        + func(R, "static void rootZcFlushDisplayStats(void) {")
+        + func(R, "static void rootZcNoteApplied(uint32_t seq) {"),
     "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
         + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
         + func(R, "static void rootZcNothingNewDone(void) {")
@@ -126,6 +134,7 @@ recipes = {
               "static RegionPtr lorieRootPendingPresentRegion")
         + opt(lambda: macro(I, "LORIE_ROOT_CARRY_ENTRIES") + func(I, carry_sig()),
               "static void lorieRootCarryOnGpu")
+        + opt(lambda: "static uint32_t lorieRootPublishSeq = 0;\n", "static uint32_t lorieRootPublishSeq")
         + func(I, "static Bool lorieRootHandover(LoriePixmapPriv *priv) {")
         + func(I, "static void lorieNoteRootPublished(LoriePixmapPriv *priv) {"),
     "rootseed": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN")
