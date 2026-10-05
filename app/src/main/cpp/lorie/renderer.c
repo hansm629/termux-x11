@@ -258,8 +258,9 @@ static ASurfaceControl *rootSurfaceControl = NULL;
 static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Two slots stay with the X server - one it draws into, one to publish into - so this is how many
-// are ours. Holding one more than this blocks it from publishing at all, which is what dropped the
-// desktop to 72 updates a second against a 120Hz display.
+// are ours: the one submitted last and up to three before it (lorie.h, rootHandover). Holding one more
+// than this blocks it from publishing at all, which is what dropped the desktop to 72 updates a second
+// against a 120Hz display.
 /* ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE. Spelled out because the enum is not in the headers this
  * builds against at minSdk, the same reason the calls themselves are resolved with dlsym. */
 #define LORIE_SC_TRANSPARENCY_OPAQUE 2

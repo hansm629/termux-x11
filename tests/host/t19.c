@@ -3,10 +3,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sched.h>
-#define LORIE_ROOT_SLOTS_FOR_STATE 5
+#include "rootslots_src.inc"
 static struct {
     volatile uint32_t rootHandover;
-    volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS_FOR_STATE];
+    volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     volatile uint8_t rootDoubleBuffered;
     uint64_t rootWindowTextureID;
     struct { volatile uint32_t rootStaleSlotReleases, rootClaimsAcrossPools; } presentStats;

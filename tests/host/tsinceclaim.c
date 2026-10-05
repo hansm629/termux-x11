@@ -10,6 +10,10 @@
  *    then retiring, up to LORIE_ZC_MAX_HELD), give back retiring slots, ask; the X server publishing
  *    whenever it has a slot to move on to. Every answer is compared with whether a publish was actually
  *    made since the claim; and the X server must never publish the claimed slot.
+ *    And the slot accounting through it all: the renderer never holds more than LORIE_ZC_MAX_HELD plus the
+ *    claim in flight; while it holds no more than LORIE_ZC_MAX_HELD the X server always has its two
+ *    slots and no publish is refused; the slot the X server draws into is never held; and once the
+ *    renderer gives everything back, no held bit is left.
  * 3. The pool replaced while a claim is out (the word as the X server leaves it): yes. */
 #include "rootharness.h"
 #include <sched.h>
@@ -65,8 +69,15 @@ int main(void) {
     for (int step = 0; step < 300000; step++) {
         switch (rand() % 6) {
         case 0:
-        case 1:                                     /* the X server, at a tick with new content */
-            if (lorieRootHandover(&priv)) {
+        case 1: {                                   /* the X server, at a tick with new content */
+            int held = __builtin_popcount(fakeState.rootHandover & LORIE_ROOT_HELD_MASK);
+            CHECK(held <= LORIE_ZC_MAX_HELD + 1, "step %d: the renderer holds %d slots", step, held);
+            Bool ok = lorieRootHandover(&priv);
+            CHECK(ok || held > LORIE_ZC_MAX_HELD, "step %d: publish refused with the renderer holding %d of %d",
+                  step, held, LORIE_ROOT_SLOTS);
+            CHECK(!(fakeState.rootHandover & (1u << priv.rootWrite)), "step %d: the X server draws into held slot %d",
+                  step, priv.rootWrite);
+            if (ok) {
                 publishes++;
                 if (claimed >= 0) {
                     truth = true;
@@ -75,6 +86,7 @@ int main(void) {
             } else
                 refused++;
             break;
+        }
         case 2:                                     /* a frame claims the newest */
             if (claimed < 0) {
                 claimedId = rendererClaimRootBuffer();
@@ -117,6 +129,17 @@ int main(void) {
         }
     }
     CHECK(wrong == 0, "random run: %d of %d answers wrong", wrong, asked);
+    /* everything given back: nothing may stay held */
+    if (claimed >= 0 && claimed != displayed)
+        rendererReleaseRootBuffer();
+    while (nRetiring) {
+        nRetiring--;
+        rendererReleaseRootSlot(retiring[nRetiring], retiringId[nRetiring], LORIE_ROOT_GEN(fakeState.rootHandover));
+    }
+    if (displayed >= 0)
+        rendererReleaseRootSlot(displayed, displayedId, LORIE_ROOT_GEN(fakeState.rootHandover));
+    CHECK((fakeState.rootHandover & LORIE_ROOT_HELD_MASK) == 0, "held bits left after everything was given back: %#x",
+          fakeState.rootHandover & LORIE_ROOT_HELD_MASK);
     CHECK(asked > 10000 && publishes > 10000, "random run too thin: %d asked, %d published", asked, publishes);
 
     /* 3. the pool replaced while the claim is out */

@@ -193,7 +193,14 @@ int main(void) {
         for (int k = 0; k < 3 * LORIE_ROOT_SLOTS; k++)
             lagFrame(&priv, (k % 4 == 3) ? R1 : R, 0, lag, k % 3 == 0, Q);
         printf("%d of %d once made again\n", publishes - p2, attempts - a2);
-        CHECK(publishes - p2 >= attempts - a2 - lag - 2, "lag %d: publishing did not come back once copies were made", lag);
+        /* Every fourth of these frames draws only part of the area (R1), and with the renderer behind, its
+         * publish waits a frame for the copy into its donor to land - as it does with no failures before
+         * it. Those are the steady state, one per R1 frame in the window; on top of them the run may cost
+         * the lag and two more. (The window is as long as the slots last, so it has as many R1 frames as
+         * that brings.) */
+        int r1Frames = 3 * LORIE_ROOT_SLOTS / 4;
+        CHECK(publishes - p2 >= attempts - a2 - lag - 2 - r1Frames,
+              "lag %d: publishing did not come back once copies were made", lag);
         for (int k = 0; k < lag + 2; k++) lagFrame(&priv, R, 0, lag, 0, none);   /* let it all resolve */
         while (nLagged) {                       /* and the renderer catch up with the rest */
             Job j = lagged[0];

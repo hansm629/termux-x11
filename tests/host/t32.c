@@ -23,9 +23,9 @@ struct present_fence;
 typedef struct _Window { int dummy; } *WindowPtr;
 typedef struct { int32_t width, stride, height, format, type; uint64_t id; void *buffer; } LorieBuffer_Desc;
 typedef struct LorieBuffer { LorieBuffer_Desc desc; struct LorieBuffer *nextInList; int listed, refs, freed; } LorieBuffer;
-typedef struct { LorieBuffer *buffer; Bool rootDouble; LorieBuffer *rootBuf[5]; } LoriePixmapPriv;
+#include "rootslots_src.inc"
+typedef struct { LorieBuffer *buffer; Bool rootDouble; LorieBuffer *rootBuf[LORIE_ROOT_SLOTS]; } LoriePixmapPriv;
 typedef struct _Pixmap { LoriePixmapPriv *priv; } *PixmapPtr;
-#define LORIE_ROOT_SLOTS 5
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((p) ? ((PixmapPtr) (p))->priv : NULL)
 #define LORIE_BUFFER_FROM_PIXMAP(p) ((p) ? ((PixmapPtr) (p))->priv->buffer : NULL)
@@ -134,7 +134,9 @@ static void reset(void) {
     memset(bufs, 0, sizeof bufs);
     for (int i = 0; i < 64; i++) { bufs[i].desc.id = i; bufs[i].refs = 1; }
     registeredHead = NULL; conn_fd = -1; session = 0; workHead = workTail = 0; doubleCloses = 0;
-    rootPrivRec = (LoriePixmapPriv) { &bufs[1], TRUE, { &bufs[2], &bufs[3], &bufs[4], &bufs[5], &bufs[6] } };
+    rootPrivRec = (LoriePixmapPriv) { &bufs[1], TRUE, { 0 } };
+    for (int i = 0; i < LORIE_ROOT_SLOTS; i++)
+        rootPrivRec.rootBuf[i] = &bufs[2 + i];          /* bufs 2.. are the slots; 20 and up are other buffers */
     flipPrivRec = (LoriePixmapPriv) { &bufs[20], FALSE, { 0 } };
     shownPixmap = &rootPixmap;
 }

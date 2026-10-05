@@ -14,7 +14,8 @@
 #include <stdbool.h>
 #include <sched.h>
 
-static volatile uint64_t ids[5];
+#include "rootslots_src.inc"
+static volatile uint64_t ids[LORIE_ROOT_SLOTS];
 static void hook(void);
 static volatile uint64_t *idsAt(void) { hook(); return ids; }
 static struct {

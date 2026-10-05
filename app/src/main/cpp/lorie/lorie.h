@@ -496,21 +496,26 @@ struct lorie_shared_server_state {
      * So the root gets several buffers: the renderer takes the one the X server published last, the
      * X server draws into one nobody else needs, and neither ever waits for the other.
      *
-     * Five, because handing a buffer straight to the compositor means it keeps reading it until a
+     * Six, because handing a buffer straight to the compositor means it keeps reading it until a
      * later one is latched, and both sides need room at once.
      *
-     * The renderer holds up to three: the one on screen, and up to two waiting for the release
-     * fence that says the compositor has finished with them - two because that fence arrives during
-     * the vsync after the one that queued it, so insisting the older one be back first costs a
-     * frame every time. The X server needs two: the one it is drawing into and one to move to when
-     * it publishes. Take either side down to what looks sufficient and the publishing rate halves,
-     * which on a 120Hz panel is plainly visible when a window is dragged.
+     * The renderer holds up to four: the one it submitted last, and up to three it submitted before
+     * that, waiting for the release fence that says the compositor has finished with them - two of
+     * those because that fence arrives during the vsync after the one that queued it, so insisting
+     * the older one be back first costs a frame every time; and one more because a compositor that
+     * queues a buffer instead of dropping it (buffer backpressure) keeps the pipeline a frame deeper
+     * once a frame is late, and then the one on screen is no longer the one submitted last. With
+     * three, that deeper pipeline has no room as soon as a release fence or a completion comes after
+     * the next frame's claim, and a frame is not submitted (tools/model/zcslots.py). The X server
+     * needs two: the one it is drawing into and one to move to when it publishes. Take either side
+     * down to what looks sufficient and the publishing rate halves, which on a 120Hz panel is
+     * plainly visible when a window is dragged.
      *
      * rootHandover carries all of it in one word, so the handover needs no mutex:
      *
-     *   bits 0..4    one bit per slot, set while the renderer still needs that slot
-     *   bits 5..7    the slot published most recently - what the renderer takes next
-     *   bits 8..15   publish counter, for debugging only - it wraps, so nothing may decide on it
+     *   bits 0..5    one bit per slot, set while the renderer still needs that slot
+     *   bits 6..8    the slot published most recently - what the renderer takes next
+     *   bits 9..15   publish counter, for debugging only - it wraps, so nothing may decide on it
      *   bits 16..31  which pool of buffers the rest is about - odd while the X server is replacing it
      *
      * Only the renderer writes the held bits and only the X server writes the published slot, but
@@ -526,18 +531,18 @@ struct lorie_shared_server_state {
      * straddled a replacement - and a release, being a compare-and-swap of this word, cannot clear a
      * bit in a generation it was not made in.
      */
-#define LORIE_ROOT_SLOTS 5
-#define LORIE_ROOT_HELD_MASK 0x1fu
-#define LORIE_ROOT_NEWEST_SHIFT 5
+#define LORIE_ROOT_SLOTS 6
+#define LORIE_ROOT_HELD_MASK 0x3fu
+#define LORIE_ROOT_NEWEST_SHIFT 6
 #define LORIE_ROOT_NEWEST_MASK 0x7u
-#define LORIE_ROOT_COUNT_STEP 0x100u
-#define LORIE_ROOT_COUNT_MASK 0xff00u
+#define LORIE_ROOT_COUNT_STEP 0x200u
+#define LORIE_ROOT_COUNT_MASK 0xfe00u
 #define LORIE_ROOT_GEN_SHIFT 16
 #define LORIE_ROOT_GEN(word) ((uint32_t) (word) >> LORIE_ROOT_GEN_SHIFT)
 
     volatile uint64_t rootBufferIds[LORIE_ROOT_SLOTS];
     /* The X server's publish count, in full, for each slot as it was last handed on - written before
-     * the publish that hands it on, so a claim sees it. Never reused: 8 bits of it are in rootHandover. */
+     * the publish that hands it on, so a claim sees it. Never reused: 7 bits of it are in rootHandover. */
     volatile uint32_t rootPublishSeq[LORIE_ROOT_SLOTS];
 
     /*
@@ -947,6 +952,17 @@ struct lorie_shared_server_state {
         volatile uint8_t updated, moved;
     } cursor;
 };
+
+/* rootHandover's fields (see above): a held bit per slot, the newest slot's number, the debugging count and
+ * the generation - each wide enough, none overlapping the next. */
+_Static_assert(LORIE_ROOT_HELD_MASK == (1u << LORIE_ROOT_SLOTS) - 1u, "one held bit per root slot");
+_Static_assert(LORIE_ROOT_NEWEST_SHIFT >= LORIE_ROOT_SLOTS, "the newest field above the held bits");
+_Static_assert(LORIE_ROOT_SLOTS - 1 <= LORIE_ROOT_NEWEST_MASK, "every slot number fits the newest field");
+_Static_assert((((uint32_t) LORIE_ROOT_NEWEST_MASK << LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_COUNT_MASK) == 0,
+               "the newest field and the count apart");
+_Static_assert(LORIE_ROOT_COUNT_STEP == (LORIE_ROOT_COUNT_MASK & (0u - LORIE_ROOT_COUNT_MASK)),
+               "the count steps by its lowest bit");
+_Static_assert(LORIE_ROOT_COUNT_MASK < (1u << LORIE_ROOT_GEN_SHIFT), "the count below the generation");
 
 static int android_to_linux_keycode[304] = {
         [ 4   /* ANDROID_KEYCODE_BACK */] = KEY_ESC,

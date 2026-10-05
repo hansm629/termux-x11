@@ -36,6 +36,8 @@ recipes = {
             "LorieRendererSessionRec")
         + func(I, "Bool lorieGpuCopyMade(uint64_t serial) {")
         + func(I, "Bool lorieGpuCopyResolved(uint64_t serial) {"),
+    # just the slot count, for tests that size their own copies of the root's arrays by it
+    "rootslots": lambda: macro(H, "LORIE_ROOT_SLOTS"),
     "slots": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_NEWEST_SHIFT") + macro(H, "LORIE_ROOT_NEWEST_MASK")
         + opt(lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN"), "#define LORIE_ROOT_GEN_SHIFT", H)
         + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"

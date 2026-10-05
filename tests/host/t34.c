@@ -18,12 +18,13 @@
 static int verbose;
 #define V(...) do { if (verbose) printf(__VA_ARGS__); } while (0)
 
-/* bufs[0..4] are the root's slots; then a client's AHB pixmap, one in plain memory, and an AHB pixmap the
- * root is copied out into */
-#define CLIENT 5
-#define REGULAR 6
-#define OUT 7
-#define SCRATCH 8      /* what lorieScratchBuffer allocates */
+/* bufs[0 .. LORIE_ROOT_SLOTS - 1] are the root's slots; then a client's AHB pixmap, one in plain memory, and
+ * an AHB pixmap the root is copied out into */
+#define CLIENT LORIE_ROOT_SLOTS
+#define REGULAR (LORIE_ROOT_SLOTS + 1)
+#define OUT (LORIE_ROOT_SLOTS + 2)
+#define SCRATCH (LORIE_ROOT_SLOTS + 3)      /* what lorieScratchBuffer allocates */
+_Static_assert(SCRATCH < (int) (sizeof bufs / sizeof bufs[0]), "rootharness.h has a buffer for each");
 static uint32_t clientPixels[W * H], regularPixels[W * H], outPixels[W * H], scratchPixels[512 * 512];
 static uint32_t *mem(int b) {
     return b < LORIE_ROOT_SLOTS ? pixels[b] : b == CLIENT ? clientPixels : b == REGULAR ? regularPixels
