@@ -40,9 +40,28 @@ recipes = {
         + opt(lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN"), "#define LORIE_ROOT_GEN_SHIFT", H)
         + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
         + "static uint32_t rendererRootSlotGen __attribute__((unused)) = 0;\n"
+        + opt(lambda: "static uint32_t rendererRootSlotWord __attribute__((unused)) = 0;\n", "rendererRootSlotWord", R)
         + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
+    # the renderer's side of handing the root to the compositor (renderer.c): its claim, its wait
+    # predicate and the gates a ROOT_DIRECT frame leaves - tpacing.c
+    "pacing": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
+        + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_ROOT_COUNT_MASK")
+        + macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN")
+        + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
+        + "static uint32_t rendererRootSlotGen = 0;\nstatic uint32_t rendererRootSlotWord = 0;\n"
+        + "static bool rootZcRetryPending = false;\n"
+        + func(R, "static void rendererSetOutputRetry(bool pending) {")
+        + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
+        + func(R, "static bool rootZcPublishedSinceClaim(void) {")
+        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
+        + func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {"),
+    "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
+        + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
+        + func(R, "static void rootZcNothingNewDone(void) {")
+        + func(R, "static void rootZcSubmitDone(void) {"),
     "t21": lambda: span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
         + opt(lambda: "#define HAVE_VSYNC_SEQ 1\n" + func(I, "static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {"),
               "static Bool lorieReadVsyncRecord")

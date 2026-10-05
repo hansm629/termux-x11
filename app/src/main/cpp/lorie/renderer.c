@@ -1850,6 +1850,7 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
 static int rendererRootSlot = -1;
 static uint64_t rendererRootSlotId = 0;   // the buffer that slot held when it was claimed
 static uint32_t rendererRootSlotGen = 0;  // and the pool it was claimed from (see rootHandover)
+static uint32_t rendererRootSlotWord = 0; // the whole word it was claimed in: its publish count says what was newest then
 
 static uint64_t rendererClaimRootBuffer(void) {
     uint32_t old, claimed, now;
@@ -1909,7 +1910,51 @@ static uint64_t rendererClaimRootBuffer(void) {
     rendererRootSlot = slot;
     rendererRootSlotId = id;
     rendererRootSlotGen = LORIE_ROOT_GEN(claimed);
+    rendererRootSlotWord = claimed;
     return id;
+}
+
+/*
+ * Whether the X server has published again since this frame claimed its slot (rendererRootSlotWord): the
+ * publish count, or the pool, has moved. What the frame looked at is then not the newest content there
+ * is. The fence orders the frame's own clearing of drawRequested before this look, so a publish it does
+ * not see is one whose drawRequested lands after that clearing, and survives it.
+ */
+static bool rootZcPublishedSinceClaim(void) {
+    uint32_t now;
+
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    now = __atomic_load_n(&state->rootHandover, __ATOMIC_ACQUIRE);
+    return ((now ^ rendererRootSlotWord) & LORIE_ROOT_COUNT_MASK) ||
+           LORIE_ROOT_GEN(now) != LORIE_ROOT_GEN(rendererRootSlotWord);
+}
+
+/*
+ * The gates a ROOT_DIRECT frame leaves for the next one (rootZcPresent), where it decides them. Begun,
+ * with the shared lock held and the queue drained: what asked for the frame is being dealt with.
+ * Drained, its copies finished: a frame with something newer to show takes the vsync. Done with nothing
+ * newer than what is on screen: the vsync is left for the slot the X server is about to publish - see
+ * rootZcPresent - and one published meanwhile is asked for at once. Done having submitted: one
+ * published meanwhile is asked for at the next vsync.
+ */
+static void rootZcFrameBegun(void) {
+    state->drawRequested = FALSE;
+}
+
+static void rootZcFrameDrained(bool alreadyOnScreen) {
+    if (!alreadyOnScreen)
+        state->waitForNextFrame = true;
+}
+
+static void rootZcNothingNewDone(void) {
+    rendererSetOutputRetry(false);   // what the X server had published when claimed is on screen
+    __atomic_fetch_add(&state->presentStats.directReuseNoSubmit, 1, __ATOMIC_RELAXED);
+    if (rootZcPublishedSinceClaim())
+        state->drawRequested = TRUE;
+}
+
+static void rootZcSubmitDone(void) {
+    rendererSetOutputRetry(rootZcPublishedSinceClaim());
 }
 
 // The frame's fence is no longer waited for between the drawing and the swap. Waiting there drains
@@ -3638,10 +3683,12 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         gpuCopySerial = rendererApplyPendingGpuCopiesLocked(alreadyOnScreen ? -1 : slot, &gpuWorkIssued);
         // Checked under the same lock as the drain, so the answer describes the queue it just left.
         frameIncomplete = !alreadyOnScreen && rendererBufferHasQueuedCopies(desc->id);
-        state->drawRequested = FALSE;
+        rootZcFrameBegun();
         if (gpuWorkIssued)
             rendererFinishIssuedWork(&flushUs, &fenceWaitUs);
-        state->waitForNextFrame = true;
+        // Only a frame that has something newer to show takes the vsync: see the alreadyOnScreen case
+        // below for why one with nothing newer must not.
+        rootZcFrameDrained(alreadyOnScreen);
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         rendererNoteLock(rendererNsToUs(lockHeldStartNs - lockStartNs),
                          rendererNsToUs(rendererNowNs() - lockHeldStartNs), lockHeldStartNs);
@@ -3679,15 +3726,25 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     pthread_mutex_lock(&rootOverlayLock);
 
     if (alreadyOnScreen) {
-        // Nothing new was published; the compositor is already showing this buffer. Keep holding it.
-        // The copies above still happened, so they are still reported.
+        /*
+         * Nothing newer was published when the slot was claimed: the compositor already shows it, and
+         * keeps it. The slot on screen is never written while it is (the X server does not draw into a
+         * held slot, and a copy into one waits), so this really is the content on screen.
+         *
+         * Such a frame is mostly one woken by the copies of a client's present - queued, and the
+         * renderer signalled, before the X server hands on the slot they fill. It drains them (above),
+         * and the handover follows a moment later. Taking the vsync here (waitForNextFrame) made that
+         * slot wait for the next vsync, where the next present's handover had already replaced it: the
+         * frame on screen went out twice and the one after it never did. So it is left for the slot
+         * the handover publishes. Published already while this frame ran - its drawRequested cleared
+         * by this frame above - that slot is asked for again at once.
+         */
         pthread_mutex_unlock(&rootOverlayLock);
         rendererRootSlot = -1;
-        rendererSetOutputRetry(false);   // what the X server has published is on screen
         // Nothing was submitted: the compositor keeps the buffer it already has. Counting this as a
         // frame was worse than not counting it, because the summary then derived the GL frame count
         // by subtraction and attributed it to a GL pass that never ran.
-        __atomic_fetch_add(&state->presentStats.directReuseNoSubmit, 1, __ATOMIC_RELAXED);
+        rootZcNothingNewDone();
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
     }
@@ -3756,7 +3813,10 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 
     // This slot is ours until the compositor lets go, so the generic release must leave it alone.
     rendererRootSlot = -1;
-    rendererSetOutputRetry(false);
+    // Published again while this one was being submitted: its drawRequested may be the one this frame
+    // cleared above, and with nothing else to ask for it, it waited for the next present's damage - by
+    // which time a newer slot had replaced it. The output retry asks for it at the next vsync.
+    rootZcSubmitDone();
     __atomic_fetch_add(&state->renderedFrames, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&state->presentStats.directBufferSubmits, 1, __ATOMIC_RELAXED);
     lorieTrace(state, LORIE_TRACE_DIRECT, slot, rootZcDisplayedId);
