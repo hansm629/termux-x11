@@ -647,6 +647,11 @@ struct lorie_shared_server_state {
         volatile uint32_t cpuPresents[LORIE_CPU_PRESENT_REASONS];
         /* Presents with more rects than a GPU copy takes, widened to fit (lorieWidenPresentRegion). */
         volatile uint32_t presentsWidened;
+        /* Presents the GPU path had no room for, held back for the renderer to make some
+         * (lorieMakeRoomForPresent): the waits, their time, and how many then went to the GPU after all. */
+        volatile uint32_t presentRoomWaits;
+        volatile uint32_t presentRoomWaitUs;
+        volatile uint32_t presentRoomMade;
         volatile uint64_t cpuUnflipBytes;
         /* Every byte above and below, once: with a renderer there and the GPU path on - what has to
          * reach 0 - and apart from that, with no renderer to copy anything or GPU copies turned off. */

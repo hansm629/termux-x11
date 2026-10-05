@@ -115,6 +115,15 @@ recipes = {
                       + func(I, "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {"),
               "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {")
         + func(I, "static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {"),
+    "proom_types": lambda: macro(H, "LORIE_GPU_COPY_MAX_RECTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
+        + span(H, "/* Why a present was drawn by the CPU", "    LORIE_CPU_PRESENT_REASONS\n};"),
+    "proom_funcs": lambda: span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
+        + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
+        + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
+        + macro(I, "LORIE_PREFLIGHT_MAX_US") + macro(I, "LORIE_PRESENT_ROOM_WAIT_DEFAULT_US")
+        + func(I, "static uint64_t lorieRoomWaitUs(void) {")
+        + func(I, "static Bool lorieWaitForRenderer(uint64_t *startUs) {")
+        + func(I, "static int lorieMakeRoomForPresent(LoriePixmapPriv *rootPriv, LorieAbandonedCopy **record) {"),
     "pwiden": lambda: func(I, "Bool lorieWidenPresentRegion(RegionPtr region, RegionPtr valid, RegionPtr clip) {"),
     "corecopy": lambda: opt(lambda: "#define HAVE_CORE_GPU 1\n"
             + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback that made them",

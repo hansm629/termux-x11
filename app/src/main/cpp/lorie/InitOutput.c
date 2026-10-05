@@ -1246,6 +1246,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
         snap.cpuPresents[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresents[why], 0, __ATOMIC_RELAXED);
     snap.presentsWidened = __atomic_exchange_n(&pvfb->state->presentStats.presentsWidened, 0, __ATOMIC_RELAXED);
+    snap.presentRoomWaits = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomWaits, 0, __ATOMIC_RELAXED);
+    snap.presentRoomWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomWaitUs, 0, __ATOMIC_RELAXED);
+    snap.presentRoomMade = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomMade, 0, __ATOMIC_RELAXED);
     snap.gpuCarryJobs = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryJobs, 0, __ATOMIC_RELAXED);
     snap.gpuCarryBytes = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryBytes, 0, __ATOMIC_RELAXED);
     snap.gpuCarryTakenBack = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryTakenBack, 0, __ATOMIC_RELAXED);
@@ -1485,6 +1488,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD],
                 snap.presentsWidened);
+        if (snap.presentRoomWaits)
+            log(INFO, "XloriePresentRoom: %u waits for the renderer to make room for a present, %.1f ms in all; %u "
+                      "presents then went to the GPU (the rest are among the CPU's above)",
+                snap.presentRoomWaits, snap.presentRoomWaitUs / 1000.0, snap.presentRoomMade);
         {
             uint32_t kept = 0;
 
@@ -2410,6 +2417,8 @@ static void lorieGiveBackCopyRecord(LorieAbandonedCopy *c) {
     c->inUse = FALSE;
 }
 
+static int lorieMakeRoomForPresent(LoriePixmapPriv *rootPriv, LorieAbandonedCopy **record);
+
 // A present the GPU path turned down, which present_execute_copy() then has the CPU draw
 // (present_copy_region). Counted by why; the bytes are counted where the CPU copies them, under
 // LORIE_COPY_CTX_PRESENT (lorieNoteCoreCopy). Returns FALSE for the caller.
@@ -2462,7 +2471,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     BoxRec fullBox;
     BoxPtr box;
     int numRects, i;
-    uint32_t writeIndex, readIndex;
+    uint32_t writeIndex;
 
     if (pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing)
         return lorieCpuPresent(LORIE_CPU_PRESENT_DISABLED, pixmap, update);
@@ -2508,34 +2517,14 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
             lorieRootRepairOnGpu(rootPriv);
     }
 
+    {
+        LoriePixmapPriv *rootPriv = dst == pScreenPtr->devPrivate ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
+        int why = lorieMakeRoomForPresent(rootPriv && rootPriv->rootDouble ? rootPriv : NULL, &record);
+
+        if (why >= 0)
+            return lorieCpuPresent(why, pixmap, update);
+    }
     writeIndex = pvfb->state->gpuCopyQueue.writeIndex;
-    // Acquire, pairing with the renderer's release when it hands a slot back: seeing the slot free
-    // has to mean the renderer's reads of its previous entry are done before this overwrites it.
-    readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
-    if (writeIndex - readIndex >= LORIE_GPU_COPY_QUEUE_CAPACITY)
-        return lorieCpuPresent(LORIE_CPU_PRESENT_QUEUE_FULL, pixmap, update);
-
-    // A copy into the root over an area the drawing slot still owes needs a record of its own until
-    // it resolves (see rootReplacing). With no room for one it is not offered, and the CPU draws it.
-    if (dst == pScreenPtr->devPrivate) {
-        LoriePixmapPriv *rootPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst);
-
-        if (rootPriv && rootPriv->rootDouble && !lorieRootCanQueueCopy(rootPriv)) {
-            pvfb->state->presentStats.rootReplacingFull++;
-            return lorieCpuPresent(LORIE_CPU_PRESENT_REPLACING_FULL, pixmap, update);
-        }
-    }
-
-    // Last thing that can refuse, and the last thing before any of this becomes visible to the
-    // renderer. Without a record there is no way to account for the copy afterwards, and the one
-    // moment that costs is cancellation - where the only remaining options are to release buffers
-    // the GPU may still be reading, or to keep them forever. So a copy that cannot be tracked is
-    // never offered: the caller falls back to the CPU, which needs no tracking at all.
-    record = lorieTakeCopyRecord();
-    if (!record) {
-        pvfb->state->presentStats.copyRecordExhausted++;
-        return lorieCpuPresent(LORIE_CPU_PRESENT_NO_RECORD, pixmap, update);
-    }
 
     // Make sure the renderer has (or will have) this texture. Idempotent if already registered.
     lorieRegisterBuffer(srcBuffer);
@@ -4781,6 +4770,117 @@ static Bool lorieFallbackWait(void) {
         pvfb->state->presentStats.exaPreflightWaitUs += (uint32_t) (lorieNowUs() - startUs);
     }
     return drained;
+}
+
+/*
+ * How long a present the GPU path has no room for waits for the renderer to make some (lorieWaitForRenderer)
+ * before the CPU draws it instead. TERMUX_X11_PRESENT_ROOM_WAIT_US sets it; 0 waits not at all.
+ */
+#define LORIE_PRESENT_ROOM_WAIT_DEFAULT_US 2000ULL
+static uint64_t lorieRoomWaitUs(void) {
+    static long long waitUs = -1;
+
+    if (waitUs < 0) {
+        const char *e = getenv("TERMUX_X11_PRESENT_ROOM_WAIT_US");
+        waitUs = e ? atoll(e) : (long long) LORIE_PRESENT_ROOM_WAIT_DEFAULT_US;
+        if (waitUs < 0)
+            waitUs = 0;
+        if ((unsigned long long) waitUs > LORIE_PREFLIGHT_MAX_US)
+            waitUs = (long long) LORIE_PREFLIGHT_MAX_US;
+    }
+    return (uint64_t) waitUs;
+}
+
+/*
+ * Waits for the renderer to get on with the queue - to take an entry or report one done - for as long as
+ * is left of lorieRoomWaitUs since `*startUs` (set on the first call). What a present the GPU path has no
+ * room for is waiting on - a queue entry, a copy record held by a copy the renderer is finishing, an
+ * owed-area record of the root's (rootReplacing) - is made by exactly that. FALSE, without waiting, once
+ * the time is up, or where waiting cannot help: an access open, so the shared lock held and the renderer
+ * unable to drain, or no renderer to drain at all.
+ */
+static Bool lorieWaitForRenderer(uint64_t *startUs) {
+    uint64_t maxUs = lorieRoomWaitUs(), nowUs = lorieNowUs(), done;
+    uint32_t seen;
+
+    if (!*startUs)
+        *startUs = nowUs;
+    if (!maxUs || nowUs - *startUs >= maxUs || lorieSharedLockHeld > 0 || !lorieConnectionAlive() ||
+        !lorieRendererAvailable())
+        return FALSE;
+
+    seen = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    done = __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE);
+    pthread_cond_signal(rendererCond);
+    __atomic_fetch_add(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    for (;;) {
+        uint64_t elapsedUs = lorieNowUs() - *startUs, nap;
+        struct timespec left;
+
+        if (__atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE) != seen ||
+            __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) != done ||
+            elapsedUs >= maxUs)
+            break;
+        // completedSerial moves after the renderer's fence, with no wake of its own: a short nap at most.
+        nap = min(maxUs - elapsedUs, 500ULL);
+        left.tv_sec = 0;
+        left.tv_nsec = (long) (nap * 1000u);
+        syscall(__NR_futex, &pvfb->state->gpuCopyQueue.readIndex, FUTEX_WAIT, seen, &left, NULL, 0);
+    }
+    __atomic_fetch_sub(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    pvfb->state->presentStats.presentRoomWaits++;
+    return TRUE;
+}
+
+/*
+ * Room for one present's GPU copy: a queue entry, the root's owed-area record when `rootPriv` (the root,
+ * double buffered, as the destination) needs one (lorieRootCanQueueCopy), and the copy's own record,
+ * taken into `*record`. Where one is missing the renderer is let make it (lorieWaitForRenderer) - the
+ * present held back a little, not drawn by the CPU - and copies it has finished with give their records
+ * back on the way (lorieReapAbandonedCopies). -1 once there is room; otherwise why not
+ * (LORIE_CPU_PRESENT_*), and nothing taken.
+ *
+ * The record is taken last, and is the last thing before any of this becomes visible to the renderer.
+ * Without one there is no way to account for the copy afterwards, and the one moment that costs is
+ * cancellation - where the only remaining options are to release buffers the GPU may still be reading, or
+ * to keep them forever. So a copy that cannot be tracked is never offered: the caller falls back to the
+ * CPU, which needs no tracking at all.
+ */
+static int lorieMakeRoomForPresent(LoriePixmapPriv *rootPriv, LorieAbandonedCopy **record) {
+    uint64_t startUs = 0, waitedFrom;
+    int why;
+
+    for (;;) {
+        // Acquire, pairing with the renderer's release when it hands a slot back: seeing the slot free
+        // has to mean the renderer's reads of its previous entry are done before this overwrites it.
+        uint32_t used = pvfb->state->gpuCopyQueue.writeIndex -
+                        __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+
+        if (used >= LORIE_GPU_COPY_QUEUE_CAPACITY)
+            why = LORIE_CPU_PRESENT_QUEUE_FULL;
+        // A copy into the root over an area the drawing slot still owes needs a record of its own until
+        // it resolves (see rootReplacing).
+        else if (rootPriv && !lorieRootCanQueueCopy(rootPriv))
+            why = LORIE_CPU_PRESENT_REPLACING_FULL;
+        else if (!(*record = lorieTakeCopyRecord()))
+            why = LORIE_CPU_PRESENT_NO_RECORD;
+        else
+            break;
+
+        waitedFrom = lorieNowUs();
+        if (!lorieWaitForRenderer(&startUs)) {
+            if (why == LORIE_CPU_PRESENT_REPLACING_FULL)
+                pvfb->state->presentStats.rootReplacingFull++;
+            else if (why == LORIE_CPU_PRESENT_NO_RECORD)
+                pvfb->state->presentStats.copyRecordExhausted++;
+            return why;
+        }
+        pvfb->state->presentStats.presentRoomWaitUs += (uint32_t) (lorieNowUs() - waitedFrom);
+        lorieReapAbandonedCopies();
+    }
+    if (startUs)
+        pvfb->state->presentStats.presentRoomMade++;
+    return -1;
 }
 
 #define LORIE_PREFLIGHT_ROUNDS 4
