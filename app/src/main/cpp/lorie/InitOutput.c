@@ -1014,6 +1014,11 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
             uint32_t remapUs;
             LorieBuffer_unlock(priv->buffer);
             status = LorieBuffer_lock(priv->buffer, &priv->locked);
+            // The slot's mapping as it is now: the CPU copies into and out of it go through rootLocked,
+            // and the handover hands it back as `locked` when the slot is drawn into again. Nothing
+            // says a lock after an unlock maps the buffer at the same address.
+            if (priv->rootDouble)
+                priv->rootLocked[priv->rootWrite] = priv->locked;
             remapUs = (uint32_t) (lorieNowUs() - remapStartUs);
             pvfb->state->presentStats.rootRemapUs += remapUs;
             pvfb->state->presentStats.rootRemaps++;
