@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pixman.h>
+#include <time.h>
 typedef int Bool;
 #define TRUE 1
 #define FALSE 0
@@ -32,6 +33,7 @@ static inline void RegionEmpty(RegionPtr r) { pixman_region_clear(r); }
 static inline int RegionNumRects(RegionPtr r) { return pixman_region_n_rects(r); }
 static inline BoxPtr RegionRects(RegionPtr r) { return pixman_region_rectangles(r, NULL); }
 static inline BoxPtr RegionExtents(RegionPtr r) { return pixman_region_extents(r); }
+static inline void RegionTranslate(RegionPtr r, int x, int y) { pixman_region_translate(r, x, y); }
 /* pixman's region code links against these for region_init_from_image and logging */
 void _pixman_log_error(const char *f, const char *m) { (void) f; (void) m; }
 int pixman_image_get_width(pixman_image_t *i) { (void) i; return 0; }
@@ -50,23 +52,18 @@ static const LorieBuffer_Desc *LorieBuffer_description(LorieBuffer *b) { return 
 #define LORIE_TRACE_PUBLISH 0
 #define lorieTrace(...) do {} while (0)
 
-/* The renderer's two answers about a serial (lorieGpuCopyResolved, lorieGpuCopyMade): it passes them
- * in order, so a watermark says which have been dealt with, and a set says which of those failed. */
-static uint64_t fakeNow = 1, fakeCompleted = 0;
+static uint64_t fakeNow = 1;
 #define FAKE_SERIALS 4096
 static uint8_t fakeFailed[FAKE_SERIALS];
 static uint64_t lorieNowUs(void) { return fakeNow++; }
-static Bool lorieGpuCopyResolved(uint64_t serial) { return fakeCompleted >= serial; }
-static Bool lorieGpuCopyMade(uint64_t serial) { return fakeCompleted >= serial && !fakeFailed[serial % FAKE_SERIALS]; }
-/* Only the handover from before the region tracking asks this; it means "a copy into this slot has not
- * landed yet", which the harness knows from what it queued and what it let land. */
 static uint64_t slotPendingSerial[8];
 static LorieBuffer bufs[8];
-static Bool LorieBuffer_hasGpuCopyPending(LorieBuffer *b) { return slotPendingSerial[b - bufs] > fakeCompleted; }
 static struct {
     volatile uint32_t rootHandover;
     volatile uint8_t rootDoubleBuffered;
     volatile uint64_t rootBufferIds[8];
+    /* as many apart as are queued; the watermark is the renderer's, below */
+    struct { volatile uint32_t writeIndex, readIndex; volatile uint64_t completedSerial; } gpuCopyQueue;
     struct { uint64_t rootCopyBytes; uint32_t rootCopyUs, rootCopies, rootPublishAttempts, rootPublishHeldForRepair,
              rootPublishNoSlot, rootPublishes, rootStalePostponed, rootOwedRepairs, rootHandoverDeferrals,
              rootUnpublishedMaxUs, rootReplacementsNotMade, rootOwedFromOlder, rootOwedLost,
@@ -74,9 +71,19 @@ static struct {
              uint64_t cpuCarryBytes, cpuOwedFetchBytes;
              uint32_t gpuCarryJobs, gpuCarryTakenBack, gpuCarryNotMade, cpuCarryKept[8];
              uint64_t gpuCarryBytes, cpuSeedBytes;
-             uint32_t gpuOwedRepairs; } presentStats;
+             uint32_t gpuOwedRepairs;
+             uint32_t coreGpuCopies[2], coreGpuKept[16], coreGpuWaitUs, coreGpuWaitMaxUs;
+             uint64_t coreGpuBytes[2]; } presentStats;
 } fakeState;
-static struct { typeof(fakeState) *state; struct { Bool legacyDrawing; } root; } fakePvfb = { &fakeState };
+/* The renderer's two answers about a serial (lorieGpuCopyResolved, lorieGpuCopyMade): it passes them
+ * in order, so a watermark says which have been dealt with, and a set says which of those failed. */
+#define fakeCompleted (fakeState.gpuCopyQueue.completedSerial)
+static Bool lorieGpuCopyResolved(uint64_t serial) { return fakeCompleted >= serial; }
+static Bool lorieGpuCopyMade(uint64_t serial) { return fakeCompleted >= serial && !fakeFailed[serial % FAKE_SERIALS]; }
+/* Only the handover from before the region tracking asks this; it means "a copy into this slot has not
+ * landed yet", which the harness knows from what it queued and what it let land. */
+static Bool LorieBuffer_hasGpuCopyPending(LorieBuffer *b) { return slotPendingSerial[b - bufs] > fakeCompleted; }
+static struct { typeof(fakeState) *state; struct { Bool legacyDrawing; } root; Bool gpuPresentDisabled; } fakePvfb = { &fakeState };
 #define pvfb (&fakePvfb)
 /* what lorieRootCopyCancelled looks the root up through */
 typedef void *PixmapPtr;
@@ -141,7 +148,7 @@ static int published = -1, retiring = -1;
 static void init(LoriePixmapPriv *priv) {
     memset(priv, 0, sizeof *priv); memset(pixels, 0, sizeof pixels); memset(fakeFailed, 0, sizeof fakeFailed);
     for (int i = 0; i < LORIE_ROOT_SLOTS; i++) {
-        bufs[i].desc = (LorieBuffer_Desc) { W, W, H, 100 + i };
+        bufs[i].desc = (LorieBuffer_Desc) { W, W, H, 100 + i, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, LORIEBUFFER_AHARDWAREBUFFER };
         priv->rootBuf[i] = &bufs[i]; priv->rootLocked[i] = pixels[i];
         RegionNull(&priv->rootStale[i]);
 #ifdef HAVE_GPU_PENDING

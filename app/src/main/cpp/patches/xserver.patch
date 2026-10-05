@@ -146,7 +146,7 @@
          pExaScr->prepare_access_reg(pPixmap, index, NULL);
      else
 +++ ./exa/exa_priv.h
-@@ -250,9 +250,25 @@
+@@ -250,9 +250,29 @@
  }
  #endif
  
@@ -162,6 +162,10 @@
 +#define LORIE_CORE_COPY_WINDOW 0
 +#define LORIE_CORE_COPY_AREA 1
 +extern uint64_t lorieCoreCopyBegin(void);
++/* lorie: lorie/InitOutput.c - the same copy made by the GPU instead, if it can be; TRUE if it was, and the
++ * fallback then copies nothing. Called before the copy's accesses are opened. */
++extern Bool lorieCoreCopyOnGpu(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,
++                               Bool plain);
 +extern void lorieNoteCoreCopy(int kind, PixmapPtr src, PixmapPtr dst, RegionPtr dstRegion, int sdx, int sdy, int bpp,
 +                              uint64_t startUs);
 +
@@ -173,7 +177,7 @@
  
  #define EXA_POST_FALLBACK(_screen_) \
      pExaScr->fallback_counter--;
-@@ -260,7 +276,8 @@
+@@ -260,7 +280,8 @@
  #define EXA_PRE_FALLBACK_GC(_gc_) \
      ExaScreenPriv(_gc_->pScreen); \
      ExaGCPriv(_gc_); \
@@ -184,7 +188,37 @@
  
  #define EXA_POST_FALLBACK_GC(_gc_) \
 +++ ./exa/exa_unaccel.c
-@@ -155,6 +155,21 @@
+@@ -130,6 +130,29 @@
+     EXA_FALLBACK(("from %p to %p (%c,%c)\n", pSrc, pDst,
+                   exaDrawableLocation(pSrc), exaDrawableLocation(pDst)));
+ 
++    /* lorie: made by the GPU instead if it can be (lorieCoreCopyOnGpu) - before any access is opened, since
++     * it waits for the renderer, which must not happen with the shared lock held. */
++    {
++        PixmapPtr lorieSrcPix = exaGetDrawablePixmap(pSrc), lorieDstPix = exaGetDrawablePixmap(pDst);
++        int lorieSx, lorieSy, lorieDx, lorieDy;
++        RegionRec lorieDst;
++        Bool lorieDone;
++
++        exaGetDrawableDeltas(pSrc, lorieSrcPix, &lorieSx, &lorieSy);
++        exaGetDrawableDeltas(pDst, lorieDstPix, &lorieDx, &lorieDy);
++        if (!RegionInitBoxes(&lorieDst, pbox, nbox))
++            RegionNull(&lorieDst);
++        RegionTranslate(&lorieDst, lorieDx, lorieDy);
++        lorieDone = lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA, lorieSrcPix, lorieDstPix, &lorieDst,
++                                       dx + lorieSx - lorieDx, dy + lorieSy - lorieDy, pDst->bitsPerPixel,
++                                       !bitplane && pGC->alu == GXcopy && EXA_PM_IS_SOLID(pDst, pGC->planemask));
++        RegionUninit(&lorieDst);
++        if (lorieDone) {
++            EXA_POST_FALLBACK_GC(pGC);
++            return;
++        }
++    }
++
+     if (pExaScr->prepare_access_reg && RegionInitBoxes(&reg, pbox, nbox)) {
+         PixmapPtr pPixmap = exaGetDrawablePixmap(pSrc);
+ 
+@@ -155,6 +178,21 @@
      else
          exaPrepareAccess(pDst, EXA_PREPARE_DEST);
  
@@ -206,7 +240,7 @@
      /* This will eventually call fbCopyNtoN, with some calculation overhead. */
      while (nbox--) {
          pGC->ops->CopyArea(pSrc, pDst, pGC, pbox->x1 - pSrc->x + dx,
-@@ -163,6 +178,11 @@
+@@ -163,6 +201,11 @@
                             pbox->y1 - pDst->y);
          pbox++;
      }
@@ -218,7 +252,7 @@
      exaFinishAccess(pSrc, EXA_PREPARE_SRC);
      exaFinishAccess(pDst, EXA_PREPARE_DEST);
      EXA_POST_FALLBACK_GC(pGC);
-@@ -212,7 +232,33 @@
+@@ -212,7 +255,33 @@
                    exaDrawableLocation(pSrc), exaDrawableLocation(pDst)));
      ExaFallbackPrepareReg(pSrc, pGC, srcx, srcy, w, h, EXA_PREPARE_SRC, FALSE);
      ExaFallbackPrepareReg(pDst, pGC, dstx, dsty, w, h, EXA_PREPARE_DEST, TRUE);
@@ -253,10 +287,34 @@
      exaFinishAccess(pSrc, EXA_PREPARE_SRC);
      exaFinishAccess(pDst, EXA_PREPARE_DEST);
      EXA_POST_FALLBACK_GC(pGC);
-@@ -374,6 +420,12 @@
+@@ -374,6 +443,36 @@
      EXA_PRE_FALLBACK(pScreen);
      EXA_FALLBACK(("from %p\n", pWin));
  
++    /* lorie: made by the GPU instead if it can be (lorieCoreCopyOnGpu), before any access is opened: what
++     * the move writes, as fbCopyWindow works it out, in the window pixmap's coordinates. */
++    {
++        PixmapPtr loriePix = pScreen->GetWindowPixmap(pWin);
++        int lorieDx = ptOldOrg.x - pWin->drawable.x, lorieDy = ptOldOrg.y - pWin->drawable.y;
++        int lorieXoff, lorieYoff;
++        RegionRec lorieDst;
++        Bool lorieDone;
++
++        RegionNull(&lorieDst);
++        RegionCopy(&lorieDst, prgnSrc);
++        RegionTranslate(&lorieDst, -lorieDx, -lorieDy);
++        RegionIntersect(&lorieDst, &lorieDst, &pWin->borderClip);
++        exaGetDrawableDeltas(&pWin->drawable, loriePix, &lorieXoff, &lorieYoff);
++        RegionTranslate(&lorieDst, lorieXoff, lorieYoff);
++        lorieDone = lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW, loriePix, loriePix, &lorieDst, lorieDx, lorieDy,
++                                       pDrawable->bitsPerPixel, TRUE);
++        RegionUninit(&lorieDst);
++        if (lorieDone) {
++            EXA_POST_FALLBACK(pScreen);
++            return;
++        }
++    }
++
 +    /* lorie: CopyWindow writes the window's new area of this pixmap, but prepares the pixmap only as
 +     * a source below - so the write would never be seen as one. Every window move lands here (lorie's
 +     * EXA driver accelerates no copies), so queued GPU copies into that area are dealt with now, as
@@ -266,7 +324,7 @@
      /* Only need the source bits, the destination region will be overwritten */
      if (pExaScr->prepare_access_reg) {
          PixmapPtr pPixmap = pScreen->GetWindowPixmap(pWin);
-@@ -387,9 +439,32 @@
+@@ -387,9 +486,32 @@
      else
          exaPrepareAccess(pDrawable, EXA_PREPARE_SRC);
  

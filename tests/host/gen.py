@@ -86,6 +86,8 @@ recipes = {
         + func(I, "static Bool lorieRepairRootOwed(LoriePixmapPriv *priv) {")
         + opt(lambda: func(I, "static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {"),
             "static uint32_t lorieRootPinnedSlots")
+        + opt(lambda: "#define HAVE_TEMP_SLOT 1\n" + func(I, "static int lorieRootTempSlot(LoriePixmapPriv *priv) {"),
+              "static int lorieRootTempSlot")
         + opt(lambda: func(I, "static void lorieRootKeepConditional(LoriePixmapPriv *priv, int slot) {")
             + func(I, "static void lorieRootReuseSlot(LoriePixmapPriv *priv, int slot) {")
             + func(I, "static void lorieRootCopyCancelled(uint64_t serial) {"),
@@ -113,6 +115,19 @@ recipes = {
                       + func(I, "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {"),
               "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {")
         + func(I, "static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {"),
+    "corecopy": lambda: opt(lambda: "#define HAVE_CORE_GPU 1\n"
+            + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback that made them",
+                   "    LORIE_CORE_COPY_KINDS\n};")
+            + span(H, "/* Why a copy X core rendering makes stayed with the CPU", "    LORIE_CORE_KEPT_REASONS\n};")
+            + func(I, "static Bool lorieCoreKept(int why) {")
+            + "static uint64_t lorieCoreCopyWaitUs(void);\n"
+            + "static Bool lorieWaitCompleted(uint64_t serial, uint64_t startUs, uint64_t maxUs);\n"
+            + macro(I, "LORIE_CORE_OWED_ROUNDS")
+            + func(I, "static Bool lorieRootOwedSettled(LoriePixmapPriv *priv, uint64_t startUs) {")
+            + macro(I, "LORIE_CORE_COPY_HARD_WAIT_US")
+            + func(I, "static Bool lorieAwaitCopies(uint64_t first, uint64_t last, uint64_t whole, uint64_t startUs) {")
+            + func(I, "Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int bpp,"),
+            "Bool lorieCoreCopyOnGpu("),
     "t10": lambda: macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + span(I, "typedef struct {\n    struct xorg_list link;    /* only while waiting to be reaped */", "} LorieAbandonedCopy;")
         + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
@@ -208,6 +223,8 @@ recipes = {
         + span(I, "#define LORIE_COPY_RECORDS", "static LorieAbandonedCopy lorieCopyRecords[LORIE_COPY_RECORDS];")
         + func(I, "static LorieAbandonedCopy *lorieTakeCopyRecord(void) {")
         + func(I, "static Bool lorieRootCarryAllowed(int entries) {")
+        + opt(lambda: func(I, "static uint64_t lorieQueueBufferCopy(LorieBuffer *src, LorieBuffer *dst, BoxPtr box, int n, int xOff, int yOff,\n"
+                              "                                     int traceKind) {"), "static uint64_t lorieQueueBufferCopy")
         + func(I, "static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {")
         + func(I, "static Bool lorieQueueHoldsOnlyCarries(void) {")
         + opt(lambda: macro(I, "LORIE_PREFLIGHT_MAX_US") + macro(I, "LORIE_CARRY_WAIT_DEFAULT_US")

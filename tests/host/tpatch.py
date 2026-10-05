@@ -7,7 +7,9 @@ Applies the patch's exa/ and present/ sections to the tree's own sources and che
     lorie/InitOutput.c);
   - every copy an EXA fallback makes with the CPU is timed from before it and counted after it
     (lorieNoteCoreCopy), and the present and flip-end copies are counted as theirs (lorieCopyContext),
-    with the constants the patch repeats matching lorie/lorie.h.
+    with the constants the patch repeats matching lorie/lorie.h;
+  - CopyArea's and CopyWindow's fallbacks offer the copy to the GPU first (lorieCoreCopyOnGpu), before
+    any access is opened, and copy nothing with the CPU when it was made.
 
 usage: tpatch.py <xserver source dir> <xserver.patch> <scratch dir>
 """
@@ -76,6 +78,40 @@ f = body("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOl
 check(before(f, "RegionCopy(&lorieDst, prgnSrc);", "pScreen->CopyWindow(pWin, ptOldOrg, prgnSrc);"),
       "ExaCheckCopyWindow: what it writes is taken from prgnSrc after fbCopyWindow has moved it")
 
+# The core copies offered to the GPU first (lorieCoreCopyOnGpu): before any access is opened - it waits
+# for the renderer, which must not happen with the shared lock held - and, made, ending the fallback
+# with nothing copied by the CPU.
+def gpu_first(path, signature, call, firsts, post):
+    f = body(path, signature)
+    name = signature.strip().split("(")[0]
+    check(all(before(f, call, x) for x in firsts), name + ": the GPU is offered the copy after an access is opened")
+    tail = f[f.find(call):]
+    check(re.search(r"if \(lorieDone\) \{\s*" + re.escape(post) + r";\s*return;\s*\}", tail) is not None and
+          before(tail, "if (lorieDone)", "lorieCoreCopyBegin()"),
+          name + ": made by the GPU, it does not end the fallback and return before the CPU's copy")
+gpu_first("exa_unaccel.c", "\nExaCheckCopyNtoN(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,",
+          "lorieCoreCopyOnGpu(LORIE_CORE_COPY_AREA,", ["prepare_access_reg", "exaPrepareAccess(", "lorieCoreCopyBegin()"],
+          "EXA_POST_FALLBACK_GC(pGC)")
+gpu_first("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)",
+          "lorieCoreCopyOnGpu(LORIE_CORE_COPY_WINDOW,", ["lorieExaAccess(", "EXA_PREPARE_SRC", "lorieCoreCopyBegin()"],
+          "EXA_POST_FALLBACK(pScreen)")
+f = body("exa_unaccel.c", "\nExaCheckCopyNtoN(DrawablePtr pSrc, DrawablePtr pDst, GCPtr pGC,")
+check("!bitplane && pGC->alu == GXcopy && EXA_PM_IS_SOLID(pDst, pGC->planemask)" in f,
+      "ExaCheckCopyNtoN: the GPU is offered copies that are not plain (a bit plane, a raster op, a plane mask)")
+f = body("exa_unaccel.c", "\nExaCheckCopyWindow(WindowPtr pWin, DDXPointRec ptOldOrg, RegionPtr prgnSrc)")
+check(before(f, "RegionIntersect(&lorieDst, &lorieDst, &pWin->borderClip);", "lorieCoreCopyOnGpu(") and
+      before(f, "exaGetDrawableDeltas(&pWin->drawable, loriePix", "lorieCoreCopyOnGpu("),
+      "ExaCheckCopyWindow: what the GPU is given to write is not fbCopyWindow's destination in the pixmap")
+# The patch's declaration of it, as lorie/InitOutput.c defines it.
+def params(text, name):
+    m = re.search(r"\bBool\s+" + name + r"\s*\(([^)]*)\)", text)
+    # the types, in order: the names may differ
+    return m and [re.sub(r"\s*\w+$", "", re.sub(r"\s+", " ", p).strip()) for p in m.group(1).split(",")]
+init_c = open(os.path.join(os.path.dirname(os.path.abspath(PATCH)), "..", "lorie", "InitOutput.c")).read()
+check(params(open(os.path.join(work, "exa/exa_priv.h")).read(), "lorieCoreCopyOnGpu") is not None and
+      params(open(os.path.join(work, "exa/exa_priv.h")).read(), "lorieCoreCopyOnGpu") == params(init_c, "lorieCoreCopyOnGpu"),
+      "lorieCoreCopyOnGpu in exa_priv.h is not lorie/InitOutput.c's")
+
 # The copies that are a framebuffer copy of their own, counted as that and the context ended after.
 def context(path, signature, call, ctx):
     f = body(path, signature)
@@ -102,5 +138,5 @@ for name in ("LORIE_COPY_CTX_NONE", "LORIE_COPY_CTX_PRESENT", "LORIE_COPY_CTX_UN
     check(defined(priv, name) is not None and defined(priv, name) == defined(lorie_h, name),
           "%s in present_priv.h is not lorie.h's" % name)
 
-print("patch hooks (exa write paths reach lorieExaAccess, CPU copies counted): %s (%d failures)" % ("FAIL" if fails else "PASS", fails))
+print("patch hooks (exa write paths reach lorieExaAccess, CPU copies counted, core copies offered to the GPU): %s (%d failures)" % ("FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

@@ -116,10 +116,21 @@ int main(void) {
           "record does not say what it holds");
     CHECK(session7.outstanding == 1, "the session does not owe the answer");
 
+    /* a copy between any two buffers, written at an offset from where it is read */
+    LorieBuffer other = { { 900 }, 1, 0 };
+    fakeState.gpuCopyQueue.writeIndex = fakeState.gpuCopyQueue.readIndex = 1;
+    uint64_t s2 = lorieQueueBufferCopy(&other, &bufs[2], boxes, 1, -7, 9, 3);
+    LorieGpuCopyEntry *e2 = &fakeState.gpuCopyQueue.entries[1];
+    CHECK(s2 == 43 && e2->srcBufferId == 900 && e2->dstBufferId == 102 && e2->xOff == -7 && e2->yOff == 9 &&
+          e2->numRects == 1 && e2->rects[0].x2 == 30, "a buffer copy at an offset not queued as asked");
+    CHECK(other.refs == 2 && other.pending == 1 && bufs[2].refs == 2 && bufs[2].pending == 1, "a buffer copy's buffers not held");
+    fakeState.gpuCopyQueue.writeIndex = fakeState.gpuCopyQueue.readIndex = 0;
+
     /* no room: nothing taken, nothing held */
+    int listedBefore = listed();
     fakeState.gpuCopyQueue.writeIndex = fakeState.gpuCopyQueue.readIndex + LORIE_GPU_COPY_QUEUE_CAPACITY;
     CHECK(lorieQueueRootSlotCopy(&priv, 1, 3, boxes, 2) == 0, "queued into a full queue");
-    CHECK(bufs[1].refs == 2 && bufs[3].pending == 1 && listed() == 1, "a refused copy still took references");
+    CHECK(bufs[1].refs == 2 && bufs[3].pending == 1 && listed() == listedBefore, "a refused copy still took references");
     fakeState.gpuCopyQueue.writeIndex = fakeState.gpuCopyQueue.readIndex = 1;
     CHECK(lorieQueueRootSlotCopy(&priv, 1, 3, boxes, LORIE_GPU_COPY_MAX_RECTS + 1) == 0, "more rects than an entry holds");
 

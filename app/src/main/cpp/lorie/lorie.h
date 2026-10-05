@@ -315,6 +315,21 @@ enum {
     LORIE_CORE_COPY_AREA,             /* CopyArea between drawables, and what is built on it */
     LORIE_CORE_COPY_KINDS
 };
+/* Why a copy X core rendering makes stayed with the CPU instead of going to the GPU (coreGpuKept). */
+enum {
+    LORIE_CORE_KEPT_OFF,              /* TERMUX_X11_CORE_GPU_COPY=0, GPU presents off, or legacy drawing */
+    LORIE_CORE_KEPT_NO_RENDERER,      /* no renderer connected, or it has no surface */
+    LORIE_CORE_KEPT_OP,               /* not a plain copy: a raster op, a plane mask, a bit plane, not 32 bpp */
+    LORIE_CORE_KEPT_NOT_GPU,          /* source or destination not in a buffer the GPU can use */
+    LORIE_CORE_KEPT_SAME_PIXMAP,      /* within one pixmap other than the root: nothing to stage it through */
+    LORIE_CORE_KEPT_NO_SLOT,          /* within the root, and no slot free to stage it through */
+    LORIE_CORE_KEPT_RECTS,            /* within the root, more rects than one queue entry holds */
+    LORIE_CORE_KEPT_OWED,             /* the root's drawing slot still owes an area, not had in time */
+    LORIE_CORE_KEPT_BUSY,             /* no room in the queue, or the shared lock already held */
+    LORIE_CORE_KEPT_TIMEOUT,          /* queued, and not done in time or not made: taken back */
+    LORIE_CORE_KEPT_REASONS
+};
+
 /* What a CPU copy made through X core rendering is a part of, set around the callers whose copy is a
  * framebuffer copy of its own (lorieCopyContext). The values are also used by the xserver patch
  * (present_priv.h), which cannot include this header. */
@@ -648,6 +663,14 @@ struct lorie_shared_server_state {
         volatile uint64_t coreCopyRootBytes[LORIE_CORE_COPY_KINDS];
         volatile uint64_t coreCopySameBytes[LORIE_CORE_COPY_KINDS];
         volatile uint64_t coreCopyOverlapBytes[LORIE_CORE_COPY_KINDS];
+        /* The same copies made by the GPU instead (lorieCoreCopyOnGpu): how many and their bytes, how
+         * long the X server waited for them and the longest wait, and the ones kept on the CPU, by why
+         * (LORIE_CORE_KEPT_*). */
+        volatile uint32_t coreGpuCopies[LORIE_CORE_COPY_KINDS];
+        volatile uint64_t coreGpuBytes[LORIE_CORE_COPY_KINDS];
+        volatile uint32_t coreGpuWaitUs;
+        volatile uint32_t coreGpuWaitMaxUs;
+        volatile uint32_t coreGpuKept[LORIE_CORE_KEPT_REASONS];
         /* The carry the GPU did instead (lorieRootCarryOnGpu): copies queued and their bytes, the ones
          * a CPU access took back before the renderer got to them - the CPU then fetched the area, which
          * is in cpuOwedFetchBytes - and the ones not made. cpuCarryKept is a handover whose carry

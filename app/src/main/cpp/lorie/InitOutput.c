@@ -355,8 +355,8 @@ typedef struct {
     uint64_t rootGpuPendingSerial[LORIE_ROOT_SLOTS];
     /*
      * The part of rootGpuPending that is clients' presents, which only the client's pixmap holds the
-     * content of until they land - unlike a copy from another slot (a carry, a repair), whose content
-     * that slot already has. A handover waits on these alone.
+     * content of until they land - unlike a copy from another slot (a carry, a repair, a core copy staged
+     * through one), whose content that slot already has. A handover waits on these alone.
      */
     RegionRec rootPresentPending[LORIE_ROOT_SLOTS];
     uint64_t rootPresentPendingSerial[LORIE_ROOT_SLOTS];
@@ -1224,7 +1224,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.cpuTotalBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuTotalBytes, 0, __ATOMIC_RELAXED);
     snap.cpuDegradedBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuDegradedBytes, 0, __ATOMIC_RELAXED);
     snap.cpuBehindBytes = __atomic_exchange_n(&pvfb->state->presentStats.cpuBehindBytes, 0, __ATOMIC_RELAXED);
+    snap.coreGpuWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitUs, 0, __ATOMIC_RELAXED);
+    snap.coreGpuWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuWaitMaxUs, 0, __ATOMIC_RELAXED);
+    for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
+        snap.coreGpuKept[why] = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuKept[why], 0, __ATOMIC_RELAXED);
     for (int kind = 0; kind < LORIE_CORE_COPY_KINDS; kind++) {
+        snap.coreGpuCopies[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuCopies[kind], 0, __ATOMIC_RELAXED);
+        snap.coreGpuBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreGpuBytes[kind], 0, __ATOMIC_RELAXED);
         snap.coreCopyCalls[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyCalls[kind], 0, __ATOMIC_RELAXED);
         snap.coreCopyBytes[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyBytes[kind], 0, __ATOMIC_RELAXED);
         snap.coreCopyUs[kind] = __atomic_exchange_n(&pvfb->state->presentStats.coreCopyUs[kind], 0, __ATOMIC_RELAXED);
@@ -1473,6 +1479,25 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_QUEUE_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD]);
+        {
+            uint32_t kept = 0;
+
+            for (int why = 0; why < LORIE_CORE_KEPT_REASONS; why++)
+                kept += snap.coreGpuKept[why];
+            if (snap.coreGpuCopies[LORIE_CORE_COPY_WINDOW] || snap.coreGpuCopies[LORIE_CORE_COPY_AREA] || kept)
+                log(INFO, "XlorieCoreGpu: CopyWindow %u by the GPU %.1f MB, CopyArea %u by the GPU %.1f MB; waited "
+                          "%.1f ms (longest %.2f ms); kept on the CPU: off %u, no renderer %u, not a plain copy %u, not "
+                          "GPU buffers %u, within one pixmap %u, no slot to stage through %u, too many rects %u, root "
+                          "not up to date %u, queue busy %u, not done in time %u",
+                    snap.coreGpuCopies[LORIE_CORE_COPY_WINDOW], snap.coreGpuBytes[LORIE_CORE_COPY_WINDOW] / 1048576.0,
+                    snap.coreGpuCopies[LORIE_CORE_COPY_AREA], snap.coreGpuBytes[LORIE_CORE_COPY_AREA] / 1048576.0,
+                    snap.coreGpuWaitUs / 1000.0, snap.coreGpuWaitMaxUs / 1000.0,
+                    snap.coreGpuKept[LORIE_CORE_KEPT_OFF], snap.coreGpuKept[LORIE_CORE_KEPT_NO_RENDERER],
+                    snap.coreGpuKept[LORIE_CORE_KEPT_OP], snap.coreGpuKept[LORIE_CORE_KEPT_NOT_GPU],
+                    snap.coreGpuKept[LORIE_CORE_KEPT_SAME_PIXMAP], snap.coreGpuKept[LORIE_CORE_KEPT_NO_SLOT],
+                    snap.coreGpuKept[LORIE_CORE_KEPT_RECTS], snap.coreGpuKept[LORIE_CORE_KEPT_OWED],
+                    snap.coreGpuKept[LORIE_CORE_KEPT_BUSY], snap.coreGpuKept[LORIE_CORE_KEPT_TIMEOUT]);
+        }
         for (int kind = 0; kind < LORIE_CORE_COPY_KINDS; kind++)
             if (snap.coreCopyCalls[kind])
                 log(INFO, "XlorieCoreCopy: %s %u by the CPU, %.1f MB in %.1f ms (longest %.2f ms); %.1f MB into the "
@@ -3851,6 +3876,39 @@ static uint32_t lorieRootPinnedSlots(LoriePixmapPriv *priv) {
 }
 
 /*
+ * A root slot nothing will read from or show before it is drawn into again, to stage a copy within the
+ * drawing slot through (lorieCoreCopyOnGpu) - or -1. Not the drawing slot, not one the renderer holds or
+ * is about to take (the newest published), not one pinned (lorieRootPinnedSlots: content still owed from
+ * it, or a carry still to read it), not the donor of anything owed or kept conditional, and with no GPU
+ * write still pending into it. What it held there is stale in it from then on.
+ */
+static int lorieRootTempSlot(LoriePixmapPriv *priv) {
+    uint32_t word = __atomic_load_n(&pvfb->state->rootHandover, __ATOMIC_ACQUIRE);
+    uint32_t avoid = (word & LORIE_ROOT_HELD_MASK) | lorieRootPinnedSlots(priv) | (1u << priv->rootWrite)
+                     | (1u << ((word >> LORIE_ROOT_NEWEST_SHIFT) & LORIE_ROOT_NEWEST_MASK));
+    int i, j;
+
+    if (priv->rootOwedDonor >= 0 && RegionNotEmpty(&priv->rootOwed))
+        avoid |= 1u << priv->rootOwedDonor;
+    for (i = 0; i < LORIE_ROOT_SLOTS; i++)
+        if (priv->rootCondCount[i] > 0 && priv->rootCondDonor[i] >= 0)
+            avoid |= 1u << priv->rootCondDonor[i];
+    for (i = 0; i < LORIE_ROOT_SLOTS; i++) {
+        if (avoid & (1u << i))
+            continue;
+        if (RegionNotEmpty(lorieRootPendingGpuRegion(priv, i)))
+            continue;
+        for (j = 0; j < priv->rootCondCount[i]; j++)
+            if (!lorieGpuCopyResolved(priv->rootCond[i][j].serial))
+                break;
+        if (j < priv->rootCondCount[i])
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+/*
  * The drawing slot is going out: what is still pending over its owed area becomes the question
  * rootCond answers for it later, with the donor it was owed from.
  */
@@ -4182,13 +4240,14 @@ static Bool lorieRootCarryAllowed(int entries) {
 }
 
 /*
- * Queues one GPU copy of `n` rects from root slot `from` into slot `to`, at the same place, and returns
- * its serial - 0 if there was no room after all. The renderer's ordinary copy path runs it; nothing on
- * that side knows it from a present. Nobody acks it either, so its record goes straight to the ones
- * let go of once settled (lorieReapAbandonedCopies), holding both slots until the renderer is done.
+ * Queues one GPU copy of `n` rects, given in `src`'s coordinates, from `src` into `dst` at (xOff, yOff)
+ * from there, and returns its serial - 0 if there was no room after all. The renderer's ordinary copy
+ * path runs it; nothing on that side knows it from a present. Nobody acks it either, so its record goes
+ * straight to the ones let go of once settled (lorieReapAbandonedCopies), holding both buffers until the
+ * renderer is done. `traceKind` is the ENQUEUE trace's `a`.
  */
-static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {
-    LorieBuffer *src = priv->rootBuf[from], *dst = priv->rootBuf[to];
+static uint64_t lorieQueueBufferCopy(LorieBuffer *src, LorieBuffer *dst, BoxPtr box, int n, int xOff, int yOff,
+                                     int traceKind) {
     uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex;
     uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
     LorieAbandonedCopy *record;
@@ -4213,8 +4272,8 @@ static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, 
     entry->serial = serial;
     entry->srcBufferId = LorieBuffer_description(src)->id;
     entry->dstBufferId = LorieBuffer_description(dst)->id;
-    entry->xOff = 0;
-    entry->yOff = 0;
+    entry->xOff = (int16_t) xOff;
+    entry->yOff = (int16_t) yOff;
     entry->numRects = (uint16_t) n;
     // As lorieTryScheduleGpuCopy does: queued before the release below publishes the entry.
     __atomic_store_n(&pvfb->state->gpuCopyQueue.entryState[writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY],
@@ -4230,8 +4289,13 @@ static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, 
         live->outstanding++;
     record->startUs = lorieNowUs();
     xorg_list_add(&record->link, &lorieAbandonedCopies);
-    lorieTrace(pvfb->state, LORIE_TRACE_ENQUEUE, 2, serial);
+    lorieTrace(pvfb->state, LORIE_TRACE_ENQUEUE, traceKind, serial);
     return serial;
+}
+
+// One copy from root slot `from` into slot `to`, at the same place: a carry (lorieRootCarryOnGpu).
+static uint64_t lorieQueueRootSlotCopy(LoriePixmapPriv *priv, int from, int to, BoxPtr box, int n) {
+    return lorieQueueBufferCopy(priv->rootBuf[from], priv->rootBuf[to], box, n, 0, 0, 2);
 }
 
 /*
@@ -4697,6 +4761,328 @@ void lorieExaFallbackBegin(void) {
         if (!lorieFallbackWait() || !rootPriv)
             break;
     }
+}
+
+/*
+ * How long the X server waits for a core copy it gave the GPU (lorieCoreCopyOnGpu) before taking it back
+ * for the CPU. TERMUX_X11_CORE_COPY_WAIT_US sets it; 0 gives the GPU none at all.
+ */
+#define LORIE_CORE_COPY_WAIT_DEFAULT_US 8000ULL
+static uint64_t lorieCoreCopyWaitUs(void) {
+    static long long waitUs = -1;
+
+    if (waitUs < 0) {
+        const char *e = getenv("TERMUX_X11_CORE_COPY_WAIT_US");
+        waitUs = e ? atoll(e) : (long long) LORIE_CORE_COPY_WAIT_DEFAULT_US;
+        if (waitUs < 0)
+            waitUs = 0;
+        if ((unsigned long long) waitUs > LORIE_PREFLIGHT_MAX_US)
+            waitUs = (long long) LORIE_PREFLIGHT_MAX_US;
+    }
+    return (uint64_t) waitUs;
+}
+
+// Cancels the queued entry with this serial if the renderer has not claimed it; TRUE if it was cancelled.
+static Bool lorieCancelSerial(uint64_t serial) {
+    uint32_t readIndex = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t writeIndex = pvfb->state->gpuCopyQueue.writeIndex, i;
+
+    for (i = readIndex; i != writeIndex; i++)
+        if (pvfb->state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].serial == serial)
+            return lorieCancelQueuedEntry(i % LORIE_GPU_COPY_QUEUE_CAPACITY);
+    return FALSE;
+}
+
+/*
+ * Waits for the copies `first`..`last` the X server has just queued and needs done before it goes on
+ * (lorieCoreCopyOnGpu), until lorieCoreCopyWaitUs after `startUs`, and says whether every one of them was
+ * made. Called with no access open, so with the shared lock free - waiting on the renderer otherwise
+ * could deadlock.
+ *
+ * Out of time, what the renderer has not claimed is taken back, and the caller copies it with the CPU.
+ * `whole`, if not 0, is a copy that must run whole or not at all - the second step of a copy staged
+ * through another slot, which writes the drawing slot: cancelled first; if the renderer has it already,
+ * nothing is taken back and it is waited out, since it reads what the first step wrote.
+ */
+/*
+ * Sleeps until the renderer has dealt with every copy up to `serial`, or until `maxUs` after `startUs`;
+ * TRUE if it had. Only with the shared lock free - the renderer cannot drain otherwise.
+ */
+static Bool lorieWaitCompleted(uint64_t serial, uint64_t startUs, uint64_t maxUs) {
+    Bool done;
+
+    pthread_cond_signal(rendererCond);
+    __atomic_fetch_add(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    for (;;) {
+        uint32_t seen = __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+        uint64_t elapsedUs = lorieNowUs() - startUs, nap;
+        struct timespec left;
+
+        if ((done = __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial))
+            break;
+        if (elapsedUs >= maxUs)
+            break;
+        // readIndex moves as the renderer takes entries, completedSerial a moment later, after its fence;
+        // so a short nap at most between looks at the latter.
+        nap = min(maxUs - elapsedUs, 500ULL);
+        left.tv_sec = 0;
+        left.tv_nsec = (long) (nap * 1000u);
+        syscall(__NR_futex, &pvfb->state->gpuCopyQueue.readIndex, FUTEX_WAIT, seen, &left, NULL, 0);
+    }
+    __atomic_fetch_sub(&pvfb->state->gpuCopyQueue.readIndexWaiters, 1, __ATOMIC_ACQ_REL);
+    return done;
+}
+
+/*
+ * Whether the root's drawing slot owes nothing any more, for a core copy that reads or writes it - as a
+ * CPU access has it after its PrepareAccess (lorieRepairRootOwed). What the copy reads has to be there;
+ * and the damage after it takes more out of what is owed than it writes - the part of a CopyArea whose
+ * source was obscured, which nothing writes - and that keeps whatever content it has.
+ *
+ * An owed area is given to the GPU (lorieRootRepairOnGpu) and waited for, and so is one with a copy into
+ * it still in the queue - not read through, though the queue runs in order: that copy can yet come back
+ * not made (a buffer the renderer never got), and what was read there would be the slot's older content,
+ * moved somewhere nothing repairs it. An area the GPU cannot repair yet - the donor's own copies there
+ * still pending - is waited for until it can, round by round. FALSE where it is not done in time, or
+ * cannot be done by the GPU at all.
+ */
+#define LORIE_CORE_OWED_ROUNDS 3
+static Bool lorieRootOwedSettled(LoriePixmapPriv *priv, uint64_t startUs) {
+    RegionRec over, part;
+    Bool ready = FALSE;
+    int round, i, donor;
+
+    RegionNull(&over);
+    RegionNull(&part);
+    for (round = 0; round < LORIE_CORE_OWED_ROUNDS; round++) {
+        uint64_t waitFor = 0;
+
+        lorieRootRepairOnGpu(priv);
+        lorieRootSettleReplacements(priv);
+        RegionCopy(&over, &priv->rootOwed);
+        if (!RegionNotEmpty(&over)) {
+            ready = TRUE;
+            break;
+        }
+        for (i = 0; i < priv->rootReplacingCount; i++) {
+            RegionIntersect(&part, &priv->rootReplacing[i].region, &over);
+            if (RegionNotEmpty(&part))
+                waitFor = max(waitFor, priv->rootReplacing[i].serial);
+            RegionSubtract(&over, &over, &priv->rootReplacing[i].region);
+        }
+        // Owed with nothing on its way: repaired by the GPU once what the donor waits for has landed, and
+        // never if the donor has been drawn into since (lorieRootFetchOwed's, with the CPU).
+        donor = priv->rootOwedDonor;
+        if (RegionNotEmpty(&over)) {
+            if (donor < 0 || donor == priv->rootWrite || priv->rootEpoch[donor] != priv->rootOwedDonorEpoch)
+                break;
+            if (!lorieGpuCopyResolved(priv->rootOwedSerial))
+                waitFor = max(waitFor, priv->rootOwedSerial);
+            for (i = 0; i < priv->rootCondCount[donor]; i++) {
+                RegionIntersect(&part, &priv->rootCond[donor][i].region, &over);
+                if (RegionNotEmpty(&part) && !lorieGpuCopyResolved(priv->rootCond[donor][i].serial))
+                    waitFor = max(waitFor, priv->rootCond[donor][i].serial);
+            }
+        }
+        if (!waitFor || !lorieWaitCompleted(waitFor, startUs, lorieCoreCopyWaitUs()))
+            break;
+    }
+    RegionUninit(&part);
+    RegionUninit(&over);
+    return ready;
+}
+
+#define LORIE_CORE_COPY_HARD_WAIT_US 200000ULL
+static Bool lorieAwaitCopies(uint64_t first, uint64_t last, uint64_t whole, uint64_t startUs) {
+    uint64_t s;
+    uint32_t waitedUs;
+    Bool timedOut, running = FALSE;
+
+    timedOut = !lorieWaitCompleted(last, startUs, lorieCoreCopyWaitUs());
+    if (timedOut) {
+        Bool waitedOut;
+
+        running = whole && !lorieCancelSerial(whole);
+        if (!running)
+            for (s = first; s <= last; s++)
+                lorieCancelSerial(s);
+        // A claimed copy runs under the shared lock, fence and all: taking it waits that out.
+        waitedOut = lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        if (waitedOut)
+            lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        waitedOut = waitedOut && lorieConnectionAlive();
+        // Running, it has to finish: what it reads is not there to copy again, and the CPU making it a
+        // second time would read the slot it has already moved. It has, once the lock is had from a
+        // renderer still there - which reports it a moment after letting go of the lock, so a late
+        // report is waited for, and past that what is still unreported is taken as made. (Both steps
+        // are between the same two root slots, so the renderer has both or neither: the second does
+        // not run on a first it gave up.)
+        while (running && __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) < last &&
+               lorieNowUs() - startUs < LORIE_CORE_COPY_HARD_WAIT_US) {
+            struct timespec nap = { 0, 200000 };
+            nanosleep(&nap, NULL);
+        }
+        running = running && waitedOut;
+    }
+
+    waitedUs = (uint32_t) (lorieNowUs() - startUs);
+    pvfb->state->presentStats.coreGpuWaitUs += waitedUs;
+    if (waitedUs > pvfb->state->presentStats.coreGpuWaitMaxUs)
+        pvfb->state->presentStats.coreGpuWaitMaxUs = waitedUs;
+    for (s = first; s <= last; s++)
+        if (!lorieGpuCopyMade(s) && !(running && !lorieGpuCopyResolved(s)))
+            return FALSE;
+    return TRUE;
+}
+
+static Bool lorieCoreKept(int why) {
+    pvfb->state->presentStats.coreGpuKept[why]++;
+    return FALSE;
+}
+
+/*
+ * A copy X core rendering is about to make with the CPU (the EXA fallbacks for CopyArea and CopyWindow,
+ * see xserver.patch), made by the GPU instead if it can be - TRUE if it was, and the caller then copies
+ * nothing. `dstRegion` is what it writes, in `dst`'s coordinates; the source is that moved by
+ * (sdx, sdy) in `src`. `plain` says it is a straight copy: GXcopy, every plane, no bit plane.
+ *
+ * Called before the copy's accesses are opened, so with the shared lock free, and waits for what it
+ * queued (lorieAwaitCopies): to everything after it, the copy has happened, exactly as the CPU's would
+ * have - nothing has to be ordered against it later. Out of time, it is taken back and the CPU makes it.
+ * The root, read or written, owes nothing first (lorieRootOwedSettled), as after a CPU access's prepare.
+ *
+ * Both buffers have to be ones the GPU reads and writes (AHardwareBuffers). Within the root, source and
+ * destination are the drawing slot itself, which one copy cannot both read and write: it is staged
+ * through a slot nothing needs (lorieRootTempSlot) - into it, then back at the destination, the second
+ * step a single entry, so it runs whole or not at all. Within any other pixmap it stays with the CPU.
+ */
+Bool lorieCoreCopyOnGpu(int kind, PixmapPtr srcPix, PixmapPtr dstPix, RegionPtr dstRegion, int sdx, int sdy, int bpp,
+                        Bool plain) {
+    static int enabled = -1;
+    LoriePixmapPriv *srcPriv, *dstPriv, *rootPriv = NULL;
+    PixmapPtr screenPix;
+    RegionRec srcRegion;
+    BoxPtr box;
+    uint64_t first = 0, last = 0, whole = 0, s, pixels = 0, startUs = lorieNowUs();
+    uint32_t used;
+    int n, i, temp = -1, entries;
+
+    if (!pvfb->state || !pScreenPtr || kind < 0 || kind >= LORIE_CORE_COPY_KINDS || !dstRegion ||
+        !RegionNotEmpty(dstRegion))
+        return FALSE;
+    if (enabled < 0) {
+        const char *e = getenv("TERMUX_X11_CORE_GPU_COPY");
+        enabled = !(e && !strcmp(e, "0"));
+    }
+    if (!enabled || pvfb->gpuPresentDisabled || pvfb->root.legacyDrawing)
+        return lorieCoreKept(LORIE_CORE_KEPT_OFF);
+    if (!plain || bpp != 32)
+        return lorieCoreKept(LORIE_CORE_KEPT_OP);
+    if (!lorieConnectionAlive() || !lorieRendererAvailable())
+        return lorieCoreKept(LORIE_CORE_KEPT_NO_RENDERER);
+    if (lorieSharedLockHeld > 0)
+        return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
+
+    srcPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(srcPix);
+    dstPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dstPix);
+    if (!srcPriv || !dstPriv || srcPriv->mem || dstPriv->mem || !srcPriv->buffer || !dstPriv->buffer ||
+        LorieBuffer_description(srcPriv->buffer)->type != LORIEBUFFER_AHARDWAREBUFFER ||
+        LorieBuffer_description(dstPriv->buffer)->type != LORIEBUFFER_AHARDWAREBUFFER)
+        return lorieCoreKept(LORIE_CORE_KEPT_NOT_GPU);
+
+    screenPix = (*pScreenPtr->GetScreenPixmap)(pScreenPtr);
+    if (srcPix == screenPix || dstPix == screenPix) {
+        rootPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(screenPix);
+        // Single buffered, the renderer may be showing the very buffer this would write.
+        if (!rootPriv || !rootPriv->rootDouble)
+            return lorieCoreKept(LORIE_CORE_KEPT_NO_SLOT);
+    }
+    if (srcPix == dstPix && srcPix != screenPix)
+        return lorieCoreKept(LORIE_CORE_KEPT_SAME_PIXMAP);
+
+    RegionNull(&srcRegion);
+    RegionCopy(&srcRegion, dstRegion);
+    RegionTranslate(&srcRegion, sdx, sdy);
+    if (rootPriv && !lorieRootOwedSettled(rootPriv, startUs)) {
+        RegionUninit(&srcRegion);
+        return lorieCoreKept(LORIE_CORE_KEPT_OWED);
+    }
+
+    n = RegionNumRects(&srcRegion);
+    box = RegionRects(&srcRegion);
+    if (srcPix == dstPix) {
+        if (n > LORIE_GPU_COPY_MAX_RECTS) {
+            RegionUninit(&srcRegion);
+            return lorieCoreKept(LORIE_CORE_KEPT_RECTS);
+        }
+        if ((temp = lorieRootTempSlot(rootPriv)) < 0) {
+            RegionUninit(&srcRegion);
+            return lorieCoreKept(LORIE_CORE_KEPT_NO_SLOT);
+        }
+        entries = 2;
+    } else
+        entries = (n + LORIE_GPU_COPY_MAX_RECTS - 1) / LORIE_GPU_COPY_MAX_RECTS;
+    used = pvfb->state->gpuCopyQueue.writeIndex - __atomic_load_n(&pvfb->state->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    if (used + (uint32_t) entries > LORIE_GPU_COPY_QUEUE_CAPACITY) {
+        RegionUninit(&srcRegion);
+        return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
+    }
+
+    if (srcPix == dstPix) {
+        int w = rootPriv->rootWrite;
+
+        first = lorieQueueBufferCopy(rootPriv->rootBuf[w], rootPriv->rootBuf[temp], box, n, 0, 0, 3);
+        if (first)
+            whole = last = lorieQueueBufferCopy(rootPriv->rootBuf[temp], rootPriv->rootBuf[w], box, n, -sdx, -sdy, 3);
+        if (!first || !last) {
+            if (first)
+                lorieCancelSerial(first);
+            RegionUninit(&srcRegion);
+            return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
+        }
+        // The slot it was staged through holds something else there now, and is not read until done.
+        RegionUnion(&rootPriv->rootStale[temp], &rootPriv->rootStale[temp], &srcRegion);
+        RegionUnion(&rootPriv->rootGpuPending[temp], &rootPriv->rootGpuPending[temp], &srcRegion);
+        rootPriv->rootGpuPendingSerial[temp] = first;
+        rootPriv->rootCarrySrcSerial[temp] = last;
+        rootPriv->rootEpoch[temp]++;
+    } else {
+        if (srcPix != screenPix)
+            lorieRegisterBuffer(srcPriv->buffer);
+        if (dstPix != screenPix)
+            lorieRegisterBuffer(dstPriv->buffer);
+        for (i = 0; i < n; i += LORIE_GPU_COPY_MAX_RECTS) {
+            s = lorieQueueBufferCopy(srcPriv->buffer, dstPriv->buffer, box + i, min(LORIE_GPU_COPY_MAX_RECTS, n - i),
+                                     -sdx, -sdy, 3);
+            if (!s)
+                break;
+            first = first ? first : s;
+            last = s;
+        }
+        if (i < n) {
+            for (s = first; first && s <= last; s++)
+                lorieCancelSerial(s);
+            RegionUninit(&srcRegion);
+            return lorieCoreKept(LORIE_CORE_KEPT_BUSY);
+        }
+    }
+    if (dstPix == screenPix) {
+        int w = rootPriv->rootWrite;
+
+        lorieMarkRootStale(rootPriv, dstRegion);
+        RegionUnion(&rootPriv->rootGpuPending[w], &rootPriv->rootGpuPending[w], dstRegion);
+        rootPriv->rootGpuPendingSerial[w] = last;
+    }
+
+    for (i = 0; i < n; i++)
+        pixels += (uint64_t) (box[i].x2 - box[i].x1) * (box[i].y2 - box[i].y1);
+    RegionUninit(&srcRegion);
+
+    if (!lorieAwaitCopies(first, last, whole, startUs))
+        return lorieCoreKept(LORIE_CORE_KEPT_TIMEOUT);
+    pvfb->state->presentStats.coreGpuCopies[kind]++;
+    pvfb->state->presentStats.coreGpuBytes[kind] += pixels * 4;
+    return TRUE;
 }
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
