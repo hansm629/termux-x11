@@ -59,7 +59,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tpatch.py" "$HERE/../../app/src/main/cp
 "$CC" -Wall -Wno-unused-function -O2 -pthread -DPARKING_FAILS -I"$OUT" "$HERE/tzchide.c" -o "$OUT/tzchide-noparking"
 "$OUT/tzchide-noparking" || status=1
 
-for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy tcarryq tpresentroom tpacing tsfstats t21 t29 tvblank tstat ttrace; do
+for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy tcarryq tpresentroom tpacing tsfstats tzccommit t21 t29 tvblank tstat ttrace; do
     "$CC" -Wall -Wno-unused-function -O2 -pthread -I"$OUT" "$HERE/$t.c" -o "$OUT/$t"
     OUT="$OUT" "$OUT/$t" || status=1
 done

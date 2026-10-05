@@ -411,6 +411,8 @@ enum {
                                *                                       a = apply seq,           b = latch time ns, 0 none */
     LORIE_TRACE_SFPRESENT,    /* compositor: present fence signalled, dated by the fence
                                *                                       a = apply seq,           b = 0 */
+    LORIE_TRACE_ZCCOMMIT,     /* compositor: OnCommit, dated when it came (measurement only)
+                               *                                       a = apply seq,           b = apply -> OnCommit us */
 };
 /* LORIE_TRACE_PREFLIGHT results. Nothing is recorded when nothing was queued - the common case,
  * which would otherwise fill the ring during exactly the drags being looked at. A queued copy
@@ -884,6 +886,20 @@ struct lorie_shared_server_state {
         volatile uint32_t sfStatsMissing;
         /* Completions whose present fence call gave nothing (-1): the call exists, the fence did not. */
         volatile uint32_t sfNoPresentFence;
+        /* OnCommit (API 31), measurement only - nothing waits on it (renderer.c, rootZcFlushCommits):
+         * callbacks, i.e. root transactions the compositor applied and has ready to present (not latched,
+         * shown or released: those are the completion's and the release fence's); the time from the apply
+         * in buckets of under 0.5, 1, 2, 4, 8, 16, 33 ms and longer, and the longest; callbacks whose apply
+         * time was no longer known, and ones not recorded; and how many transactions submitted on the
+         * current layer were not committed yet each time another was submitted (none, 1, 2, 3 or more),
+         * and the most. */
+        volatile uint32_t zcCommits;
+        volatile uint32_t zcCommitLatencyBuckets[8];
+        volatile uint32_t zcCommitLatencyMaxUs;
+        volatile uint32_t zcCommitUnmatched;
+        volatile uint32_t zcCommitLost;
+        volatile uint32_t zcUncommittedAtSubmit[4];
+        volatile uint32_t zcUncommittedMax;
         volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
         /* A frame not submitted because a copy into its own slot was still queued behind one the
          * drain had to wait on. What was on screen stays, and it is tried again next vsync. */
@@ -942,6 +958,8 @@ struct lorie_shared_server_state {
     /* 1 once the root layer has the compositor's buffer backpressure (API 31): a root buffer is queued
      * rather than dropped for a newer one. 0 where it is not available. */
     volatile uint8_t rootBackpressure;
+    /* 1 where the root's transactions carry an OnCommit callback (API 31), for the measurement above. */
+    volatile uint8_t rootCommitTracked;
     volatile char outputBackendReason[96];
 
     struct {

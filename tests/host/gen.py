@@ -118,9 +118,27 @@ recipes = {
         + func(R, "static void rootZcSetBackpressure(ASurfaceControl *sc) {")
         + func(R, "static void teardownRootOverlay(void) {")
         + "static ANativeWindow *defaultWin = NULL, *win = NULL;\nstatic bool cursorOverlayResolveApi(void);\n"
+        + opt(lambda: span(R, "static uint32_t rootZcCommitFirstSeq = 1, rootZcSubmittedOnLayer = 0, rootZcCommittedOnLayer = 0;",
+                           "static uint32_t rootZcCommitFirstSeq = 1, rootZcSubmittedOnLayer = 0, rootZcCommittedOnLayer = 0;")
+                      + func(R, "static void rootZcCommitNewLayer(void) {"), "static void rootZcCommitNewLayer(void) {", R)
         + func(R, "static void ensureRootOverlay(void) {")
         # where the renderer asks for backpressure: once, per layer, never in a buffer transaction
         + "#define BACKPRESSURE_CALL_SITES %d\n" % open(R, encoding="utf-8").read().count("scApi.txSetEnableBackPressure("),
+    # OnCommit, measured only - tzccommit.c; and where its state is touched, to show nothing else reads it
+    "zccommit": lambda: span(R, "#define LORIE_ZC_COMMITS 64", "static uint32_t rootZcCommitFirstSeq = 1, rootZcSubmittedOnLayer = 0, rootZcCommittedOnLayer = 0;")
+        + func(R, "static void rootZcOnCommit(void *context, ASurfaceTransactionStats *stats) {")
+        + func(R, "static void rootZcCommitNewLayer(void) {")
+        + func(R, "static void rootZcNoteSubmitted(uint32_t seq) {")
+        + func(R, "static void rootZcFlushCommits(void) {")
+        + "".join("#define USES_%s_IN_FILE %d\n#define USES_%s_MEASURED %d\n" % (
+            name, open(R, encoding="utf-8").read().count(name), name,
+            sum(func(R, sig).count(name) for sig in (
+                "static void rootZcOnCommit(void *context, ASurfaceTransactionStats *stats) {",
+                "static void rootZcCommitNewLayer(void) {", "static void rootZcNoteSubmitted(uint32_t seq) {",
+                "static void rootZcFlushCommits(void) {"))
+            + span(R, "#define LORIE_ZC_COMMITS 64", "static uint32_t rootZcCommitFirstSeq = 1, rootZcSubmittedOnLayer = 0, rootZcCommittedOnLayer = 0;").count(name))
+            for name in ("rootZcCommitSeen", "rootZcApplyTimes", "rootZcCommitFirstSeq", "rootZcSubmittedOnLayer",
+                         "rootZcCommittedOnLayer")),
     "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
         + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
         + func(R, "static void rootZcNothingNewDone(void) {")

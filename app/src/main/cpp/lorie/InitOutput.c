@@ -1203,6 +1203,15 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.sfPresentLateGaps = __atomic_exchange_n(&pvfb->state->presentStats.sfPresentLateGaps, 0, __ATOMIC_RELAXED);
     snap.sfPresentGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.sfPresentGapMaxUs, 0, __ATOMIC_RELAXED);
     snap.sfStatsLost = __atomic_exchange_n(&pvfb->state->presentStats.sfStatsLost, 0, __ATOMIC_RELAXED);
+    snap.zcCommits = __atomic_exchange_n(&pvfb->state->presentStats.zcCommits, 0, __ATOMIC_RELAXED);
+    for (int i = 0; i < 8; i++)
+        snap.zcCommitLatencyBuckets[i] = __atomic_exchange_n(&pvfb->state->presentStats.zcCommitLatencyBuckets[i], 0, __ATOMIC_RELAXED);
+    snap.zcCommitLatencyMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.zcCommitLatencyMaxUs, 0, __ATOMIC_RELAXED);
+    snap.zcCommitUnmatched = __atomic_exchange_n(&pvfb->state->presentStats.zcCommitUnmatched, 0, __ATOMIC_RELAXED);
+    snap.zcCommitLost = __atomic_exchange_n(&pvfb->state->presentStats.zcCommitLost, 0, __ATOMIC_RELAXED);
+    for (int i = 0; i < 4; i++)
+        snap.zcUncommittedAtSubmit[i] = __atomic_exchange_n(&pvfb->state->presentStats.zcUncommittedAtSubmit[i], 0, __ATOMIC_RELAXED);
+    snap.zcUncommittedMax = __atomic_exchange_n(&pvfb->state->presentStats.zcUncommittedMax, 0, __ATOMIC_RELAXED);
     snap.displayRefreshMHz = pvfb->state->presentStats.displayRefreshMHz;
     snap.fenceFallbacks = __atomic_exchange_n(&pvfb->state->presentStats.fenceFallbacks, 0, __ATOMIC_RELAXED);
     snap.fenceWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.fenceWaitMaxUs, 0, __ATOMIC_RELAXED);
@@ -1397,13 +1406,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 log(INFO, "XlorieCursor: %u cursor image updates put off with every cursor buffer still "
                           "with the compositor", snap.cursorOverlayWaits);
 
-            log(INFO, "XlorieBackend: asked for %s, filtering %s%s, compositor backpressure %s; %u direct submits, "
+            log(INFO, "XlorieBackend: asked for %s, filtering %s%s, compositor backpressure %s, OnCommit %s; %u direct submits, "
                       "%u nothing-new, %u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
                 pvfb->state->outputFilterNearest ? "nearest" : "linear",
                 pvfb->state->outputFilterNearest && snap.directBufferSubmits
                     ? " (direct frames were scaled bilinearly regardless)" : "",
                 pvfb->state->rootBackpressure ? "on" : "off",
+                pvfb->state->rootCommitTracked ? "measured" : "unavailable",
                 snap.directBufferSubmits,
                 snap.directReuseNoSubmit,
                 snap.directHeldIncomplete,
@@ -1439,6 +1449,23 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.sfPresentLateGaps,
                 snap.sfPresentGapMaxUs / 1000.0, snap.sfStatsLost);
         }
+        /*
+         * OnCommit, measurement only: how long after the apply the compositor had each root transaction
+         * applied and ready to present, and how deep its queue was each time another was submitted. Not a
+         * latch, a presentation or a release - those are XlorieDisplay's.
+         */
+        if (snap.zcCommits || snap.zcUncommittedAtSubmit[0] || snap.zcUncommittedAtSubmit[1] ||
+            snap.zcUncommittedAtSubmit[2] || snap.zcUncommittedAtSubmit[3])
+            log(INFO, "XlorieCommit: %u OnCommit callbacks (%u with the apply time no longer known, %u not recorded); "
+                      "apply -> OnCommit under 0.5 ms %u, 1 ms %u, 2 ms %u, 4 ms %u, 8 ms %u, 16 ms %u, 33 ms %u, "
+                      "longer %u, longest %.1f ms; transactions not yet committed when the next was submitted: "
+                      "none %u, 1 %u, 2 %u, 3 or more %u, most %u",
+                snap.zcCommits, snap.zcCommitUnmatched, snap.zcCommitLost,
+                snap.zcCommitLatencyBuckets[0], snap.zcCommitLatencyBuckets[1], snap.zcCommitLatencyBuckets[2],
+                snap.zcCommitLatencyBuckets[3], snap.zcCommitLatencyBuckets[4], snap.zcCommitLatencyBuckets[5],
+                snap.zcCommitLatencyBuckets[6], snap.zcCommitLatencyBuckets[7], snap.zcCommitLatencyMaxUs / 1000.0,
+                snap.zcUncommittedAtSubmit[0], snap.zcUncommittedAtSubmit[1], snap.zcUncommittedAtSubmit[2],
+                snap.zcUncommittedAtSubmit[3], snap.zcUncommittedMax);
         if (snap.requests)
             log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
                 snap.requests,

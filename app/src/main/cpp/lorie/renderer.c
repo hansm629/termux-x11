@@ -344,6 +344,7 @@ static struct {
     int64_t (*statsLatchTime)(ASurfaceTransactionStats *);             // optional, measurement only
     int (*statsPresentFenceFd)(ASurfaceTransactionStats *);           // optional, measurement only
     void (*txSetEnableBackPressure)(ASurfaceTransaction *, ASurfaceControl *, bool); // optional, API 31
+    void (*txSetOnCommit)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *)); // optional, API 31, measurement only
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -393,6 +394,9 @@ static bool cursorOverlayResolveApi(void) {
     // Optional too: without it the compositor may drop a root buffer for a newer one, as it always did.
     scApi.txSetEnableBackPressure = (void (*)(ASurfaceTransaction *, ASurfaceControl *, bool))
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setEnableBackPressure");
+    // And this, which only measures (rootZcOnCommit).
+    scApi.txSetOnCommit = (void (*)(ASurfaceTransaction *, void *, void (*)(void *, ASurfaceTransactionStats *)))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setOnCommit");
 
     if (!scApi.createFromWindow || !scApi.release || !scApi.txCreate || !scApi.txDelete ||
         !scApi.txApply || !scApi.txSetVisibility || !scApi.txSetZOrder || !scApi.txSetBuffer ||
@@ -3306,6 +3310,7 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
     if (state) {
         state->outputFilterNearest = filtering == GL_NEAREST ? 1u : 0u;
         state->rootBackpressure = rootZcBackpressureOn ? 1u : 0u;
+        state->rootCommitTracked = scApi.txSetOnCommit ? 1u : 0u;
     }
 
     if (state && (!published || publishedReason != reason || publishedTo != state)) {
@@ -3543,6 +3548,103 @@ static int64_t rootZcFenceSignalledNs(int fd) {
 
 // Renderer thread: what the callbacks recorded taken out under the lock, everything else after it -
 // the gaps, the fences asked when they signalled, and the frame trace's records of both.
+/*
+ * OnCommit (API 31), for measurement only. Its callback says a transaction has been applied and is ready to
+ * be presented, and that one applied after it will go to the next frame - not that it was latched, shown or
+ * released: those stay the completion's and the release fence's, and the slots go back on them alone.
+ * Nothing here decides anything; no frame waits for it. What it measures: how long after the apply it comes
+ * (which is what pacing on it would cost), and how many of the transactions submitted on this layer were
+ * not committed yet each time another was submitted - the depth of the compositor's queue, which buffer
+ * backpressure makes a frame deeper after a late frame.
+ *
+ * The callback runs on a binder thread and only notes the number and the time, under rootZcCommitLock; the
+ * renderer thread takes them at its next frame (rootZcFlushCommits) and does the rest.
+ */
+#define LORIE_ZC_COMMITS 64
+static pthread_mutex_t rootZcCommitLock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    uint32_t count, lost;
+    struct { uint32_t seq; int64_t ns; } seen[LORIE_ZC_COMMITS];
+} rootZcCommitSeen;                                     // rootZcCommitLock
+// Renderer thread only: when each transaction was applied, by its number; and from which number, and how
+// many, the current layer has had submitted and committed.
+static struct { uint32_t seq; int64_t ns; } rootZcApplyTimes[LORIE_ZC_COMMITS];
+static uint32_t rootZcCommitFirstSeq = 1, rootZcSubmittedOnLayer = 0, rootZcCommittedOnLayer = 0;
+
+static void rootZcOnCommit(void *context, ASurfaceTransactionStats *stats) {
+    uint32_t seq = (uint32_t) (uintptr_t) context;
+    int64_t nowNs = rendererNowNs();
+
+    (void) stats;   // no release or present fence in it, and nothing else wanted from it
+    pthread_mutex_lock(&rootZcCommitLock);
+    if (rootZcCommitSeen.count < LORIE_ZC_COMMITS) {
+        rootZcCommitSeen.seen[rootZcCommitSeen.count].seq = seq;
+        rootZcCommitSeen.seen[rootZcCommitSeen.count++].ns = nowNs;
+    } else
+        rootZcCommitSeen.lost++;
+    pthread_mutex_unlock(&rootZcCommitLock);
+}
+
+// A new root layer: whatever was submitted on the one before no longer counts as waiting.
+static void rootZcCommitNewLayer(void) {
+    rootZcCommitFirstSeq = rootZcRetireSeq + 1u;
+    rootZcSubmittedOnLayer = rootZcCommittedOnLayer = 0;
+}
+
+// A transaction carrying an OnCommit callback is about to be applied.
+static void rootZcNoteSubmitted(uint32_t seq) {
+    uint32_t waiting = rootZcSubmittedOnLayer - rootZcCommittedOnLayer;
+
+    rootZcApplyTimes[seq % LORIE_ZC_COMMITS].seq = seq;
+    rootZcApplyTimes[seq % LORIE_ZC_COMMITS].ns = rendererNowNs();
+    rootZcSubmittedOnLayer++;
+    if (state) {
+        __atomic_fetch_add(&state->presentStats.zcUncommittedAtSubmit[waiting < 3 ? waiting : 3], 1, __ATOMIC_RELAXED);
+        LORIE_STAT_MAX(&state->presentStats.zcUncommittedMax, waiting);
+    }
+}
+
+// Renderer thread, at the start of a frame: what the OnCommit callbacks noted since the last one.
+static void rootZcFlushCommits(void) {
+    static const uint32_t boundsUs[7] = { 500, 1000, 2000, 4000, 8000, 16000, 33000 };
+    struct { uint32_t seq; int64_t ns; } seen[LORIE_ZC_COMMITS];
+    uint32_t count, lost, i, unmatched = 0;
+
+    pthread_mutex_lock(&rootZcCommitLock);
+    count = rootZcCommitSeen.count;
+    lost = rootZcCommitSeen.lost;
+    memcpy(seen, rootZcCommitSeen.seen, sizeof(seen[0]) * (size_t) count);
+    rootZcCommitSeen.count = rootZcCommitSeen.lost = 0;
+    pthread_mutex_unlock(&rootZcCommitLock);
+
+    for (i = 0; i < count; i++) {
+        uint32_t seq = seen[i].seq;
+
+        // Only this layer's: a late one from the layer before says nothing about this one's queue.
+        if ((int32_t) (seq - rootZcCommitFirstSeq) >= 0 && rootZcCommittedOnLayer < rootZcSubmittedOnLayer)
+            rootZcCommittedOnLayer++;
+        if (rootZcApplyTimes[seq % LORIE_ZC_COMMITS].seq == seq && seen[i].ns >= rootZcApplyTimes[seq % LORIE_ZC_COMMITS].ns) {
+            uint32_t us = (uint32_t) ((seen[i].ns - rootZcApplyTimes[seq % LORIE_ZC_COMMITS].ns) / 1000);
+            int b = 0;
+
+            while (b < 7 && us >= boundsUs[b])
+                b++;
+            if (state) {
+                __atomic_fetch_add(&state->presentStats.zcCommitLatencyBuckets[b], 1, __ATOMIC_RELAXED);
+                LORIE_STAT_MAX(&state->presentStats.zcCommitLatencyMaxUs, us);
+                if (state->traceEnabled)
+                    lorieTraceAt(state, LORIE_TRACE_ZCCOMMIT, seq, us, (uint64_t) seen[i].ns / 1000);
+            }
+        } else
+            unmatched++;
+    }
+    if (state) {
+        __atomic_fetch_add(&state->presentStats.zcCommits, count, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&state->presentStats.zcCommitUnmatched, unmatched, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&state->presentStats.zcCommitLost, lost, __ATOMIC_RELAXED);
+    }
+}
+
 static void rootZcFlushDisplayStats(void) {
     static int64_t lastLatchNs = 0, lastPresentNs = 0;
     static struct { uint32_t seq; int fence; } pending[LORIE_ZC_SEEN * 2];
@@ -3970,6 +4072,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         return false;
 
     rootZcFlushDisplayStats();
+    rootZcFlushCommits();
     rootZcClearLetterbox(surfaceW, surfaceH);
 
     // The X server had nothing newer to publish, so this is the buffer the compositor is already
@@ -4129,6 +4232,11 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     scApi.txSetGeometry(t, rootSurfaceControl, &src, &dst, 0);
     if (scApi.txSetOnComplete)
         scApi.txSetOnComplete(t, (void *) (uintptr_t) applySeq, rootZcOnComplete);
+    if (scApi.txSetOnCommit) {
+        // Measurement only: nothing waits for it.
+        scApi.txSetOnCommit(t, (void *) (uintptr_t) applySeq, rootZcOnCommit);
+        rootZcNoteSubmitted(applySeq);
+    }
     scApi.txApply(t);
     scApi.txDelete(t);
     lorieTrace(state, LORIE_TRACE_ZCAPPLY, frameSeq, applySeq);
@@ -4224,8 +4332,10 @@ static void ensureRootOverlay(void) {
         rootSurfaceControl = scApi.createFromWindow(win, "lorie-root");
         if (!rootSurfaceControl)
             log("Xlorie: could not create the root layer, drawing the root through GL instead");
-        else
+        else {
             rootZcSetBackpressure(rootSurfaceControl);
+            rootZcCommitNewLayer();
+        }
     }
     pthread_mutex_unlock(&rootOverlayLock);
 }
