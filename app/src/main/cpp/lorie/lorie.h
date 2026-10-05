@@ -652,6 +652,11 @@ struct lorie_shared_server_state {
         volatile uint32_t presentRoomWaits;
         volatile uint32_t presentRoomWaitUs;
         volatile uint32_t presentRoomMade;
+        /* Clients' pixmaps given AHardwareBuffers from the start (lorieAhbPixmapWanted), the time the
+         * allocations took, and the ones that failed and fell back to plain memory. */
+        volatile uint32_t ahbPixmaps;
+        volatile uint32_t ahbPixmapFailures;
+        volatile uint32_t ahbPixmapAllocUs;
         volatile uint64_t cpuUnflipBytes;
         /* Every byte above and below, once: with a renderer there and the GPU path on - what has to
          * reach 0 - and apart from that, with no renderer to copy anything or GPU copies turned off. */

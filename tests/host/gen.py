@@ -124,6 +124,10 @@ recipes = {
         + func(I, "static uint64_t lorieRoomWaitUs(void) {")
         + func(I, "static Bool lorieWaitForRenderer(uint64_t *startUs) {")
         + func(I, "static int lorieMakeRoomForPresent(LoriePixmapPriv *rootPriv, LorieAbandonedCopy **record) {"),
+    "ahbpixmap": lambda: macro(I, "CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED") + macro(I, "LORIE_AHB_PIXMAP_MIN_DEFAULT")
+        + func(I, "static Bool lorieAhbPixmapWanted(int width, int height, int depth, int usage_hint) {")
+        + func(I, "static LorieBuffer *lorieAllocateAhbPixmap(int width, int height) {")
+        + func(I, "void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, int depth, int usage_hint, __unused int bpp, int *new_fb_pitch) {"),
     "pwiden": lambda: func(I, "Bool lorieWidenPresentRegion(RegionPtr region, RegionPtr valid, RegionPtr clip) {"),
     "corecopy": lambda: opt(lambda: "#define HAVE_CORE_GPU 1\n"
             + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback that made them",

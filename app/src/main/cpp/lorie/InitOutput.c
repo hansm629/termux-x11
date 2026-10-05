@@ -1248,6 +1248,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
         snap.cpuPresents[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresents[why], 0, __ATOMIC_RELAXED);
     snap.presentsWidened = __atomic_exchange_n(&pvfb->state->presentStats.presentsWidened, 0, __ATOMIC_RELAXED);
+    snap.ahbPixmaps = __atomic_exchange_n(&pvfb->state->presentStats.ahbPixmaps, 0, __ATOMIC_RELAXED);
+    snap.ahbPixmapFailures = __atomic_exchange_n(&pvfb->state->presentStats.ahbPixmapFailures, 0, __ATOMIC_RELAXED);
+    snap.ahbPixmapAllocUs = __atomic_exchange_n(&pvfb->state->presentStats.ahbPixmapAllocUs, 0, __ATOMIC_RELAXED);
     snap.presentRoomWaits = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomWaits, 0, __ATOMIC_RELAXED);
     snap.presentRoomWaitUs = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomWaitUs, 0, __ATOMIC_RELAXED);
     snap.presentRoomMade = __atomic_exchange_n(&pvfb->state->presentStats.presentRoomMade, 0, __ATOMIC_RELAXED);
@@ -1490,6 +1493,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD],
                 snap.presentsWidened);
+        if (snap.ahbPixmaps || snap.ahbPixmapFailures)
+            log(INFO, "XlorieAhbPixmaps: %u pixmaps given AHardwareBuffers from the start, %.1f ms allocating; %u "
+                      "allocations failed and fell back to plain memory",
+                snap.ahbPixmaps, snap.ahbPixmapAllocUs / 1000.0, snap.ahbPixmapFailures);
         if (snap.presentRoomWaits)
             log(INFO, "XloriePresentRoom: %u waits for the renderer to make room for a present, %.1f ms in all; %u "
                       "presents then went to the GPU (the rest are among the CPU's above)",
@@ -3370,7 +3377,47 @@ static struct present_screen_info loriePresentInfo = {
 
 void exaDDXDriverInit(__unused ScreenPtr pScreen) {}
 
-void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unused int depth, int usage_hint, __unused int bpp, int *new_fb_pitch) {
+/*
+ * Whether a client's pixmap gets an AHardwareBuffer from the start rather than plain memory: one the GPU
+ * copies to and from (lorieCoreCopyOnGpu, presents) - the back buffer a toolkit copies into its window at
+ * the end of every paint, a redirected window's own pixmap - so that copy is the GPU's, and no pixmap is
+ * moved into such a buffer by the CPU later (lorieEnsureGpuSampleable). Only depth 24, the copies the GPU
+ * makes; only ones the size of a back buffer, TERMUX_X11_AHB_PIXMAP_MIN pixels or more - an icon or a
+ * tile is copied sooner by the CPU than the X server can hear back from the GPU; and not scratch or glyph
+ * pixmaps. TERMUX_X11_AHB_PIXMAPS=0 turns it off.
+ */
+#define LORIE_AHB_PIXMAP_MIN_DEFAULT (128 * 128)
+static Bool lorieAhbPixmapWanted(int width, int height, int depth, int usage_hint) {
+    static int enabled = -1;
+    static long long minPixels = -1;
+
+    if (enabled < 0) {
+        const char *e = getenv("TERMUX_X11_AHB_PIXMAPS"), *m = getenv("TERMUX_X11_AHB_PIXMAP_MIN");
+        enabled = !(e && !strcmp(e, "0"));
+        minPixels = m ? atoll(m) : LORIE_AHB_PIXMAP_MIN_DEFAULT;
+    }
+    return enabled && !pvfb->root.legacyDrawing && !pvfb->gpuPresentDisabled && depth == 24 &&
+           (usage_hint == 0 || usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP) &&
+           (long long) width * height >= minPixels;
+}
+
+// A client's pixmap in an AHardwareBuffer (lorieAhbPixmapWanted), or NULL; timed and counted either way.
+static LorieBuffer *lorieAllocateAhbPixmap(int width, int height) {
+    uint64_t startUs = lorieNowUs();
+    LorieBuffer *buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM,
+                                               LORIEBUFFER_AHARDWAREBUFFER);
+
+    if (pvfb->state) {
+        pvfb->state->presentStats.ahbPixmapAllocUs += (uint32_t) (lorieNowUs() - startUs);
+        if (buffer)
+            pvfb->state->presentStats.ahbPixmaps++;
+        else
+            pvfb->state->presentStats.ahbPixmapFailures++;
+    }
+    return buffer;
+}
+
+void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, int depth, int usage_hint, __unused int bpp, int *new_fb_pitch) {
     LoriePixmapPriv *priv;
     size_t size = sizeof(LoriePixmapPriv);
     *new_fb_pitch = 0;
@@ -3387,16 +3434,16 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     // first of them as it is (lorieEnsureRootDoubleBuffer).
     if (type == LORIEBUFFER_AHARDWAREBUFFER)
         priv->buffer = lorieAllocateRootBuffer(width, height, &priv->overlayGranted);
-    else
+    else if (!lorieAhbPixmapWanted(width, height, depth, usage_hint) ||
+             !(priv->buffer = lorieAllocateAhbPixmap(width, height)))
         priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
-    *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
-
-    LorieBuffer_lock(priv->buffer, &priv->locked);
     if (!priv->buffer) {
         free(priv);
         return NULL;
     }
+    *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
 
+    LorieBuffer_lock(priv->buffer, &priv->locked);
     return priv;
 }
 
