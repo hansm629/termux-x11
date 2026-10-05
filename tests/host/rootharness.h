@@ -74,7 +74,8 @@ static struct {
              uint32_t gpuOwedRepairs;
              uint32_t coreGpuCopies[2], coreGpuKept[16], coreGpuWaitUs, coreGpuWaitMaxUs;
              uint64_t coreGpuBytes[2];
-             uint64_t resizeGpuBytes; uint32_t resizeGpuKept[16]; } presentStats;
+             uint64_t resizeGpuBytes; uint32_t resizeGpuKept[16];
+             uint32_t presentsWidened; } presentStats;
 } fakeState;
 /* The renderer's two answers about a serial (lorieGpuCopyResolved, lorieGpuCopyMade): it passes them
  * in order, so a watermark says which have been dealt with, and a set says which of those failed. */

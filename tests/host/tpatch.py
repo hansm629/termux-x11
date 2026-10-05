@@ -118,6 +118,15 @@ check(params(open(os.path.join(work, "exa/exa_priv.h")).read(), "lorieCoreCopyOn
       params(open(os.path.join(work, "exa/exa_priv.h")).read(), "lorieCoreCopyOnGpu") == params(init_c, "lorieCoreCopyOnGpu"),
       "lorieCoreCopyOnGpu in exa_priv.h is not lorie/InitOutput.c's")
 
+# A present's region widened to fit one GPU copy once it is clipped to the window, within its valid area.
+f = body("present/present_execute.c", "\nlorieBuildGpuCopyRegion(present_vblank_ptr vblank, WindowPtr window, RegionPtr out)")
+check(before(f, "RegionIntersect(out, out, &clip);", "lorieWidenPresentRegion(out, vblank->valid, &clip);") and
+      before(f, "lorieWidenPresentRegion(out, vblank->valid, &clip);", "RegionUninit(&clip);"),
+      "lorieBuildGpuCopyRegion: not widened after the clip, within the valid area")
+check(params(open(os.path.join(work, "present/present_priv.h")).read(), "lorieWidenPresentRegion") is not None and
+      params(open(os.path.join(work, "present/present_priv.h")).read(), "lorieWidenPresentRegion") ==
+      params(init_c, "lorieWidenPresentRegion"), "lorieWidenPresentRegion in present_priv.h is not lorie/InitOutput.c's")
+
 # The copies that are a framebuffer copy of their own, counted as that and the context ended after.
 def context(path, signature, call, ctx):
     f = body(path, signature)

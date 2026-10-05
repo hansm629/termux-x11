@@ -115,6 +115,7 @@ recipes = {
                       + func(I, "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {"),
               "static LorieBuffer *lorieAllocateRootBuffer(int w, int h, bool *granted) {")
         + func(I, "static void lorieEnsureRootDoubleBuffer(PixmapPtr root) {"),
+    "pwiden": lambda: func(I, "Bool lorieWidenPresentRegion(RegionPtr region, RegionPtr valid, RegionPtr clip) {"),
     "corecopy": lambda: opt(lambda: "#define HAVE_CORE_GPU 1\n"
             + span(H, "/* The copies X core rendering makes with the CPU, by the EXA fallback that made them",
                    "    LORIE_CORE_COPY_KINDS\n};")

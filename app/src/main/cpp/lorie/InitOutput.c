@@ -1245,6 +1245,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     }
     for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
         snap.cpuPresents[why] = __atomic_exchange_n(&pvfb->state->presentStats.cpuPresents[why], 0, __ATOMIC_RELAXED);
+    snap.presentsWidened = __atomic_exchange_n(&pvfb->state->presentStats.presentsWidened, 0, __ATOMIC_RELAXED);
     snap.gpuCarryJobs = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryJobs, 0, __ATOMIC_RELAXED);
     snap.gpuCarryBytes = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryBytes, 0, __ATOMIC_RELAXED);
     snap.gpuCarryTakenBack = __atomic_exchange_n(&pvfb->state->presentStats.gpuCarryTakenBack, 0, __ATOMIC_RELAXED);
@@ -1454,14 +1455,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
         for (int why = 0; why < LORIE_CPU_PRESENT_REASONS; why++)
             cpuPresents += snap.cpuPresents[why];
-        if (snap.cpuTotalBytes || snap.cpuDegradedBytes || cpuPresents || snap.cpuConverts)
+        if (snap.cpuTotalBytes || snap.cpuDegradedBytes || cpuPresents || snap.cpuConverts || snap.presentsWidened)
             log(INFO, "XlorieCpuCopy: total %.1f MB copied by the CPU with a renderer there (%.1f MB of it with the "
                       "renderer behind; %.1f MB more with none, or the GPU path off) = root carried forward %.1f MB, "
                       "owed areas fetched %.1f MB, slots "
                       "seeded %.1f MB, resize %.1f MB, flip ended %.1f MB, %u pixmaps moved into GPU buffers %.1f "
                       "MB, CopyWindow %.1f MB, CopyArea %.1f MB, %u presents drawn by the CPU %.1f MB (GPU path "
                       "off %u, no renderer %u, not GPU-readable %u, too many rects %u, queue full %u, owed-area "
-                      "records full %u, no copy record %u)",
+                      "records full %u, no copy record %u; %u more widened to fewer rects and given to the GPU)",
                 snap.cpuTotalBytes / 1048576.0,
                 snap.cpuBehindBytes / 1048576.0,
                 snap.cpuDegradedBytes / 1048576.0,
@@ -1482,7 +1483,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.cpuPresents[LORIE_CPU_PRESENT_RECTS],
                 snap.cpuPresents[LORIE_CPU_PRESENT_QUEUE_FULL],
                 snap.cpuPresents[LORIE_CPU_PRESENT_REPLACING_FULL],
-                snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD]);
+                snap.cpuPresents[LORIE_CPU_PRESENT_NO_RECORD],
+                snap.presentsWidened);
         {
             uint32_t kept = 0;
 
@@ -2416,6 +2418,37 @@ static Bool lorieCpuPresent(int why, __unused PixmapPtr pixmap, __unused RegionP
         pvfb->state->presentStats.cpuPresents[why]++;
     gpuCopyAttempts++;
     return FALSE;
+}
+
+/*
+ * A present's region with more rects than one queue entry holds, which lorieTryScheduleGpuCopy would turn
+ * down (LORIE_CPU_PRESENT_RECTS), made fewer: its bounding box, kept to what the pixmap holds valid
+ * content in (`valid`, or all of it) and to what the window shows (`clip`, in the pixmap's coordinates).
+ * Present lets the server copy more of the pixmap than the update - a flip shows all of it - so long as it
+ * is valid content, and the clip still keeps it off whatever is over the window. Called with `region`
+ * already the update within the pixmap and the clip (lorieBuildGpuCopyRegion, xserver.patch). TRUE if it
+ * fits now; left unchanged if even that does not, for the CPU.
+ */
+Bool lorieWidenPresentRegion(RegionPtr region, RegionPtr valid, RegionPtr clip) {
+    RegionRec wide;
+    BoxRec box;
+
+    if (RegionNumRects(region) <= LORIE_GPU_COPY_MAX_RECTS)
+        return TRUE;
+    box = *RegionExtents(region);
+    RegionInit(&wide, &box, 1);
+    if (valid)
+        RegionIntersect(&wide, &wide, valid);
+    RegionIntersect(&wide, &wide, clip);
+    if (RegionNumRects(&wide) > LORIE_GPU_COPY_MAX_RECTS) {
+        RegionUninit(&wide);
+        return FALSE;
+    }
+    RegionCopy(region, &wide);
+    RegionUninit(&wide);
+    if (pvfb->state)
+        pvfb->state->presentStats.presentsWidened++;
+    return TRUE;
 }
 
 Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
