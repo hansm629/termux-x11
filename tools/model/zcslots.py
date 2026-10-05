@@ -1,131 +1,198 @@
 #!/usr/bin/env python3
-"""A deterministic model of the ROOT_DIRECT root-slot lifecycle, against the compositor with buffer
-backpressure off (what the NDK gives a SurfaceControl by default) and on (what BLASTBufferQueue sets).
+"""A deterministic model of the ROOT_DIRECT root-slot lifecycle against the compositor, to choose how frames
+are paced before anything in the app changes.
 
-usage: zcslots.py [--slots N ...] [--scenario NAME ...]
+usage: zcslots.py [--hz 60 120] [--policy A B ...] [--scenario NAME ...] [--lifecycle] [--delays]
 
-The renderer and X server rules are the ones in the sources, in the same order:
+Policies (renderer side), all with the X server and renderer rules as they are in the sources:
+  A        5 slots, backpressure off, transactions applied at once            (what the app does now)
+  B        5 slots, backpressure on, applied at once
+  C-apply  5 slots, backpressure off, OnCommit-paced: transaction N+1 is applied only once N's OnCommit has
+           come, waiting right before txApply (claim, room check and copies as now)
+  C-late   C-apply, with the room check moved from the start of the frame to right before txApply (after
+           the wait): retired slots are given back at both points
+  C-claim  the same as C-apply, but the frame - claim, room check, copies - does not start before it
+  D        6 slots, backpressure on, no frame starts while submitted - committed >= 2
+           (uncommittedDepth <= 1 before a submit)
+  D-wait   D, but a frame that would exceed the depth waits for the OnCommit instead of being retried
+           at the next vsync
+  D-nocap  6 slots, backpressure on, no depth bound
+  E        6 slots, backpressure off, C-apply
 
-  X server (InitOutput.c lorieRootHandover): at a tick with new content it publishes the slot it drew
-    into and moves on to the first slot that is neither that one nor held; with none, it does not
-    publish and keeps drawing into the same slot (rootPublishNoSlot).
-  renderer (renderer.c rendererRedrawLocked -> rootZcPresent): a frame claims the newest published
-    slot (its held bit), then rootZcDrainRetiring gives back every retiring slot whose completion
-    has arrived and whose release fence has signalled (or came as -1), and goes on only if
-    kept + 2 <= LORIE_ZC_MAX_HELD (= slots - 2); otherwise the frame is dropped, the claim given back
-    unless it is a slot it holds anyway, and retried at the next vsync. A claim of the slot it last
-    submitted is "nothing new" and submits nothing. Otherwise, after the frame's fence wait, the slot
-    it submitted last joins the retiring list under this transaction's number, the new slot becomes
-    rootZcDisplayedSlot, and the transaction is applied. waitForNextFrame shuts until the next tick.
-  completion (rootZcOnComplete): transaction N's callback hands its previous release fence to the
-    retiring entry with N's number.
+Rules taken from the sources:
+  X server (InitOutput.c lorieRootHandover): publishes the slot it drew into at a tick with new content
+    and moves on to the first slot that is neither that one nor held; with none, it keeps drawing into
+    the same one (rootPublishNoSlot). Pool replacement (resize): a new generation, every held bit cleared.
+  renderer (renderer.c): a frame claims the newest slot (held bit), rootZcDrainRetiring gives back every
+    retiring slot of the current generation whose completion came and whose release fence has signalled
+    (entries of an older generation are dropped without touching held bits), and the frame goes on only
+    if kept + 2 <= slots - 2; else the claim goes back unless it is held anyway, and the frame is retried
+    at the next vsync. A claim of the slot submitted last is "nothing new". Otherwise, once its copies are
+    done (waitForNextFrame shut there, rootZcFrameDrained), the slot submitted before joins the retiring
+    list under the new transaction's number, and the transaction is applied. Completions are matched by
+    that number (rootZcOnComplete). rootZcStopPresenting hides the layer and retires the slot submitted
+    last under the hide transaction's number. Off the root layer, a frame samples the newest slot and
+    gives it back (the GL path).
 
-The compositor follows AOSP (frameworks/native, main): SurfaceFlinger.cpp transactionReadyBufferCheck,
-Layer.cpp setBuffer/releasePreviousBuffer/findCallbackHandle/updateTexImage.
+The compositor, from AOSP main (frameworks/native):
+  - a transaction is ready for the flush of a latch if applied MARGIN before it; the flush is the start
+    of SurfaceFlinger::commit, the latch inside it (latchBuffers);
+  - backpressure off: every ready transaction is applied; the last buffer is latched, the ones before it
+    released at once. Only the frame's first buffer callback gets a previous release fence - for the
+    buffer that was on screen (Layer.cpp releasePreviousBuffer, findCallbackHandle, updateTexImage);
+  - backpressure on (automatic timestamps): with a buffer already ready in this flush the next one stays
+    queued (SurfaceFlinger.cpp transactionReadyBufferCheck);
+  - a transaction without a buffer change gets no previous release fence (releasePreviousBuffer is reset
+    after every handle, Layer::setTransactionCompletedListeners);
+  - OnCommit (NDK: "applied and the updates are ready to be presented ... any new transactions applied
+    will not overwrite the transaction ... and instead will be included in the next frame"; no release or
+    present fence) is sent from commit, after latchBuffers: here the latch + commitAt (scenarios move it
+    to just before), reaching the client commitDelay later. It is "committed / overwrite-safe", not
+    latched, presented or released;
+  - OnComplete comes CALLBACK after the latch, with the previous release fence (or none); the latched
+    buffer goes on screen at the next vsync, the one it replaced is read until then and its release fence
+    signals then (+ the scenario's delay). A hidden layer is no longer scanned out from the next vsync.
 
-  A transaction is ready for a latch if it was applied MARGIN before it.
-  Backpressure off: every ready one is applied to the layer that frame; the last is latched, the ones
-    before it are dropped and their buffers released at once. Of the frame's callbacks only the first
-    carries a previous release fence - for the buffer that was on screen; the others carry none, the
-    buffer before each having been dropped. Only the latched one gets a latch time.
-  Backpressure on (and an automatic timestamp, as here): with a buffer already going to be presented
-    from this flush, the next transaction stays queued - one buffer per latch, in order.
-  Each latched buffer goes on screen at the next vsync; the one it replaced is released then
-  (+ the release-fence delay). Callbacks for a frame come CALLBACK after its latch.
-
-What is checked, all the time: the held bits are exactly the renderer's claim, its last submitted
-slot and its retiring slots (no leak, nothing unprotected); the renderer never gives back a slot the
-compositor still has; the X server never draws into or moves on to such a slot.
+Checked all the time: the held bits of the current pool are exactly the claim, the slot submitted last
+and the retiring slots; no slot goes back to the X server while the compositor still reads or holds it;
+the X server never draws into or moves on to such a slot.
 """
 import argparse, heapq, sys
 
-P = 16667          # 60 Hz
-TICK = 300         # the X server takes the vsync up this long after it
-WAKE = 200         # and the renderer a publish
-LATCH = 10860      # the compositor latches this long after the vsync (829b4ec trace, p50)
-CALLBACK = 2240    # the completion callback comes this long after the latch (same trace, p50)
-COMMIT = 500       # an OnCommit callback (API 31): sent when the transaction is latched
-MARGIN = 300       # applied at least this long before a latch to make it (trace replay)
-WORK = 2500        # an ordinary frame: claim -> apply
-SLOW = 13000       # a frame applied after the latch but before the next tick (what superseding needs)
-SLOWER = 18000     # one applied after the next tick as well
+class Timing:
+    def __init__(self, hz):
+        self.hz = hz
+        self.P = int(round(1e6 / hz))
+        self.TICK, self.WAKE = 300, 200
+        self.LATCH = int(self.P * 0.6516)      # 10.86 ms at 60 Hz (829b4ec trace p50); the same phase at 120
+        self.CALLBACK = 2240                   # OnComplete after the latch (trace p50)
+        self.MARGIN = 300                      # applied this long before a latch to make it (trace replay)
+        self.WORK = 2500                       # claim -> copies done, an ordinary frame
+        self.SLOW = self.LATCH + (self.P - self.LATCH) // 2   # done after the latch, before the next tick
+        self.SLOWER = self.P + 1500            # done after the next tick as well
+
+COMMIT_AT = 0          # internal OnCommit, relative to the latch
+COMMIT_DELAY = 500     # and on to the client
+
+class Policy:
+    def __init__(self, name, slots, bp, pace=None, depth=None):
+        self.name, self.slots, self.bp, self.pace, self.depth = name, slots, bp, pace, depth
+        self.lateRoom = name == "C-late"
+
+POLICIES = {
+    "A": Policy("A", 5, False),
+    "B": Policy("B", 5, True),
+    "C-apply": Policy("C-apply", 5, False, pace="apply"),
+    "C-late": Policy("C-late", 5, False, pace="apply"),
+    "C-claim": Policy("C-claim", 5, False, pace="claim"),
+    "D": Policy("D", 6, True, depth=1),
+    "D-wait": Policy("D-wait", 6, True, pace="depth", depth=1),
+    "D-nocap": Policy("D-nocap", 6, True),
+    "E": Policy("E", 6, False, pace="apply"),
+}
 
 class Scenario:
-    def __init__(self, name, ticks=240, work=None, cbLate=None, relLate=None, content=None, extra=None, sfSkip=None,
-                 commitLate=None):
+    def __init__(self, name, ticks=240, **kw):
         self.name, self.ticks = name, ticks
-        self.work = work or (lambda k: WORK)            # claim -> apply for the frame published at tick k
-        self.cbLate = cbLate or (lambda k: 0)           # extra callback delay for a latch in vsync k
-        self.relLate = relLate or (lambda k: 0)         # extra release-fence delay for a switch at vsync k
-        self.content = content or (lambda k: True)      # whether the client has a new frame at tick k
-        self.extra = extra or (lambda k: False)         # a second publish and gate opening mid-vsync
-        self.sfSkip = sfSkip or (lambda k: False)       # the compositor latches nothing this vsync
-        self.commitLate = commitLate or (lambda k: 0)   # extra OnCommit delay for a latch in vsync k
+        none = lambda k: 0
+        self.work = kw.get("work")                       # (timing, k) -> claim -> copies done
+        self.cbLate = kw.get("cbLate", none)             # extra OnComplete delay, latch in vsync k
+        self.relLate = kw.get("relLate", none)           # extra release delay, switch at vsync k
+        self.commitAt = kw.get("commitAt", lambda k: COMMIT_AT)
+        self.commitDelay = kw.get("commitDelay", lambda k: COMMIT_DELAY)
+        self.content = kw.get("content", lambda k: True)
+        self.extra = kw.get("extra", lambda k: False)    # a second publish and gate opening mid-vsync
+        self.sfSkip = kw.get("sfSkip", lambda k: False)
+        self.stopAt = kw.get("stopAt")                   # leave the root layer (rootZcStopPresenting)
+        self.resumeAt = kw.get("resumeAt")               # come back to it
+        self.resizeAt = kw.get("resizeAt")               # the X server replaces the pool
+        self.teardownAt = kw.get("teardownAt")           # the surface goes: hide, reparent, a new SurfaceControl
+        self.oldCallbacks = kw.get("oldCallbacks", "arrive")   # for the old layer's transactions: arrive / never
+        self.midPoll = kw.get("midPoll", lambda k: False)      # a renderer frame (cursor, GL) between a
+                                                               # completion and the next vsync
 
-def deep(k):
-    """one slow frame at tick 90 first: with backpressure on, the pipeline is a frame deeper from there"""
-    return SLOW if k == 90 else WORK
+def scenarios(T):
+    P = T.P
+    deep = lambda T_, k: T_.SLOW if k == 90 else T_.WORK
+    every10 = lambda T_, k: T_.SLOW if k % 10 == 5 else T_.WORK
+    spread = lambda k, lo, hi: lo + (k * 7919) % (hi - lo + 1)
+    late = lambda k: P if 100 <= k < 160 else 0
+    return [
+        Scenario("steady"),
+        Scenario("one slow frame", work=lambda T_, k: T_.SLOW if k == 100 else T_.WORK),
+        Scenario("five slow frames in a row", work=lambda T_, k: T_.SLOW if 100 <= k < 105 else T_.WORK),
+        Scenario("one frame slower than a whole period", work=lambda T_, k: T_.SLOWER if k == 100 else T_.WORK),
+        Scenario("a slow frame every 10 ticks", work=every10),
+        Scenario("OnComplete a frame late", work=deep, cbLate=late),
+        Scenario("release fences a frame late", work=deep, relLate=late),
+        Scenario("OnComplete and release fences a frame late", work=deep, cbLate=late, relLate=late),
+        Scenario("release fences 0-2 ms after the vsync", work=deep, relLate=lambda k: spread(k, 0, 2000)),
+        Scenario("release fence after the claim in 6% of frames", work=deep,
+                 relLate=lambda k: 1500 if (k * 7919) % 100 < 6 else 0),
+        Scenario("slow frames every 10 ticks, release fences 0-2 ms late", work=every10,
+                 relLate=lambda k: spread(k, 0, 2000)),
+        Scenario("client faster than the display", extra=lambda k: 100 <= k < 130),
+        Scenario("compositor skips a latch every 20 vsyncs", sfSkip=lambda k: k % 20 == 7),
+        Scenario("client stops after one queued frame, then resumes",
+                 work=lambda T_, k: T_.SLOW if k == 119 else T_.WORK, content=lambda k: not 120 <= k < 180),
+        Scenario("OnCommit internally just before the latch", work=every10, commitAt=lambda k: -T.MARGIN),
+        Scenario("OnCommit 3 ms late to the client", work=every10, commitDelay=lambda k: 3000),
+        Scenario("OnCommit a frame late, ticks 100-159", work=deep,
+                 commitDelay=lambda k: P if 100 <= k < 160 else COMMIT_DELAY),
+        Scenario("OnCommit 0.2-6 ms late, slow frames every 10 ticks", work=every10,
+                 commitDelay=lambda k: spread(k, 200, 6000)),
+    ]
 
-def spread(k, lo, hi):
-    return lo + (k * 7919) % (hi - lo + 1)
-
-SCENARIOS = [
-    Scenario("steady 60Hz"),
-    Scenario("one slow frame", work=lambda k: SLOW if k == 100 else WORK),
-    Scenario("five slow frames in a row", work=lambda k: SLOW if 100 <= k < 105 else WORK),
-    Scenario("one frame slower than a whole period", work=lambda k: SLOWER if k == 100 else WORK),
-    Scenario("a slow frame every 10 ticks", work=lambda k: SLOW if k % 10 == 5 else WORK),
-    Scenario("callbacks a frame late", work=deep, cbLate=lambda k: P if 100 <= k < 160 else 0),
-    Scenario("release fences a frame late", work=deep, relLate=lambda k: P if 100 <= k < 160 else 0),
-    Scenario("callbacks and release fences a frame late", work=deep,
-             cbLate=lambda k: P if 100 <= k < 160 else 0, relLate=lambda k: P if 100 <= k < 160 else 0),
-    Scenario("release fences 0-2 ms after the vsync", work=deep, relLate=lambda k: spread(k, 0, 2000)),
-    Scenario("release fence after the claim in 6% of frames", work=deep,
-             relLate=lambda k: 1500 if (k * 7919) % 100 < 6 else 0),
-    Scenario("slow frames every 10 ticks, release fences 0-2 ms late",
-             work=lambda k: SLOW if k % 10 == 5 else WORK, relLate=lambda k: spread(k, 0, 2000)),
-    Scenario("client faster than the display", extra=lambda k: 100 <= k < 130),
-    Scenario("compositor skips a latch every 20 vsyncs", sfSkip=lambda k: k % 20 == 7 and k < 240),
-    Scenario("commit and complete callbacks a frame late", work=deep,
-             cbLate=lambda k: P if 100 <= k < 160 else 0, commitLate=lambda k: P if 100 <= k < 160 else 0),
-    Scenario("client stops after one queued frame, then resumes",
-             work=lambda k: SLOW if k == 119 else WORK, content=lambda k: not 120 <= k < 180),
-]
+def lifecycle(T):
+    deep = lambda T_, k: T_.SLOW if k == 90 else T_.WORK
+    return [
+        Scenario("stop presenting, then resume", work=deep, stopAt=100, resumeAt=130),
+        Scenario("stop presenting, a renderer frame between the hide's callback and the vsync", work=deep,
+                 stopAt=100, resumeAt=130, midPoll=lambda k: 100 <= k < 104),
+        Scenario("pool replaced (resize) with callbacks in flight", work=deep, resizeAt=100,
+                 cbLate=lambda k: T.P if 95 <= k < 105 else 0),
+        Scenario("surface torn down with a transaction queued; old callbacks arrive late", work=deep,
+                 teardownAt=100, resumeAt=104, cbLate=lambda k: 2 * T.P if 95 <= k < 105 else 0,
+                 commitDelay=lambda k: 2 * T.P if 95 <= k < 105 else COMMIT_DELAY),
+        Scenario("surface torn down; old callbacks never arrive, then the pool is replaced", work=deep,
+                 teardownAt=100, resumeAt=104, oldCallbacks="never", resizeAt=110),
+    ]
 
 class Violation(Exception):
     pass
 
+SF_STATE = {"queued": "has it queued", "latched": "has it latched", "on screen": "shows it",
+            "being released": "still reads it", "hidden": "still scans it out"}
+
 class Sim:
-    def __init__(self, slots, backpressure, sc, bugs=(), cap=None):
-        self.n, self.maxHeld, self.bp, self.sc, self.bugs = slots, slots - 2, backpressure, sc, set(bugs)
-        # a depth cap: no frame while two submitted transactions are not known to be latched yet, known
-        # from OnCommit ("commit") or from OnComplete ("complete")
-        self.cap = cap
-        self.knownLatched = set()
-        self.held = set()
-        self.displayed = None           # rootZcDisplayedSlot: the slot submitted last
-        self.retiring = []              # [seq, slot, arrived, fenceAt]
+    def __init__(self, T, pol, sc, bugs=(), fixHide=False):
+        self.T, self.pol, self.sc, self.bugs, self.fixHide = T, pol, sc, set(bugs), fixHide
+        self.n, self.maxHeld = pol.slots, pol.slots - 2
+        self.gen = 0
+        self.held = set()                 # held bits of the current pool
+        self.displayed = None             # rootZcDisplayedSlot: (gen, idx) submitted last
+        self.retiring = []                # dict(seq, slot, arrived, fenceAt)
         self.claimed = None
-        self.claimWord = 0
-        self.drawn, self.newest, self.pubCount = 0, None, 0
-        self.pending = False            # content the X server has not published yet
-        self.drawRequested = self.retry = False
-        self.gateOpen = False
-        self.busy = False
+        self.claimNewest = None           # (gen, newest) at the claim
+        self.drawn, self.newest = 0, None
+        self.pending = self.drawRequested = self.retry = False
+        self.gateOpen = self.busy = self.waitingCommit = False
+        self.zc = True
+        self.epoch = 0                    # SurfaceControl
         self.seq = 0
-        self.sfQueue = []               # applied, not taken by a latch yet
-        self.onScreen = None            # the tx on screen
-        self.sfHas = {}                 # slot -> what the compositor is doing with it
+        self.submitted, self.committed = {}, {}           # per SurfaceControl
+        self.sfQueue = []
+        self.onScreen = {}
+        self.sfHas = {}                   # (gen, idx) -> what the compositor does with it
         self.ev, self.order = [], 0
-        self.publishTick = {}           # slot -> tick its content was published at
+        self.publishTick = {}
         self.txs = []
-        # results
         self.presented, self.dropped, self.publishStalls, self.frameStalls = [], 0, 0, 0
-        self.heldMax = self.heldWithClaimMax = self.queuedMax = 0
-        self.xAvailMin = slots
-        self.publishedAt = []
+        self.heldMax = self.queuedMax = self.uncommittedMax = 0
+        self.xAvailMin = self.n
+        self.publishedAt, self.contentTicks = [], []
         self.sfSkips = self.extraPubs = self.overruns = 0
-        self.contentTicks = []
+        self.shownVsyncs = []
 
     def at(self, t, kind, *data):
         self.order += 1
@@ -134,23 +201,31 @@ class Sim:
     def fail(self, t, what):
         raise Violation("%.1f ms: %s" % (t / 1000.0, what))
 
+    def cur(self, s):
+        return s is not None and s[0] == self.gen
+
     def check(self, t):
-        owned = {s for s in [self.claimed, self.displayed] + [e[1] for e in self.retiring] if s is not None}
+        owned = {s[1] for s in [self.claimed, self.displayed] + [e["slot"] for e in self.retiring] if self.cur(s)}
         if self.held != owned:
-            self.fail(t, "held bits %s, renderer accounts for %s" % (sorted(self.held), sorted(owned)))
-        if self.drawn in self.held or self.drawn in self.sfHas:
+            self.fail(t, "held bits %s, the renderer accounts for %s" % (sorted(self.held), sorted(owned)))
+        d = (self.gen, self.drawn)
+        if self.drawn in self.held or d in self.sfHas:
             self.fail(t, "the X server draws into slot %d, which is %s" % (
-                self.drawn, "held" if self.drawn in self.held else self.sfHas[self.drawn]))
-        n = len({s for s in [self.displayed] + [e[1] for e in self.retiring] if s is not None})
+                self.drawn, "held" if self.drawn in self.held else self.sfHas[d]))
+        n = len({s for s in [self.displayed] + [e["slot"] for e in self.retiring] if self.cur(s)})
         self.heldMax = max(self.heldMax, n)
-        self.heldWithClaimMax = max(self.heldWithClaimMax, len(self.held))
         if n > self.maxHeld:
-            self.fail(t, "renderer holds %d after a submit, over %d" % (n, self.maxHeld))
+            self.fail(t, "the renderer holds %d after a submit, over %d" % (n, self.maxHeld))
 
     # ---- X server
     def tick(self, t, k):
-        self.gateOpen = True                              # loriePerformVblanks; waitForNextFrame = false
-        if self.sc.content(k):
+        self.gateOpen = True
+        if self.sc.resizeAt == k:
+            self.gen += 1                                 # a new pool: new buffers, every held bit cleared
+            self.held = set()
+            self.newest = None
+            self.drawn = 0
+        if self.sc.content(k) or self.sc.resizeAt == k:
             self.pending = True
             self.contentTicks.append(k)
         if self.pending:
@@ -158,108 +233,189 @@ class Sim:
         self.wake(t)
 
     def publish(self, t, k):
-        free = [i for i in range(self.n) if i not in self.held]
-        self.xAvailMin = min(self.xAvailMin, len(free))
-        nxt = None
-        for i in range(self.n):
-            if i != self.drawn and (i not in self.held or "x-ignores-held" in self.bugs):
-                nxt = i
-                break
+        self.xAvailMin = min(self.xAvailMin, sum(1 for i in range(self.n) if i not in self.held))
+        nxt = next((i for i in range(self.n) if i != self.drawn and
+                    (i not in self.held or "x-ignores-held" in self.bugs)), None)
         if nxt is None:
             self.publishStalls += 1
             return
-        if nxt in self.sfHas:
-            self.fail(t, "the X server moves on to slot %d, which the compositor has (%s)" % (nxt, self.sfHas[nxt]))
+        if (self.gen, nxt) in self.sfHas:
+            self.fail(t, "the X server moves on to slot %d, which the compositor %s" % (nxt, SF_STATE[self.sfHas[(self.gen, nxt)]]))
         self.newest = self.drawn
-        self.publishTick[self.drawn] = k
-        self.pubCount += 1
+        self.publishTick[(self.gen, self.drawn)] = k
         self.publishedAt.append(k)
         self.drawn = nxt
         self.pending = False
         self.drawRequested = True
 
     # ---- renderer
+    def uncommitted(self):
+        return self.submitted.get(self.epoch, 0) - self.committed.get(self.epoch, 0)
+
     def wake(self, t):
-        if not self.busy and self.gateOpen and (self.drawRequested or self.retry) and self.newest is not None:
-            self.busy = True
-            self.at(t + WAKE, "frame")
+        if self.busy or not self.gateOpen or not (self.drawRequested or self.retry) or self.newest is None:
+            return
+        if self.zc and ((self.pol.pace == "claim" and self.uncommitted() > 0) or
+                        (self.pol.pace == "depth" and self.uncommitted() > self.pol.depth)):
+            self.waitingCommit = True                     # started when the OnCommit comes
+            return
+        self.busy = True
+        self.at(t + self.T.WAKE, "frame")
 
     def drainRetiring(self, t):
         kept = []
         for e in self.retiring:
-            seq, slot, arrived, fenceAt = e
-            done = arrived and (fenceAt is None or fenceAt <= t or "no-fence-wait" in self.bugs)
+            if not self.cur(e["slot"]):
+                continue                                  # an older pool: its held bit went with it
+            done = e["arrived"] and (e["fenceAt"] is None or e["fenceAt"] <= t or "no-fence-wait" in self.bugs)
             if done:
-                if slot in self.sfHas:
-                    self.fail(t, "slot %d given back while the compositor has it (%s)" % (slot, self.sfHas[slot]))
-                self.held.discard(slot)
+                if e["slot"] in self.sfHas:
+                    self.fail(t, "slot %d given back while the compositor %s" % (e["slot"][1], SF_STATE[self.sfHas[e["slot"]]]))
+                self.held.discard(e["slot"][1])
             else:
                 kept.append(e)
         self.retiring = kept
-        need = 1 if "room-plus-one" in self.bugs else 2
-        return len(kept) + need <= self.maxHeld
+        return len(kept) + (1 if "room-plus-one" in self.bugs else 2) <= self.maxHeld
 
     def frame(self, t):
         self.drawRequested = False
-        self.claimed = self.newest
-        self.held.add(self.claimed)
-        self.claimWord = self.pubCount
+        self.claimed = (self.gen, self.newest)
+        self.claimNewest = (self.gen, self.newest)
+        self.held.add(self.newest)
         self.check(t)
-        unlatched = sum(1 for tx in self.txs if tx["seq"] not in self.knownLatched)
-        capped = self.cap is not None and unlatched >= 2
-        if capped or not self.drainRetiring(t):
+        if not self.zc:                                   # the GL path samples the slot and gives it back
+            self.drainRetiring(t)
+            self.held.discard(self.claimed[1])
+            self.claimed = None
+            self.busy = False
+            self.gateOpen = False
+            self.check(t)
+            return
+        capped = self.pol.depth is not None and self.pol.pace != "depth" and self.uncommitted() > self.pol.depth
+        room = self.drainRetiring(t)
+        if capped or (not room and not self.pol.lateRoom):
             self.frameStalls += 1
-            mine = self.claimed == self.displayed or any(e[1] == self.claimed for e in self.retiring)
+            mine = self.claimed == self.displayed or any(e["slot"] == self.claimed for e in self.retiring)
             if not mine:
-                self.held.discard(self.claimed)
+                self.held.discard(self.claimed[1])
             self.claimed = None
             self.retry = True
             self.gateOpen = False
             self.busy = False
             self.check(t)
             return
-        if self.claimed == self.displayed:                # already submitted: nothing new
+        if self.claimed == self.displayed:
             self.claimed = None
             self.retry = False
             self.busy = False
-            if self.pubCount != self.claimWord:
+            if self.publishedSinceClaim():
                 self.drawRequested = True
             self.check(t)
             self.wake(t)
             return
         if self.claimed in self.sfHas:
-            self.fail(t, "the frame copies into slot %d, which the compositor has" % self.claimed)
-        work = self.sc.work(self.publishTick[self.claimed])
-        if work > P - WAKE:
-            self.overruns += 1                            # busy through the next tick: its content is lost anyway
-        self.at(t + work, "apply")
+            self.fail(t, "the frame copies into slot %d, which the compositor %s" % (self.claimed[1], SF_STATE[self.sfHas[self.claimed]]))
+        work = self.sc.work(self.T, self.publishTick[self.claimed]) if self.sc.work else self.T.WORK
+        if work > self.T.P - self.T.WAKE:
+            self.overruns += 1
+        self.at(t + work, "drained")
+
+    def publishedSinceClaim(self):
+        # by the newest slot and the pool, not by a wrapping counter (the 6-slot counter analysis)
+        return (self.gen, self.newest) != self.claimNewest
+
+    def drained(self, t):
+        self.gateOpen = False                             # rootZcFrameDrained: waitForNextFrame
+        if self.pol.pace == "apply" and self.uncommitted() > 0:
+            self.waitingCommit = True
+            return
+        self.apply(t)
+
+    def stall(self, t):
+        self.frameStalls += 1
+        mine = self.claimed == self.displayed or any(e["slot"] == self.claimed for e in self.retiring)
+        if not mine:
+            self.held.discard(self.claimed[1])
+        self.claimed = None
+        self.retry = True
+        self.busy = False
+        self.check(t)
 
     def apply(self, t):
+        self.waitingCommit = False
+        if self.claimed is not None and self.cur(self.claimed) and not self.zc:
+            # left the root layer while this frame ran: nothing is submitted, the claim goes back
+            if self.claimed != self.displayed and all(e["slot"] != self.claimed for e in self.retiring):
+                self.held.discard(self.claimed[1])
+            self.claimed = None
+            self.busy = False
+            self.check(t)
+            return
+        if self.pol.lateRoom and self.claimed is not None and self.cur(self.claimed) and not self.drainRetiring(t):
+            self.stall(t)
+            return
+        if self.claimed is None or not self.cur(self.claimed):
+            self.claimed = None                           # the pool went while the frame ran
+            self.busy = False
+            self.retry = True
+            self.check(t)
+            return
         self.seq += 1
         if self.displayed is not None:
-            self.retiring.append([self.seq, self.displayed, False, None])
+            self.retiring.append(dict(seq=self.seq, slot=self.displayed, arrived=False, fenceAt=None))
         self.displayed = self.claimed
         self.claimed = None
-        tx = {"seq": self.seq, "slot": self.displayed, "applied": t, "pub": self.publishTick[self.displayed]}
+        tx = dict(seq=self.seq, slot=self.displayed, applied=t, pub=self.publishTick[self.displayed],
+                  epoch=self.epoch, buffer=True)
         self.txs.append(tx)
         self.sfQueue.append(tx)
         self.sfHas[tx["slot"]] = "queued"
-        self.queuedMax = max(self.queuedMax, len(self.sfQueue))
-        self.retry = self.pubCount != self.claimWord
-        self.gateOpen = False
+        self.submitted[self.epoch] = self.seq
+        self.queuedMax = max(self.queuedMax, sum(1 for x in self.sfQueue if x["buffer"] and x["epoch"] == self.epoch))
+        self.uncommittedMax = max(self.uncommittedMax, self.uncommitted())
+        self.retry = self.publishedSinceClaim()
         self.busy = False
         self.check(t)
         self.wake(t)
 
-    def known(self, t, seq):
-        self.knownLatched.add(seq)
+    def stopPresenting(self, t):
+        self.zc = False
+        self.seq += 1
+        if self.displayed is not None:
+            self.retiring.append(dict(seq=self.seq, slot=self.displayed, arrived=False, fenceAt=None))
+            self.displayed = None
+        self.sfQueue.append(dict(seq=self.seq, slot=None, applied=t, epoch=self.epoch, buffer=False, hide=True))
+        self.submitted[self.epoch] = self.seq
+        if not self.busy:
+            self.drainRetiring(t)
 
-    def complete(self, t, seq, fenceAt):
-        if self.cap == "complete":
-            self.knownLatched.add(seq)
+    def teardown(self, t):
+        self.stopPresenting(t)
+        self.epoch += 1                                   # reparented and released; a new SurfaceControl next
+        if "seq-restart" in self.bugs:
+            self.seq = 0                                  # numbering per SurfaceControl
+        # pacing starts again on the new SurfaceControl: nothing of it is uncommitted yet
+        self.submitted[self.epoch] = self.committed[self.epoch] = self.seq
+
+    # ---- callbacks
+    def commitcb(self, t, epoch, seq):
+        if "seq-restart" in self.bugs:
+            epoch = self.epoch                            # and OnCommit not told apart by SurfaceControl
+        self.committed[epoch] = max(self.committed.get(epoch, 0), seq)
+        limit = self.pol.depth if self.pol.pace == "depth" else 0
+        if self.waitingCommit and self.uncommitted() <= limit:
+            if self.busy:
+                self.at(t + 100, "apply")
+            else:
+                self.waitingCommit = False
+                self.wake(t)
+
+    def complete(self, t, seq, fenceAt, slot):
         for e in self.retiring:
-            if e[0] == seq and not e[2]:
-                e[2], e[3] = True, fenceAt
+            if e["arrived"]:
+                continue
+            if e["seq"] == seq or ("match-by-index" in self.bugs and slot is not None and e["slot"][1] == slot[1]):
+                e["arrived"], e["fenceAt"] = True, fenceAt
                 return
 
     # ---- compositor
@@ -267,77 +423,119 @@ class Sim:
         if self.sc.sfSkip(k):
             self.sfSkips += 1
             return
-        ready = [tx for tx in self.sfQueue if tx["applied"] <= t - MARGIN]
+        T = self.T
+        ready = [tx for tx in self.sfQueue if tx["applied"] <= t - T.MARGIN]
         if not ready:
             return
-        flush = ready[:1] if self.bp else ready
+        if self.pol.bp:
+            flush, seen = [], set()
+            for tx in self.sfQueue:
+                if tx not in ready or (tx["buffer"] and tx["epoch"] in seen):
+                    break
+                flush.append(tx)
+                if tx["buffer"]:
+                    seen.add(tx["epoch"])
+        else:
+            flush = ready
         for tx in flush:
             self.sfQueue.remove(tx)
-        latched, dropped = flush[-1], flush[:-1]
-        switch = (k + 1) * P
+        switch = (k + 1) * T.P
         release = switch + self.sc.relLate(k + 1)
-        cb = t + CALLBACK + self.sc.cbLate(k)
-        for i, tx in enumerate(flush):
-            # only the first callback of the frame says when the buffer on screen is released
-            first = len(flush) - 1 if "fence-to-last" in self.bugs else 0
-            fence = (release if self.onScreen is not None else None) if i == first else None
-            self.at(cb, "complete", tx["seq"], fence)
-            if self.cap == "commit":
-                self.at(t + COMMIT + self.sc.commitLate(k), "known", tx["seq"])
-        for tx in dropped:
-            del self.sfHas[tx["slot"]]
-            self.dropped += 1
-        self.sfHas[latched["slot"]] = "latched"
-        self.at(switch, "switch", latched, release)
+        byEpoch = {}
+        for tx in flush:
+            byEpoch.setdefault(tx["epoch"], []).append(tx)
+        for epoch, txs in byEpoch.items():
+            silent = epoch != self.epoch and self.sc.oldCallbacks == "never"
+            bufs = [tx for tx in txs if tx["buffer"]]
+            latched = bufs[-1] if bufs else None
+            shown = self.onScreen.get(epoch)
+            for tx in txs:
+                if silent:
+                    continue
+                first = tx is (latched if "fence-to-last" in self.bugs else (bufs[0] if bufs else None))
+                if tx["buffer"]:
+                    fence = (release if shown is not None else None) if first else None
+                elif self.fixHide:
+                    fence = switch                        # the present fence of the frame that hides it
+                else:
+                    fence = None                          # no buffer change: no previous release fence
+                retired = next((e["slot"] for e in self.retiring if e["seq"] == tx["seq"]), None)
+                self.at(t + T.CALLBACK + self.sc.cbLate(k), "complete", tx["seq"], fence, retired)
+                self.at(t + self.sc.commitAt(k) + self.sc.commitDelay(k), "commitcb", epoch, tx["seq"])
+            for tx in bufs[:-1]:
+                del self.sfHas[tx["slot"]]
+                self.dropped += 1
+            if latched is not None:
+                self.sfHas[latched["slot"]] = "latched"
+                self.at(switch, "switch", epoch, latched, release)
+            if any(tx.get("hide") for tx in txs):
+                self.at(switch, "hidden", epoch)
 
-    def switch(self, t, tx, release):
-        old = self.onScreen
-        self.onScreen = tx
+    def switch(self, t, epoch, tx, release):
+        old = self.onScreen.get(epoch)
+        self.onScreen[epoch] = tx
         self.sfHas[tx["slot"]] = "on screen"
-        self.presented.append((tx["seq"], t // P - tx["pub"]))
+        self.presented.append((tx["seq"], t // self.T.P - tx["pub"], epoch))
+        self.shownVsyncs.append(t // self.T.P)
         if old is not None:
             self.sfHas[old["slot"]] = "being released"
-            self.at(release, "released", old["slot"], old["seq"])
+            self.at(release, "released", old["slot"])
 
-    def released(self, t, slot, seq):
+    def hidden(self, t, epoch):
+        tx = self.onScreen.pop(epoch, None)
+        if tx is not None and self.sfHas.get(tx["slot"]) == "on screen":
+            del self.sfHas[tx["slot"]]                    # no longer scanned out from this vsync
+
+    def released(self, t, slot):
         if self.sfHas.get(slot) == "being released":
             del self.sfHas[slot]
 
     def run(self):
-        end = self.sc.ticks + 30                          # then 30 ticks of new content to settle
-        for k in range(end + 10):                         # the compositor carries on after the last tick
-            v = k * P
+        T, sc = self.T, self.sc
+        end = sc.ticks + 30
+        for k in range(end + 10):
+            v = k * T.P
             if k < end:
-                self.at(v + TICK, "tick", k)
-            self.at(v + LATCH, "latch", k)
-            if k < self.sc.ticks and self.sc.extra(k):
-                self.at(v + 8000, "extra", k)
-        content = self.sc.content
-        self.sc.content = lambda k: True if k >= self.sc.ticks else content(k)
+                self.at(v + T.TICK - 1, "events", k)
+                self.at(v + T.TICK, "tick", k)
+                if sc.extra(k):
+                    self.at(v + T.P // 2, "extra", k)
+                if sc.midPoll(k):
+                    # half way between a completion for this vsync's latch and the next vsync
+                    self.at(v + (T.LATCH + T.CALLBACK + T.P) // 2, "poll", k)
+            self.at(v + T.LATCH, "latch", k)
         while self.ev:
             t, _, kind, data = heapq.heappop(self.ev)
-            if kind == "tick": self.tick(t, *data)
+            if kind == "events":
+                k = data[0]
+                if sc.stopAt == k: self.stopPresenting(t)
+                if sc.teardownAt == k: self.teardown(t)
+                if sc.resumeAt == k: self.zc = True
+            elif kind == "tick": self.tick(t, *data)
             elif kind == "extra":
                 self.extraPubs += 1
                 self.pending = True
                 self.publish(t, data[0])
-                self.gateOpen = True                      # a second redraw, or a retry, in the same vsync
+                self.gateOpen = True
                 self.wake(t)
+            elif kind == "poll":
+                if not self.busy:
+                    self.drainRetiring(t)
             elif kind == "frame": self.frame(t)
+            elif kind == "drained": self.drained(t)
             elif kind == "apply": self.apply(t)
             elif kind == "latch": self.latch(t, *data)
             elif kind == "complete": self.complete(t, *data)
-            elif kind == "known": self.known(t, *data)
+            elif kind == "commitcb": self.commitcb(t, *data)
             elif kind == "switch": self.switch(t, *data)
+            elif kind == "hidden": self.hidden(t, *data)
             elif kind == "released": self.released(t, *data)
             self.check(t)
         return self.result()
 
     def result(self):
-        seqs = [s for s, _ in self.presented]
-        inOrder = seqs == sorted(seqs)
-        lat = sorted(l for _, l in self.presented)
-        # half rate: 8 ticks in a row with new content but no more than 4 publishes among them
+        seqs = [s for s, _, e in self.presented if e == self.epoch]
+        lat = sorted(l for _, l, e in self.presented)
         pubs, content, episodes, run = set(self.publishedAt), set(self.contentTicks), 0, False
         for k in range(self.sc.ticks + 30 - 8):
             window = range(k, k + 8)
@@ -345,87 +543,116 @@ class Sim:
             if half and not run:
                 episodes += 1
             run = half
-        lost = [tx["seq"] for tx in self.txs if tx["seq"] not in set(seqs)]
+        shownAt = {}
+        for s_, l, e in self.presented:
+            pass
+        stopped = set()
+        if self.sc.stopAt is not None:
+            stopped |= set(range(self.sc.stopAt, self.sc.resumeAt or self.sc.stopAt))
+        if self.sc.teardownAt is not None:
+            stopped |= set(range(self.sc.teardownAt, self.sc.resumeAt or self.sc.teardownAt))
+        offRoot = stopped | {k + i for k in stopped for i in range(1, 4)}   # shown through GL, not modelled
+        shownVsyncs = set(self.shownVsyncs)
+        presentedHalf, run = 0, False
+        for k in range(10, self.sc.ticks + 30 - 8):
+            window = range(k, k + 8)
+            half = not any(i in offRoot for i in window) and all(i - 1 in content for i in window) \
+                and sum(i in shownVsyncs for i in window) <= 4
+            if half and not run:
+                presentedHalf += 1
+            run = half
         submitted = {tx["pub"] for tx in self.txs}
-        skipped = sum(1 for k in set(self.publishedAt) if k not in submitted)
+        skipped = sum(1 for k in set(self.publishedAt) if k not in submitted and k not in stopped)
+        live = [tx for tx in self.txs if tx["epoch"] == self.epoch]
+        lost = [tx["seq"] for tx in live if tx["seq"] not in set(seqs)]
         return dict(presented=len(self.presented), dropped=self.dropped, publishStalls=self.publishStalls,
-                    frameStalls=self.frameStalls, heldMax=self.heldMax, heldWithClaimMax=self.heldWithClaimMax,
-                    queuedMax=self.queuedMax, xAvailMin=self.xAvailMin, inOrder=inOrder,
-                    latency=(lat[len(lat) // 2], lat[-1]) if lat else (None, None),
-                    halfRate=episodes, notPresented=len(lost), leftQueued=len(self.sfQueue), skipped=skipped,
-                    unavoidable=self.sfSkips + self.extraPubs + self.overruns)
+                    frameStalls=self.frameStalls, heldMax=self.heldMax, queuedMax=self.queuedMax,
+                    uncommittedMax=self.uncommittedMax, xAvailMin=self.xAvailMin,
+                    inOrder=seqs == sorted(seqs), latency=(lat[len(lat) // 2], lat[-1]) if lat else (None, None),
+                    halfRate=episodes + presentedHalf, notPresented=len(lost), skipped=skipped,
+                    unavoidable=self.sfSkips + self.extraPubs + self.overruns + (1 if self.sc.resizeAt is not None else 0),
+                    stuck=self.waitingCommit,
+                    leftHeld=len([e for e in self.retiring if self.cur(e["slot"])]))
 
-def verdict(r, bp):
-    """bp: the criteria for backpressure on. Off, superseding is what it does - reported, not failed."""
+def verdict(r, strict=True):
+    """strict: what a policy meant to stop dropping frames has to meet as well"""
     why = []
     if r["xAvailMin"] < 2: why.append("X server down to %d slot(s)" % r["xAvailMin"])
     if r["halfRate"]: why.append("%d half-rate episode(s)" % r["halfRate"])
-    if bp and r["dropped"]: why.append("%d dropped with backpressure on" % r["dropped"])
-    if bp and r["notPresented"]: why.append("%d never presented" % r["notPresented"])
-    lost = r["skipped"] + r["dropped"]
-    if bp and lost > r["unavoidable"]:
-        why.append("%d published frames lost, %d of them unavoidable" % (lost, r["unavoidable"]))
-    if bp and r["latency"][0] is not None and r["latency"][0] > 2:
-        why.append("latency grew to %d frames" % r["latency"][0])
     if not r["inOrder"]: why.append("presented out of order")
+    if r["stuck"]: why.append("waiting for an OnCommit that never comes")
+    if strict:
+        lost = r["skipped"] + r["dropped"]
+        if lost > r["unavoidable"]:
+            why.append("%d frames lost, %d unavoidable" % (lost, r["unavoidable"]))
+        if r["latency"][0] is not None and r["latency"][0] > 2:
+            why.append("latency grew to %d frames" % r["latency"][0])
     return why
+
+def runAll(T, pol, scs, bugs=(), fixHide=False, strict=True):
+    out = {}
+    for sc in scs:
+        try:
+            r = Sim(T, pol, sc, bugs, fixHide).run()
+            out[sc.name] = (None, r, verdict(r, strict))
+        except Violation as v:
+            out[sc.name] = (str(v), None, None)
+    return out
+
+DELAYS = (200, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000, 12000, 16700)
+
+def sweep(T, pol, bugs=()):
+    rows = []
+    for d in DELAYS:
+        a = Sim(T, pol, Scenario("one slow frame", work=lambda T_, k: T_.SLOW if k == 90 else T_.WORK,
+                                 commitDelay=lambda k, d=d: d), bugs).run()
+        b = Sim(T, pol, Scenario("slow every 10", work=lambda T_, k: T_.SLOW if k % 10 == 5 else T_.WORK,
+                                 commitDelay=lambda k, d=d: d), bugs).run()
+        rows.append((d, a, b, verdict(a) + verdict(b)))
+    return rows
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slots", type=int, nargs="*", default=[5, 6, 7])
+    ap.add_argument("--hz", type=int, nargs="*", default=[60, 120])
+    ap.add_argument("--policy", nargs="*", default=list(POLICIES))
     ap.add_argument("--scenario", nargs="*")
-    ap.add_argument("--bug", nargs="*", default=[], help="seed a rule change, to show the checks catch it")
-    ap.add_argument("--caps", action="store_true", help="also the depth caps")
+    ap.add_argument("--lifecycle", action="store_true")
+    ap.add_argument("--fix-hide", action="store_true", help="retire a hidden slot on the hide frame's present fence")
+    ap.add_argument("--delays", action="store_true", help="sweep the OnCommit delay for each policy")
+    ap.add_argument("--bug", nargs="*", default=[])
     args = ap.parse_args()
-    configs = [("A", 5, False, None)] + [(chr(ord("B") + i), n, True, None) for i, n in enumerate(args.slots)]
-    if args.caps:
-        configs += [("%s+cap(%s)" % (chr(ord("B") + i), c), n, True, c) for c in ("commit", "complete")
-                    for i, n in enumerate(args.slots) if n <= 6]
-    status = 0
-    summary = []
-    for name, slots, bp, cap in configs:
-        if name != "A" and slots not in args.slots:
+    for hz in args.hz:
+        T = Timing(hz)
+        if args.delays:
+            print("== %d Hz: OnCommit delay to the client, a slow frame at tick 90 / a slow frame every 10 ticks" % hz)
+            for name in args.policy:
+                cells = []
+                for d, a, b, why in sweep(T, POLICIES[name], args.bug):
+                    cells.append("%4.1f:%s" % (d / 1000.0, "ok" if not why else "lat%d lost%d half%d" % (
+                        max(a["latency"][0], b["latency"][0]), a["skipped"] + a["dropped"] + b["skipped"] + b["dropped"]
+                        - a["unavoidable"] - b["unavoidable"], a["halfRate"] + b["halfRate"])))
+                print("  %-8s %s" % (name, " | ".join(cells)))
             continue
-        print("== %s. %d slots, backpressure %s (LORIE_ZC_MAX_HELD %d)%s" % (
-            name, slots, "ON" if bp else "OFF", slots - 2, ", depth cap known from On%s" % cap.capitalize() if cap else ""))
-        agg = dict(presented=0, dropped=0, skipped=0, publishStalls=0, frameStalls=0, heldMax=0, heldWithClaimMax=0,
-                   queuedMax=0, xAvailMin=slots, latency=0, halfRate=0, fails=[], violations=0)
-        for sc in SCENARIOS:
-            if args.scenario and sc.name not in args.scenario:
-                continue
-            try:
-                r = Sim(slots, bp, sc, args.bug, cap).run()
-            except Violation as v:
-                print("  %-48s VIOLATION %s" % (sc.name, v))
-                agg["violations"] += 1
-                status = 1
-                continue
-            why = verdict(r, bp)
-            for key in ("presented", "dropped", "skipped", "publishStalls", "frameStalls", "halfRate"):
-                agg[key] += r[key]
-            for key in ("heldMax", "heldWithClaimMax", "queuedMax"):
-                agg[key] = max(agg[key], r[key])
-            agg["xAvailMin"] = min(agg["xAvailMin"], r["xAvailMin"])
-            agg["latency"] = max(agg["latency"], r["latency"][0] or 0)
-            if why:
-                agg["fails"].append(sc.name)
-            print("  %-48s %s presented %d dropped %d skipped %d publish-stalls %d frame-stalls %d held %d (+claim %d) "
-                  "SF-queued %d X-avail-min %d latency %s/%s half-rate %d%s" % (
-                      sc.name, "PASS" if not why else "FAIL", r["presented"], r["dropped"], r["skipped"], r["publishStalls"],
-                      r["frameStalls"], r["heldMax"], r["heldWithClaimMax"], r["queuedMax"], r["xAvailMin"],
-                      r["latency"][0], r["latency"][1], r["halfRate"], (" - " + "; ".join(why)) if why else ""))
-            if why and bp:
-                status = 1
-        summary.append((name, slots, bp, cap, agg))
-    print("== summary over all scenarios")
-    for name, slots, bp, cap, a in summary:
-        print("  %-16s %s  presented %d dropped %d skipped %d publish-stalls %d frame-stalls %d renderer-held max %d "
-              "(+claim %d) SF-queued max %d X-available min %d latency p50 up to %d half-rate %d violations %d%s" % (
-                  name, "PASS" if not a["fails"] and not a["violations"] else "FAIL", a["presented"], a["dropped"],
-                  a["skipped"], a["publishStalls"], a["frameStalls"], a["heldMax"], a["heldWithClaimMax"],
-                  a["queuedMax"], a["xAvailMin"], a["latency"], a["halfRate"], a["violations"],
-                  (" - fails: " + ", ".join(a["fails"])) if a["fails"] else ""))
-    return status
+        scs = lifecycle(T) if args.lifecycle else scenarios(T)
+        if args.scenario:
+            scs = [s for s in scs if s.name in args.scenario]
+        for name in args.policy:
+            pol = POLICIES[name]
+            print("== %d Hz, %s: %d slots, backpressure %s%s%s" % (hz, name, pol.slots, "ON" if pol.bp else "OFF",
+                  ", OnCommit-paced before %s" % ("txApply" if pol.pace == "apply" else "the claim") if pol.pace else "",
+                  ", uncommittedDepth <= %d" % pol.depth if pol.depth is not None else ""))
+            out = runAll(T, pol, scs, args.bug, args.fix_hide, strict=name != "A")
+            for sc in scs:
+                v, r, why = out[sc.name]
+                if v:
+                    print("  %-70s VIOLATION %s" % (sc.name, v))
+                    continue
+                print("  %-70s %s presented %d dropped %d skipped %d stalls %d/%d held %d SF-queued %d uncommitted %d "
+                      "X-min %d latency %s/%s half %d%s" % (
+                          sc.name, "PASS" if not why else "FAIL", r["presented"], r["dropped"], r["skipped"],
+                          r["publishStalls"], r["frameStalls"], r["heldMax"], r["queuedMax"], r["uncommittedMax"],
+                          r["xAvailMin"], r["latency"][0], r["latency"][1], r["halfRate"],
+                          (" - " + "; ".join(why)) if why else ""))
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
