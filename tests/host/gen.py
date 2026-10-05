@@ -80,6 +80,19 @@ recipes = {
               "static Bool lorieReadVsyncRecord")
         + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {")).replace(
             "#define LORIE_VSYNC_RECORDS 16", "#define LORIE_VSYNC_RECORDS 4"),
+    # the vsync clock with everything Present reads it through, and the tick lorieRedraw takes, cut out of it
+    "tvblank": lambda: span(I, "struct vblank {", "};")
+        + span(I, "#define LORIE_VSYNC_RECORDS 16", "static uint64_t lorieVsyncPeriodUs = 16667;")
+        + func(I, "static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {")
+        + func(I, "static uint32_t lorieAdvanceVsyncClock(void) {")
+        + func(I, "static uint64_t lorieUstForMsc(uint64_t msc) {")
+        + func(I, "static int loriePresentGetUstMsc(__unused RRCrtcPtr crtc, uint64_t *ust, uint64_t *msc) {")
+        + func(I, "static Bool loriePresentQueueVblank(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t msc) {")
+        + func(I, "static void loriePresentAbortVblank(__unused RRCrtcPtr crtc, uint64_t id, __unused uint64_t msc) {")
+        + func(I, "static void loriePerformVblanks(void) {")
+        + "static void lorieRedrawTick(void) {\n"
+        + span(I, "        uint32_t steps = lorieAdvanceVsyncClock();",
+               "            pvfb->state->waitForNextFrame = false;\n        }") + "}\n",
     "tstat": lambda: macro(H, "LORIE_STAT_MAX"),
     "root": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(H, "LORIE_ROOT_HELD_MASK") + macro(H, "LORIE_ROOT_NEWEST_SHIFT")
         + macro(H, "LORIE_ROOT_NEWEST_MASK") + macro(H, "LORIE_ROOT_COUNT_STEP") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")

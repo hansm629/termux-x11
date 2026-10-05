@@ -769,8 +769,9 @@ struct lorie_shared_server_state {
         volatile uint32_t rootUnpublishedMaxUs;
         volatile uint32_t rootUnpublishedNowMaxUs;
         volatile uint32_t xDispatchMaxUs; /* longest gap between two X server redraw ticks */
-        /* Vsync ticks the X server fell so far behind on that their records were overwritten before
-         * it read them. The ticks are still counted in msc; only their individual times are lost. */
+        /* Vsync ticks the X server ran no redraw of their own for - it was busy, or the redraw was never
+         * queued - and took up together with a later one. They are still counted in msc; their times
+         * are not used, the later tick's is. */
         volatile uint32_t vsyncRecordsLost;
         /* Longest gap between a frame's start, as the Choreographer reports it, and its callback
          * actually running here. 0 where the 64-bit frame time is not available. */

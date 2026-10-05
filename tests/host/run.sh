@@ -44,7 +44,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tframes.py" "$HERE/../../tools/trace/fr
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tpatch.py" "$HERE/../../app/src/main/cpp/xserver" \
     "$HERE/../../app/src/main/cpp/patches/xserver.patch" "$OUT" || status=1
 
-for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy tcarryq tpresentroom tpacing tsfstats t21 t29 tstat ttrace; do
+for t in t07 t10 t19 t27 t28 tsession t32 tlogcat tcpucopy tcarryq tpresentroom tpacing tsfstats t21 t29 tvblank tstat ttrace; do
     "$CC" -Wall -Wno-unused-function -O2 -pthread -I"$OUT" "$HERE/$t.c" -o "$OUT/$t"
     OUT="$OUT" "$OUT/$t" || status=1
 done

@@ -32,17 +32,18 @@ int main(void) {
     CHECK(total == 1, "one callback, ten redraws: msc moved %u, want 1", total);
     CHECK(lorieVsyncUs == 1000000, "ust %llu, want 1000000", (unsigned long long) lorieVsyncUs);
 
-    /* 2. three ticks recorded while the X server was busy: each keeps its own time, none in the future */
+    /* 2. three ticks recorded while the X server was busy: the next redraw takes all three, dated by the
+     * newest - whatever it does is done after that one. The redraws queued meanwhile take nothing. (This
+     * used to want one tick per call, each with its own time: a redraw that never comes then leaves the
+     * clock behind for good - tvblank.c.) */
     reset();
     lorieRecordVsync(1000000); lorieRecordVsync(1016667); lorieRecordVsync(1033334);
-    uint64_t want[3] = {1000000, 1016667, 1033334};
-    for (int i = 0; i < 3; i++) {
-        uint32_t st = lorieAdvanceVsyncClock();
-        CHECK(st == 1, "tick %d: steps %u, want 1", i, st);
-        CHECK(lorieVsyncUs == want[i], "tick %d: ust %llu, want %llu", i,
-              (unsigned long long) lorieVsyncUs, (unsigned long long) want[i]);
-    }
-    CHECK(lorieAdvanceVsyncClock() == 0, "no fourth tick");
+    uint32_t st2 = lorieAdvanceVsyncClock();
+    CHECK(st2 == 3, "busy: steps %u, want 3", st2);
+    CHECK(lorieVsyncUs == 1033334, "busy: ust %llu, want 1033334", (unsigned long long) lorieVsyncUs);
+    CHECK(fakeState.presentStats.vsyncRecordsLost == 2, "busy: taken up late %u, want 2",
+          fakeState.presentStats.vsyncRecordsLost);
+    CHECK(lorieAdvanceVsyncClock() == 0 && lorieAdvanceVsyncClock() == 0, "the other two redraws take nothing");
 
     /* 3. ring overrun: 20 ticks unread with 16 records - all 20 counted, 19 times lost, newest time kept */
     reset();

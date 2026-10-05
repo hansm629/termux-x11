@@ -220,6 +220,14 @@ static uint8_t lorieOutputBackend = LORIE_OUTPUT_AUTO;
  * lapped the ring - which missed the producer being half way through writing that very slot for its
  * next lap, and a 64-bit stamp is not even written in one go on the 32-bit ABIs. Now a record is
  * used only if it held the tick wanted both before and after the stamp was read.
+ *
+ * The reader takes every tick produced so far, dated by the newest. It used to take only the oldest
+ * one it had not taken, one per redraw, counting on one redraw per callback to keep up. Nothing
+ * makes up a redraw that never came - callbacks before the screen existed queue none, and a work
+ * proc lost on the way is gone - so ticks left over stayed left over for good: in one device trace
+ * the clock ran exactly four ticks behind for the whole session, and every time Present reported to
+ * a client was 67 ms old. A tick the X server missed has no redraw of its own either way; whatever it
+ * runs next runs after the newest tick, and that is the one to report it against.
  */
 #define LORIE_VSYNC_RECORDS 16
 static struct {
@@ -257,10 +265,10 @@ static Bool lorieReadVsyncRecord(uint32_t idx, uint64_t *us) {
 }
 
 /*
- * Takes the next tick, if there is one, and returns how many vsyncs current_msc has to move - 0 if
- * this call was not for a tick at all, more than 1 only if the X server fell so far behind that
- * records were overwritten before it read them. Those ticks did happen and are counted; only their
- * times are gone, and the newest surviving one is used for the lot.
+ * Takes every tick that has happened since the last call and returns how many vsyncs current_msc has
+ * to move - 0 if this call was not for a tick at all, more than 1 if the X server ran no redraw for
+ * some of them. Those ticks did happen and are counted; the clock is dated by the newest, the one the
+ * X server is now running after, so that current_msc and lorieVsyncUs name the same tick.
  */
 static uint32_t lorieAdvanceVsyncClock(void) {
     uint32_t produced = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE);
@@ -270,9 +278,9 @@ static uint32_t lorieAdvanceVsyncClock(void) {
     if (produced == lorieVsyncConsumed)
         return 0;
 
-    idx = produced - lorieVsyncConsumed > LORIE_VSYNC_RECORDS ? produced - 1u : lorieVsyncConsumed;
-    // Written over since - the producer lapped the ring while this was being decided or read. Every
-    // tick up to its newest one has happened by then; move on to that one.
+    idx = produced - 1u;
+    // Written over since - the producer lapped the ring while this was being read. Every tick up to
+    // its newest one has happened by then; move on to that one.
     while (!lorieReadVsyncRecord(idx, &us))
         idx = __atomic_load_n(&lorieVsyncProduced, __ATOMIC_ACQUIRE) - 1u;
 
@@ -1506,7 +1514,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 snap.rootReplacingFull,
                 snap.rootPublishHeldForDonor);
         log(INFO, "XlorieStall: root remap %.1f ms over %u frames, longest X server gap %.1f ms, "
-                  "%u vsync times lost to backlog, vsync callback up to %.1f ms late",
+                  "%u vsync ticks taken up late, vsync callback up to %.1f ms late",
             snap.rootRemapUs / 1000.0,
             snap.rootRemaps,
             snap.xDispatchMaxUs / 1000.0,
