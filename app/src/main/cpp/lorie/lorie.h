@@ -834,6 +834,28 @@ struct lorie_shared_server_state {
         volatile uint32_t glOutputSubmitFailures; /* and the ones where it did not */
         volatile uint32_t directBufferSubmits;    /* a new root buffer put into a SurfaceControl transaction */
         volatile uint32_t directReuseNoSubmit;    /* nothing new to submit; the compositor keeps what it has */
+        /* Of those, the ones during which the X server published after all - woken by a present's
+         * copies before the handover - and so taken in the same vsync instead of the next. */
+        volatile uint32_t directPublishedDuringNothingNew;
+        /* A newer slot published while one was being submitted, asked for at the next vsync. */
+        volatile uint32_t directPublishedDuringSubmit;
+        /* Published slots never submitted: replaced by a newer one before a frame took them. */
+        volatile uint32_t directPublishesSkipped;
+        /* What the compositor did with the root's transactions (renderer.c, rootZcFlushDisplayStats):
+         * their completion callbacks; latch times not seen before, and ones equal to the one before;
+         * gaps of over 1.5 refresh periods between latches, and the longest; present fences signalled,
+         * the gaps between them the same way; what could not be recorded or read; and which of the two
+         * calls this device lacks (1 the latch time, 2 the present fence). Measurement only. */
+        volatile uint32_t sfCompletions;
+        volatile uint32_t sfLatches;
+        volatile uint32_t sfSameLatch;
+        volatile uint32_t sfLatchLateGaps;
+        volatile uint32_t sfLatchGapMaxUs;
+        volatile uint32_t sfPresents;
+        volatile uint32_t sfPresentLateGaps;
+        volatile uint32_t sfPresentGapMaxUs;
+        volatile uint32_t sfStatsLost;
+        volatile uint32_t sfStatsMissing;
         volatile uint32_t zeroCopyStalls;         /* frames held back because the previous buffer was not released */
         /* A frame not submitted because a copy into its own slot was still queued behind one the
          * drain had to wait on. What was on screen stays, and it is tried again next vsync. */

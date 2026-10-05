@@ -1159,6 +1159,18 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     snap.directBufferSubmits = __atomic_exchange_n(&pvfb->state->presentStats.directBufferSubmits, 0, __ATOMIC_RELAXED);
     snap.directHeldIncomplete = __atomic_exchange_n(&pvfb->state->presentStats.directHeldIncomplete, 0, __ATOMIC_RELAXED);
     snap.directReuseNoSubmit = __atomic_exchange_n(&pvfb->state->presentStats.directReuseNoSubmit, 0, __ATOMIC_RELAXED);
+    snap.directPublishedDuringNothingNew = __atomic_exchange_n(&pvfb->state->presentStats.directPublishedDuringNothingNew, 0, __ATOMIC_RELAXED);
+    snap.directPublishedDuringSubmit = __atomic_exchange_n(&pvfb->state->presentStats.directPublishedDuringSubmit, 0, __ATOMIC_RELAXED);
+    snap.directPublishesSkipped = __atomic_exchange_n(&pvfb->state->presentStats.directPublishesSkipped, 0, __ATOMIC_RELAXED);
+    snap.sfCompletions = __atomic_exchange_n(&pvfb->state->presentStats.sfCompletions, 0, __ATOMIC_RELAXED);
+    snap.sfLatches = __atomic_exchange_n(&pvfb->state->presentStats.sfLatches, 0, __ATOMIC_RELAXED);
+    snap.sfSameLatch = __atomic_exchange_n(&pvfb->state->presentStats.sfSameLatch, 0, __ATOMIC_RELAXED);
+    snap.sfLatchLateGaps = __atomic_exchange_n(&pvfb->state->presentStats.sfLatchLateGaps, 0, __ATOMIC_RELAXED);
+    snap.sfLatchGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.sfLatchGapMaxUs, 0, __ATOMIC_RELAXED);
+    snap.sfPresents = __atomic_exchange_n(&pvfb->state->presentStats.sfPresents, 0, __ATOMIC_RELAXED);
+    snap.sfPresentLateGaps = __atomic_exchange_n(&pvfb->state->presentStats.sfPresentLateGaps, 0, __ATOMIC_RELAXED);
+    snap.sfPresentGapMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.sfPresentGapMaxUs, 0, __ATOMIC_RELAXED);
+    snap.sfStatsLost = __atomic_exchange_n(&pvfb->state->presentStats.sfStatsLost, 0, __ATOMIC_RELAXED);
     snap.displayRefreshMHz = pvfb->state->presentStats.displayRefreshMHz;
     snap.fenceFallbacks = __atomic_exchange_n(&pvfb->state->presentStats.fenceFallbacks, 0, __ATOMIC_RELAXED);
     snap.fenceWaitMaxUs = __atomic_exchange_n(&pvfb->state->presentStats.fenceWaitMaxUs, 0, __ATOMIC_RELAXED);
@@ -1314,7 +1326,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             snap.pointerMoves,
             snap.displayRefreshMHz / 1000.0);
         if (snap.presentCompletions > 1) {
-            log(INFO, "XloriePresent: %u client presents reached the screen in 5.0 s "
+            log(INFO, "XloriePresent: %u client presents done on the X server's side in 5.0 s - the GPU copy "
+                      "into the root made, or the flip ended; not what the compositor showed, see XlorieDisplay "
                       "(avg %.1f ms apart, longest %.1f ms, %u later than 33 ms)",
                 snap.presentCompletions,
                 snap.presentGapSumUs / 1000.0 /
@@ -1368,6 +1381,29 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->outputBackendReason[0] ? (const char *) pvfb->state->outputBackendReason : "");
         }
 
+        /*
+         * Each stage between a client's present and the display, counted where it happens and apart
+         * from the others: published is the X server handing a root slot on, applied a SurfaceControl
+         * transaction carrying it, and everything after that is what the compositor reported back.
+         * Only the present fences say what was shown, and when.
+         */
+        if (snap.directBufferSubmits || snap.directReuseNoSubmit || snap.sfCompletions) {
+            uint32_t missing = pvfb->state->presentStats.sfStatsMissing;
+
+            log(INFO, "XlorieDisplay: %u client presents submitted, %u copies completed, %u root slots published, "
+                      "%u applied to the compositor (%u published slots never applied; %u frames found nothing newer, "
+                      "%u of them took a slot published meanwhile in the same vsync; %u published during a submit, "
+                      "taken at the next vsync); compositor: %u transactions completed, %u latched%s (%u with the same "
+                      "latch time as the one before, %u latch gaps over 1.5 refresh periods, longest %.1f ms), %u "
+                      "presented%s (%u present gaps over 1.5 refresh periods, longest %.1f ms); %u not recorded or read",
+                snap.presentSubmits, snap.copyCompletions, snap.rootPublishes, snap.directBufferSubmits,
+                snap.directPublishesSkipped, snap.directReuseNoSubmit, snap.directPublishedDuringNothingNew,
+                snap.directPublishedDuringSubmit, snap.sfCompletions, snap.sfLatches,
+                missing & 1 ? " (latch times unavailable on this device)" : "", snap.sfSameLatch,
+                snap.sfLatchLateGaps, snap.sfLatchGapMaxUs / 1000.0, snap.sfPresents,
+                missing & 2 ? " (present fences unavailable on this device)" : "", snap.sfPresentLateGaps,
+                snap.sfPresentGapMaxUs / 1000.0, snap.sfStatsLost);
+        }
         if (snap.requests)
             log(INFO, "XlorieRequest: %u arrived, longest gap between arrivals %.1f ms, furthest target +%u vsyncs",
                 snap.requests,

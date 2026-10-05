@@ -25,6 +25,8 @@
 #include <math.h>
 #include <android/looper.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <linux/sync_file.h>
 #include <android/log.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
@@ -337,6 +339,8 @@ static struct {
     int (*statsPrevReleaseFenceFd)(ASurfaceTransactionStats *, ASurfaceControl *);
     void (*statsGetControls)(ASurfaceTransactionStats *, ASurfaceControl ***, size_t *);
     void (*statsReleaseControls)(ASurfaceControl **);
+    int64_t (*statsLatchTime)(ASurfaceTransactionStats *);             // optional, measurement only
+    int (*statsPresentFenceFd)(ASurfaceTransactionStats *);           // optional, measurement only
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -372,6 +376,10 @@ static bool cursorOverlayResolveApi(void) {
         dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getASurfaceControls");
     scApi.statsReleaseControls = (void (*)(ASurfaceControl **))
         dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_releaseASurfaceControls");
+    scApi.statsLatchTime = (int64_t (*)(ASurfaceTransactionStats *))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getLatchTime");
+    scApi.statsPresentFenceFd = (int (*)(ASurfaceTransactionStats *))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransactionStats_getPresentFenceFd");
 
     // Optional: hiding the layer is enough to get it off the screen, taking it out of the tree as
     // well is just tidier.
@@ -418,6 +426,8 @@ static int64_t rendererLastPreRedrawCoalesceWaitUs = -1;
 static uint64_t rendererPreRedrawCoalescedCount = 0;
 static int64_t rendererBackpressureLastSwapUs = 0;
 static float rendererDisplayRefreshRateHz = 60.0f;
+// The same as a period, for threads other than the one that sets it (rootZcFlushDisplayStats).
+static volatile int64_t rendererDisplayPeriodNs = 16666667;
 static bool rendererHighRefreshEnabled = false;
 
 #ifndef RENDERER_V330_ONSCREEN_SWAP_INTERVAL
@@ -1162,6 +1172,7 @@ __unused void rendererSetDisplayRefreshRate(JNIEnv* env, jobject self, jfloat re
         refreshRate = 60.0f;
 
     rendererDisplayRefreshRateHz = refreshRate;
+    __atomic_store_n(&rendererDisplayPeriodNs, (int64_t) (1e9f / refreshRate), __ATOMIC_RELAXED);
 
     if (refreshRate >= 90.0f) {
         rendererHighRefreshEnabled = true;
@@ -1949,12 +1960,18 @@ static void rootZcFrameDrained(bool alreadyOnScreen) {
 static void rootZcNothingNewDone(void) {
     rendererSetOutputRetry(false);   // what the X server had published when claimed is on screen
     __atomic_fetch_add(&state->presentStats.directReuseNoSubmit, 1, __ATOMIC_RELAXED);
-    if (rootZcPublishedSinceClaim())
+    if (rootZcPublishedSinceClaim()) {
         state->drawRequested = TRUE;
+        __atomic_fetch_add(&state->presentStats.directPublishedDuringNothingNew, 1, __ATOMIC_RELAXED);
+    }
 }
 
 static void rootZcSubmitDone(void) {
-    rendererSetOutputRetry(rootZcPublishedSinceClaim());
+    if (rootZcPublishedSinceClaim()) {
+        rendererSetOutputRetry(true);
+        __atomic_fetch_add(&state->presentStats.directPublishedDuringSubmit, 1, __ATOMIC_RELAXED);
+    } else
+        rendererSetOutputRetry(false);
 }
 
 // The frame's fence is no longer waited for between the drawing and the swap. Waiting there drains
@@ -3417,11 +3434,176 @@ static void cursorPoolOrphan(void) {
     cursorPoolHandedSlot = -1;
 }
 
+/*
+ * What the compositor did with the root's transactions, for measurement only. The completion callback
+ * (a binder thread) records only what the stats say - the latch time, the present fence - into
+ * rootZcSeen under rootOverlayLock, and does nothing else there. The renderer thread takes them out
+ * (rootZcFlushDisplayStats), lets go of the lock, and only then works out gaps and asks the fences when
+ * they signalled, so none of this lengthens a hold of the lock the root's own handover needs.
+ *
+ *   completed   a transaction's completion callback came
+ *   latched     a latch time (ASurfaceTransactionStats_getLatchTime) not seen before; one equal to the
+ *               one before it is counted as that (sameLatch), without saying what the compositor did
+ *   presented   a present fence (ASurfaceTransactionStats_getPresentFenceFd) signalled, at the time the
+ *               fence itself records
+ *
+ * Gaps longer than one and a half refresh periods between latches, or between presents, are vsyncs that
+ * showed nothing new from here - a repeated frame while frames are coming, or simply idle time. A device
+ * without either call has that part reported unavailable; the root layer itself does not need them.
+ */
+#define LORIE_ZC_SEEN 16
+static struct {
+    uint32_t completions, lost;
+    int64_t latchNs[LORIE_ZC_SEEN];
+    int latchCount, fences[LORIE_ZC_SEEN], fenceCount;
+} rootZcSeen;
+
+// Binder thread, at the start of every root transaction's completion callback.
+static void rootZcNoteCompletion(ASurfaceTransactionStats *stats) {
+    int64_t latchNs = scApi.statsLatchTime ? scApi.statsLatchTime(stats) : -1;
+    int fd = scApi.statsPresentFenceFd ? scApi.statsPresentFenceFd(stats) : -1, unkept = -1;
+
+    pthread_mutex_lock(&rootOverlayLock);
+    rootZcSeen.completions++;
+    if (latchNs > 0) {
+        if (rootZcSeen.latchCount < LORIE_ZC_SEEN)
+            rootZcSeen.latchNs[rootZcSeen.latchCount++] = latchNs;
+        else
+            rootZcSeen.lost++;
+    }
+    if (fd >= 0) {
+        if (rootZcSeen.fenceCount < LORIE_ZC_SEEN)
+            rootZcSeen.fences[rootZcSeen.fenceCount++] = fd;
+        else {
+            rootZcSeen.lost++;
+            unkept = fd;
+        }
+    }
+    pthread_mutex_unlock(&rootOverlayLock);
+    if (unkept >= 0)
+        close(unkept);   // outside the lock
+}
+
+// When a fence signalled, by the fence's own record: 0 not yet, -1 if it cannot say.
+static int64_t rootZcFenceSignalledNs(int fd) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    struct sync_fence_info fences[4];
+    struct sync_file_info info;
+    int64_t latest = 0;
+    uint32_t i;
+    int r = poll(&p, 1, 0);
+
+    if (r == 0)
+        return 0;
+    if (r < 0 || (p.revents & (POLLERR | POLLNVAL)))
+        return -1;
+    memset(&info, 0, sizeof info);
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0 || !info.num_fences)
+        return -1;
+    if (info.num_fences > 4)
+        info.num_fences = 4;
+    memset(fences, 0, sizeof fences);
+    info.sync_fence_info = (uint64_t) (uintptr_t) fences;
+    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0)
+        return -1;
+    for (i = 0; i < info.num_fences; i++)
+        if (fences[i].status == 1 && (int64_t) fences[i].timestamp_ns > latest)
+            latest = (int64_t) fences[i].timestamp_ns;
+    return latest > 0 ? latest : -1;
+}
+
+// Renderer thread: what the callbacks recorded taken out under the lock, everything else after it.
+static void rootZcFlushDisplayStats(void) {
+    static int64_t lastLatchNs = 0, lastPresentNs = 0;
+    static int pending[LORIE_ZC_SEEN * 2], pendingCount = 0;
+    int64_t latchNs[LORIE_ZC_SEEN], lateNs;
+    int fences[LORIE_ZC_SEEN], latchCount, fenceCount, i;
+    uint32_t completions, lost, latches = 0, sameLatch = 0, latchLate = 0, latchGapMaxUs = 0;
+    uint32_t presents = 0, presentLate = 0, presentGapMaxUs = 0, unusable = 0;
+
+    if (!state)
+        return;
+    pthread_mutex_lock(&rootOverlayLock);
+    completions = rootZcSeen.completions;
+    lost = rootZcSeen.lost;
+    latchCount = rootZcSeen.latchCount;
+    fenceCount = rootZcSeen.fenceCount;
+    memcpy(latchNs, rootZcSeen.latchNs, sizeof(int64_t) * (size_t) latchCount);
+    memcpy(fences, rootZcSeen.fences, sizeof(int) * (size_t) fenceCount);
+    rootZcSeen.completions = rootZcSeen.lost = 0;
+    rootZcSeen.latchCount = rootZcSeen.fenceCount = 0;
+    pthread_mutex_unlock(&rootOverlayLock);
+
+    lateNs = __atomic_load_n(&rendererDisplayPeriodNs, __ATOMIC_RELAXED) * 3 / 2;
+    for (i = 0; i < latchCount; i++) {
+        if (latchNs[i] == lastLatchNs) {
+            sameLatch++;
+            continue;
+        }
+        if (lastLatchNs > 0 && latchNs[i] > lastLatchNs) {
+            int64_t gapNs = latchNs[i] - lastLatchNs;
+
+            if (gapNs > lateNs)
+                latchLate++;
+            if ((uint64_t) gapNs / 1000 > latchGapMaxUs)
+                latchGapMaxUs = (uint32_t) (gapNs / 1000);
+        }
+        lastLatchNs = latchNs[i];
+        latches++;
+    }
+    for (i = 0; i < fenceCount; i++) {
+        if (pendingCount < (int) (sizeof pending / sizeof pending[0]))
+            pending[pendingCount++] = fences[i];
+        else {
+            close(fences[i]);
+            lost++;
+        }
+    }
+    i = 0;
+    while (i < pendingCount) {
+        int64_t ns = rootZcFenceSignalledNs(pending[i]);
+
+        if (ns == 0) {
+            i++;
+            continue;
+        }
+        if (ns < 0)
+            unusable++;
+        else if (ns > lastPresentNs) {
+            if (lastPresentNs > 0) {
+                int64_t gapNs = ns - lastPresentNs;
+
+                if (gapNs > lateNs)
+                    presentLate++;
+                if ((uint64_t) gapNs / 1000 > presentGapMaxUs)
+                    presentGapMaxUs = (uint32_t) (gapNs / 1000);
+            }
+            lastPresentNs = ns;
+            presents++;
+        }
+        close(pending[i]);
+        pending[i] = pending[--pendingCount];
+    }
+
+    __atomic_store_n(&state->presentStats.sfStatsMissing,
+                     (scApi.statsLatchTime ? 0u : 1u) | (scApi.statsPresentFenceFd ? 0u : 2u), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.sfCompletions, completions, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.sfLatches, latches, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.sfSameLatch, sameLatch, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.sfLatchLateGaps, latchLate, __ATOMIC_RELAXED);
+    LORIE_STAT_MAX(&state->presentStats.sfLatchGapMaxUs, latchGapMaxUs);
+    __atomic_fetch_add(&state->presentStats.sfPresents, presents, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&state->presentStats.sfPresentLateGaps, presentLate, __ATOMIC_RELAXED);
+    LORIE_STAT_MAX(&state->presentStats.sfPresentGapMaxUs, presentGapMaxUs);
+    __atomic_fetch_add(&state->presentStats.sfStatsLost, lost + unusable, __ATOMIC_RELAXED);
+}
+
 // Binder thread. Reports the release fence of the buffer set by the transaction before this one.
 static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {
     uint32_t seq = (uint32_t) (uintptr_t) context;
     int i;
 
+    rootZcNoteCompletion(stats);
     if (!seq)
         return;   // the transaction it belongs to retired nothing
 
@@ -3632,6 +3814,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     if (!ahb || slot < 0)
         return false;
 
+    rootZcFlushDisplayStats();
     rootZcClearLetterbox(surfaceW, surfaceH);
 
     // The X server had nothing newer to publish, so this is the buffer the compositor is already
@@ -3747,6 +3930,22 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
         rootZcNothingNewDone();
         rendererPublishFrameStats(frameStartNs, fenceWaitUs, carriedGpuCopy, 0);
         return true;
+    }
+
+    // Slots the X server published since the last one submitted that were never submitted themselves:
+    // replaced by a newer one before a frame took them, so what they held never reached the compositor.
+    {
+        static uint32_t lastSubmittedWord = 0;
+        static bool haveLast = false;
+
+        if (haveLast && LORIE_ROOT_GEN(lastSubmittedWord) == LORIE_ROOT_GEN(rendererRootSlotWord)) {
+            uint32_t published = ((rendererRootSlotWord - lastSubmittedWord) & LORIE_ROOT_COUNT_MASK) / LORIE_ROOT_COUNT_STEP;
+
+            if (published > 1)
+                __atomic_fetch_add(&state->presentStats.directPublishesSkipped, published - 1, __ATOMIC_RELAXED);
+        }
+        lastSubmittedWord = rendererRootSlotWord;
+        haveLast = true;
     }
 
     retiring = rootZcDisplayedSlot;
