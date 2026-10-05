@@ -28,6 +28,11 @@ sed -e 's/@PIXMAN_VERSION_MAJOR@/0/g' -e 's/@PIXMAN_VERSION_MINOR@/43/g' -e 's/@
 "$OUT/tseed" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/tsinceclaim.c" "$OUT/region16.o" -o "$OUT/tsinceclaim"
 "$OUT/tsinceclaim" || status=1
+# the root-slot lifecycle against compositor backpressure, and without the call for it
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/tzcbp.c" "$OUT/region16.o" -o "$OUT/tzcbp"
+"$OUT/tzcbp" || status=1
+"$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -DNO_BP_SYMBOL -I"$OUT" -I"$PIXMAN" "$HERE/tzcbp.c" "$OUT/region16.o" -o "$OUT/tzcbp-nobp"
+"$OUT/tzcbp-nobp" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/twiden.c" "$OUT/region16.o" -o "$OUT/twiden"
 "$OUT/twiden" || status=1
 "$CC" -Wall -Wno-unused-function -O1 -DHAVE_GPU_PENDING -DHAVE_OWED -I"$OUT" -I"$PIXMAN" "$HERE/t34.c" "$OUT/region16.o" -o "$OUT/t34"

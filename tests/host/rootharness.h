@@ -79,7 +79,8 @@ static struct {
              uint64_t resizeGpuBytes; uint32_t resizeGpuKept[16];
              uint32_t presentsWidened;
              uint32_t ahbPixmaps, ahbPixmapFailures, ahbPixmapAllocUs;
-             uint32_t rootClaimsAcrossPools, rootStaleSlotReleases; } presentStats;
+             uint32_t rootClaimsAcrossPools, rootStaleSlotReleases, zeroCopyFenceErrors; } presentStats;
+    volatile uint32_t outputRetryPending;        /* and the renderer's retiring list these (tzcbp.c) */
 } fakeState;
 /* The renderer's two answers about a serial (lorieGpuCopyResolved, lorieGpuCopyMade): it passes them
  * in order, so a watermark says which have been dealt with, and a set says which of those failed. */

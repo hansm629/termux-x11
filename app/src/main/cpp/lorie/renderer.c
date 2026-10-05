@@ -271,6 +271,7 @@ static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it
 static uint64_t rootZcDisplayedId = 0;  // which buffer that slot held then - see rendererReleaseRootSlot
 static uint32_t rootZcDisplayedGen = 0; // and the pool it belonged to
+static bool rootZcBackpressureOn = false; // the root layer has the compositor's buffer backpressure
 
 /*
  * A zero-copy frame that had to be dropped has to be tried again, and nothing else will ask for it.
@@ -342,6 +343,7 @@ static struct {
     void (*statsReleaseControls)(ASurfaceControl **);
     int64_t (*statsLatchTime)(ASurfaceTransactionStats *);             // optional, measurement only
     int (*statsPresentFenceFd)(ASurfaceTransactionStats *);           // optional, measurement only
+    void (*txSetEnableBackPressure)(ASurfaceTransaction *, ASurfaceControl *, bool); // optional, API 31
 } scApi;
 
 static bool cursorOverlayResolveApi(void) {
@@ -388,6 +390,9 @@ static bool cursorOverlayResolveApi(void) {
             dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setBufferTransparency");
     scApi.txReparent = (void (*)(ASurfaceTransaction *, ASurfaceControl *, ASurfaceControl *))
         dlsym(RTLD_DEFAULT, "ASurfaceTransaction_reparent");
+    // Optional too: without it the compositor may drop a root buffer for a newer one, as it always did.
+    scApi.txSetEnableBackPressure = (void (*)(ASurfaceTransaction *, ASurfaceControl *, bool))
+        dlsym(RTLD_DEFAULT, "ASurfaceTransaction_setEnableBackPressure");
 
     if (!scApi.createFromWindow || !scApi.release || !scApi.txCreate || !scApi.txDelete ||
         !scApi.txApply || !scApi.txSetVisibility || !scApi.txSetZOrder || !scApi.txSetBuffer ||
@@ -3298,8 +3303,10 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
 
     // Also where the X server can read it: the line above lands in this process' logcat, which from
     // the terminal is not readable at all.
-    if (state)
+    if (state) {
         state->outputFilterNearest = filtering == GL_NEAREST ? 1u : 0u;
+        state->rootBackpressure = rootZcBackpressureOn ? 1u : 0u;
+    }
 
     if (state && (!published || publishedReason != reason || publishedTo != state)) {
         published = true;
@@ -3910,11 +3917,49 @@ static void rootZcNoteApplied(uint32_t seq) {
     haveLast = true;
 }
 
+/*
+ * The slot about to be submitted becomes the one submitted last (rootZcDisplayedSlot); the one before it
+ * starts retiring under the new transaction's number, which is returned and goes with the transaction.
+ * rootOverlayLock held.
+ */
+static uint32_t rootZcHandOver(int slot, uint64_t bufferId, uint32_t gen) {
+    int retiring;
+    uint32_t applySeq;
+
+    if (++rootZcRetireSeq == 0)
+        rootZcRetireSeq = 1;
+    applySeq = rootZcRetireSeq;
+    retiring = rootZcDisplayedSlot;
+    if (retiring >= 0) {
+        if (rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
+            rootZcRetiring[rootZcRetiringCount].slot = retiring;
+            rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
+            rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
+            rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
+            rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
+            rootZcRetiring[rootZcRetiringCount].seq = applySeq;
+            rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
+            rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
+            rootZcRetiringCount++;
+        } else
+            // rootZcDrainRetiring() leaves room for two before this is reached, so there is no
+            // path here. Untracked would mean the slot is never given back at all - the pool runs
+            // a buffer short for the rest of the session - so it is worth saying rather than
+            // dropping quietly.
+            log("XlorieRootZc: no room to track slot %d on its way off screen; it stays held\n",
+                retiring);
+    }
+    rootZcDisplayedSlot = slot;
+    rootZcDisplayedId = bufferId;
+    rootZcDisplayedGen = gen;
+    return applySeq;
+}
+
 // Returns true when the frame has been dealt with and the GL path should be skipped.
 static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfaceH, int64_t frameStartNs) {
     AHardwareBuffer *ahb = desc->buffer;
     static uint32_t frameSeq = 0;
-    int slot = rendererRootSlot, retiring;
+    int slot = rendererRootSlot;
     uint32_t applySeq, publishSeq;
     int64_t fenceWaitUs = 0;
     uint64_t gpuCopySerial;
@@ -4057,32 +4102,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
      * matching by slot index. The retiring entry also carries its buffer id, which
      * rendererReleaseRootSlot checks independently of this. The frame trace joins on it too.
      */
-    if (++rootZcRetireSeq == 0)
-        rootZcRetireSeq = 1;
-    applySeq = rootZcRetireSeq;
-    retiring = rootZcDisplayedSlot;
-    if (retiring >= 0) {
-        if (rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
-            rootZcRetiring[rootZcRetiringCount].slot = retiring;
-            rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
-            rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
-            rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
-            rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
-            rootZcRetiring[rootZcRetiringCount].seq = applySeq;
-            rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
-            rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
-            rootZcRetiringCount++;
-        } else
-            // rootZcDrainRetiring() leaves room for two before this is reached, so there is no
-            // path here. Untracked would mean the slot is never given back at all - the pool runs
-            // a buffer short for the rest of the session - so it is worth saying rather than
-            // dropping quietly.
-            log("XlorieRootZc: no room to track slot %d on its way off screen; it stays held\n",
-                retiring);
-    }
-    rootZcDisplayedSlot = slot;
-    rootZcDisplayedId = rendererRootSlotId;
-    rootZcDisplayedGen = rendererRootSlotGen;
+    applySeq = rootZcHandOver(slot, rendererRootSlotId, rendererRootSlotGen);
 
     ARect src = { 0, 0, desc->width, desc->height };
     ARect dst = { viewportX, viewportY, viewportX + viewportW, viewportY + viewportH };
@@ -4128,6 +4148,37 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
     return true;
 }
 
+/*
+ * Asks the compositor to queue the root layer's buffers instead of replacing one not latched yet with a
+ * newer one (buffer backpressure, ASurfaceTransaction_setEnableBackPressure, API 31). Without it, a
+ * frame applied after a latch and the next one applied before the following latch end up in one flush,
+ * and the older is dropped: the vsync before shows the frame before twice, and that frame is never shown
+ * at all. With it the compositor keeps the newer one queued for the next latch, as it does for every
+ * BLASTBufferQueue - a late frame costs one repeat, and from then on the pipeline is a frame deeper
+ * (which is what the sixth root slot is for).
+ *
+ * It is the layer's state, not a transaction's (RequestedLayerState flags), so it is set once per layer:
+ * in a transaction of its own, right after the layer is made and before any buffer, on the same apply
+ * token, so it is applied first. A flush decides by the layer as it was before that flush's transactions
+ * are applied, so it holds for every buffer after the first - and nothing is queued before the first.
+ * Not repeated in the buffer transactions, where a flag change would also take them off the compositor's
+ * simple-buffer-update path. Where the call is missing (below API 31) nothing changes.
+ * rootOverlayLock held.
+ */
+static void rootZcSetBackpressure(ASurfaceControl *sc) {
+    rootZcBackpressureOn = false;
+    if (scApi.txSetEnableBackPressure) {
+        ASurfaceTransaction *t = scApi.txCreate();
+
+        scApi.txSetEnableBackPressure(t, sc, true);
+        scApi.txApply(t);
+        scApi.txDelete(t);
+        rootZcBackpressureOn = true;
+    }
+    log("XlorieRootZc: compositor backpressure %s\n",
+        rootZcBackpressureOn ? "on" : "not available; a root buffer may be dropped for a newer one");
+}
+
 static void teardownRootOverlay(void) {
     rootZcStopPresenting();
 
@@ -4145,6 +4196,7 @@ static void teardownRootOverlay(void) {
 
         scApi.release(rootSurfaceControl);
         rootSurfaceControl = NULL;
+        rootZcBackpressureOn = false;
     }
     pthread_mutex_unlock(&rootOverlayLock);
 }
@@ -4172,6 +4224,8 @@ static void ensureRootOverlay(void) {
         rootSurfaceControl = scApi.createFromWindow(win, "lorie-root");
         if (!rootSurfaceControl)
             log("Xlorie: could not create the root layer, drawing the root through GL instead");
+        else
+            rootZcSetBackpressure(rootSurfaceControl);
     }
     pthread_mutex_unlock(&rootOverlayLock);
 }

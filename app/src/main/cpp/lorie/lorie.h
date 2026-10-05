@@ -939,6 +939,9 @@ struct lorie_shared_server_state {
      * cannot honour nearest - the compositor scales bilinearly - so a comparison between the two
      * paths is only like for like when this says linear. */
     volatile uint8_t outputFilterNearest;
+    /* 1 once the root layer has the compositor's buffer backpressure (API 31): a root buffer is queued
+     * rather than dropped for a newer one. 0 where it is not available. */
+    volatile uint8_t rootBackpressure;
     volatile char outputBackendReason[96];
 
     struct {

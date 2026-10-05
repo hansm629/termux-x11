@@ -1397,12 +1397,13 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 log(INFO, "XlorieCursor: %u cursor image updates put off with every cursor buffer still "
                           "with the compositor", snap.cursorOverlayWaits);
 
-            log(INFO, "XlorieBackend: asked for %s, filtering %s%s; %u direct submits, %u nothing-new, "
-                      "%u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
+            log(INFO, "XlorieBackend: asked for %s, filtering %s%s, compositor backpressure %s; %u direct submits, "
+                      "%u nothing-new, %u held incomplete, %u GL submits (%u failed), %u held for a buffer back%s%s",
                 asked,
                 pvfb->state->outputFilterNearest ? "nearest" : "linear",
                 pvfb->state->outputFilterNearest && snap.directBufferSubmits
                     ? " (direct frames were scaled bilinearly regardless)" : "",
+                pvfb->state->rootBackpressure ? "on" : "off",
                 snap.directBufferSubmits,
                 snap.directReuseNoSubmit,
                 snap.directHeldIncomplete,

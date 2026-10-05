@@ -82,6 +82,7 @@ recipes = {
         + span(R, "static struct {\n    ASurfaceControl *(*createFromWindow)(ANativeWindow *, const char *);", "} scApi;")
         + span(R, "static ASurfaceControl *rootSurfaceControl = NULL;", "static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;")
         + span(R, "static int rootZcDisplayedSlot = -1;", "static uint32_t rootZcDisplayedGen = 0;")
+        + opt(lambda: "static bool rootZcBackpressureOn = false;\n", "static bool rootZcBackpressureOn", R)
         + span(R, "static struct {\n    int slot, fenceFd;", "static int rootZcUnusableCount = 0;")
         + span(R, "typedef enum { LORIE_ZC_FENCE_DONE", "} LorieZcFence;")
         + func(R, "static LorieZcFence rootZcFenceState(int fd) {")
@@ -93,6 +94,33 @@ recipes = {
               "static AHardwareBuffer *rootZcParkingBuffer(void) {", R)
         + func(R, "static void rootZcStopPresenting(void) {")
         + func(R, "static void teardownRootOverlay(void) {"),
+    # the renderer's whole root-slot lifecycle on the real handover, against a compositor with and without
+    # buffer backpressure - tzcbp.c
+    "zcbp": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN") + macro(R, "LORIE_ZC_MAX_HELD")
+        + span(R, "static struct {\n    ASurfaceControl *(*createFromWindow)(ANativeWindow *, const char *);", "} scApi;")
+        + span(R, "static ASurfaceControl *rootSurfaceControl = NULL;", "static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;")
+        + span(R, "static int rootZcDisplayedSlot = -1;", "static bool rootZcBackpressureOn = false;")
+        + span(R, "static struct {\n    int slot, fenceFd;", "static int rootZcUnusableCount = 0;")
+        + "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
+        + "static uint32_t rendererRootSlotGen = 0;\nstatic uint32_t rendererRootSlotWord = 0;\n"
+        + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
+        + func(R, "static bool rootZcPublishedSinceClaim(void) {")
+        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + func(R, "static void rendererReleaseRootBuffer(void) {")
+        + func(R, "static void rendererSetOutputRetry(bool pending) {")
+        + span(R, "typedef enum { LORIE_ZC_FENCE_DONE", "} LorieZcFence;")
+        + func(R, "static LorieZcFence rootZcFenceState(int fd) {")
+        + func(R, "static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {")
+        + func(R, "static bool rootZcDrainRetiring(void) {")
+        + func(R, "static AHardwareBuffer *rootZcParkingBuffer(void) {")
+        + func(R, "static void rootZcStopPresenting(void) {")
+        + func(R, "static uint32_t rootZcHandOver(int slot, uint64_t bufferId, uint32_t gen) {")
+        + func(R, "static void rootZcSetBackpressure(ASurfaceControl *sc) {")
+        + func(R, "static void teardownRootOverlay(void) {")
+        + "static ANativeWindow *defaultWin = NULL, *win = NULL;\nstatic bool cursorOverlayResolveApi(void);\n"
+        + func(R, "static void ensureRootOverlay(void) {")
+        # where the renderer asks for backpressure: once, per layer, never in a buffer transaction
+        + "#define BACKPRESSURE_CALL_SITES %d\n" % open(R, encoding="utf-8").read().count("scApi.txSetEnableBackPressure("),
     "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
         + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
         + func(R, "static void rootZcNothingNewDone(void) {")
