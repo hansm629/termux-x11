@@ -77,6 +77,22 @@ recipes = {
         + func(R, "static bool rootZcPublishedSinceClaim(void) {")
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
+    # leaving the root layer and giving its slots back: the hide, its completion, the retiring list - tzchide.c
+    "zclife": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN") + macro(R, "LORIE_ZC_MAX_HELD")
+        + span(R, "static struct {\n    ASurfaceControl *(*createFromWindow)(ANativeWindow *, const char *);", "} scApi;")
+        + span(R, "static ASurfaceControl *rootSurfaceControl = NULL;", "static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;")
+        + span(R, "static int rootZcDisplayedSlot = -1;", "static uint32_t rootZcDisplayedGen = 0;")
+        + span(R, "static struct {\n    int slot, fenceFd;", "static int rootZcUnusableCount = 0;")
+        + span(R, "typedef enum { LORIE_ZC_FENCE_DONE", "} LorieZcFence;")
+        + func(R, "static LorieZcFence rootZcFenceState(int fd) {")
+        + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + func(R, "static void rendererSetOutputRetry(bool pending) {")
+        + func(R, "static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {")
+        + func(R, "static bool rootZcDrainRetiring(void) {")
+        + opt(lambda: "#define HAVE_PARKING 1\n" + func(R, "static AHardwareBuffer *rootZcParkingBuffer(void) {"),
+              "static AHardwareBuffer *rootZcParkingBuffer(void) {", R)
+        + func(R, "static void rootZcStopPresenting(void) {")
+        + func(R, "static void teardownRootOverlay(void) {"),
     "pacing_gates": lambda: func(R, "static void rootZcFrameBegun(void) {")
         + func(R, "static void rootZcFrameDrained(bool alreadyOnScreen) {")
         + func(R, "static void rootZcNothingNewDone(void) {")

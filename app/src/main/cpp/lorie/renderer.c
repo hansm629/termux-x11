@@ -3750,7 +3750,37 @@ static bool rootZcDrainRetiring(void) {
     return room;
 }
 
-// Gives back everything we are holding. Renderer thread, on the way out of the zero-copy path.
+/*
+ * What the root layer is given in place of the slot it shows when it is hidden (rootZcStopPresenting).
+ *
+ * Hiding a layer does not take its buffer away: the layer keeps it, and a transaction that changes no
+ * buffer gets no previous release fence at all - the -1 its completion reports is not "released", it
+ * is no answer. The compositor only releases a buffer that is replaced. A layer that leaves the display
+ * with a new buffer queued has that frame's present fence set as the release of the buffer it showed
+ * (AOSP: Display::setReleasedLayers, Output::presentFrameAndReleaseLayers), and the transaction that
+ * replaced it reports that as its previous release fence. So the hide puts this in the slot's place:
+ * 1x1, allocated once, never written and never freed, so that any layer still holding it can only ever
+ * read the same pixel. Renderer thread only.
+ */
+static AHardwareBuffer *rootZcParkingBuffer(void) {
+    static AHardwareBuffer *parked = NULL;
+    static bool failed = false;
+
+    if (!parked && !failed) {
+        AHardwareBuffer_Desc desc = { .width = 1, .height = 1, .layers = 1,
+                                      .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+                                      .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE };
+
+        if (AHardwareBuffer_allocate(&desc, &parked) != 0 || !parked) {
+            parked = NULL;
+            failed = true;
+            log("XlorieRootZc: could not allocate the buffer a hidden root layer is left with; a slot "
+                "hidden from now on stays held until its pool is replaced\n");
+        }
+    }
+    return parked;
+}
+
 /*
  * Stops presenting through this path, without pretending the compositor is finished.
  *
@@ -3760,9 +3790,14 @@ static bool rootZcDrainRetiring(void) {
  * what was on screen. Nor does destroying the layer handle stop it: the layer stays composited,
  * showing the last buffer put on it.
  *
- * So the layer is hidden first, which is what makes a release possible at all, and the slot that
- * was on it joins the retiring list to be given back when its release actually arrives. Draining
- * continues from the GL path, so nothing is stranded by the switch.
+ * Then it hid the layer and took the hide's completion for the slot's release. A hide changes no
+ * buffer, so that completion carries no release fence, and -1 was read as "already released": a
+ * renderer frame between that completion and the next vsync gave the slot back while the display was
+ * still scanning it out (tools/model/zcslots.py, every policy). So the hide also replaces the slot with
+ * the parking buffer, and the slot joins the retiring list under that transaction's number, to be given
+ * back on the release fence the compositor sends for it. Without the parking buffer nothing will ever
+ * release it: it stays held, as a slot whose release cannot be waited on, until its pool is replaced.
+ * Draining continues from the GL path, so nothing is stranded by the switch.
  */
 static void rootZcStopPresenting(void) {
     // Leaving this path, so there is no zero-copy frame left to retry.
@@ -3771,35 +3806,50 @@ static void rootZcStopPresenting(void) {
     pthread_mutex_lock(&rootOverlayLock);
 
     if (rootZcDisplayedSlot >= 0) {
-        uint32_t retireSeq = 0;
+        AHardwareBuffer *parking = rootSurfaceControl ? rootZcParkingBuffer() : NULL;
+        uint32_t retireSeq = 0;                 // the hide's number, if its completion is to release the slot
 
-        if (rootSurfaceControl && rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
-            if (++rootZcRetireSeq == 0)
-                rootZcRetireSeq = 1;
-            retireSeq = rootZcRetireSeq;
+        if (rootZcRetiringCount < LORIE_ZC_MAX_HELD) {
+            if (rootSurfaceControl && parking) {
+                if (++rootZcRetireSeq == 0)
+                    rootZcRetireSeq = 1;
+                retireSeq = rootZcRetireSeq;
+            }
             rootZcRetiring[rootZcRetiringCount].slot = rootZcDisplayedSlot;
             rootZcRetiring[rootZcRetiringCount].bufferId = rootZcDisplayedId;
             rootZcRetiring[rootZcRetiringCount].gen = rootZcDisplayedGen;
             rootZcRetiring[rootZcRetiringCount].fenceFd = -1;
             rootZcRetiring[rootZcRetiringCount].fenceArrived = false;
-            rootZcRetiring[rootZcRetiringCount].fenceUnusable = false;
+            // No release will come for it without the parking buffer: held until its pool goes.
+            rootZcRetiring[rootZcRetiringCount].fenceUnusable = retireSeq == 0;
             rootZcRetiring[rootZcRetiringCount].fenceArrivedNs = 0;
             rootZcRetiring[rootZcRetiringCount].seq = retireSeq;
             rootZcRetiringCount++;
-
-            // Hiding it is the request that gets the buffer back; the completion tells us when.
-            ASurfaceTransaction *t = scApi.txCreate();
-
-            scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
-            if (scApi.txSetOnComplete)
-                scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
-            scApi.txApply(t);
-            scApi.txDelete(t);
+            if (!retireSeq)
+                rootZcUnusableCount++;
         } else
             // Nowhere to track it, so it stays held rather than being handed back while it may
             // still be on screen. It comes back when the pool is replaced.
             log("XlorieRootZc: no room to retire slot %d on the way out; it stays held\n",
                 rootZcDisplayedSlot);
+
+        if (rootSurfaceControl) {
+            ASurfaceTransaction *t = scApi.txCreate();
+
+            scApi.txSetVisibility(t, rootSurfaceControl, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+            if (parking) {
+                ARect one = { 0, 0, 1, 1 };
+
+                // The slot is replaced, which is what gets it a release; the layer is hidden, so the
+                // pixel is never shown.
+                scApi.txSetBuffer(t, rootSurfaceControl, parking, -1);
+                scApi.txSetGeometry(t, rootSurfaceControl, &one, &one, 0);
+                if (retireSeq && scApi.txSetOnComplete)
+                    scApi.txSetOnComplete(t, (void *) (uintptr_t) retireSeq, rootZcOnComplete);
+            }
+            scApi.txApply(t);
+            scApi.txDelete(t);
+        }
 
         rootZcDisplayedSlot = -1;
     }
