@@ -171,7 +171,7 @@ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuffer* _Nullable *
  *
  * @param buffer the buffer to be attached.
  */
-void LorieBuffer_attachToGL(LorieBuffer* _Nullable buffer);
+bool LorieBuffer_attachToGL(LorieBuffer* _Nullable buffer);
 
 /**
  * Call glBindTexture for the buffer.

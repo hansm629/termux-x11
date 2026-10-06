@@ -188,6 +188,71 @@ typedef struct {
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
 } LorieGpuCopyEntry;
 
+/*
+ * What renderer backend was asked for, what actually ran, and the proof of it.
+ *
+ * The renderer (renderer.c, in the activity's process) writes everything here except the fields marked
+ * X; the X server writes those and only reads the rest, which it logs every 5 seconds (XlorieBackend,
+ * XlorieGles, XlorieVk, XlorieFallback lines) - the renderer's own logcat cannot be read without root or
+ * adb, the X server's can. tools/diag/renderer-proof.sh judges a run from those lines.
+ *
+ * Every counter is cumulative and never reset, and is moved only right after the API call it names has
+ * returned success (or, for the fallback counters, right after the failure it records). Nothing here is
+ * set from a setting: a backend can only be shown as used by counters that only its own successful calls
+ * move.
+ */
+enum { LORIE_ACTIVE_NONE = 0, LORIE_ACTIVE_GLES = 1, LORIE_ACTIVE_VULKAN = 2 };
+
+#define LORIE_FALLBACK_CLASSES(X) X(FATAL_BACKEND) X(RESOURCE_LOCAL) X(INJECTED)
+#define LORIE_FALLBACK_REASONS(X) \
+    X(NONE) X(VK_LOADER) X(VK_INSTANCE) X(VK_NO_DEVICE) X(VK_EXT_ANDROID_SURFACE) X(VK_EXT_SWAPCHAIN) \
+    X(VK_EXT_AHB) X(VK_EXT_FOREIGN) X(VK_DEVICE) X(VK_SELFTEST) X(VK_SURFACE) X(VK_SURFACE_FORMAT) \
+    X(VK_SWAPCHAIN) X(VK_ROOT_NOT_AHB) X(VK_OWNERSHIP) X(VK_DEVICE_LOST) X(VK_SUBMIT) X(VK_PRESENT) \
+    X(AHB_PROPERTIES) X(AHB_EXTERNAL_FORMAT_UNSUPPORTED_BY_STAGE1) X(AHB_FORMAT_UNSUPPORTED_BY_STAGE1) \
+    X(AHB_IMAGE_USAGE_UNSUPPORTED) X(AHB_MEMORY_TYPE) X(AHB_IMPORT)
+#define LORIE_ENUM_CLASS(n) LORIE_FALLBACK_CLASS_ ## n,
+#define LORIE_ENUM_REASON(n) LORIE_FALLBACK_ ## n,
+enum { LORIE_FALLBACK_CLASSES(LORIE_ENUM_CLASS) LORIE_FALLBACK_CLASS_COUNT };
+enum { LORIE_FALLBACK_REASONS(LORIE_ENUM_REASON) LORIE_FALLBACK_REASON_COUNT };
+#undef LORIE_ENUM_CLASS
+#undef LORIE_ENUM_REASON
+
+struct lorie_renderer_diag {
+    volatile uint8_t active;                    /* LORIE_ACTIVE_*: what draws the root right now */
+
+    /* EGL/GLES (the 3c98ffa path) */
+    volatile uint32_t eglImageImports;          /* eglCreateImageKHR returned an image for a buffer */
+    volatile uint32_t glesCopyFrames;           /* GLES frames that drew the root (draw calls issued) */
+    volatile uint32_t eglSwapBuffers;           /* eglSwapBuffers returned EGL_TRUE on a window surface */
+
+    /* Vulkan */
+    volatile uint32_t vkInstanceCreated, vkDeviceCreated, vkSurfaceCreated, vkSwapchainCreated;
+    volatile uint32_t vkAhbImportAttempts, vkAhbImportSuccess;
+    volatile uint32_t vkCopyCommands, vkBlitCommands, vkRenderCommands;
+    /* draws that used an imported AHB's image as sampled source / colour destination, in a command
+     * buffer whose submission succeeded and whose fence then signalled */
+    volatile uint32_t vkImportedSourceDraws, vkImportedDestinationDraws;
+    volatile uint32_t vkQueueSubmits, vkQueuePresentSuccess, vkFramesPresented;
+    volatile uint32_t vkAcquireSuccess, vkAcquireSuboptimal, vkAcquireTimeout, vkAcquireNotReady, vkAcquireOutOfDate;
+    volatile uint64_t vkAcquireWaitUs, vkSubmitCpuUs, vkFenceWaitUs, vkPresentCallUs;
+    volatile uint8_t vkSelftest;                /* 0 not run, 1 passed, 2 failed */
+    volatile char vkDevice[96];                 /* VkPhysicalDeviceProperties.deviceName of the device used */
+    volatile uint32_t vkDriverVersion, vkApiVersion;
+    volatile char vkPresentMode[16];            /* the present mode the swapchain was created with */
+
+    /* fallbacks: every one counted, with its class and reason; the last one in detail */
+    volatile uint32_t fallbackTotal;
+    volatile uint32_t fallbackByClass[LORIE_FALLBACK_CLASS_COUNT];
+    volatile uint32_t fallbackByReason[LORIE_FALLBACK_REASON_COUNT];
+    volatile uint8_t lastFallbackClass, lastFallbackReason;
+    volatile int32_t lastVkResult;
+    volatile uint64_t lastResourceId, lastResourceUsage;
+    volatile uint32_t lastResourceFormat;
+};
+
+#define LORIE_DIAG_ADD(st, field, n) \
+    do { if (st) __atomic_fetch_add(&(st)->diag.field, (n), __ATOMIC_RELAXED); } while (0)
+
 struct lorie_shared_server_state {
     /*
      * Renderer and X server are separated into 2 different processes.
@@ -262,6 +327,9 @@ struct lorie_shared_server_state {
      * package), and it is the activity's one that decides what the present path costs.
      */
     volatile char rendererDriver[192];
+
+    /* Renderer backend and the proof of what actually ran (see struct lorie_renderer_diag). */
+    struct lorie_renderer_diag diag;
 
     struct {
         // We should not allow updating cursor content the same time renderer draws it.

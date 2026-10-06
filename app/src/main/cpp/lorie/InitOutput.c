@@ -509,6 +509,68 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
+/*
+ * The renderer's diagnostics (struct lorie_renderer_diag), every 5 seconds: each counter as its total and,
+ * in brackets, what it moved by since the last report - key=total(+delta). Only read here; the renderer
+ * moves them, after the calls they count have succeeded. tools/diag/renderer-proof.sh parses these lines,
+ * so their keys are part of its contract.
+ */
+static const char *lorieActiveName(uint8_t a) {
+    return a == LORIE_ACTIVE_GLES ? "GLES" : a == LORIE_ACTIVE_VULKAN ? "VULKAN" : "NONE";
+}
+
+#define LORIE_NAME(n) #n,
+static const char *const lorieFallbackClassNames[] = { LORIE_FALLBACK_CLASSES(LORIE_NAME) };
+static const char *const lorieFallbackReasonNames[] = { LORIE_FALLBACK_REASONS(LORIE_NAME) };
+#undef LORIE_NAME
+
+static void lorieLogRendererDiag(void) {
+    static struct lorie_renderer_diag prev;
+    struct lorie_renderer_diag d;
+    char reasons[1024];
+    size_t used = 0;
+    int i;
+
+    memcpy(&d, (const void *) &pvfb->state->diag, sizeof(d));
+#define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
+    log(INFO, "XlorieBackend: active=%s", lorieActiveName(d.active));
+    log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
+        TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
+    log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
+              "swapchain_created=%llu(+%llu) ahb_import_attempts=%llu(+%llu) ahb_import_success=%llu(+%llu) "
+              "imported_source_draws=%llu(+%llu) imported_destination_draws=%llu(+%llu) copy_commands=%llu(+%llu) "
+              "blit_commands=%llu(+%llu) render_commands=%llu(+%llu) queue_submits=%llu(+%llu) "
+              "queue_present_success=%llu(+%llu) frames_presented=%llu(+%llu)",
+        TD(vkInstanceCreated), TD(vkDeviceCreated), TD(vkSurfaceCreated), TD(vkSwapchainCreated),
+        TD(vkAhbImportAttempts), TD(vkAhbImportSuccess), TD(vkImportedSourceDraws), TD(vkImportedDestinationDraws),
+        TD(vkCopyCommands), TD(vkBlitCommands), TD(vkRenderCommands), TD(vkQueueSubmits),
+        TD(vkQueuePresentSuccess), TD(vkFramesPresented));
+    log(INFO, "XlorieVkTiming: acquire_success=%llu(+%llu) acquire_suboptimal=%llu(+%llu) acquire_timeout=%llu(+%llu) "
+              "acquire_not_ready=%llu(+%llu) acquire_out_of_date=%llu(+%llu) acquire_wait_us=%llu(+%llu) "
+              "submit_cpu_us=%llu(+%llu) fence_wait_us=%llu(+%llu) present_call_us=%llu(+%llu) selftest=%s "
+              "device=\"%s\" driver_version=0x%x api_version=0x%x present_mode=\"%s\"",
+        TD(vkAcquireSuccess), TD(vkAcquireSuboptimal), TD(vkAcquireTimeout), TD(vkAcquireNotReady),
+        TD(vkAcquireOutOfDate), TD(vkAcquireWaitUs), TD(vkSubmitCpuUs), TD(vkFenceWaitUs), TD(vkPresentCallUs),
+        d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none",
+        (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode);
+    reasons[0] = 0;
+    for (i = 1; i < LORIE_FALLBACK_REASON_COUNT; i++)
+        if (d.fallbackByReason[i] && used < sizeof(reasons))
+            used += (size_t) snprintf(reasons + used, sizeof(reasons) - used, "%s%s:%u", used ? "," : "",
+                                      lorieFallbackReasonNames[i], d.fallbackByReason[i]);
+    log(INFO, "XlorieFallback: total=%llu(+%llu) fatal_backend=%u resource_local=%u injected=%u last_class=%s "
+              "last_reason=%s last_vkresult=%d last_resource_id=%llu last_resource_format=%u "
+              "last_resource_usage=0x%llx reasons=%s",
+        TD(fallbackTotal), d.fallbackByClass[LORIE_FALLBACK_CLASS_FATAL_BACKEND],
+        d.fallbackByClass[LORIE_FALLBACK_CLASS_RESOURCE_LOCAL], d.fallbackByClass[LORIE_FALLBACK_CLASS_INJECTED],
+        d.fallbackTotal ? lorieFallbackClassNames[d.lastFallbackClass % LORIE_FALLBACK_CLASS_COUNT] : "none",
+        d.fallbackTotal ? lorieFallbackReasonNames[d.lastFallbackReason % LORIE_FALLBACK_REASON_COUNT] : "none",
+        d.lastVkResult, (unsigned long long) d.lastResourceId, d.lastResourceFormat,
+        (unsigned long long) d.lastResourceUsage, reasons[0] ? reasons : "none");
+#undef TD
+    prev = d;
+}
+
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint32_t samples;
     static Bool driverLogged = FALSE;
@@ -553,6 +615,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
+
+    if (lorieConnectionAlive())
+        lorieLogRendererDiag();
     return 5000;
 }
 

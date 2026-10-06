@@ -16,6 +16,10 @@ def opt(make, marker, path):
     return make() if marker in open(path, encoding="utf-8").read() else ""
 
 recipes = {
+    # the renderer diagnostics, as lorie.h declares them and the X server logs them - tdiaglog.c
+    "diagtypes": lambda: span(H, "enum { LORIE_ACTIVE_NONE = 0", "__ATOMIC_RELAXED); } while (0)"),
+    "diaglog": lambda: span(I, "static const char *lorieActiveName(uint8_t a) {", "#undef LORIE_NAME")
+        + func(I, "static void lorieLogRendererDiag(void) {"),
 }
 
 for name, make in recipes.items():

@@ -410,13 +410,18 @@ __LIBC_HIDDEN__ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuf
     *outBuffer = ret;
 }
 
-__LIBC_HIDDEN__ void LorieBuffer_attachToGL(LorieBuffer* buffer) {
+// Returns whether this call created an EGLImage for the buffer - what the renderer's eglImageImports
+// diagnostic counts. Nothing about the buffer itself changes with it.
+__LIBC_HIDDEN__ bool LorieBuffer_attachToGL(LorieBuffer* buffer) {
     const EGLint imageAttributes[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
+    bool imported = false;
     if (!eglGetCurrentDisplay() || !buffer)
-        return;
+        return false;
 
-    if (buffer->image == NULL && buffer->desc.buffer)
+    if (buffer->image == NULL && buffer->desc.buffer) {
         buffer->image = eglCreateImageKHR(eglGetCurrentDisplay(), EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, eglGetNativeClientBufferANDROID(buffer->desc.buffer), imageAttributes);
+        imported = buffer->image != NULL;
+    }
 
     glGenTextures(1, &buffer->id);
     glBindTexture(GL_TEXTURE_2D, buffer->id);
@@ -430,6 +435,7 @@ __LIBC_HIDDEN__ void LorieBuffer_attachToGL(LorieBuffer* buffer) {
         // The image will be updated in redraw call because of `drawRequested` flag, so we are not uploading pixels
         glTexImage2D(GL_TEXTURE_2D, 0, format, buffer->desc.stride, buffer->desc.height, 0, format, GL_UNSIGNED_BYTE, NULL);
     }
+    return imported;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {

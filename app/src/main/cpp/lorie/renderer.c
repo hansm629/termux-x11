@@ -243,9 +243,13 @@ static int rendererDexPresentStormStreakFrames = 0;
 static int rendererDexPresentSkipCooldownFrames = 0;
 static int rendererDexPresentSkipFrames = 0;
 
+static void rendererNoteEglSwap(EGLSurface surface, EGLBoolean ok);
+
 static EGLBoolean
 rendererMaybeSkipEglSwapBuffers(EGLDisplay display, EGLSurface surface)
 {
+    EGLBoolean ok;
+
     if (rendererDexPresentSkipFrames > 0) {
         rendererDexPresentSkipFrames--;
         __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer",
@@ -257,7 +261,9 @@ rendererMaybeSkipEglSwapBuffers(EGLDisplay display, EGLSurface surface)
     /* v3.30-swap-interval-call-begin */
     rendererV330MaybeSetSwapInterval(display);
     /* v3.30-swap-interval-call-end */
-    return eglSwapBuffers(display, surface);
+    ok = eglSwapBuffers(display, surface);
+    rendererNoteEglSwap(surface, ok);
+    return ok;
 }
 
 #define eglSwapBuffers(display, surface) rendererMaybeSkipEglSwapBuffers((display), (surface))
@@ -335,6 +341,25 @@ static void rendererApplyPresentMode(void) {
 }
 
 static volatile struct lorie_shared_server_state* state = NULL;
+
+// Counted after the real call (see rendererMaybeSkipEglSwapBuffers, which can skip a swap and still
+// return EGL_TRUE), and only for a window surface: the default one is the ImageReader's, never shown.
+static void rendererNoteEglSwap(EGLSurface surface, EGLBoolean ok) {
+    if (ok == EGL_TRUE && surface != defaultSfc)
+        LORIE_DIAG_ADD(state, eglSwapBuffers, 1);
+}
+
+// LorieBuffer_attachToGL, counting the EGLImages it actually creates.
+static void rendererAttachToGL(LorieBuffer *buf) {
+    if (LorieBuffer_attachToGL(buf))
+        LORIE_DIAG_ADD(state, eglImageImports, 1);
+}
+
+// What draws the root now: GLES once a window surface of ours is current, nothing on the default one.
+static void rendererPublishActive(void) {
+    if (state)
+        state->diag.active = win != defaultWin && sfc != defaultSfc ? LORIE_ACTIVE_GLES : LORIE_ACTIVE_NONE;
+}
 static struct {
     GLuint id;
     bool cursorChanged;
@@ -820,6 +845,7 @@ void rendererRefreshContext(void) {
     if (!win) {
         win = defaultWin;
         eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx);
+        rendererPublishActive();
         if (state)
             state->surfaceAvailable = false;
         notifyGpuCopyDone(); // Wake up any GPU copy stuck waiting on a surface we no longer have.
@@ -831,13 +857,16 @@ void rendererRefreshContext(void) {
         return vprintEglError("eglCreateWindowSurface failed", __LINE__);
 
     if (eglMakeCurrent(egl_display, sfc, sfc, ctx) != EGL_TRUE) {
-        if (state)
+        if (state) {
             state->surfaceAvailable = false;
+            state->diag.active = LORIE_ACTIVE_NONE;
+        }
         notifyGpuCopyDone();
         return vprintEglError("eglMakeCurrent failed", __LINE__);
     }
 
     rendererApplyPresentMode();
+    rendererPublishActive();
 
     // We should redraw image at least once right after surface change
     if (state)
@@ -1086,7 +1115,7 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
     pthread_spin_lock(&bufferLock);
     buf = LorieBufferList_findById(&buffers, id);
     if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
-        LorieBuffer_attachToGL(buf);
+        rendererAttachToGL(buf);
         LorieBuffer_addToList(buf, &buffers);
     }
     pthread_spin_unlock(&bufferLock);
@@ -1096,7 +1125,7 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
         pthread_spin_lock(&bufferLock);
         buf = LorieBufferList_findById(&buffers, id);
         if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
-            LorieBuffer_attachToGL(buf);
+            rendererAttachToGL(buf);
             LorieBuffer_addToList(buf, &buffers);
         }
         pthread_spin_unlock(&bufferLock);
@@ -1363,6 +1392,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
     draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
+    LORIE_DIAG_ADD(state, glesCopyFrames, 1);
     if (rootFenceWaitEnabled || gpuCopySerial) {
         fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
         glFlush();
@@ -1609,9 +1639,10 @@ __noreturn static void* rendererThread(void) {
             stateChanged = false;
             waitingForBuffers = false;
 
-            if (state)
+            if (state) {
                 state->surfaceAvailable = win != defaultWin;
-            else if (win != defaultWin) {
+                rendererPublishActive();
+            } else if (win != defaultWin) {
                 glClearColor(0, 0, 0, 0);
                 glClear(GL_COLOR_BUFFER_BIT);
                 eglSwapBuffers(egl_display, sfc);
@@ -1624,7 +1655,7 @@ __noreturn static void* rendererThread(void) {
         if (windowChanged) { rendererRefreshContext(); waitingForBuffers = false; } if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); } // Attach all pending buffers to GL.
         pthread_spin_lock(&bufferLock);
         while((buf = LorieBufferList_first(&addedBuffers))) {
-            LorieBuffer_attachToGL(buf);
+            rendererAttachToGL(buf);
             LorieBuffer_addToList(buf, &buffers);
             waitingForBuffers = false;
         }

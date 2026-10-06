@@ -17,10 +17,13 @@ status=0
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS=""
+C_TESTS="tdiaglog"
 for t in $C_TESTS; do
     "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }
     OUT="$OUT" "$OUT/$t" || status=1
 done
+
+# the diagnostics scripts, on synthetic logs and on the ones tdiaglog wrote with the real formatter
+PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tdiag.py" "$HERE/../../tools/diag" "$OUT" || status=1
 
 exit $status
