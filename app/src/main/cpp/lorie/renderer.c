@@ -4296,6 +4296,14 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
 }
 
 /*
+ * COMPARISON BUILD, temporary: backpressure is not asked for even where the call exists, so that one
+ * device A/B can say whether it is what costs throughput. Nothing else differs from 8900470 - the root
+ * layer, the six slots, the release lifecycle, the parking buffer and the OnCommit measurement are all
+ * as they are there. 1 asks for it again, exactly as 8900470 does.
+ */
+#define LORIE_ZC_REQUEST_BACKPRESSURE 0
+
+/*
  * Asks the compositor to queue the root layer's buffers instead of replacing one not latched yet with a
  * newer one (buffer backpressure, ASurfaceTransaction_setEnableBackPressure, API 31). Without it, a
  * frame applied after a latch and the next one applied before the following latch end up in one flush,
@@ -4314,7 +4322,7 @@ static bool rootZcPresent(const LorieBuffer_Desc *desc, int surfaceW, int surfac
  */
 static void rootZcSetBackpressure(ASurfaceControl *sc) {
     rootZcBackpressureOn = false;
-    if (scApi.txSetEnableBackPressure) {
+    if (LORIE_ZC_REQUEST_BACKPRESSURE && scApi.txSetEnableBackPressure) {
         ASurfaceTransaction *t = scApi.txCreate();
 
         scApi.txSetEnableBackPressure(t, sc, true);
@@ -4325,7 +4333,9 @@ static void rootZcSetBackpressure(ASurfaceControl *sc) {
     // "Requested", not "on": the call returns nothing and the compositor confirms nothing. Whether buffers
     // are queued shows in what it does - XlorieCommit's queue depth, XlorieDisplay's latches.
     log("XlorieRootZc: compositor backpressure %s\n",
-        rootZcBackpressureOn ? "requested" : "not available; a root buffer may be dropped for a newer one");
+        rootZcBackpressureOn ? "requested"
+        : scApi.txSetEnableBackPressure ? "not requested (comparison build); a root buffer may be dropped for a newer one"
+        : "not available; a root buffer may be dropped for a newer one");
 }
 
 static void teardownRootOverlay(void) {

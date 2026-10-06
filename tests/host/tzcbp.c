@@ -1,5 +1,7 @@
 /* TZCBP: the root-slot lifecycle against a compositor with buffer backpressure (and, built with
- * NO_BP_SYMBOL, on a system without ASurfaceTransaction_setEnableBackPressure).
+ * NO_BP_SYMBOL, on a system without ASurfaceTransaction_setEnableBackPressure; and, against a build that
+ * does not ask for it - LORIE_ZC_REQUEST_BACKPRESSURE 0, the comparison build - with the call there but
+ * never made).
  *
  * Real code: the X server's lorieRootHandover (rootharness.h), and the renderer's rendererClaimRootBuffer,
  * rootZcPublishedSinceClaim, rendererReleaseRootSlot, rootZcDrainRetiring, rootZcOnComplete,
@@ -59,6 +61,10 @@ static AHardwareBuffer parkingAhb = { -1, -1 };
 static int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *d, AHardwareBuffer **out) { (void) d; *out = &parkingAhb; return 0; }
 static void rootZcNoteCompletion(uint32_t seq, ASurfaceTransactionStats *stats) { (void) seq; (void) stats; }
 #include "zcbp_src.inc"
+/* a build that does not ask for backpressure even with the call there (the comparison build) */
+#if defined(LORIE_ZC_REQUEST_BACKPRESSURE) && !LORIE_ZC_REQUEST_BACKPRESSURE
+#define BP_NOT_REQUESTED 1
+#endif
 static bool cursorOverlayResolveApi(void) { return true; }
 static int created;
 static ASurfaceControl *createFromWindow(ANativeWindow *w, const char *name) { (void) w; (void) name; return &layers_ensure[created++ % 4]; }
@@ -475,12 +481,22 @@ int main(int argc, char **argv) {
         win = someWindow; defaultWin = NULL; rootSurfaceControl = NULL; nTxs = 0; nQ = 0; bpTransactions = 0;
         scApi.txSetEnableBackPressure = txSetEnableBackPressure;
         ensureRootOverlay(); ensureRootOverlay();
+#ifndef BP_NOT_REQUESTED
         CHECK(bpTransactions == 1 && nTxs == 1 && txs[0].bp && !txs[0].bufSet && !txs[0].cb,
               "ensureRootOverlay: %d backpressure calls in %d transactions", bpTransactions, nTxs);
+#else
+        CHECK(bpTransactions == 0 && nTxs == 0 && !rootZcBackpressureOn,
+              "comparison build, the call there: %d backpressure calls in %d transactions", bpTransactions, nTxs);
+#endif
         rootZcDisplayedSlot = -1; rootZcRetiringCount = 0;
         teardownRootOverlay();
         ensureRootOverlay();
+#ifndef BP_NOT_REQUESTED
         CHECK(bpTransactions == 2 && rootZcBackpressureOn, "a layer made again: %d backpressure calls", bpTransactions);
+#else
+        CHECK(bpTransactions == 0 && !rootZcBackpressureOn, "comparison build, a layer made again: %d backpressure calls",
+              bpTransactions);
+#endif
         teardownRootOverlay();
         scApi.txSetEnableBackPressure = NULL;   /* below API 31 */
         nTxs = 0; bpTransactions = 0;
@@ -491,23 +507,31 @@ int main(int argc, char **argv) {
         failed += fails;
         fails = 0;
     }
-#ifndef NO_BP_SYMBOL
+#if !defined(NO_BP_SYMBOL) && !defined(BP_NOT_REQUESTED)
     for (int hz = getenv("HZ") ? atoi(getenv("HZ")) : 60; hz <= (getenv("HZ") ? atoi(getenv("HZ")) : 120); hz += 60)
         for (unsigned i = 0; i < sizeof scenarios / sizeof scenarios[0]; i++)
             if (only < 0 || (int) i == only)
                 failed += runScenario(&scenarios[i], hz, 1, !beyondDesign(&scenarios[i]));
     printf("TZCBP root slots against compositor backpressure: %s (%d scenarios failing)\n", failed ? "FAIL" : "PASS", failed);
 #else
-    /* no setEnableBackPressure: nothing asked of the compositor, which may then drop a buffer for a newer
-     * one; the slot lifecycle has to stay just as safe, and the drops have to show */
-    int drops = 0;
-    for (unsigned i = 0; i < sizeof scenarios / sizeof scenarios[0]; i++) {
-        failed += runScenario(&scenarios[i], 60, 0, 0);
-        drops += dropped;
-        CHECK(bpTransactions == 0 && !rootZcBackpressureOn, "%s: backpressure asked for without the call", scenarios[i].name);
-    }
+    /* no setEnableBackPressure, or a build that does not ask for it: nothing asked of the compositor, which
+     * may then drop a buffer for a newer one. Drops are not failures here; the slot lifecycle has to stay
+     * just as safe (no slot given back that the compositor or a frame still has, the X server two slots,
+     * the renderer at most LORIE_ZC_MAX_HELD, nothing leaked), and the drops have to show */
+    int drops = 0, symbol = 0, hzTop = 60;
+#ifndef NO_BP_SYMBOL
+    symbol = 1; hzTop = 120;                            /* the call is there; this build does not make it */
+#endif
+    for (int hz = 60; hz <= hzTop; hz += 60)
+        for (unsigned i = 0; i < sizeof scenarios / sizeof scenarios[0]; i++) {
+            failed += runScenario(&scenarios[i], hz, symbol, 0);
+            drops += dropped;
+            CHECK(bpTransactions == 0 && !rootZcBackpressureOn, "%s: backpressure asked for (%d calls)", scenarios[i].name,
+                  bpTransactions);
+        }
     CHECK(drops > 0, "without backpressure no buffer was ever dropped: the check for it is blind");
-    printf("TZCBP without the backpressure call, the slot lifecycle as safe and the drops seen: %s (%d scenarios failing, %d drops)\n",
+    printf("TZCBP %s, the slot lifecycle as safe and the drops seen: %s (%d scenarios failing, %d drops)\n",
+           symbol ? "comparison build, backpressure not requested with the call there" : "without the backpressure call",
            failed || fails ? "FAIL" : "PASS", failed, drops);
     failed += fails;
 #endif

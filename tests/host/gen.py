@@ -132,6 +132,8 @@ recipes = {
         + func(R, "static AHardwareBuffer *rootZcParkingBuffer(void) {")
         + func(R, "static void rootZcStopPresenting(void) {")
         + func(R, "static uint32_t rootZcHandOver(int slot, uint64_t bufferId, uint32_t gen) {")
+        # whether this build asks for backpressure at all (the comparison build does not); absent before
+        + opt(lambda: macro(R, "LORIE_ZC_REQUEST_BACKPRESSURE"), "#define LORIE_ZC_REQUEST_BACKPRESSURE", R)
         + func(R, "static void rootZcSetBackpressure(ASurfaceControl *sc) {")
         + func(R, "static void teardownRootOverlay(void) {")
         + "static ANativeWindow *defaultWin = NULL, *win = NULL;\nstatic bool cursorOverlayResolveApi(void);\n"

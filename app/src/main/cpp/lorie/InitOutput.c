@@ -1412,7 +1412,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
                 pvfb->state->outputFilterNearest ? "nearest" : "linear",
                 pvfb->state->outputFilterNearest && snap.directBufferSubmits
                     ? " (direct frames were scaled bilinearly regardless)" : "",
-                pvfb->state->rootBackpressure ? "requested" : "not available",
+                pvfb->state->rootBackpressure ? "requested" : "not requested",
                 pvfb->state->rootCommitTracked ? "measured" : "unavailable",
                 snap.directBufferSubmits,
                 snap.directReuseNoSubmit,
