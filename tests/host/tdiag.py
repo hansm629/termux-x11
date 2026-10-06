@@ -20,13 +20,16 @@ def check(cond, what):
         fails += 1
         print("  FAIL " + what)
 
-def report(t, active, gles, vk, fb_total_delta=0, totals=None):
-    """One 5 s report, as the X server logs it. gles/vk give deltas; totals default to 10x the delta."""
+def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None):
+    """One 5 s report, as the X server logs it. gles/vk give deltas; totals default to 10x the delta. The X
+    server's AHB ownership defaults to the one that goes with `active`."""
+    ownership = ownership or ("per_access" if active == "VULKAN" else "persistent")
     totals = totals or {}
     def kv(k, d):
         return "%s=%d(+%d)" % (k, totals.get(k, d * 10), d)
     p = "10-07 12:00:%02d.000  100  101 I LorieNative: " % t
-    lines = [p + "XlorieBackend: active=%s" % active,
+    lines = [p + "XlorieBackend: requested=auto active=%s ownership=%s ownership_transitions=1 ownership_refused=0 "
+                 "x_ahb_cpu_acquires=40(+4) x_state_lock_wait_us=900(+90)" % (active, ownership),
              p + "XlorieGles: " + " ".join(kv(k, gles.get(k, 0)) for k in ("egl_image_imports", "gles_copy_frames", "egl_swap_buffers")),
              p + "XlorieVk: " + " ".join(kv(k, vk.get(k, 0)) for k in (
                  "instance_created", "device_created", "surface_created", "swapchain_created", "ahb_import_attempts",
@@ -71,6 +74,9 @@ cases = [
     ("vulkan with GLES frames in the window", reports(3, active="VULKAN", gles=GL, vk=VK), "vulkan", 1),
     ("vulkan with a fallback in the window", reports(3, active="VULKAN", gles={}, vk=VK, fb_total_delta=1), "vulkan", 1),
     ("gles with a Vulkan present in the window", reports(3, active="GLES", gles=GL, vk={"queue_present_success": 1, "frames_presented": 1}), "gles", 1),
+    ("vulkan while the X server keeps 3c98ffa's CPU locks", reports(3, active="VULKAN", gles={}, vk=VK, ownership="persistent"), "vulkan", 1),
+    ("gles while the X server is per-access", reports(3, active="GLES", gles=GL, vk={}, ownership="per_access"), "gles", 1),
+    ("an X server without the ownership field", [l.replace(" ownership=per_access", "") for l in vk_good], "vulkan", 1),
     ("backend changed within the window", report(0, active="GLES", gles=GL, vk={}) + reports(2, active="VULKAN", gles={}, vk=VK), "vulkan", 1),
     ("too few reports", reports(1, active="VULKAN", gles={}, vk=VK), "vulkan", 2),
     ("a line type missing", [l for l in vk_good if "XlorieFallback" not in l], "vulkan", 2),
@@ -81,7 +87,7 @@ for name, lines, expect, want in cases:
     check(("RESULT: PASS" in out) == (want == 0), "%s: result line does not match the exit status" % name)
 
 code, out = run("renderer-status.sh", vk_good)
-check(code == 0 and all(k in out for k in ("XlorieBackend: active=VULKAN", "XlorieGles:", "XlorieVk:", "XlorieVkTiming:", "XlorieFallback:")),
+check(code == 0 and all(k in out for k in ("XlorieBackend:", "active=VULKAN", "ownership=per_access", "XlorieGles:", "XlorieVk:", "XlorieVkTiming:", "XlorieFallback:")),
       "renderer-status: %d\n%s" % (code, out))
 check(out.count("XlorieVk:") == 1, "renderer-status printed more than the latest report")
 code, out = run("renderer-status.sh", ["nothing here"])

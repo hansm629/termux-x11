@@ -36,6 +36,7 @@ void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
 void lorieUnregisterBuffer(LorieBuffer* buffer);
 bool lorieConnectionAlive(void);
+void lorieRendererDisconnected(void);
 extern bool lorieDebugEnabled; // Set in activity.c's startLogcat, only called when TERMUX_X11_DEBUG=1.
 void lorieSetRendererWakeupCond(int fd);
 int rendererGetWakeupCondFd(void);
@@ -203,6 +204,41 @@ typedef struct {
  */
 enum { LORIE_ACTIVE_NONE = 0, LORIE_ACTIVE_GLES = 1, LORIE_ACTIVE_VULKAN = 2 };
 
+/*
+ * Which renderer backend is wanted (X: TERMUX_X11_RENDERER_BACKEND = auto | vulkan | gles, auto when unset),
+ * and the handshake that moves the X server's CPU ownership of AHardwareBuffers with the backend that is
+ * actually active - never with the one requested.
+ *
+ *   PERSISTENT  3c98ffa: the X server keeps every AHB pixmap it allocates, converts for the GPU or puts on
+ *               the root window CPU-locked for as long as 3c98ffa does; a CPU access to an AHB takes the
+ *               shared lock only where 3c98ffa did (lorieNeedsGpuLock).
+ *   PER_ACCESS  for Vulkan: no AHB stays CPU-locked; every CPU access to an AHB pixmap locks it at
+ *               PrepareAccess and unlocks it (synchronously) at FinishAccess, under the shared lock - which
+ *               the renderer holds for the whole of its use of an AHB - so the X server's CPU ownership and
+ *               the renderer's never overlap.
+ *
+ * The renderer asks: ownershipRequest = (seq << 8) | mode, seq one past the last one acknowledged. The X
+ * server takes the request up on its main thread (lorieRedraw, every frame), and under the shared lock moves
+ * its locks and answers with ownershipAck = (seq << 8) | the mode now in effect - which is PERSISTENT when it
+ * refused PER_ACCESS (a session asked for gles never leaves PERSISTENT). Since the locks and the answer only
+ * change together under that lock, the renderer may use AHBs from Vulkan in a frame only when, holding the
+ * lock, it reads its own request answered with PER_ACCESS; it asks for PERSISTENT again once Vulkan work has
+ * stopped and its fences have signalled. The X server also returns to PERSISTENT by itself (answering
+ * whatever was asked) when the renderer's connection goes away or a new one is made.
+ */
+enum { LORIE_BACKEND_AUTO = 0, LORIE_BACKEND_VULKAN = 1, LORIE_BACKEND_GLES = 2 };
+enum { LORIE_OWNERSHIP_PERSISTENT = 0, LORIE_OWNERSHIP_PER_ACCESS = 1 };
+#define LORIE_OWNERSHIP_WORD(seq, mode) (((uint32_t) (seq) << 8) | ((uint32_t) (mode) & 0xffu))
+#define LORIE_OWNERSHIP_SEQ(word) ((uint32_t) (word) >> 8)
+#define LORIE_OWNERSHIP_MODE(word) ((uint8_t) ((word) & 0xffu))
+
+struct lorie_backend_control {
+    volatile uint8_t requested;                 /* X: LORIE_BACKEND_* */
+    volatile uint8_t requestedInvalid;          /* X: the variable was set, to none of the three */
+    volatile uint32_t ownershipRequest;         /* renderer */
+    volatile uint32_t ownershipAck;             /* X */
+};
+
 #define LORIE_FALLBACK_CLASSES(X) X(FATAL_BACKEND) X(RESOURCE_LOCAL) X(INJECTED)
 #define LORIE_FALLBACK_REASONS(X) \
     X(NONE) X(VK_LOADER) X(VK_INSTANCE) X(VK_NO_DEVICE) X(VK_EXT_ANDROID_SURFACE) X(VK_EXT_SWAPCHAIN) \
@@ -248,6 +284,12 @@ struct lorie_renderer_diag {
     volatile int32_t lastVkResult;
     volatile uint64_t lastResourceId, lastResourceUsage;
     volatile uint32_t lastResourceFormat;
+
+    /* X: the AHB ownership mode in effect, its transitions, PER_ACCESS requests refused, CPU accesses that
+     * locked an AHB per access, and the time those spent waiting for the shared lock */
+    volatile uint8_t xOwnership;
+    volatile uint32_t xOwnershipTransitions, xOwnershipRefused;
+    volatile uint64_t xAhbCpuAcquires, xStateLockWaitUs;
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \
@@ -330,6 +372,8 @@ struct lorie_shared_server_state {
 
     /* Renderer backend and the proof of what actually ran (see struct lorie_renderer_diag). */
     struct lorie_renderer_diag diag;
+    /* Backend selection and the AHB ownership handshake (see struct lorie_backend_control). */
+    struct lorie_backend_control backend;
 
     struct {
         // We should not allow updating cursor content the same time renderer draws it.

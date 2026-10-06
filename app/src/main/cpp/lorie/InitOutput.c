@@ -87,6 +87,11 @@ typedef struct {
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
+
+    /* AHB CPU ownership (struct lorie_backend_control): the mode in effect, and every AHB pixmap 3c98ffa
+     * keeps CPU-locked for its lifetime - locked while PERSISTENT is in effect, not under PER_ACCESS */
+    uint8_t ownership;
+    struct xorg_list ahbPersistent;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -98,6 +103,7 @@ static lorieScreenInfo lorieScreen = {
         .root.name = "screen",
         .dri3 = TRUE,
         .vblank_queue = { &lorieScreen.vblank_queue, &lorieScreen.vblank_queue },
+        .ahbPersistent = { &lorieScreen.ahbPersistent, &lorieScreen.ahbPersistent },
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 
@@ -111,10 +117,125 @@ typedef struct {
     bool flipped, wasLocked, imported;
     void *locked;
     void *mem;
+    /* An AHB pixmap 3c98ffa keeps CPU-locked for its lifetime: on pvfb->ahbPersistent (lorieHoldPersistent) */
+    bool persistentWanted;
+    struct xorg_list persistentLink;
 } LoriePixmapPriv;
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
 #define LORIE_BUFFER_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap))->buffer : NULL)
+
+/*
+ * AHB CPU ownership (struct lorie_backend_control in lorie.h). PERSISTENT is 3c98ffa's own behaviour, and
+ * every place 3c98ffa took a lifetime CPU lock on a pixmap now goes through lorieHoldPersistent: the lock
+ * is taken exactly as before while PERSISTENT is in effect, and the pixmap is remembered either way, so that
+ * a change of mode (lorieApplyOwnership) can let go of every such lock, or take every one of them again.
+ * Pixmaps that are not AHBs (plain memory, FD) are locked as before in both modes.
+ */
+static Bool lorieAhbPerAccess(void) {
+    return pvfb->ownership == LORIE_OWNERSHIP_PER_ACCESS;
+}
+
+static Bool lorieIsAhb(LoriePixmapPriv *priv) {
+    return priv && priv->buffer && LorieBuffer_description(priv->buffer)->type == LORIEBUFFER_AHARDWAREBUFFER;
+}
+
+static void lorieHoldPersistent(LoriePixmapPriv *priv) {
+    if (!priv || !priv->buffer)
+        return;
+    if (lorieIsAhb(priv) && !priv->persistentWanted) {
+        priv->persistentWanted = TRUE;
+        xorg_list_add(&priv->persistentLink, &pvfb->ahbPersistent);
+    }
+    if (!priv->locked && !(lorieIsAhb(priv) && lorieAhbPerAccess()))
+        LorieBuffer_lock(priv->buffer, &priv->locked);
+}
+
+static void lorieDropPersistent(LoriePixmapPriv *priv) {
+    if (!priv)
+        return;
+    if (priv->persistentWanted) {
+        xorg_list_del(&priv->persistentLink);
+        priv->persistentWanted = FALSE;
+    }
+    if (priv->buffer && priv->locked) {
+        LorieBuffer_unlock(priv->buffer);
+        priv->locked = NULL;
+        priv->wasLocked = FALSE;
+    }
+}
+
+/*
+ * Puts `mode` in effect for every remembered AHB pixmap - under PER_ACCESS none stays CPU-locked, under
+ * PERSISTENT each is locked again as 3c98ffa keeps it - and answers request `seq` with it. Main thread,
+ * between requests, so no EXA access is open on any of them. The locks and the answer change together under
+ * the shared lock, so a renderer frame (which holds the same lock) always sees an answer that describes the
+ * locks: it may use the AHBs from Vulkan only in a frame whose answer is its own request with PER_ACCESS.
+ * An unlock is synchronous (no fence asked for), so the CPU's writes have landed by the time the renderer
+ * can take the lock and use the buffer.
+ */
+static void lorieApplyOwnership(uint8_t mode, uint32_t seq) {
+    LoriePixmapPriv *priv;
+
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    if (mode != pvfb->ownership) {
+        xorg_list_for_each_entry(priv, &pvfb->ahbPersistent, persistentLink) {
+            if (mode == LORIE_OWNERSHIP_PER_ACCESS && priv->locked) {
+                LorieBuffer_unlock(priv->buffer);
+                priv->locked = NULL;
+                priv->wasLocked = FALSE;
+            } else if (mode == LORIE_OWNERSHIP_PERSISTENT && !priv->locked)
+                LorieBuffer_lock(priv->buffer, &priv->locked);
+        }
+        pvfb->ownership = mode;
+        pvfb->state->diag.xOwnership = mode;
+        __atomic_fetch_add(&pvfb->state->diag.xOwnershipTransitions, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&pvfb->state->backend.ownershipAck, LORIE_OWNERSHIP_WORD(seq, mode), __ATOMIC_RELEASE);
+    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+}
+
+/*
+ * Takes up the renderer's ownership request, if there is a new one, and answers it with the mode now in
+ * effect. PER_ACCESS is refused in a session asked for gles: that one stays 3c98ffa's throughout.
+ */
+static void lorieProcessOwnershipRequest(void) {
+    uint32_t req = __atomic_load_n(&pvfb->state->backend.ownershipRequest, __ATOMIC_ACQUIRE);
+    uint32_t ack = __atomic_load_n(&pvfb->state->backend.ownershipAck, __ATOMIC_ACQUIRE);
+    uint8_t mode = LORIE_OWNERSHIP_MODE(req);
+
+    if (LORIE_OWNERSHIP_SEQ(req) == LORIE_OWNERSHIP_SEQ(ack))
+        return;
+    if (mode != LORIE_OWNERSHIP_PERSISTENT &&
+        (mode != LORIE_OWNERSHIP_PER_ACCESS || pvfb->state->backend.requested == LORIE_BACKEND_GLES)) {
+        __atomic_fetch_add(&pvfb->state->diag.xOwnershipRefused, 1, __ATOMIC_RELAXED);
+        mode = LORIE_OWNERSHIP_PERSISTENT;
+    }
+    lorieApplyOwnership(mode, LORIE_OWNERSHIP_SEQ(req));
+    pthread_cond_signal(rendererCond);
+}
+
+/*
+ * Back to 3c98ffa's ownership when no renderer is there to use AHBs from Vulkan: its connection went away, or
+ * a new one was made (which starts on GLES). Whatever was asked before is answered as PERSISTENT, so the
+ * next renderer's first request is one past it.
+ */
+static void lorieResetOwnership(void) {
+    uint32_t req = __atomic_load_n(&pvfb->state->backend.ownershipRequest, __ATOMIC_ACQUIRE);
+
+    lorieApplyOwnership(LORIE_OWNERSHIP_PERSISTENT, LORIE_OWNERSHIP_SEQ(req));
+}
+
+static Bool lorieRendererGoneWorkProc(__unused ClientPtr client, __unused void *closure) {
+    lorieResetOwnership();
+    return TRUE;
+}
+
+// Input thread (handleLorieEvents), when the renderer's connection closes: taken up on the main thread.
+void lorieRendererDisconnected(void) {
+    QueueWorkProc(lorieRendererGoneWorkProc, NULL, NULL);
+    lorieWakeServer();
+}
 
 static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
@@ -128,7 +249,10 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
         if (desc->type != LORIEBUFFER_REGULAR) {
             // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
-            LorieBuffer_lock(priv->buffer, &priv->locked);
+            // The conversion dropped the old mapping, which priv->locked still points into; 3c98ffa
+            // overwrote it with a new lock, which lorieHoldPersistent takes while PERSISTENT is in effect.
+            priv->locked = NULL;
+            lorieHoldPersistent(priv);
         }
     }
 
@@ -136,6 +260,17 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
 }
 
 static Bool lorieServerDebugEnabled = FALSE;
+
+// TERMUX_X11_RENDERER_BACKEND: auto, vulkan or gles; unset or empty is auto, and so is anything else, flagged.
+static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {
+    if (value && !strcmp(value, "vulkan"))
+        return LORIE_BACKEND_VULKAN;
+    if (value && !strcmp(value, "gles"))
+        return LORIE_BACKEND_GLES;
+    if (value && *value && strcmp(value, "auto"))
+        *invalid = 1;
+    return LORIE_BACKEND_AUTO;
+}
 
 void OsVendorInit(void) {
     pthread_mutexattr_t mutex_attr;
@@ -160,6 +295,11 @@ void OsVendorInit(void) {
     pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&lorieScreen.state->lock, &mutex_attr);
     pthread_mutex_init(&lorieScreen.state->cursor.lock, &mutex_attr);
+
+    // The renderer backend wanted (struct lorie_backend_control). Only a request: what runs is the
+    // renderer's to report (diag.active), and AHB ownership follows that, never this.
+    lorieScreen.state->backend.requested = lorieRequestedBackend(getenv("TERMUX_X11_RENDERER_BACKEND"),
+                                                                 &lorieScreen.state->backend.requestedInvalid);
 }
 
 // Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
@@ -190,6 +330,7 @@ void lorieSetRendererWakeupCond(int fd) {
 }
 
 void lorieActivityConnected(void) {
+    lorieResetOwnership();      // a new renderer starts on GLES, with 3c98ffa's ownership
     pvfb->state->drawRequested = pvfb->state->cursor.updated = true;
     lorieSendSharedServerState(pvfb->stateFd);
     lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
@@ -264,6 +405,17 @@ void drawSquare(int x, int y, int l, uint32_t color, uint32_t stride, uint32_t* 
 Bool drawSquares() {
     LoriePixmapPriv* priv = lorieRootWindowPixmapPriv();
     uint32_t* pixels = !priv ? NULL : priv->locked;
+    // PER_ACCESS: drawn into where 3c98ffa would have it CPU-locked, under the shared lock for the drawing only.
+    Bool perAccess = !pixels && lorieAhbPerAccess() && priv && priv->persistentWanted;
+    if (perAccess) {
+        uint64_t waitStartUs = GetTimeInMicros();
+        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
+        if (LorieBuffer_lock(priv->buffer, (void **) &pixels))
+            pixels = NULL;
+        else
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuAcquires, 1, __ATOMIC_RELAXED);
+    }
     if (pixels) {
         const LorieBuffer_Desc *d = LorieBuffer_description(priv->buffer);
         int l = min(d->width, d->height) / 4, x = (d->width - l)/2, y = (d->height - l)/2;
@@ -271,6 +423,11 @@ Bool drawSquares() {
         drawSquare(x - l/3, y - l/3, l, 0x00FF0000, d->stride, pixels);
         drawSquare(x, y, l, 0x0000FF00, d->stride, pixels);
         drawSquare(x + l/3, y + l/3, l, 0x000000FF, d->stride, pixels);
+    }
+    if (perAccess) {
+        if (pixels)
+            LorieBuffer_unlock(priv->buffer);
+        lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
     }
 
     return FALSE;
@@ -462,6 +619,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
+    lorieProcessOwnershipRequest();
+
     pvfb->current_msc++;
     loriePerformVblanks();
 
@@ -533,7 +692,13 @@ static void lorieLogRendererDiag(void) {
 
     memcpy(&d, (const void *) &pvfb->state->diag, sizeof(d));
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
-    log(INFO, "XlorieBackend: active=%s", lorieActiveName(d.active));
+    log(INFO, "XlorieBackend: requested=%s%s active=%s ownership=%s ownership_transitions=%u ownership_refused=%u "
+              "x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu)",
+        pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
+            : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
+        pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "", lorieActiveName(d.active),
+        d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
+        d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs));
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -651,13 +816,9 @@ void lorieSetWindowPixmap(WindowPtr pWindow, PixmapPtr newPixmap) {
     if (isRoot) {
         old = LORIE_PIXMAP_PRIV_FROM_PIXMAP(oldPixmap);
         new = LORIE_PIXMAP_PRIV_FROM_PIXMAP(newPixmap);
-        if (old && old->buffer && old->locked) {
-            LorieBuffer_unlock(old->buffer);
-            old->locked = NULL;
-            old->wasLocked = false;
-        }
+        lorieDropPersistent(old);
         if (new && new->buffer && !new->locked) {
-            LorieBuffer_lock(new->buffer, &new->locked);
+            lorieHoldPersistent(new);
             new->wasLocked = false;
         }
     }
@@ -1198,7 +1359,7 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
     *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
 
-    LorieBuffer_lock(priv->buffer, &priv->locked);
+    lorieHoldPersistent(priv);
     if (!priv->buffer) {
         free(priv);
         return NULL;
@@ -1209,6 +1370,10 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
 
 void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
     LoriePixmapPriv *priv = driverPriv;
+    if (priv->persistentWanted) {
+        xorg_list_del(&priv->persistentLink);
+        priv->persistentWanted = FALSE;
+    }
     if (priv->buffer) {
         if (priv->locked)
             LorieBuffer_unlock(priv->buffer);
@@ -1227,6 +1392,10 @@ Bool lorieModifyPixmapHeader(PixmapPtr pPix, __unused int w, __unused int h, __u
 
 // Whether a CPU access to pPix could race a GPU write from the renderer, and so needs state->lock.
 static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmapPriv *priv, int index) {
+    // PER_ACCESS (Vulkan): every CPU access to an AHB is exclusive with the renderer's use of it, which
+    // happens only while the renderer holds the same lock.
+    if (lorieAhbPerAccess() && lorieIsAhb(priv))
+        return TRUE;
     if (pScreenPtr->GetScreenPixmap(pScreenPtr) == pPix)
         return index == EXA_PREPARE_DEST || (pvfb->rootGpuCopyPending && !pvfb->root.legacyDrawing);
     return !pvfb->root.legacyDrawing && priv->buffer &&
@@ -1236,16 +1405,27 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
+    Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
+    if (lorieNeedsGpuLock(pPix, priv, index)) {
+        uint64_t waitStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        if (perAccessAhb)
+            __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
+    }
 
     if (!priv->locked && !priv->mem) {
         int err = LorieBuffer_lock(priv->buffer, &priv->locked);
         if (err) {
             dprintf(2, "Failed to lock buffer, err %d\n", err);
+            // PER_ACCESS: no FinishAccess follows a failed PrepareAccess, and the renderer would wait on
+            // this lock for good. (3c98ffa's own path is left as it was.)
+            if (perAccessAhb)
+                lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
             return FALSE;
         }
         priv->wasLocked = FALSE;
+        if (perAccessAhb)
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuAcquires, 1, __ATOMIC_RELAXED);
     } else
         priv->wasLocked = TRUE;
 
@@ -1255,6 +1435,19 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
 
 void lorieFinishAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+
+    // PER_ACCESS: the CPU lock goes before the shared one, so the renderer can never take the shared lock
+    // and use the AHB while the X server still has it CPU-locked. 3c98ffa's order is kept otherwise.
+    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
+        if (!priv->wasLocked) {
+            LorieBuffer_unlock(priv->buffer);
+            priv->locked = NULL;
+            priv->wasLocked = FALSE;
+        }
+        lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        return;
+    }
+
     if (lorieNeedsGpuLock(pPix, priv, index))
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 

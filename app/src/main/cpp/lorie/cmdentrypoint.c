@@ -280,6 +280,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
         InputThreadUnregisterDev(fd);
         close(fd);
         conn_fd = -1;
+        lorieRendererDisconnected();    // AHB ownership back to 3c98ffa's (InitOutput.c)
         lorieEnableClipboardSync(FALSE);
         while ((buf = LorieBufferList_first(&registeredBuffers)))
             LorieBuffer_removeFromList(buf);
