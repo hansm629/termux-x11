@@ -51,6 +51,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tframes.py" "$HERE/../../tools/trace/fr
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tzcslots.py" "$HERE/../../tools/model/zcslots.py" || status=1
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/thandover.py" "$HERE/../../tools/model/handover.py" || status=1
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tglphase.py" "$HERE/../../tools/model/glphase.py" || status=1
+PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tfifotick.py" "$HERE/../../tools/model/fifotick.py" || status=1
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tpatch.py" "$HERE/../../app/src/main/cpp/xserver" \
     "$HERE/../../app/src/main/cpp/patches/xserver.patch" "$OUT" || status=1
 
