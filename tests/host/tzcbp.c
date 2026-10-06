@@ -13,8 +13,13 @@
  * layer keeps its buffer. Timing from the 829b4ec trace, at 60 and 120 Hz.
  *
  * Every event: a slot whose held bit is clear is not one the compositor has (queued, latched, shown,
- * being released, kept by a hidden layer); the X server never draws into such a slot or a held one; the
- * renderer holds at most LORIE_ZC_MAX_HELD plus a claim; the X server has two slots at every publish.
+ * being released, kept by a hidden layer), nor the one a frame has claimed and is still using; the X
+ * server never draws into such a slot or a held one; the renderer holds at most LORIE_ZC_MAX_HELD plus a
+ * claim; the X server has two slots at every publish. Leaving the root layer for the GL path and coming
+ * back is rendererRedrawLocked's order too: the GL frame claims the newest slot, leaves the layer
+ * (rootZcStopPresenting), samples the slot and gives its claim back - and with nothing new published,
+ * the newest slot is the one the layer still shows, so the claim, the slot on screen and the slot being
+ * released are one buffer.
  * Every scenario: with backpressure, no buffer dropped by the compositor and no published frame lost
  * beyond the unavoidable (latches the compositor skipped, frames beyond the display rate, a frame longer
  * than a period, a pool replaced); presented in order; at the end nothing held that is not accounted for.
@@ -71,6 +76,7 @@ typedef struct {
     int64_t (*cbLate)(int k), (*relLate)(int k);
     int (*content)(int k), (*extra)(int k), (*sfSkip)(int k);
     int resizeAt, teardownAt, resumeAt;
+    int glAt, glBackAt;     /* the GL path from this tick (the layer kept, only left), back from that; 0 never */
 } Scenario;
 static int64_t workPlain(int k) { (void) k; return WORK; }
 static int64_t workEvery10(int k) { return k % 10 == 5 ? SLOW : WORK; }
@@ -85,6 +91,7 @@ static int64_t lateTwo(int k) { return k >= 100 && k < 160 ? 2 * P : 0; }
 static int on(int k) { (void) k; return 1; }
 static int off(int k) { (void) k; return 0; }
 static int contentStops(int k) { return !(k >= 120 && k < 180); }
+static int64_t lateAt130(int k) { return k >= 128 && k < 136 ? P : 0; }
 static int extraBurst(int k) { return k >= 100 && k < 130; }
 static int skipEvery20(int k) { return k % 20 == 7; }
 static const Scenario scenarios[] = {
@@ -101,6 +108,12 @@ static const Scenario scenarios[] = {
     { "surface torn down and made again, old completions late", workDeep, lateAround, lateNone, on, off, off, -1, 100, 104 },
     /* beyond what four renderer slots hold: judged for safety only, and what it costs is reported */
     { "OnComplete two frames late (beyond the design)", workDeep, lateTwo, lateNone, on, off, off, -1, -1, -1 },
+    /* leaving the root layer for GL and coming back: with nothing new, the claim is the slot on screen */
+    { "to GL and back, nothing new, back after the release", workPlain, lateNone, lateNone, contentStops, off, off,
+      -1, -1, -1, 130, 140 },
+    { "to GL and back, nothing new, back before the release", workPlain, lateNone, lateAt130, contentStops, off, off,
+      -1, -1, -1, 130, 131 },
+    { "to GL and back, content going on", workEvery10, lateNone, lateNone, on, off, off, -1, -1, -1, 130, 140 },
 };
 static int beyondDesign(const Scenario *s) { return strstr(s->name, "beyond the design") != NULL; }
 
@@ -259,6 +272,9 @@ static int pubTick[LORIE_ROOT_SLOTS], publishStalls, frameStalls, xAvailMin, hel
 
 static int heldCount(void) { return __builtin_popcount(fakeState.rootHandover & LORIE_ROOT_HELD_MASK); }
 static void check(const char *when) {
+    if (rendererRootSlot >= 0 && LORIE_ROOT_GEN(fakeState.rootHandover) == rendererRootSlotGen &&
+        !(fakeState.rootHandover & (1u << rendererRootSlot)) && violations++ < 3)
+        printf("    %s: slot %d given back while the frame that claimed it still uses it\n", when, rendererRootSlot);
     for (int s = 0; s < LORIE_ROOT_SLOTS; s++)
         if (!(fakeState.rootHandover & (1u << s)) && sfState[pool][s] != SF_FREE) {
             if (violations++ < 3) printf("    %s: slot %d not held while the compositor %s it\n", when, s, sfName[sfState[pool][s]]);
@@ -288,13 +304,17 @@ static void frame(int64_t t) {
     frameId = rendererClaimRootBuffer();
     frameSlot = rendererRootSlot; frameGen = rendererRootSlotGen;
     if (frameSlot < 0) { busy = 0; return; }
-    if (!zc) {                                          /* the GL path: sampled and given back */
-        rootZcDrainRetiring();
+    if (!zc) {                                          /* the GL path: leaves the layer, samples, gives back */
+        if (rootZcDisplayedSlot >= 0 || rootZcRetiringCount > 0)
+            rootZcStopPresenting();
+        check("GL frame, sampling");
         rendererReleaseRootBuffer();
         busy = 0; gateOpen = 0;
         return;
     }
-    if (!rootZcDrainRetiring()) {
+    int drainedRoom = rootZcDrainRetiring();
+    check("frame, after the drain");
+    if (!drainedRoom) {
         frameStalls++;
         int mine = frameSlot == rootZcDisplayedSlot && frameId == rootZcDisplayedId;
         for (int i = 0; i < rootZcRetiringCount; i++)
@@ -309,7 +329,12 @@ static void frame(int64_t t) {
         wake(t);
         return;
     }
-    if (sfState[pool][frameSlot] != SF_FREE && violations++ < 3)
+    /* the copies go into the claimed slot; one already submitted complete before has none queued (the frame
+     * that submitted it waited for them), which is what a frame back from the GL path finds */
+    int submittedBefore = 0;
+    for (int i = 0; i < rootZcRetiringCount; i++)
+        submittedBefore |= rootZcRetiring[i].slot == frameSlot && rootZcRetiring[i].bufferId == frameId;
+    if (!submittedBefore && sfState[pool][frameSlot] != SF_FREE && violations++ < 3)
         printf("    the frame copies into slot %d, which the compositor %s\n", frameSlot, sfName[sfState[pool][frameSlot]]);
     frameTick = pubTick[frameSlot];
     int64_t w = sc->work(frameTick);
@@ -383,6 +408,8 @@ static int runScenario(const Scenario *s, int hz, int bpSymbol, int strict) {
             if (k == s->resizeAt) replacePool();
             if (k == s->teardownAt) { teardownRootOverlay(); zc = 0; }
             if (k == s->resumeAt) { rootSurfaceControl = &layers[++epoch]; rootZcSetBackpressure(rootSurfaceControl); zc = 1; }
+            if (s->glAt && k == s->glAt) { zc = 0; drawRequested = 1; }      /* e.g. the filtering changed: redrawn */
+            if (s->glBackAt && k == s->glBackAt) { zc = 1; drawRequested = 1; }
             if (!zc) stopped[k] = 1;
             if (k >= 240 || s->content(k) || k == s->resizeAt) pending = 1;
             if (pending) publish(k);

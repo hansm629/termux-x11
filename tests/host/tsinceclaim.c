@@ -17,6 +17,7 @@
  * 3. The pool replaced while a claim is out (the word as the X server leaves it): yes. */
 #include "rootharness.h"
 #include <sched.h>
+#include <pthread.h>
 static typeof(fakeState) *state = &fakeState;
 static int64_t rendererNowNs(void) { return 0; }
 #define log(...) ((void) 0)

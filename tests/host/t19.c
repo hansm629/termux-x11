@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sched.h>
+#include <pthread.h>
 #include "rootslots_src.inc"
 static struct {
     volatile uint32_t rootHandover;

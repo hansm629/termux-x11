@@ -2113,8 +2113,28 @@ static void rendererReleaseRootSlot(int slot, uint64_t bufferId, uint32_t gen) {
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
 }
 
+/*
+ * Whether the zero-copy path still holds this buffer for the compositor: as the one it submitted last,
+ * or as one waiting for its release. A slot can be held for more than one reason at once - a frame
+ * claims the slot the compositor shows when nothing newer was published, and after the root layer is
+ * left, the slot it showed is still being released when the next frame (GL, or zero-copy again) claims
+ * it as the newest. There is one held bit per slot, so whichever lets go first must leave the bit alone
+ * while another still needs it: the last one to let go clears it. rootOverlayLock held.
+ */
+static bool rootZcHoldsSlotLocked(int slot, uint64_t bufferId, uint32_t gen) {
+    int i;
+
+    if (rootZcDisplayedSlot == slot && rootZcDisplayedId == bufferId && rootZcDisplayedGen == gen)
+        return true;
+    for (i = 0; i < rootZcRetiringCount; i++)
+        if (rootZcRetiring[i].slot == slot && rootZcRetiring[i].bufferId == bufferId && rootZcRetiring[i].gen == gen)
+            return true;
+    return false;
+}
+
 static void rendererReleaseRootBuffer(void) {
     int slot = rendererRootSlot;
+    bool zcHolds;
 
     // Deliberately not conditional on rootDoubleBuffered: the X server clears that for the frames
     // where a client has flipped its own pixmap in, and a slot claimed before that still has to be
@@ -2123,7 +2143,14 @@ static void rendererReleaseRootBuffer(void) {
         return;
 
     rendererRootSlot = -1;
-    rendererReleaseRootSlot(slot, rendererRootSlotId, rendererRootSlotGen);
+    // Not while the compositor may still read it: the GL frame that leaves the root layer claims the
+    // slot that layer shows, and giving that claim back cleared the bit before the compositor had
+    // released the slot - the X server could draw into what was still on screen.
+    pthread_mutex_lock(&rootOverlayLock);
+    zcHolds = rootZcHoldsSlotLocked(slot, rendererRootSlotId, rendererRootSlotGen);
+    pthread_mutex_unlock(&rootOverlayLock);
+    if (!zcHolds)
+        rendererReleaseRootSlot(slot, rendererRootSlotId, rendererRootSlotGen);
 }
 
 void rendererRedrawLocked(bool* waitingForBuffers) {
@@ -3792,6 +3819,7 @@ static bool rootZcDrainRetiring(void) {
     int freed[LORIE_ZC_MAX_HELD], freedFds[LORIE_ZC_MAX_HELD], freedCount = 0;
     uint64_t freedIds[LORIE_ZC_MAX_HELD];
     uint32_t freedGens[LORIE_ZC_MAX_HELD];
+    bool freedStillHeld[LORIE_ZC_MAX_HELD];
     int i, kept = 0;
     bool room;
 
@@ -3848,13 +3876,24 @@ static bool rootZcDrainRetiring(void) {
     // Presenting adds the one on screen to this list and puts a new one on screen, so there has to be
     // room for two more.
     room = kept + 2 <= LORIE_ZC_MAX_HELD;
+    /*
+     * Released by the compositor, but maybe still held for something else (rootZcHoldsSlotLocked): this
+     * frame's own claim - the newest slot, which after the root layer was left is the one it showed - or
+     * that same buffer submitted again since, or still waiting on a later release. Clearing the bit then
+     * let the X server draw into a slot being sampled, or put back on screen.
+     */
+    for (i = 0; i < freedCount; i++)
+        freedStillHeld[i] = rootZcHoldsSlotLocked(freed[i], freedIds[i], freedGens[i]) ||
+                            (freed[i] == rendererRootSlot && freedIds[i] == rendererRootSlotId &&
+                             freedGens[i] == rendererRootSlotGen);
     pthread_mutex_unlock(&rootOverlayLock);
 
     for (i = 0; i < freedCount; i++) {
         if (freedFds[i] >= 0)
             close(freedFds[i]);
         lorieTrace(state, LORIE_TRACE_RELEASE, freed[i], freedIds[i]);
-        rendererReleaseRootSlot(freed[i], freedIds[i], freedGens[i]);
+        if (!freedStillHeld[i])
+            rendererReleaseRootSlot(freed[i], freedIds[i], freedGens[i]);
     }
     return room;
 }

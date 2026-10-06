@@ -23,6 +23,17 @@ def opt(make, marker, path=I):
     before a function existed, which is how a test is shown to fail there."""
     return make() if marker in open(path, encoding="utf-8").read() else ""
 
+# What rendererReleaseRootBuffer and rootZcDrainRetiring ask before clearing a held bit - whether the
+# zero-copy path still holds the slot (rootZcHoldsSlotLocked) - and, for recipes without it already, the
+# state it reads. Nothing against code from before it. The test includes <pthread.h> itself.
+HOLDS = "static bool rootZcHoldsSlotLocked(int slot, uint64_t bufferId, uint32_t gen) {"
+def zc_holds(state, max_held=False):
+    return opt(lambda: ((macro(R, "LORIE_ZC_MAX_HELD") if max_held else "")
+                        + "static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;\n"
+                        + span(R, "static int rootZcDisplayedSlot = -1;", "static uint32_t rootZcDisplayedGen = 0;")
+                        + span(R, "static struct {\n    int slot, fenceFd;", "static int rootZcRetiringCount = 0;")
+                        if state else "") + func(R, HOLDS), HOLDS, R)
+
 recipes = {
     "t07": lambda: macro(H, "LORIE_GPU_COPY_FAILED_SLOTS") + macro(H, "LORIE_GPU_COPY_QUEUE_CAPACITY")
         + func(R, "static void rendererPublishFailedSerial(uint64_t serial) {")
@@ -45,6 +56,7 @@ recipes = {
         + opt(lambda: "static uint32_t rendererRootSlotWord __attribute__((unused)) = 0;\n", "rendererRootSlotWord", R)
         + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + zc_holds(True, max_held=True)
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
     # the renderer's side of handing the root to the compositor (renderer.c): its claim, its wait
     # predicate and the gates a ROOT_DIRECT frame leaves - tpacing.c
@@ -76,6 +88,7 @@ recipes = {
         + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
         + func(R, "static bool rootZcPublishedSinceClaim(void) {")
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + zc_holds(True)
         + func(R, "static void rendererReleaseRootBuffer(void) {"),
     # leaving the root layer and giving its slots back: the hide, its completion, the retiring list - tzchide.c
     "zclife": lambda: macro(H, "LORIE_ROOT_GEN_SHIFT") + macro(H, "LORIE_ROOT_GEN") + macro(R, "LORIE_ZC_MAX_HELD")
@@ -89,6 +102,9 @@ recipes = {
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
         + func(R, "static void rendererSetOutputRetry(bool pending) {")
         + func(R, "static void rootZcOnComplete(void *context, ASurfaceTransactionStats *stats) {")
+        + opt(lambda: "static int rendererRootSlot = -1;\nstatic uint64_t rendererRootSlotId = 0;\n"
+                      "static uint32_t rendererRootSlotGen = 0;\n", HOLDS, R)
+        + zc_holds(False)
         + func(R, "static bool rootZcDrainRetiring(void) {")
         + opt(lambda: "#define HAVE_PARKING 1\n" + func(R, "static AHardwareBuffer *rootZcParkingBuffer(void) {"),
               "static AHardwareBuffer *rootZcParkingBuffer(void) {", R)
@@ -106,6 +122,7 @@ recipes = {
         + func(R, "static uint64_t rendererClaimRootBuffer(void) {")
         + func(R, "static bool rootZcPublishedSinceClaim(void) {")
         + func(R, "static void rendererReleaseRootSlot(int slot, uint64_t bufferId")
+        + zc_holds(False)
         + func(R, "static void rendererReleaseRootBuffer(void) {")
         + func(R, "static void rendererSetOutputRetry(bool pending) {")
         + span(R, "typedef enum { LORIE_ZC_FENCE_DONE", "} LorieZcFence;")

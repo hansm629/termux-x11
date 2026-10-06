@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sched.h>
+#include <pthread.h>
 
 #include "rootslots_src.inc"
 static volatile uint64_t ids[LORIE_ROOT_SLOTS];
