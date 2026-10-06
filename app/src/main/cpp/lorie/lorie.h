@@ -955,8 +955,9 @@ struct lorie_shared_server_state {
      * cannot honour nearest - the compositor scales bilinearly - so a comparison between the two
      * paths is only like for like when this says linear. */
     volatile uint8_t outputFilterNearest;
-    /* 1 once the root layer has the compositor's buffer backpressure (API 31): a root buffer is queued
-     * rather than dropped for a newer one. 0 where it is not available. */
+    /* 1 once buffer backpressure (API 31: a root buffer queued rather than dropped for a newer one) has been
+     * asked for on the root layer. Asked for only - the call returns nothing and the compositor confirms
+     * nothing; what it does shows in the commit and display stats. 0 where the call is not available. */
     volatile uint8_t rootBackpressure;
     /* 1 where the root's transactions carry an OnCommit callback (API 31), for the measurement above. */
     volatile uint8_t rootCommitTracked;

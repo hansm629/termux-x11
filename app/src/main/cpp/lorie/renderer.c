@@ -271,7 +271,7 @@ static pthread_mutex_t rootOverlayLock = PTHREAD_MUTEX_INITIALIZER;
 static int rootZcDisplayedSlot = -1;   // in the transaction we applied last; the compositor reads it
 static uint64_t rootZcDisplayedId = 0;  // which buffer that slot held then - see rendererReleaseRootSlot
 static uint32_t rootZcDisplayedGen = 0; // and the pool it belonged to
-static bool rootZcBackpressureOn = false; // the root layer has the compositor's buffer backpressure
+static bool rootZcBackpressureOn = false; // asked for on the root layer - the compositor does not say whether it took
 
 /*
  * A zero-copy frame that had to be dropped has to be tried again, and nothing else will ask for it.
@@ -4322,8 +4322,10 @@ static void rootZcSetBackpressure(ASurfaceControl *sc) {
         scApi.txDelete(t);
         rootZcBackpressureOn = true;
     }
+    // "Requested", not "on": the call returns nothing and the compositor confirms nothing. Whether buffers
+    // are queued shows in what it does - XlorieCommit's queue depth, XlorieDisplay's latches.
     log("XlorieRootZc: compositor backpressure %s\n",
-        rootZcBackpressureOn ? "on" : "not available; a root buffer may be dropped for a newer one");
+        rootZcBackpressureOn ? "requested" : "not available; a root buffer may be dropped for a newer one");
 }
 
 static void teardownRootOverlay(void) {
