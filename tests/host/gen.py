@@ -398,6 +398,11 @@ recipes = {
         + func(H, "static inline __always_inline uint64_t lorieTraceNowUs(void) {")
         + func(H, "static inline __always_inline void lorieTraceAt(struct lorie_shared_server_state *st, uint32_t kind,\n"
                   "                                                 uint32_t a, uint64_t b, uint64_t tUs) {"),
+    # which output path the renderer takes - toutput.c
+    "output": lambda: macro(H, "LORIE_ROOT_SLOTS") + macro(R, "LORIE_ZC_MAX_HELD")
+        + macro(H, "LORIE_OUTPUT_AUTO") + macro(H, "LORIE_OUTPUT_GPU_COPY") + macro(H, "LORIE_OUTPUT_ROOT_DIRECT")
+        + opt(lambda: macro(R, "LORIE_ROOT_DIRECT_ALLOWED"), "#define LORIE_ROOT_DIRECT_ALLOWED", R)
+        + func(R, "static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {"),
     "ttrace_src_funcs": lambda: "static FILE *lorieTraceFile = NULL;\n"
         + func(I, "static void lorieTraceFlush(Bool force) {"),
 }

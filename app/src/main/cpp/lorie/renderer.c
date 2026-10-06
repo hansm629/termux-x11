@@ -3288,6 +3288,15 @@ static void ensureCursorOverlay(void) {
 
 // Says which output path a frame will take and, when it is not the direct one, why. Logged only on
 // a change, so a run's log states the backend it actually used rather than the one it was asked for.
+/*
+ * COMPARISON BUILD, temporary (parent 87a473d): ROOT_DIRECT is never used, so every frame takes the GL /
+ * GPU_COPY output path - the same one "-output-backend gpu-copy" selects, without touching how the X server
+ * is started. Nothing else differs from 87a473d: the root layer is still made (and given no buffer, as
+ * under gpu-copy), the six slots, the vsync clock, the release lifecycle and the rest are as they are
+ * there. 1 is 87a473d.
+ */
+#define LORIE_ROOT_DIRECT_ALLOWED 0
+
 static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
     static const char *lastReason = NULL;
     static bool logged = false;
@@ -3304,6 +3313,8 @@ static bool rootZeroCopyUsable(const LorieBuffer_Desc *desc) {
 
     if (!state)
         reason = "no shared state";
+    else if (!LORIE_ROOT_DIRECT_ALLOWED)
+        reason = "comparison build: ROOT_DIRECT off";
     else if (forced == LORIE_OUTPUT_GPU_COPY)
         reason = "forced to gpu-copy";
     else if (!rootSurfaceControl)
