@@ -6,7 +6,7 @@ It therefore records what it actually did in the state it shares with the X serv
 in its own log, which Termux can read with `logcat -d`:
 
 ```
-XlorieBackend:  requested=auto|vulkan|gles active=GLES|VULKAN|NONE ownership=persistent|per_access
+XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
@@ -20,7 +20,10 @@ Every counter is moved only right after the API call it names returned success (
 after the failure they record); none is set from a configuration value.
 
 `requested` is `TERMUX_X11_RENDERER_BACKEND` as the X server read it (`(invalid-value)` appended when it
-was set to anything else, which counts as auto). `ownership` is how the X server holds the AHardwareBuffers
+was set to anything else, which counts as auto). `vk_fail_at` is `TERMUX_X11_RENDERER_VK_FAIL_AT`, the
+point where the Vulkan backend is made to fail on purpose (instance, device, surface, swapchain, import,
+submit, present; `none` when unset, and `(invalid-value)` when set to anything else, which injects
+nothing): such a failure is counted in the `injected` fallback class. `ownership` is how the X server holds the AHardwareBuffers
 at that moment (`struct lorie_backend_control`): `persistent` is 3c98ffa's lifetime CPU locks, `per_access`
 the CPU lock only for each access, under the lock shared with the renderer - which the X server moves to only
 when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu_acquires` and

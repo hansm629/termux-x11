@@ -17,13 +17,23 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/gen.py" "$LORIE" "$OUT" "$BASE"
 CC=${CC:-cc}
 status=0
 
+# Vulkan headers for the tests of vk.c: their own two directories only, so the host compiler keeps its own libc
+# headers. Termux's by default (VULKAN_INCLUDE to use others); without them the run fails rather than skips.
+VKINC=${VULKAN_INCLUDE:-/data/data/com.termux/files/usr/include}
+if [ ! -f "$VKINC/vulkan/vulkan_core.h" ]; then
+    echo "FAIL no Vulkan headers in $VKINC (set VULKAN_INCLUDE)"
+    exit 1
+fi
+rm -rf "$OUT/vkinc" && mkdir -p "$OUT/vkinc" && cp -r "$VKINC/vulkan" "$OUT/vkinc/"
+[ ! -d "$VKINC/vk_video" ] || cp -r "$VKINC/vk_video" "$OUT/vkinc/"
+
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS="tdiaglog townership"
+C_TESTS="tdiaglog townership tvkinit"
 rm -f "$OUT/diag-vulkan.log" "$OUT/diag-gles.log"     # written by tdiaglog: never judge an earlier run's
 for t in $C_TESTS; do
-    "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }
+    "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$OUT/vkinc" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }
     OUT="$OUT" "$OUT/$t" || status=1
 done
 

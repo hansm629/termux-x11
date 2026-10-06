@@ -616,6 +616,25 @@ int main(void) {
     invalid = 0;
     CHECK(lorieRequestedBackend("vk", &invalid) == LORIE_BACKEND_AUTO && invalid, "vk: not flagged");
 
+    /* TERMUX_X11_RENDERER_VK_FAIL_AT: the seven points, lowercase; nothing else injects */
+    {
+        static const struct { const char *value; uint8_t point; bool invalid; } t[] = {
+            { NULL, LORIE_VK_FAIL_AT_NONE, false }, { "", LORIE_VK_FAIL_AT_NONE, false },
+            { "instance", LORIE_VK_FAIL_AT_INSTANCE, false }, { "device", LORIE_VK_FAIL_AT_DEVICE, false },
+            { "surface", LORIE_VK_FAIL_AT_SURFACE, false }, { "swapchain", LORIE_VK_FAIL_AT_SWAPCHAIN, false },
+            { "import", LORIE_VK_FAIL_AT_IMPORT, false }, { "submit", LORIE_VK_FAIL_AT_SUBMIT, false },
+            { "present", LORIE_VK_FAIL_AT_PRESENT, false }, { "none", LORIE_VK_FAIL_AT_NONE, true },
+            { "Instance", LORIE_VK_FAIL_AT_NONE, true }, { "acquire", LORIE_VK_FAIL_AT_NONE, true },
+        };
+        for (unsigned k = 0; k < sizeof t / sizeof *t; k++) {
+            uint8_t point;
+            invalid = 0;
+            point = lorieRequestedVkFailAt(t[k].value, &invalid);
+            CHECK(point == t[k].point && invalid == t[k].invalid, "TERMUX_X11_RENDERER_VK_FAIL_AT=%s: point %u, flagged %u",
+                  t[k].value ? t[k].value : "(unset)", point, invalid);
+        }
+    }
+
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
 }

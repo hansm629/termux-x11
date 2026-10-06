@@ -232,9 +232,21 @@ enum { LORIE_OWNERSHIP_PERSISTENT = 0, LORIE_OWNERSHIP_PER_ACCESS = 1 };
 #define LORIE_OWNERSHIP_SEQ(word) ((uint32_t) (word) >> 8)
 #define LORIE_OWNERSHIP_MODE(word) ((uint8_t) ((word) & 0xffu))
 
+/*
+ * Fault injection for the Vulkan backend (X: TERMUX_X11_RENDERER_VK_FAIL_AT = instance | device | surface |
+ * swapchain | import | submit | present, none when unset): at that point the renderer does not make the call
+ * and handles it as failed, recording the fallback with class INJECTED and the point's own reason.
+ */
+#define LORIE_VK_FAIL_POINTS(X) X(NONE) X(INSTANCE) X(DEVICE) X(SURFACE) X(SWAPCHAIN) X(IMPORT) X(SUBMIT) X(PRESENT)
+#define LORIE_ENUM_FAIL_AT(n) LORIE_VK_FAIL_AT_ ## n,
+enum { LORIE_VK_FAIL_POINTS(LORIE_ENUM_FAIL_AT) LORIE_VK_FAIL_AT_COUNT };
+#undef LORIE_ENUM_FAIL_AT
+
 struct lorie_backend_control {
     volatile uint8_t requested;                 /* X: LORIE_BACKEND_* */
     volatile uint8_t requestedInvalid;          /* X: the variable was set, to none of the three */
+    volatile uint8_t vkFailAt;                  /* X: LORIE_VK_FAIL_AT_* */
+    volatile uint8_t vkFailAtInvalid;           /* X: the variable was set, to none of the seven */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };
@@ -245,7 +257,7 @@ struct lorie_backend_control {
     X(VK_EXT_AHB) X(VK_EXT_FOREIGN) X(VK_DEVICE) X(VK_SELFTEST) X(VK_SURFACE) X(VK_SURFACE_FORMAT) \
     X(VK_SWAPCHAIN) X(VK_ROOT_NOT_AHB) X(VK_OWNERSHIP) X(VK_DEVICE_LOST) X(VK_SUBMIT) X(VK_PRESENT) \
     X(AHB_PROPERTIES) X(AHB_EXTERNAL_FORMAT_UNSUPPORTED_BY_STAGE1) X(AHB_FORMAT_UNSUPPORTED_BY_STAGE1) \
-    X(AHB_IMAGE_USAGE_UNSUPPORTED) X(AHB_MEMORY_TYPE) X(AHB_IMPORT)
+    X(AHB_IMAGE_USAGE_UNSUPPORTED) X(AHB_MEMORY_TYPE) X(AHB_IMPORT) X(VK_VERSION)
 #define LORIE_ENUM_CLASS(n) LORIE_FALLBACK_CLASS_ ## n,
 #define LORIE_ENUM_REASON(n) LORIE_FALLBACK_ ## n,
 enum { LORIE_FALLBACK_CLASSES(LORIE_ENUM_CLASS) LORIE_FALLBACK_CLASS_COUNT };

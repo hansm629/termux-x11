@@ -46,7 +46,8 @@ int main(void) {
     logf = fopen(path, "r");
     while (fgets(line, sizeof line, logf))
         if (strstr(line, "XlorieBackend:") && strstr(line, "x_ahb_cpu_acquires=480(+120)")) {
-            CHECK(strstr(line, "XlorieBackend: requested=vulkan active=VULKAN ownership=per_access ownership_transitions=1 ")
+            CHECK(strstr(line, "XlorieBackend: requested=vulkan vk_fail_at=none active=VULKAN ownership=per_access "
+                               "ownership_transitions=1 ")
                   && strstr(line, "x_state_lock_wait_us=16000(+4000)"), "vulkan backend line: %s", line);
             backendOk++;
         }
@@ -78,7 +79,8 @@ int main(void) {
                 deltaOk++;
         }
         if (strstr(line, "XlorieBackend:"))
-            CHECK(strstr(line, "XlorieBackend: requested=vulkan active=GLES ownership=persistent ownership_transitions=2 "),
+            CHECK(strstr(line, "XlorieBackend: requested=vulkan vk_fail_at=none active=GLES ownership=persistent "
+                               "ownership_transitions=2 "),
                   "gles backend line: %s", line);
         if (strstr(line, "XlorieFallback:"))
             CHECK(strstr(line, "last_reason=VK_DEVICE_LOST") && strstr(line, "reasons=VK_DEVICE_LOST:1"),

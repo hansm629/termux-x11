@@ -13,6 +13,8 @@ from extract import func, macro, span
 
 L, OUT, BASE = sys.argv[1], sys.argv[2], sys.argv[3]
 I, R, H, B = (os.path.join(L, f) for f in ("InitOutput.c", "renderer.c", "lorie.h", "buffer.c"))
+VC, VH = os.path.join(L, "vk.c"), os.path.join(L, "vk.h")
+FAILAT = lambda: span(I, "static const char *const lorieVkFailAtNames[] = {", '"lorieVkFailAtNames is LORIE_VK_FAIL_POINTS");')
 BI = os.path.join(BASE, "InitOutput.c")
 XS = os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "xserver")
 
@@ -42,7 +44,7 @@ def own(path, ownership):
 recipes = {
     # the renderer diagnostics, as lorie.h declares them and the X server logs them - tdiaglog.c
     "diagtypes": lambda: span(H, "enum { LORIE_ACTIVE_NONE = 0", "__ATOMIC_RELAXED); } while (0)"),
-    "diaglog": lambda: span(I, "static const char *lorieActiveName(uint8_t a) {", "#undef LORIE_NAME")
+    "diaglog": lambda: span(I, "static const char *lorieActiveName(uint8_t a) {", "#undef LORIE_NAME") + FAILAT()
         + func(I, "static void lorieLogRendererDiag(void) {"),
     # AHB CPU ownership - townership.c: xserver's list, EXA's access indices, then every pixmap path that takes
     # or drops a CPU lock, as 3c98ffa has them ("own_base") and as they are now, with the handshake ("own_new")
@@ -62,7 +64,17 @@ recipes = {
         "static Bool lorieRendererGoneWorkProc(",
         "void lorieRendererDisconnected(void) {",
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
-    ]),
+    ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {"),
+    # the Vulkan backend's instance and device - tvkinit.c
+    "vkinit": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    VkQueue queue;\n};")
+        + span(VC, "static const char *const lorieVkInstanceExtensions[] = {", "#define LORIE_VK_MAX_DEVICES 8")
+        + "".join(func(VC, f) for f in (
+            "void lorieVkFallback(volatile struct lorie_shared_server_state *st, uint8_t cls, uint8_t reason, VkResult result) {",
+            "bool lorieVkInjected(volatile struct lorie_shared_server_state *st, uint8_t point, uint8_t reason) {",
+            "static bool lorieVkHasExtension(const VkExtensionProperties *ext, uint32_t count, const char *name) {",
+            "static uint8_t lorieVkDeviceUnsuitable(struct lorie_vk *vk, VkPhysicalDevice pd, uint32_t *queueFamily) {",
+            "void lorieVkDestroyDevice(struct lorie_vk *vk) {",
+            "bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, volatile struct lorie_shared_server_state *st) {")),
 }
 
 for name, make in recipes.items():

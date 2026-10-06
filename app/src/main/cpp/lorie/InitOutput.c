@@ -272,6 +272,23 @@ static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invali
     return LORIE_BACKEND_AUTO;
 }
 
+// TERMUX_X11_RENDERER_VK_FAIL_AT, lowercase, LORIE_VK_FAIL_POINTS without NONE: unset or empty is none, and so
+// is anything else, flagged.
+static const char *const lorieVkFailAtNames[] = {
+        "none", "instance", "device", "surface", "swapchain", "import", "submit", "present" };
+_Static_assert(sizeof(lorieVkFailAtNames) / sizeof(*lorieVkFailAtNames) == LORIE_VK_FAIL_AT_COUNT,
+               "lorieVkFailAtNames is LORIE_VK_FAIL_POINTS");
+
+static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {
+    uint8_t i;
+    for (i = LORIE_VK_FAIL_AT_NONE + 1; value && i < LORIE_VK_FAIL_AT_COUNT; i++)
+        if (!strcmp(value, lorieVkFailAtNames[i]))
+            return i;
+    if (value && *value)
+        *invalid = 1;
+    return LORIE_VK_FAIL_AT_NONE;
+}
+
 void OsVendorInit(void) {
     pthread_mutexattr_t mutex_attr;
 
@@ -300,6 +317,8 @@ void OsVendorInit(void) {
     // renderer's to report (diag.active), and AHB ownership follows that, never this.
     lorieScreen.state->backend.requested = lorieRequestedBackend(getenv("TERMUX_X11_RENDERER_BACKEND"),
                                                                  &lorieScreen.state->backend.requestedInvalid);
+    lorieScreen.state->backend.vkFailAt = lorieRequestedVkFailAt(getenv("TERMUX_X11_RENDERER_VK_FAIL_AT"),
+                                                                 &lorieScreen.state->backend.vkFailAtInvalid);
 }
 
 // Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
@@ -692,11 +711,13 @@ static void lorieLogRendererDiag(void) {
 
     memcpy(&d, (const void *) &pvfb->state->diag, sizeof(d));
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
-    log(INFO, "XlorieBackend: requested=%s%s active=%s ownership=%s ownership_transitions=%u ownership_refused=%u "
-              "x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu)",
+    log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s active=%s ownership=%s ownership_transitions=%u "
+              "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu)",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
-        pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "", lorieActiveName(d.active),
+        pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
+        lorieVkFailAtNames[pvfb->state->backend.vkFailAt < LORIE_VK_FAIL_AT_COUNT ? pvfb->state->backend.vkFailAt : 0],
+        pvfb->state->backend.vkFailAtInvalid ? "(invalid-value)" : "", lorieActiveName(d.active),
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs));
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",

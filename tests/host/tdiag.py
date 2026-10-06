@@ -28,7 +28,7 @@ def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None):
     def kv(k, d):
         return "%s=%d(+%d)" % (k, totals.get(k, d * 10), d)
     p = "10-07 12:00:%02d.000  100  101 I LorieNative: " % t
-    lines = [p + "XlorieBackend: requested=auto active=%s ownership=%s ownership_transitions=1 ownership_refused=0 "
+    lines = [p + "XlorieBackend: requested=auto vk_fail_at=none active=%s ownership=%s ownership_transitions=1 ownership_refused=0 "
                  "x_ahb_cpu_acquires=40(+4) x_state_lock_wait_us=900(+90)" % (active, ownership),
              p + "XlorieGles: " + " ".join(kv(k, gles.get(k, 0)) for k in ("egl_image_imports", "gles_copy_frames", "egl_swap_buffers")),
              p + "XlorieVk: " + " ".join(kv(k, vk.get(k, 0)) for k in (

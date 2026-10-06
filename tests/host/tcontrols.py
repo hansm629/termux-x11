@@ -127,6 +127,61 @@ CONTROLS = [
      """    if (value && !strcmp(value, "vulkan"))""",
      """    if (value && !strcasecmp(value, "vulkan"))""",
      "townership"),
+    ("TERMUX_X11_RENDERER_VK_FAIL_AT matched without case", "InitOutput.c",
+     """        if (!strcmp(value, lorieVkFailAtNames[i]))""",
+     """        if (!strcasecmp(value, lorieVkFailAtNames[i]))""",
+     "townership"),
+    ("TERMUX_X11_RENDERER_VK_FAIL_AT=none accepted, though it is no injection point", "InitOutput.c",
+     """    for (i = LORIE_VK_FAIL_AT_NONE + 1; value && i < LORIE_VK_FAIL_AT_COUNT; i++)""",
+     """    for (i = LORIE_VK_FAIL_AT_NONE; value && i < LORIE_VK_FAIL_AT_COUNT; i++)""",
+     "townership"),
+    ("VK_EXT_queue_family_foreign not required", "vk.c",
+     """        VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+        VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME };""",
+     """        VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME };""",
+     "tvkinit"),
+    ("a Vulkan 1.0 device accepted", "vk.c",
+     """    if (props.apiVersion < VK_API_VERSION_1_1)
+        return LORIE_FALLBACK_VK_VERSION;
+""",
+     "",
+     "tvkinit"),
+    ("the device counted before vkCreateDevice succeeds", "vk.c",
+     """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_DEVICE, LORIE_FALLBACK_VK_DEVICE))
+        goto fail;""",
+     """    LORIE_DIAG_ADD(st, vkDeviceCreated, 1);
+    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_DEVICE, LORIE_FALLBACK_VK_DEVICE))
+        goto fail;""",
+     "tvkinit"),
+    ("injected at instance, vkCreateInstance still called", "vk.c",
+     """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_INSTANCE, LORIE_FALLBACK_VK_INSTANCE))
+        goto fail;""",
+     """    lorieVkInjected(st, LORIE_VK_FAIL_AT_INSTANCE, LORIE_FALLBACK_VK_INSTANCE);""",
+     "tvkinit"),
+    ("injected at device, recorded as an ordinary failure", "vk.c",
+     """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_DEVICE, LORIE_FALLBACK_VK_DEVICE))
+        goto fail;""",
+     """    if (st && st->backend.vkFailAt == LORIE_VK_FAIL_AT_DEVICE) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_DEVICE, VK_SUCCESS);
+        goto fail;
+    }""",
+     "tvkinit"),
+    ("the instance left behind when the device fails", "vk.c",
+     """    if (vk->instance && vk->DestroyInstance)   // without it (a broken loader) the instance is left to the process' end
+        vk->DestroyInstance(vk->instance, NULL);""",
+     "",
+     "tvkinit"),
+    ("the device destroyed while it may still be busy", "vk.c",
+     """        vk->DeviceWaitIdle(vk->device);
+""",
+     "",
+     "tvkinit"),
+    ("the first device used whatever it lacks", "vk.c",
+     """        if (!(reason = lorieVkDeviceUnsuitable(vk, devices[i], &family)))
+            break;""",
+     """        if (!(reason = lorieVkDeviceUnsuitable(vk, devices[i], &family)) || 1)
+            break;""",
+     "tvkinit"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();
@@ -171,7 +226,8 @@ for n, (what, file, old, new, test) in enumerate(CONTROLS):
     else:
         subprocess.run([sys.executable, os.path.join(HERE, "gen.py"), src, gen, BASE], check=True, env=env)
         exe = os.path.join(gen, test)
-        b = subprocess.run([CC, "-Wall", "-Wno-unused-function", "-O1", "-pthread", "-I" + gen, "-I" + HERE,
+        b = subprocess.run([CC, "-Wall", "-Wno-unused-function", "-O1", "-pthread", "-I" + gen,
+                            "-I" + os.path.join(OUT, "vkinc"), "-I" + HERE,
                             os.path.join(HERE, test + ".c"), "-o", exe, "-lm"], capture_output=True, text=True)
         if b.returncode != 0:
             fails += 1
