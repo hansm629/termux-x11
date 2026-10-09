@@ -4,9 +4,10 @@
  *   SurfaceFlinger VSYNC
  *     -> AChoreographer frame callback on the owner thread - the thread CmdEntryPoint.start() runs on, i.e.
  *        the Java main Looper of the X server process. The callback is one-shot and re-posts itself.
- *     -> lorieQueueRedraw(): QueueWorkProc(lorieRedraw) + eventfd wake of the X server (InitOutput.c)
- *     -> X server main thread, WaitForSomething -> ProcessWorkQueue -> lorieRedraw: current_msc++,
- *        Present vblanks, waitForNextFrame = false, signal the renderer
+ *     -> lorieQueueRedraw(): QueueWorkProc(lorieRedraw) + eventfd wake of the X server (InitOutput.c),
+ *        unless a lorieRedraw is still queued: then the tick is only counted (coalesced)
+ *     -> X server main thread, WaitForSomething -> ProcessWorkQueue -> lorieRedraw: current_msc += the
+ *        ticks counted since the last one, Present vblanks, waitForNextFrame = false, signal the renderer
  *     -> renderer thread (activity process) draws once and sets waitForNextFrame again.
  *
  * A long visible frame gap can come from any of those hops, and the renderer's own numbers (frame_delta
@@ -15,8 +16,8 @@
  *   - the callback: count, gaps, the VSYNC timestamps it was handed and how late it ran after them. A
  *     late callback with regular VSYNC timestamps means its thread did not run; an on-time callback with
  *     a large VSYNC gap means no VSYNC was sent;
- *   - callback -> lorieRedraw: how long a tick waited for the X server main thread, how many ticks piled
- *     up meanwhile and how many queued lorieRedraws then ran with nothing new (the backlog replay);
+ *   - callback -> lorieRedraw: how long a tick waited for the X server main thread and how many ticks
+ *     piled up meanwhile;
  *   - lorieRedraw -> renderer: from struct lorie_frame_clock_stats in the shared state;
  *   - how the two X server threads involved were scheduled (run/runnable-wait time, CPU, nice, affinity).
  *
@@ -28,6 +29,14 @@
  * silent for far longer than any display can legitimately be. It never draws or ticks by itself.
  * When the activity comes back (a new surface, a new connection) the owner thread is asked to look at
  * the chain right away, and re-arms it if it has been quiet for a stall's length.
+ *
+ * At most one lorieRedraw is queued at a time. Before, every callback queued its own, so after the X
+ * server main thread was busy for N frames, ProcessWorkQueue ran N lorieRedraws back to back: N Present
+ * vblank rounds in microseconds, each reporting a different MSC with the same UST, and the renderer
+ * released again within its own frame - the catch-up burst. Now ticks that arrive while one is queued
+ * are counted, and that one lorieRedraw advances MSC by all of them: the MSC still counts every VSYNC the
+ * callback saw, exactly as before, and Present clients waiting for any MSC up to it are completed once,
+ * at the MSC actually reached - what a real CRTC does when an interrupt is serviced late.
  */
 
 #include <dlfcn.h>
@@ -70,6 +79,12 @@
 #define FC_SILENT_NS (2000 * NS_PER_MS)
 /* While nothing is on screen a silent chain is left alone; it is looked at again this often. */
 #define FC_IDLE_CHECK_NS (5000 * NS_PER_MS)
+/*
+ * A queued lorieRedraw that has not run for this long is presumed dropped (a server reset clears the
+ * work queue) and one more is queued: a stuck flag must never stop the clock. Should the X server only
+ * have been that busy, the extra one runs right after the first and finds no ticks to take.
+ */
+#define FC_REQUEUE_NS (1000 * NS_PER_MS)
 
 typedef void (*FcFrameCallback64)(int64_t frameTimeNanos, void *data);
 typedef void (*FcPostFrameCallback64)(AChoreographer *choreographer, FcFrameCallback64 callback, void *data);
@@ -94,6 +109,8 @@ static struct {
     /* owner thread -> X server main thread */
     uint32_t pendingTicks;          /* callbacks since the last lorieRedraw took them */
     int64_t oldestTickNs;           /* when the first of them arrived */
+    bool redrawQueued;              /* a lorieRedraw is queued and has not started yet */
+    int64_t queuedNs;               /* owner thread only: when it was queued */
 
     /* X server main thread */
     int64_t lastRedrawNs, xWakeNs;
@@ -105,7 +122,7 @@ static struct {
     uint32_t callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms, resumeChecks;
     uint32_t cbGapMaxUs, vsyncGapMaxUs, vsyncGapMinUs, cbLatencyMaxUs, cbLate;
     uint32_t cbHist[FC_HIST_BUCKETS];
-    uint32_t queueTry, queueActual;
+    uint32_t queueTry, queueActual, queueCoalesced, requeues;
     uint32_t redraws, replays, ticksMax, multiTick, redrawGapMaxUs;
     uint32_t redrawHist[FC_HIST_BUCKETS];
     uint32_t cbToRedrawMaxUs, cbToRedrawSamples;
@@ -264,12 +281,26 @@ static void fcTick(int64_t now) {
     if (!lorieScreenReady())
         return;
 
+    // Count the tick before looking at the flag: a lorieRedraw that cleared the flag takes the count
+    // only after that, so it either takes this tick or this callback finds the flag clear and queues a
+    // lorieRedraw that will.
     if (__atomic_fetch_add(&fc.pendingTicks, 1, __ATOMIC_ACQ_REL) == 0)
         __atomic_store_n(&fc.oldestTickNs, now, __ATOMIC_RELEASE);
 
     FC_ADD(queueTry, 1);
-    FC_ADD(queueActual, 1);
-    lorieQueueRedraw();
+    if (!__atomic_exchange_n(&fc.redrawQueued, true, __ATOMIC_SEQ_CST)) {
+        fc.queuedNs = now;
+        FC_ADD(queueActual, 1);
+        lorieQueueRedraw();
+    } else if (now - fc.queuedNs >= FC_REQUEUE_NS) {
+        log(WARN, "XlorieFrameClock: the queued redraw has not run for %" PRId64 " ms, queueing another",
+            (now - fc.queuedNs) / NS_PER_MS);
+        fc.queuedNs = now;
+        FC_ADD(requeues, 1);
+        FC_ADD(queueActual, 1);
+        lorieQueueRedraw();
+    } else
+        FC_ADD(queueCoalesced, 1);
 }
 
 static void fcOnFrame(int64_t frameTimeNs, bool frameTimeValid, void *data) {
@@ -363,10 +394,20 @@ void lorieFrameClockSetXThread(void) {
     fc.xTid = gettid();
 }
 
+void lorieFrameClockResetQueue(void) {
+    __atomic_store_n(&fc.redrawQueued, false, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&fc.pendingTicks, 0, __ATOMIC_SEQ_CST);
+}
+
 uint32_t lorieFrameClockRedrawBegin(void) {
     int64_t now = lorieFrameClockNowNs();
-    uint32_t ticks = __atomic_exchange_n(&fc.pendingTicks, 0, __ATOMIC_ACQ_REL);
-    int64_t oldest = __atomic_exchange_n(&fc.oldestTickNs, 0, __ATOMIC_ACQ_REL);
+    uint32_t ticks;
+    int64_t oldest;
+
+    // Clear first, take second (see fcTick): from here on a new tick queues a new lorieRedraw.
+    __atomic_store_n(&fc.redrawQueued, false, __ATOMIC_SEQ_CST);
+    ticks = __atomic_exchange_n(&fc.pendingTicks, 0, __ATOMIC_ACQ_REL);
+    oldest = __atomic_exchange_n(&fc.oldestTickNs, 0, __ATOMIC_ACQ_REL);
 
     FC_ADD(redraws, 1);
     if (fc.lastRedrawNs) {
@@ -377,7 +418,7 @@ uint32_t lorieFrameClockRedrawBegin(void) {
     fc.lastRedrawNs = now;
 
     if (!ticks) {
-        // An earlier lorieRedraw already took every tick that arrived: this one only replays.
+        // Every tick was taken by an earlier lorieRedraw (a re-queue, or a tick that raced the flag).
         FC_ADD(replays, 1);
         return 0;
     }
@@ -525,6 +566,7 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
     uint32_t vsyncGapMinUs = __atomic_exchange_n(&st.vsyncGapMinUs, UINT32_MAX, __ATOMIC_RELAXED);
     uint32_t cbLatencyMaxUs = FC_TAKE(cbLatencyMaxUs), cbLate = FC_TAKE(cbLate);
     uint32_t queueTry = FC_TAKE(queueTry), queueActual = FC_TAKE(queueActual);
+    uint32_t queueCoalesced = FC_TAKE(queueCoalesced), requeues = FC_TAKE(requeues);
     uint32_t redraws = FC_TAKE(redraws), replays = FC_TAKE(replays), ticksMax = FC_TAKE(ticksMax);
     uint32_t multiTick = FC_TAKE(multiTick), redrawGapMaxUs = FC_TAKE(redrawGapMaxUs);
     uint32_t cbToRedrawMaxUs = FC_TAKE(cbToRedrawMaxUs), cbToRedrawSamples = FC_TAKE(cbToRedrawSamples);
@@ -552,20 +594,20 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
 
     // Steady lines only while something is on screen; anything that looks like a stall regardless.
     anomaly = cbGapMaxUs >= fcUs(FC_ANOMALY_GAP_NS) || replays || xBusyMaxUs >= fcUs(FC_ANOMALY_GAP_NS) ||
-              staleCallbacks || stalls || rearms;
+              staleCallbacks || stalls || rearms || requeues;
     if (!(surfaceAvailable && connected) && !anomaly && !debug)
         goto out;
 
     log(INFO, "XlorieFrameClock: app_hz=%u period_us=%u gen=%u cb=%u post=%u stale_cb=%u stall=%u rearm=%u "
               "forced_rearm=%u resume_check=%u cb_gap_max_us=%u "
               "cb_hist=%u/%u/%u/%u/%u/%u vsync_gap_min_us=%u vsync_gap_max_us=%u cb_lat_max_us=%u cb_late=%u "
-              "queue_try=%u queue_actual=%u redraw=%u replay=%u ticks_max=%u multi_tick=%u "
+              "queue_try=%u queue_actual=%u queue_coalesced=%u requeue=%u redraw=%u replay=%u ticks_max=%u multi_tick=%u "
               "cb_to_redraw_max_us=%u cb_to_redraw_avg_us=%u redraw_gap_max_us=%u redraw_hist=%u/%u/%u/%u/%u/%u",
         appHz, fcUs(__atomic_load_n(&fc.periodNs, __ATOMIC_RELAXED)), __atomic_load_n(&fc.generation, __ATOMIC_RELAXED),
         callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms, resumeChecks, cbGapMaxUs,
         cbHist[0], cbHist[1], cbHist[2], cbHist[3], cbHist[4], cbHist[5],
         vsyncGapMinUs == UINT32_MAX ? 0 : vsyncGapMinUs, vsyncGapMaxUs, cbLatencyMaxUs, cbLate,
-        queueTry, queueActual, redraws, replays, ticksMax, multiTick,
+        queueTry, queueActual, queueCoalesced, requeues, redraws, replays, ticksMax, multiTick,
         cbToRedrawMaxUs, cbToRedrawSamples ? (uint32_t) (cbToRedrawSumUs / cbToRedrawSamples) : 0, redrawGapMaxUs,
         redrawHist[0], redrawHist[1], redrawHist[2], redrawHist[3], redrawHist[4], redrawHist[5]);
 

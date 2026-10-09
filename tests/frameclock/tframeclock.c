@@ -113,6 +113,7 @@ static int vsyncAt(int64_t frameTimeNs) {
     return n;
 }
 static int vsync(void) { return vsyncAt(nowNs); }
+static void runFramesNoX(int n, int64_t step);
 
 /* ---- X server side ---- */
 static int queued, screenReady = 1, surfaceShown = 1;
@@ -183,25 +184,80 @@ static void testChainReposts(void) {
     report();
 }
 
-static void testBacklogReplay(void) {
+static void testBacklogCoalesces(void) {
     const char *line;
-    printf("backlog: ticks that pile up while the X server is busy are taken by the first redraw\n");
+    printf("backlog: ticks that pile up while the X server is busy make one redraw that takes them all\n");
     reset();
     nowNs += STEP; vsync();
     nowNs += STEP; vsync();
     nowNs += STEP; vsync();
-    CHECK(queued == 3);
+    CHECK(queued == 1);
     nowNs += 2 * NS_PER_MS;
     CHECK(lorieFrameClockRedrawBegin() == 3);
-    CHECK(lorieFrameClockRedrawBegin() == 0);
-    CHECK(lorieFrameClockRedrawBegin() == 0);
     line = report();
     CHECK(fieldOf(line, "queue_try") == 3);
-    CHECK(fieldOf(line, "redraw") == 3);
-    CHECK(fieldOf(line, "replay") == 2);
+    CHECK(fieldOf(line, "queue_actual") == 1);
+    CHECK(fieldOf(line, "queue_coalesced") == 2);
+    CHECK(fieldOf(line, "redraw") == 1);
+    CHECK(fieldOf(line, "replay") == 0);
     CHECK(fieldOf(line, "ticks_max") == 3);
     CHECK(fieldOf(line, "multi_tick") == 1);
     CHECK(fieldOf(line, "cb_to_redraw_max_us") == (unsigned) ((2 * STEP + 2 * NS_PER_MS) / 1000));
+    // Once it ran, the next tick queues a fresh one.
+    nowNs += STEP; vsync();
+    CHECK(queued == 2);
+    CHECK(lorieFrameClockRedrawBegin() == 1);
+}
+
+static void testTickCountIsKept(void) {
+    uint64_t msc = 0;
+    int i;
+    printf("msc: however the X server falls behind, MSC still advances by one per VSYNC in total\n");
+    reset();
+    for (i = 0; i < 200; i++) {
+        advance(STEP);
+        vsync();
+        // The X server only gets to its work queue on some frames, and then runs what is queued.
+        if (i % 7 == 0 || i % 11 == 3)
+            for (; queued; queued--)
+                msc += lorieFrameClockRedrawBegin();
+    }
+    for (; queued; queued--)
+        msc += lorieFrameClockRedrawBegin();
+    CHECK(msc == 200);
+}
+
+static void testStuckFlagRequeues(void) {
+    const char *line;
+    uint32_t taken;
+    printf("requeue: a queued redraw that never ran (work queue cleared) does not stop the clock\n");
+    reset();
+    advance(STEP);
+    vsync();
+    CHECK(queued == 1);
+    runFramesNoX(119, STEP);        // ~1 s: the queued lorieRedraw was lost
+    CHECK(queued == 1);
+    runFramesNoX(2, STEP);
+    CHECK(queued == 2);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: the queued redraw"), "queueing another") != NULL);
+    taken = lorieFrameClockRedrawBegin();
+    CHECK(taken == 122);
+    CHECK(lorieFrameClockRedrawBegin() == 0); // the original turns up after all: nothing left to take
+    line = report();
+    CHECK(fieldOf(line, "requeue") == 1 && fieldOf(line, "replay") == 1);
+}
+
+static void testResetQueue(void) {
+    printf("reset: after a server reset the next tick queues a redraw again\n");
+    reset();
+    advance(STEP);
+    vsync();
+    CHECK(queued == 1);
+    lorieFrameClockResetQueue();    // ClearWorkQueue dropped it; lorieScreenInit clears the flag
+    advance(STEP);
+    vsync();
+    CHECK(queued == 2);
+    CHECK(lorieFrameClockRedrawBegin() == 1);
 }
 
 static void testLatencyAndGaps(void) {
@@ -248,6 +304,15 @@ static void testNoScreen(void) {
     CHECK(queued == 0);
     CHECK(nposted == 1);
     CHECK(lorieFrameClockRedrawBegin() == 0);
+}
+
+/* VSYNCs with an X server that does not run at all. */
+static void runFramesNoX(int n, int64_t step) {
+    int i;
+    for (i = 0; i < n; i++) {
+        advance(step);
+        vsync();
+    }
 }
 
 /* Plays the X server keeping up: every queued tick is taken right away. */
@@ -406,7 +471,7 @@ static void testResumeOldCallbackLateIsStale(void) {
 
 int main(void) {
     testChainReposts();
-    testBacklogReplay();
+    testBacklogCoalesces();
     testLatencyAndGaps();
     testNo64();
     testNoScreen();
@@ -418,6 +483,9 @@ int main(void) {
     testSilentWithoutSurfaceWaits();
     testResumeRearmsAQuietChain();
     testResumeOldCallbackLateIsStale();
+    testTickCountIsKept();
+    testStuckFlagRequeues();
+    testResetQueue();
     printf(failures ? "frameclock: %d FAILED\n" : "frameclock: PASS\n", failures);
     return failures != 0;
 }

@@ -35,8 +35,9 @@ void lorieFrameClockStart(void);
 /* Any thread: the activity is back (new surface, new connection); have the owner thread check the chain. */
 void lorieFrameClockResumeCheck(void);
 
-/* X server main thread. */
+/* X server main thread. RedrawBegin returns the frame ticks to advance MSC by, 0 when there are none. */
 void lorieFrameClockSetXThread(void);
+void lorieFrameClockResetQueue(void);
 uint32_t lorieFrameClockRedrawBegin(void);
 void lorieFrameClockNoteClear(bool wasWaiting);
 void lorieFrameClockXWakeup(void);

@@ -461,10 +461,15 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
+    uint32_t ticks = lorieFrameClockRedrawBegin();
     uint64_t tick;
 
-    lorieFrameClockRedrawBegin();
-    pvfb->current_msc++;
+    if (!ticks)
+        return TRUE; // An earlier run already took the ticks this one was queued for.
+
+    // One run for every VSYNC since the last one (frameclock.c): MSC counts them all, and every vblank
+    // they reached is delivered once, at the MSC actually reached.
+    pvfb->current_msc += ticks;
     loriePerformVblanks();
 
     // The serial goes up before the flag is cleared, so a renderer that sets the flag and then reads
@@ -759,6 +764,8 @@ static void lorieWakeupHandler(unused void *data, unused int result) {
 
 static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
     static int eventFd = -1;
+    // After a server reset: ClearWorkQueue dropped whatever lorieRedraw was queued.
+    lorieFrameClockResetQueue();
     pScreenPtr = pScreen;
 
     lorieFrameClockSetXThread();
