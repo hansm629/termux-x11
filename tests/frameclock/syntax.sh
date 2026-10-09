@@ -43,10 +43,17 @@ ERRS="-Werror=implicit -Werror=implicit-function-declaration -Werror=incompatibl
 DEFS="-DHAVE_DIX_CONFIG_H -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XSERVER64=1 -DEGL_NO_PLATFORM_SPECIFIC_TYPES"
 status=0
 cd "$CPP"
-for target in aarch64-linux-android26 armv7a-linux-androideabi26; do
+for target in aarch64-linux-android26 armv7a-linux-androideabi26 i686-linux-android26; do
     for f in lorie/frameclock.c lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/buffer.c; do
         out=$("$CLANG" --target=$target -fsyntax-only -std=gnu11 -Wno-everything $ERRS $DEFS \
               -include lorie/shm/shm.h $INC "$f" 2>&1 | grep -E "error" || true)
+        # The frame clock's own 64 bit atomics must stay lock-free on every ABI (shared across processes).
+        # Clang only diagnoses this while generating code, hence -emit-llvm instead of -fsyntax-only.
+        atomics=$("$CLANG" --target=$target -S -emit-llvm -o /dev/null -std=gnu11 -Wno-everything -Watomic-alignment \
+              $DEFS -include lorie/shm/shm.h $INC "$f" 2>&1 | grep -A2 -E "warning: misaligned atomic" | grep -E "^ *[0-9]+ \|" | grep -v "gpuCopyQueue" || true)
+        if [ -n "$atomics" ]; then
+            echo "== $target $f: misaligned atomics"; echo "$atomics" | head -10; status=1
+        fi
         if [ -n "$out" ]; then
             echo "== $target $f"; echo "$out" | head -20; status=1
         fi
@@ -58,5 +65,5 @@ if [ "${WARN:-0}" = 1 ]; then
         -Wredundant-decls -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-missing-prototypes \
         $DEFS -include lorie/shm/shm.h $INC lorie/frameclock.c 2>&1 | grep -E "warning|error" || true
 fi
-[ $status = 0 ] && echo "syntax (Android arm64 + armv7, CI error flags): PASS"
+[ $status = 0 ] && echo "syntax (Android arm64 + armv7 + x86, CI error flags, aligned atomics): PASS"
 exit $status

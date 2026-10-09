@@ -117,13 +117,13 @@ static struct {
     bool stallSeen;                 /* the watchdog found the chain quiet since the last valid callback */
     bool rearmedThisStall;          /* ... and re-armed it */
     int64_t startNs, lastCallbackNs, lastFrameTimeNs;
-    int64_t periodNs;               /* from the refresh rate callback, 0 if it never ran */
+    int64_t periodNs LORIE_ATOMIC64; /* from the refresh rate callback, 0 if it never ran */
     int timerFd;                    /* the watchdog, on the owner thread's Looper; -1 without one */
     int kickFd;                     /* eventfd, same Looper: lorieFrameClockResumeCheck() from any thread */
 
     /* owner thread -> X server main thread */
     uint32_t pendingTicks;          /* callbacks since the last lorieRedraw took them */
-    int64_t oldestTickNs;           /* when the first of them arrived */
+    int64_t oldestTickNs LORIE_ATOMIC64; /* when the first of them arrived */
     bool redrawQueued;              /* a lorieRedraw is queued and has not started yet */
     int64_t queuedNs;               /* owner thread only: when it was queued */
 
@@ -141,10 +141,10 @@ static struct {
     uint32_t redraws, replays, ticksMax, multiTick, redrawGapMaxUs;
     uint32_t redrawHist[FC_HIST_BUCKETS];
     uint32_t cbToRedrawMaxUs, cbToRedrawSamples;
-    uint64_t cbToRedrawSumUs;
+    uint64_t cbToRedrawSumUs LORIE_ATOMIC64;
     uint32_t waitClears;
     uint32_t xBusyMaxUs, lockWaitMaxUs;
-    uint64_t lockWaitSumUs;
+    uint64_t lockWaitSumUs LORIE_ATOMIC64;
 } st = { .vsyncGapMinUs = UINT32_MAX };
 
 /* Fault injection (see the top of this file). Set before the X server thread starts, never after. */

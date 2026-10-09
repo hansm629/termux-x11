@@ -3,6 +3,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 64 bit fields used with __atomic builtins: 32 bit x86 aligns int64_t to 4 only, which turns them into
+ * locked library calls - not atomic across the two processes sharing the struct. */
+#define LORIE_ATOMIC64 __attribute__((aligned(8)))
+
 /*
  * The frame clock (frameclock.c): Android VSYNC -> AChoreographer callback -> QueueWorkProc(lorieRedraw)
  * -> X server main thread -> lorieRedraw (MSC, Present vblanks, waitForNextFrame) -> renderer.
@@ -13,9 +17,9 @@
  * resets the per-window ones after printing them (a lost update at the boundary is not worth a lock).
  */
 struct lorie_frame_clock_stats {
-    volatile uint64_t tickSerial;        /* X: lorieRedraw runs, i.e. frame ticks handed to the renderer */
-    volatile int64_t lastTickNs;         /* X: CLOCK_MONOTONIC time of the last one */
-    volatile uint64_t drawTickSerial;    /* X: tickSerial of the last tick that asked the renderer to draw */
+    volatile uint64_t tickSerial LORIE_ATOMIC64;     /* X: lorieRedraw runs, i.e. frame ticks handed to the renderer */
+    volatile int64_t lastTickNs LORIE_ATOMIC64;      /* X: CLOCK_MONOTONIC time of the last one */
+    volatile uint64_t drawTickSerial LORIE_ATOMIC64; /* X: tickSerial of the last tick that asked the renderer to draw */
 
     volatile uint32_t waitSet;           /* frames that set waitForNextFrame */
     volatile uint32_t waitSetOverTick;   /* ... although a tick had cleared it again while the frame ran */
