@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include "linux/input-event-codes.h"
 #include "buffer.h"
+#include "frameclock.h"
 
 #define PORT 7892
 #define MAGIC "0xDEADBEEF"
@@ -30,7 +31,6 @@ void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);
@@ -254,6 +254,9 @@ struct lorie_shared_server_state {
         volatile uint32_t gpuCopyFrames;  /* frames that carried at least one present copy */
         volatile uint32_t coalescedFrames;/* redraws the backpressure guard delayed */
     } presentStats;
+
+    /* Frame clock hand-off between lorieRedraw and the renderer (see frameclock.h). */
+    struct lorie_frame_clock_stats frameClock;
 
     /*
      * GL_VENDOR | GL_RENDERER of the context the renderer actually draws with, published once so

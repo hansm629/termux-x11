@@ -461,11 +461,19 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
+    uint64_t tick;
 
+    lorieFrameClockRedrawBegin();
     pvfb->current_msc++;
     loriePerformVblanks();
 
-    pvfb->state->waitForNextFrame = false;
+    // The serial goes up before the flag is cleared, so a renderer that sets the flag and then reads
+    // the serial always sees a tick whose clear it may have overwritten (frameclock.h).
+    tick = pvfb->state->frameClock.tickSerial + 1;
+    __atomic_store_n(&pvfb->state->frameClock.lastTickNs, lorieFrameClockNowNs(), __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->frameClock.tickSerial, tick, __ATOMIC_SEQ_CST);
+    lorieFrameClockNoteClear(pvfb->state->waitForNextFrame);
+    __atomic_store_n(&pvfb->state->waitForNextFrame, false, __ATOMIC_SEQ_CST);
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
         return TRUE;
@@ -491,6 +499,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         }
 
         DamageEmpty(pvfb->damage);
+        if (!pvfb->state->drawRequested)
+            __atomic_store_n(&pvfb->state->frameClock.drawTickSerial, tick, __ATOMIC_RELEASE);
         pvfb->state->drawRequested = TRUE;
     }
 
@@ -542,6 +552,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->presentStats.gpuCopyFrames,
             pvfb->state->presentStats.coalescedFrames);
     }
+
+    lorieFrameClockReport(&pvfb->state->frameClock, pvfb->state->renderedFrames,
+                          pvfb->state->surfaceAvailable, lorieConnectionAlive(), pvfb->root.framerate);
 
     pvfb->state->presentStats.frameSamples = 0;
     pvfb->state->presentStats.frameSumUs = 0;
@@ -722,17 +735,30 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
-    AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
-    if (pScreenPtr) {
-        QueueWorkProc(lorieRedraw, NULL, NULL);
-        lorieWakeServer();
-    }
+// Both called from the frame clock's AChoreographer callback (frameclock.c), off the X server thread.
+bool lorieScreenReady(void) {
+    return pScreenPtr != NULL;
+}
+
+void lorieQueueRedraw(void) {
+    QueueWorkProc(lorieRedraw, NULL, NULL);
+    lorieWakeServer();
+}
+
+static void lorieBlockHandler(unused void *data, unused void *timeout) {
+    lorieFrameClockXBlock();
+}
+
+static void lorieWakeupHandler(unused void *data, unused int result) {
+    lorieFrameClockXWakeup();
 }
 
 static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {
     static int eventFd = -1;
     pScreenPtr = pScreen;
+
+    lorieFrameClockSetXThread();
+    RegisterBlockAndWakeupHandlers(lorieBlockHandler, lorieWakeupHandler, NULL);
 
     if (eventFd == -1)
         eventFd = eventfd(0, EFD_CLOEXEC);
@@ -1171,8 +1197,12 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
-    if (lorieNeedsGpuLock(pPix, priv, index))
+    if (lorieNeedsGpuLock(pPix, priv, index)) {
+        // Waits for a renderer frame in progress: time the X server main thread cannot spend on ticks.
+        int64_t lockStartNs = lorieFrameClockNowNs();
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        lorieFrameClockNoteLockWait(lorieFrameClockNowNs() - lockStartNs);
+    }
 
     if (!priv->locked && !priv->mem) {
         int err = LorieBuffer_lock(priv->buffer, &priv->locked);

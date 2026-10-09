@@ -816,6 +816,8 @@ void rendererRefreshContext(void) {
     win = pendingWin;
     pendingWin = NULL;
     windowChanged = FALSE;
+    if (state)
+        state->frameClock.surfaceGeneration++;
 
     if (!win) {
         win = defaultWin;
@@ -1082,6 +1084,7 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
     LorieBuffer *buf;
     int attempt;
+    int64_t waitStartNs = 0;
 
     pthread_spin_lock(&bufferLock);
     buf = LorieBufferList_findById(&buffers, id);
@@ -1092,6 +1095,8 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
     pthread_spin_unlock(&bufferLock);
 
     for (attempt = 0; attempt < 20 && !buf; attempt++) {
+        if (!waitStartNs)
+            waitStartNs = rendererNowNs();
         usleep(5000);
         pthread_spin_lock(&bufferLock);
         buf = LorieBufferList_findById(&buffers, id);
@@ -1100,6 +1105,13 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
             LorieBuffer_addToList(buf, &buffers);
         }
         pthread_spin_unlock(&bufferLock);
+    }
+
+    // Spent with state->lock held, i.e. with the X server's drawing into root blocked too.
+    if (waitStartNs && state) {
+        uint32_t waitUs = (uint32_t) rendererNsToUs(rendererNowNs() - waitStartNs);
+        if (waitUs > state->frameClock.bufferWaitMaxUs)
+            state->frameClock.bufferWaitMaxUs = waitUs;
     }
     return buf;
 }
@@ -1264,6 +1276,30 @@ static void rendererPublishFrameStats(int64_t frameStartNs, int64_t fenceWaitUs,
         state->presentStats.coalescedFrames++;
 }
 
+// How many frame ticks a draw request waited for this frame (frameclock.h): none when the renderer
+// started on the tick that asked for it, more when it was busy, missed the wakeup or was still gated
+// by waitForNextFrame.
+static void rendererNoteHandover(int64_t frameStartNs, uint64_t tick) {
+    static uint64_t lastHandledDrawTick = 0;
+    uint64_t drawTick = __atomic_load_n(&state->frameClock.drawTickSerial, __ATOMIC_ACQUIRE);
+
+    if (!drawTick || drawTick == lastHandledDrawTick)
+        return; // Not a draw request from a tick (cursor, viewport, new surface), or one already drawn.
+
+    lastHandledDrawTick = drawTick;
+    state->frameClock.handoverFrames++;
+    if (tick > drawTick) {
+        uint32_t late = tick - drawTick > UINT32_MAX ? UINT32_MAX : (uint32_t) (tick - drawTick);
+        state->frameClock.handoverLate++;
+        if (late > state->frameClock.handoverLateMaxTicks)
+            state->frameClock.handoverLateMaxTicks = late;
+    } else {
+        int64_t sinceTickUs = rendererNsToUs(frameStartNs - __atomic_load_n(&state->frameClock.lastTickNs, __ATOMIC_RELAXED));
+        if (sinceTickUs > 0 && (uint64_t) sinceTickUs > state->frameClock.handoverMaxUs)
+            state->frameClock.handoverMaxUs = sinceTickUs > UINT32_MAX ? UINT32_MAX : (uint32_t) sinceTickUs;
+    }
+}
+
 void rendererRedrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
     LorieBuffer_Desc *desc = NULL;
@@ -1274,6 +1310,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     bool swapBackpressureGuardEnabled = rendererSwapBackpressureGuardEnabled;
     // Unconditional: rendererPublishFrameStats() needs it even with the perf log off.
     int64_t frameStartNs = rendererNowNs();
+    uint64_t tickAtStart = __atomic_load_n(&state->frameClock.tickSerial, __ATOMIC_ACQUIRE);
+    int64_t lockHeldStartNs;
     int64_t rootWaitUs = rootFenceWaitEnabled ? 0 : -1;
     int64_t swapUs = 0;
     int64_t preSwapFlushUs = -1;
@@ -1353,8 +1391,11 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     glViewport(viewportX, surfaceH - viewportY - viewportH, viewportW, viewportH);
 
+    rendererNoteHandover(frameStartNs, tickAtStart);
+
     // We should signal X server to not use root window while we actively copy it
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    lockHeldStartNs = rendererNowNs();
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
@@ -1397,7 +1438,17 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();
     }
-    state->waitForNextFrame = true;
+    // Set first, read the serial second: a tick that cleared the flag before this store cannot go
+    // unseen, since lorieRedraw raises the serial before it clears (frameclock.h).
+    __atomic_store_n(&state->waitForNextFrame, true, __ATOMIC_SEQ_CST);
+    state->frameClock.waitSet++;
+    if (__atomic_load_n(&state->frameClock.tickSerial, __ATOMIC_SEQ_CST) != tickAtStart)
+        state->frameClock.waitSetOverTick++;
+    {
+        int64_t heldUs = rendererNsToUs(rendererNowNs() - lockHeldStartNs);
+        if (heldUs > 0 && (uint64_t) heldUs > state->frameClock.lockHeldMaxUs)
+            state->frameClock.lockHeldMaxUs = heldUs > UINT32_MAX ? UINT32_MAX : (uint32_t) heldUs;
+    }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 // Gaming fast path: submit GL commands before swap without creating or waiting on fences.
     // This keeps the no-fence fast path but avoids moving all submit work into swap.

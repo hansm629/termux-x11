@@ -200,9 +200,8 @@ Java_com_termux_x11_CmdEntryPoint_start(JNIEnv *env, __unused jclass cls, jobjec
 
     (*env)->GetJavaVM(env, &vm);
 
-    AChoreographer *choreographer = AChoreographer_getInstance();
-    // Trigger it first time
-    AChoreographer_postFrameCallback(choreographer, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, choreographer);
+    // This thread has the process' main Looper: the frame clock's AChoreographer belongs to it (frameclock.c).
+    lorieFrameClockStart();
 
     xorg_list_init(&registeredBuffers);
     pthread_create(&t, NULL, startServer, vm);
