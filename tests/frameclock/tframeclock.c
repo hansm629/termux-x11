@@ -183,6 +183,7 @@ static void testChainReposts(void) {
         CHECK(lorieFrameClockRedrawBegin() == 1);
     }
     CHECK(queued == 10);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: first callback"), "NOT") == NULL);
     report();
 }
 

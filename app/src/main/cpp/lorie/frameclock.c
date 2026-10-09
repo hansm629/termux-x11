@@ -283,7 +283,9 @@ static void fcNoteCallback(int64_t now, int64_t frameTimeNs, bool frameTimeValid
         fcMax(&st.cbGapMaxUs, gapUs);
         FC_ADD(cbHist[fcHistBucket(gapUs)], 1);
     } else
-        log(INFO, "XlorieFrameClock: first callback");
+        // The callback must run on the thread that owns the AChoreographer (and the watchdog's Looper).
+        log(INFO, "XlorieFrameClock: first callback on tid %d, owner tid %d%s", gettid(), fc.ownerTid,
+            gettid() == fc.ownerTid ? "" : " - NOT the owner thread");
     fc.lastCallbackNs = now;
 
     if (!frameTimeValid)
