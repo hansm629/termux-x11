@@ -32,6 +32,8 @@ int64_t lorieFrameClockNowNs(void);
 
 /* Owner thread (the one CmdEntryPoint.start() runs on, which has a Looper): starts the callback chain. */
 void lorieFrameClockStart(void);
+/* Any thread: the activity is back (new surface, new connection); have the owner thread check the chain. */
+void lorieFrameClockResumeCheck(void);
 
 /* X server main thread. */
 void lorieFrameClockSetXThread(void);

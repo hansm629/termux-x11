@@ -289,6 +289,8 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
     if (read(fd, &e, sizeof(e)) == sizeof(e)) {
         switch(e.type) {
             case EVENT_SCREEN_SIZE: {
+                // Sent whenever the activity applies a surface, e.g. coming back from the screen being off.
+                lorieFrameClockResumeCheck();
                 lorieEvent *copy = calloc(1, sizeof(lorieEvent) + e.screenSize.name_size + 1);
                 memcpy(copy, &e, sizeof(e));
                 copy->screenSize.name = copy->screenSize.name_size ? (char*) (copy + 1) : NULL;
@@ -455,6 +457,7 @@ static Bool addFd(__unused ClientPtr pClient, void *closure) {
     InputThreadRegisterDev((int) (int64_t) closure, handleLorieEvents, NULL);
     conn_fd = (int) (int64_t) closure;
     lorieActivityConnected();
+    lorieFrameClockResumeCheck();
     return TRUE;
 }
 

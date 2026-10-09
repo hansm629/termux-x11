@@ -26,6 +26,8 @@
  * never run twice per VSYNC. A watchdog on the owner thread's Looper re-arms the chain when it is lost -
  * no callback of the current generation registered - and once per stall when a registered one has been
  * silent for far longer than any display can legitimately be. It never draws or ticks by itself.
+ * When the activity comes back (a new surface, a new connection) the owner thread is asked to look at
+ * the chain right away, and re-arms it if it has been quiet for a stall's length.
  */
 
 #include <dlfcn.h>
@@ -38,6 +40,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <android/choreographer.h>
 #include <android/log.h>
@@ -81,10 +84,12 @@ static struct {
     /* owner thread */
     uint32_t generation;            /* of the chain; callbacks carrying another one are stale */
     bool outstanding;               /* a callback of the current generation is registered */
-    bool rearmedThisStall;          /* the watchdog already re-armed since the last valid callback */
+    bool stallSeen;                 /* the watchdog found the chain quiet since the last valid callback */
+    bool rearmedThisStall;          /* ... and re-armed it */
     int64_t startNs, lastCallbackNs, lastFrameTimeNs;
     int64_t periodNs;               /* from the refresh rate callback, 0 if it never ran */
     int timerFd;                    /* the watchdog, on the owner thread's Looper; -1 without one */
+    int kickFd;                     /* eventfd, same Looper: lorieFrameClockResumeCheck() from any thread */
 
     /* owner thread -> X server main thread */
     uint32_t pendingTicks;          /* callbacks since the last lorieRedraw took them */
@@ -97,7 +102,7 @@ static struct {
 /* Per 5 second window; the X server main thread reads and resets them. */
 #define FC_HIST_BUCKETS 6
 static struct {
-    uint32_t callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms;
+    uint32_t callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms, resumeChecks;
     uint32_t cbGapMaxUs, vsyncGapMaxUs, vsyncGapMinUs, cbLatencyMaxUs, cbLate;
     uint32_t cbHist[FC_HIST_BUCKETS];
     uint32_t queueTry, queueActual;
@@ -182,7 +187,10 @@ static void fcCheck(void) {
         return;
     }
 
-    FC_ADD(stalls, 1);
+    if (!fc.stallSeen) {
+        fc.stallSeen = true;
+        FC_ADD(stalls, 1);
+    }
     if (!fc.outstanding) {
         // Nothing registered will ever call back: the chain is lost.
         fcRearm("lost", since);
@@ -197,11 +205,27 @@ static void fcCheck(void) {
     // Once re-armed for this stall, only the next valid callback arms the watchdog again.
 }
 
+/*
+ * The activity got a surface or connected again. If the chain has gone quiet meanwhile, re-arm it now
+ * instead of waiting for the watchdog's silence limit: this is exactly when a stale registration would
+ * otherwise keep the screen frozen.
+ */
+static void fcResumeCheck(void) {
+    int64_t since = lorieFrameClockNowNs() - (fc.lastCallbackNs ? fc.lastCallbackNs : fc.startNs);
+
+    FC_ADD(resumeChecks, 1);
+    if (since >= FC_STALL_NS && !fc.rearmedThisStall)
+        fcRearm("resume", since);
+}
+
 static int fcLooperCallback(int fd, __unused int events, __unused void *data) {
-    uint64_t expirations;
-    while (read(fd, &expirations, sizeof(expirations)) > 0)
+    uint64_t value;
+    while (read(fd, &value, sizeof(value)) > 0)
         ;
-    fcCheck();
+    if (fd == fc.kickFd)
+        fcResumeCheck();
+    else
+        fcCheck();
     return 1;
 }
 
@@ -261,7 +285,7 @@ static void fcOnFrame(int64_t frameTimeNs, bool frameTimeValid, void *data) {
     if (fc.rearmedThisStall)
         log(INFO, "XlorieFrameClock: callbacks are back, %" PRId64 " ms after the last one, generation %u",
             (now - fc.lastCallbackNs) / NS_PER_MS, fc.generation);
-    fc.rearmedThisStall = false;
+    fc.stallSeen = fc.rearmedThisStall = false;
     fcNoteCallback(now, frameTimeNs, frameTimeValid);
     fcPost();
     fcArmWatchdog(FC_STALL_NS);
@@ -291,7 +315,7 @@ void lorieFrameClockStart(void) {
 
     fc.ownerTid = gettid();
     fc.startNs = lorieFrameClockNowNs();
-    fc.timerFd = -1;
+    fc.timerFd = fc.kickFd = -1;
     fc.choreographer = AChoreographer_getInstance();
     if (!fc.choreographer) {
         log(ERROR, "XlorieFrameClock: no AChoreographer on tid %d, the frame clock is not running", fc.ownerTid);
@@ -306,19 +330,33 @@ void lorieFrameClockStart(void) {
     if (registerRefreshRate)
         registerRefreshRate(fc.choreographer, fcRefreshRateCallback, NULL);
 
-    // The watchdog runs on the same Looper as the callbacks, so it is serialized with them.
-    if ((looper = ALooper_forThread()) && (fc.timerFd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)) >= 0 &&
-        ALooper_addFd(looper, fc.timerFd, ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, fcLooperCallback, NULL) != 1) {
-        close(fc.timerFd);
-        fc.timerFd = -1;
+    // The watchdog and the resume check run on the same Looper as the callbacks, so they are serialized
+    // with them.
+    if ((looper = ALooper_forThread())) {
+        if ((fc.timerFd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)) >= 0 &&
+            ALooper_addFd(looper, fc.timerFd, ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, fcLooperCallback, NULL) != 1) {
+            close(fc.timerFd);
+            fc.timerFd = -1;
+        }
+        if ((fc.kickFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) >= 0 &&
+            ALooper_addFd(looper, fc.kickFd, ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, fcLooperCallback, NULL) != 1) {
+            close(fc.kickFd);
+            fc.kickFd = -1;
+        }
     }
 
-    log(INFO, "XlorieFrameClock: owner tid %d, postFrameCallback64 %s, refresh rate callback %s, watchdog %s",
-        fc.ownerTid, fc.post64 ? "yes" : "no", registerRefreshRate ? "yes" : "no", fc.timerFd >= 0 ? "yes" : "no");
+    log(INFO, "XlorieFrameClock: owner tid %d, postFrameCallback64 %s, refresh rate callback %s, watchdog %s, "
+              "resume check %s", fc.ownerTid, fc.post64 ? "yes" : "no", registerRefreshRate ? "yes" : "no",
+        fc.timerFd >= 0 ? "yes" : "no", fc.kickFd >= 0 ? "yes" : "no");
 
     fc.generation = 1;
     fcPost();
     fcArmWatchdog(FC_STALL_NS);
+}
+
+void lorieFrameClockResumeCheck(void) {
+    if (fc.kickFd >= 0)
+        eventfd_write(fc.kickFd, 1);
 }
 
 void lorieFrameClockSetXThread(void) {
@@ -482,6 +520,7 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
     uint32_t cbHist[FC_HIST_BUCKETS], redrawHist[FC_HIST_BUCKETS];
     uint32_t callbacks = FC_TAKE(callbacks), posts = FC_TAKE(posts), staleCallbacks = FC_TAKE(staleCallbacks);
     uint32_t stalls = FC_TAKE(stalls), rearms = FC_TAKE(rearms), forcedRearms = FC_TAKE(forcedRearms);
+    uint32_t resumeChecks = FC_TAKE(resumeChecks);
     uint32_t cbGapMaxUs = FC_TAKE(cbGapMaxUs), vsyncGapMaxUs = FC_TAKE(vsyncGapMaxUs);
     uint32_t vsyncGapMinUs = __atomic_exchange_n(&st.vsyncGapMinUs, UINT32_MAX, __ATOMIC_RELAXED);
     uint32_t cbLatencyMaxUs = FC_TAKE(cbLatencyMaxUs), cbLate = FC_TAKE(cbLate);
@@ -518,12 +557,12 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
         goto out;
 
     log(INFO, "XlorieFrameClock: app_hz=%u period_us=%u gen=%u cb=%u post=%u stale_cb=%u stall=%u rearm=%u "
-              "forced_rearm=%u cb_gap_max_us=%u "
+              "forced_rearm=%u resume_check=%u cb_gap_max_us=%u "
               "cb_hist=%u/%u/%u/%u/%u/%u vsync_gap_min_us=%u vsync_gap_max_us=%u cb_lat_max_us=%u cb_late=%u "
               "queue_try=%u queue_actual=%u redraw=%u replay=%u ticks_max=%u multi_tick=%u "
               "cb_to_redraw_max_us=%u cb_to_redraw_avg_us=%u redraw_gap_max_us=%u redraw_hist=%u/%u/%u/%u/%u/%u",
         appHz, fcUs(__atomic_load_n(&fc.periodNs, __ATOMIC_RELAXED)), __atomic_load_n(&fc.generation, __ATOMIC_RELAXED),
-        callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms, cbGapMaxUs,
+        callbacks, posts, staleCallbacks, stalls, rearms, forcedRearms, resumeChecks, cbGapMaxUs,
         cbHist[0], cbHist[1], cbHist[2], cbHist[3], cbHist[4], cbHist[5],
         vsyncGapMinUs == UINT32_MAX ? 0 : vsyncGapMinUs, vsyncGapMaxUs, cbLatencyMaxUs, cbLate,
         queueTry, queueActual, redraws, replays, ticksMax, multiTick,

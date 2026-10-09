@@ -27,8 +27,9 @@ int fake_clock_gettime(__unused clockid_t clock, struct timespec *ts) {
 
 /* ---- watchdog timerfd and the owner thread's Looper ---- */
 static int64_t timerDeadlineNs; /* 0: disarmed */
-static int timerFdNo = -1, looperFd = -1, timerFires;
-static ALooper_callbackFunc looperCallback;
+static int timerFdNo = -1, looperDummy, timerFires;
+static struct { int fd; ALooper_callbackFunc callback; } looperFds[4];
+static int nLooperFds;
 int fake_timerfd_create(__unused int clockid, __unused int flags) {
     if (timerFdNo < 0)
         timerFdNo = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); // something read() can drain
@@ -39,11 +40,22 @@ int fake_timerfd_settime(__unused int fd, __unused int flags, const struct itime
     timerDeadlineNs = ns ? nowNs + ns : 0;
     return 0;
 }
-ALooper *ALooper_forThread(void) { return (ALooper *) &looperFd; }
+ALooper *ALooper_forThread(void) { return (ALooper *) &looperDummy; }
 int ALooper_addFd(__unused ALooper *looper, int fd, __unused int ident, __unused int events, ALooper_callbackFunc callback, __unused void *data) {
-    looperFd = fd;
-    looperCallback = callback;
+    int i;
+    for (i = 0; i < nLooperFds && looperFds[i].fd != fd; i++)
+        ;
+    looperFds[i].fd = fd;
+    looperFds[i].callback = callback;
+    if (i == nLooperFds)
+        nLooperFds++;
     return 1;
+}
+static void looperDispatch(int fd) {
+    int i;
+    for (i = 0; i < nLooperFds; i++)
+        if (looperFds[i].fd == fd)
+            looperFds[i].callback(fd, ALOOPER_EVENT_INPUT, NULL);
 }
 /* Lets time pass; the watchdog fires when its deadline is reached, like the Looper would. */
 static void advance(int64_t ns) {
@@ -52,9 +64,15 @@ static void advance(int64_t ns) {
         nowNs = timerDeadlineNs;
         timerDeadlineNs = 0;
         timerFires++;
-        looperCallback(looperFd, ALOOPER_EVENT_INPUT, NULL);
+        looperDispatch(timerFdNo);
     }
     nowNs = end;
+}
+
+/* What the activity coming back does: the resume check, then the owner thread's Looper running it. */
+static void resumeKick(void) {
+    lorieFrameClockResumeCheck();
+    looperDispatch(fc.kickFd);
 }
 
 /* ---- choreographer ---- */
@@ -141,7 +159,7 @@ static void reset(void) {
     memset(&st, 0, sizeof(st));
     st.vsyncGapMinUs = UINT32_MAX;
     memset(&rs, 0, sizeof(rs));
-    nposted = queued = timerFires = 0;
+    nposted = queued = timerFires = nLooperFds = 0;
     timerDeadlineNs = 0;
     screenReady = surfaceShown = 1;
     have64 = 1;
@@ -344,6 +362,46 @@ static void testSilentWithoutSurfaceWaits(void) {
     surfaceShown = 1;
     advance(FC_IDLE_CHECK_NS);
     CHECK(fc.generation == 2 && nposted == 1);
+    CHECK(fieldOf(report(), "stall") == 1);   // one stall, however often it was looked at
+}
+
+static void testResumeRearmsAQuietChain(void) {
+    const char *line;
+    printf("resume: coming back to a quiet chain re-arms it at once, a running one is left alone\n");
+    reset();
+    runFrames(5, STEP);
+    resumeKick();                   // callbacks are flowing: nothing to do
+    CHECK(fc.generation == 1);
+    nposted = 0;                    // the screen goes off and the registered callback is never delivered
+    surfaceShown = 0;
+    advance(30000 * NS_PER_MS);
+    CHECK(fc.generation == 1);
+    surfaceShown = 1;
+    resumeKick();                   // new surface: re-armed without waiting for the silence limit
+    CHECK(fc.generation == 2 && nposted == 1);
+    resumeKick();                   // a second event of the same resume does not re-arm again
+    CHECK(fc.generation == 2 && nposted == 1);
+    runFrames(5, STEP);
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 1 && fieldOf(line, "forced_rearm") == 1 && fieldOf(line, "resume_check") == 3);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: re-arming"), "(resume)") != NULL);
+}
+
+static void testResumeOldCallbackLateIsStale(void) {
+    const char *line;
+    int q;
+    printf("resume: if the replaced callback turns up after all, it is stale and the cadence stays single\n");
+    reset();
+    runFrames(5, STEP);
+    advance(500 * NS_PER_MS);       // quiet, but the generation 1 callback is still registered
+    resumeKick();
+    CHECK(fc.generation == 2 && nposted == 2);
+    q = queued;
+    advance(STEP);
+    CHECK(vsync() == 2);
+    CHECK(queued == q + 1 && nposted == 1);
+    line = report();
+    CHECK(fieldOf(line, "stale_cb") == 1);
 }
 
 int main(void) {
@@ -358,6 +416,8 @@ int main(void) {
     testLostChainRecovers();
     testSilentChainRearmsOnce();
     testSilentWithoutSurfaceWaits();
+    testResumeRearmsAQuietChain();
+    testResumeOldCallbackLateIsStale();
     printf(failures ? "frameclock: %d FAILED\n" : "frameclock: PASS\n", failures);
     return failures != 0;
 }
