@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include "../../app/src/main/cpp/lorie/frameclock.c"
 
 static int failures;
@@ -22,6 +23,38 @@ int fake_clock_gettime(__unused clockid_t clock, struct timespec *ts) {
     ts->tv_sec = nowNs / 1000000000LL;
     ts->tv_nsec = nowNs % 1000000000LL;
     return 0;
+}
+
+/* ---- watchdog timerfd and the owner thread's Looper ---- */
+static int64_t timerDeadlineNs; /* 0: disarmed */
+static int timerFdNo = -1, looperFd = -1, timerFires;
+static ALooper_callbackFunc looperCallback;
+int fake_timerfd_create(__unused int clockid, __unused int flags) {
+    if (timerFdNo < 0)
+        timerFdNo = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); // something read() can drain
+    return timerFdNo;
+}
+int fake_timerfd_settime(__unused int fd, __unused int flags, const struct itimerspec *value, __unused struct itimerspec *old) {
+    int64_t ns = (int64_t) value->it_value.tv_sec * 1000000000LL + value->it_value.tv_nsec;
+    timerDeadlineNs = ns ? nowNs + ns : 0;
+    return 0;
+}
+ALooper *ALooper_forThread(void) { return (ALooper *) &looperFd; }
+int ALooper_addFd(__unused ALooper *looper, int fd, __unused int ident, __unused int events, ALooper_callbackFunc callback, __unused void *data) {
+    looperFd = fd;
+    looperCallback = callback;
+    return 1;
+}
+/* Lets time pass; the watchdog fires when its deadline is reached, like the Looper would. */
+static void advance(int64_t ns) {
+    int64_t end = nowNs + ns;
+    while (timerDeadlineNs && timerDeadlineNs <= end) {
+        nowNs = timerDeadlineNs;
+        timerDeadlineNs = 0;
+        timerFires++;
+        looperCallback(looperFd, ALOOPER_EVENT_INPUT, NULL);
+    }
+    nowNs = end;
 }
 
 /* ---- choreographer ---- */
@@ -64,8 +97,9 @@ static int vsyncAt(int64_t frameTimeNs) {
 static int vsync(void) { return vsyncAt(nowNs); }
 
 /* ---- X server side ---- */
-static int queued, screenReady = 1;
+static int queued, screenReady = 1, surfaceShown = 1;
 bool lorieScreenReady(void) { return screenReady; }
+bool lorieSurfaceShown(void) { return surfaceShown; }
 void lorieQueueRedraw(void) { queued++; }
 
 /* ---- log ---- */
@@ -107,8 +141,9 @@ static void reset(void) {
     memset(&st, 0, sizeof(st));
     st.vsyncGapMinUs = UINT32_MAX;
     memset(&rs, 0, sizeof(rs));
-    nposted = queued = 0;
-    screenReady = 1;
+    nposted = queued = timerFires = 0;
+    timerDeadlineNs = 0;
+    screenReady = surfaceShown = 1;
     have64 = 1;
     lorieFrameClockStart();
 }
@@ -197,12 +232,132 @@ static void testNoScreen(void) {
     CHECK(lorieFrameClockRedrawBegin() == 0);
 }
 
+/* Plays the X server keeping up: every queued tick is taken right away. */
+static void runFrames(int n, int64_t step) {
+    int i;
+    for (i = 0; i < n; i++) {
+        advance(step);
+        vsync();
+        while (lorieFrameClockRedrawBegin())
+            ;
+    }
+}
+
+static void testHealthyChainNeverRearms(void) {
+    const char *line;
+    printf("watchdog: a healthy 120 Hz chain never wakes it\n");
+    reset();
+    runFrames(1200, STEP);
+    CHECK(timerFires == 0);
+    line = report();
+    CHECK(fieldOf(line, "stall") == 0 && fieldOf(line, "rearm") == 0 && fieldOf(line, "stale_cb") == 0);
+    CHECK(fieldOf(line, "gen") == 1);
+}
+
+static void testSlowPanelNeverRearms(void) {
+    const char *line;
+    printf("watchdog: a panel idling at 1 Hz is a stall to report, not to re-arm\n");
+    reset();
+    runFrames(10, 1000 * NS_PER_MS);
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 0);
+    CHECK(fieldOf(line, "stall") == 10);
+    CHECK(fieldOf(line, "gen") == 1);
+    CHECK(nposted == 1);
+}
+
+static void testStaleCallbackIsDropped(void) {
+    const char *line;
+    int q;
+    printf("stale: a callback of a replaced generation neither ticks nor re-posts\n");
+    reset();
+    runFrames(5, STEP);
+    fcRearm("test", 0);             // two callbacks registered now: generation 1 and 2
+    CHECK(nposted == 2);
+    q = queued;
+    advance(STEP);
+    CHECK(vsync() == 2);
+    CHECK(queued == q + 1);         // one tick for one VSYNC
+    CHECK(nposted == 1);            // only generation 2 re-posted
+    CHECK((uint32_t) (uintptr_t) posted[0].data == 2);
+    lorieFrameClockRedrawBegin();
+    runFrames(5, STEP);
+    CHECK(queued == q + 6);
+    line = report();
+    CHECK(fieldOf(line, "stale_cb") == 1);
+    CHECK(fieldOf(line, "forced_rearm") == 1);
+    CHECK(fieldOf(line, "gen") == 2);
+}
+
+static void testLostChainRecovers(void) {
+    const char *line;
+    printf("lost: a chain with nothing registered is re-armed after the stall threshold\n");
+    reset();
+    runFrames(5, STEP);
+    // The last callback did not re-post (what TERMUX_X11_CHOREO_TEST_DROP does).
+    nposted = 0;
+    fc.outstanding = false;
+    advance(FC_STALL_NS - NS_PER_MS);
+    CHECK(fc.generation == 1 && nposted == 0);
+    advance(2 * NS_PER_MS);
+    CHECK(fc.generation == 2 && nposted == 1 && fc.outstanding);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: re-arming"), "(lost)") != NULL);
+    runFrames(10, STEP);
+    CHECK(nposted == 1);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: callbacks are back"), "generation 2") != NULL);
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 1 && fieldOf(line, "forced_rearm") == 0 && fieldOf(line, "stale_cb") == 0);
+    // Once recovered, a healthy chain does not wake the watchdog again.
+    timerFires = 0;
+    runFrames(600, STEP);
+    CHECK(timerFires == 0);
+}
+
+static void testSilentChainRearmsOnce(void) {
+    const char *line;
+    printf("silent: a registered callback that never fires is replaced once per stall\n");
+    reset();
+    runFrames(5, STEP);
+    nposted = 0;                    // Choreographer dropped it; we still think it is registered
+    advance(FC_SILENT_NS - NS_PER_MS);
+    CHECK(fc.generation == 1);
+    advance(2 * NS_PER_MS);
+    CHECK(fc.generation == 2 && nposted == 1);
+    advance(60000 * NS_PER_MS);     // still nothing: no second re-arm, and no more wake-ups
+    CHECK(fc.generation == 2 && nposted == 1);
+    CHECK(timerDeadlineNs == 0);
+    runFrames(3, STEP);
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 1 && fieldOf(line, "forced_rearm") == 1);
+}
+
+static void testSilentWithoutSurfaceWaits(void) {
+    printf("silent: with nothing on screen the chain is only looked at every few seconds\n");
+    reset();
+    runFrames(5, STEP);
+    nposted = 0;
+    surfaceShown = 0;
+    timerFires = 0;
+    advance(60000 * NS_PER_MS);
+    CHECK(fc.generation == 1);
+    CHECK(timerFires <= 2 + 60000 / 5000);
+    surfaceShown = 1;
+    advance(FC_IDLE_CHECK_NS);
+    CHECK(fc.generation == 2 && nposted == 1);
+}
+
 int main(void) {
     testChainReposts();
     testBacklogReplay();
     testLatencyAndGaps();
     testNo64();
     testNoScreen();
+    testHealthyChainNeverRearms();
+    testSlowPanelNeverRearms();
+    testStaleCallbackIsDropped();
+    testLostChainRecovers();
+    testSilentChainRearmsOnce();
+    testSilentWithoutSurfaceWaits();
     printf(failures ? "frameclock: %d FAILED\n" : "frameclock: PASS\n", failures);
     return failures != 0;
 }

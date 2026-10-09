@@ -43,6 +43,8 @@ void lorieFrameClockNoteLockWait(int64_t ns);
 void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int renderedFrames,
                            bool surfaceAvailable, bool connected, uint32_t appHz);
 
-/* Provided by InitOutput.c: whether the screen exists, and queueing one lorieRedraw on the X server. */
+/* Provided by InitOutput.c: whether the screen exists, whether the renderer shows it on a surface, and
+ * queueing one lorieRedraw on the X server. */
 bool lorieScreenReady(void);
+bool lorieSurfaceShown(void);
 void lorieQueueRedraw(void);

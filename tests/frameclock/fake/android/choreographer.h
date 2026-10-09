@@ -17,9 +17,14 @@ enum { ALOOPER_POLL_CALLBACK = -2, ALOOPER_EVENT_INPUT = 1 << 0, ALOOPER_EVENT_E
 ALooper *ALooper_forThread(void);
 int ALooper_addFd(ALooper *looper, int fd, int ident, int events, ALooper_callbackFunc callback, void *data);
 
+struct itimerspec;
 int fake_clock_gettime(clockid_t clock, struct timespec *ts);
+int fake_timerfd_create(int clockid, int flags);
+int fake_timerfd_settime(int fd, int flags, const struct itimerspec *value, struct itimerspec *old);
 void *fake_dlopen(const char *name, int flags);
 void *fake_dlsym(void *handle, const char *symbol);
 #define clock_gettime fake_clock_gettime
+#define timerfd_create fake_timerfd_create
+#define timerfd_settime fake_timerfd_settime
 #define dlopen fake_dlopen
 #define dlsym fake_dlsym

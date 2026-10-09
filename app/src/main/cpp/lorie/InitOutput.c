@@ -740,6 +740,10 @@ bool lorieScreenReady(void) {
     return pScreenPtr != NULL;
 }
 
+bool lorieSurfaceShown(void) {
+    return pvfb->state && pvfb->state->surfaceAvailable && lorieConnectionAlive();
+}
+
 void lorieQueueRedraw(void) {
     QueueWorkProc(lorieRedraw, NULL, NULL);
     lorieWakeServer();
