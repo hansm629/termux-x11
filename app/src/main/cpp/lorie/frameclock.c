@@ -37,6 +37,18 @@
  * are counted, and that one lorieRedraw advances MSC by all of them: the MSC still counts every VSYNC the
  * callback saw, exactly as before, and Present clients waiting for any MSC up to it are completed once,
  * at the MSC actually reached - what a real CRTC does when an interrupt is serviced late.
+ *
+ * Fault injection for testing all of the above on a device, off unless its variable is set (in the X
+ * server's environment). Each fault is injected once per FC_TEST_PERIOD_NS, the first one a little
+ * after start, and logged as "XlorieFrameClock: test: ...":
+ *   TERMUX_X11_CHOREO_TEST_DROP=n         n times, a callback does not re-post: the chain is lost
+ *                                         (expect: re-arm (lost) ~100 ms later, then a normal cadence)
+ *   TERMUX_X11_CHOREO_TEST_REARM=n        n times, a healthy chain is re-armed (expect: stale_cb=1, one
+ *                                         tick per VSYNC throughout)
+ *   TERMUX_X11_CHOREO_TEST_BLOCK_MS=ms    the choreographer thread sleeps ms after a callback (expect: a
+ *                                         late callback with a regular VSYNC gap, cb_lat_max_us ~ ms)
+ *   TERMUX_X11_FRAMECLOCK_TEST_XSTALL_MS=ms  the X server main thread sleeps ms (expect: callbacks go on,
+ *                                         queue_coalesced ~ ms / frame, one redraw takes them, replay=0)
  */
 
 #include <dlfcn.h>
@@ -86,6 +98,9 @@
  */
 #define FC_REQUEUE_NS (1000 * NS_PER_MS)
 
+#define FC_TEST_PERIOD_NS (10000 * NS_PER_MS)
+#define FC_TEST_MAX_SLEEP_NS (5000 * NS_PER_MS)
+
 typedef void (*FcFrameCallback64)(int64_t frameTimeNanos, void *data);
 typedef void (*FcPostFrameCallback64)(AChoreographer *choreographer, FcFrameCallback64 callback, void *data);
 typedef void (*FcRefreshRateCallback)(int64_t vsyncPeriodNanos, void *data);
@@ -131,6 +146,20 @@ static struct {
     uint32_t xBusyMaxUs, lockWaitMaxUs;
     uint64_t lockWaitSumUs;
 } st = { .vsyncGapMinUs = UINT32_MAX };
+
+/* Fault injection (see the top of this file). Set before the X server thread starts, never after. */
+static struct {
+    long drops, rearms;
+    int64_t ownerBlockNs, xStallNs;
+    int64_t nextDropNs, nextRearmNs, nextOwnerBlockNs; /* owner thread */
+    int64_t nextXStallNs;                              /* X server main thread */
+} fcTest;
+
+static void fcTestSleep(int64_t ns) {
+    struct timespec ts = { .tv_sec = ns / 1000000000LL, .tv_nsec = ns % 1000000000LL };
+    while (nanosleep(&ts, &ts) == -1)
+        ;
+}
 
 #define FC_ADD(field, n) __atomic_fetch_add(&st.field, (n), __ATOMIC_RELAXED)
 #define FC_TAKE(field) __atomic_exchange_n(&st.field, 0, __ATOMIC_RELAXED)
@@ -318,9 +347,30 @@ static void fcOnFrame(int64_t frameTimeNs, bool frameTimeValid, void *data) {
             (now - fc.lastCallbackNs) / NS_PER_MS, fc.generation);
     fc.stallSeen = fc.rearmedThisStall = false;
     fcNoteCallback(now, frameTimeNs, frameTimeValid);
-    fcPost();
+
+    if (fcTest.drops > 0 && now >= fcTest.nextDropNs) {
+        fcTest.drops--;
+        fcTest.nextDropNs = now + FC_TEST_PERIOD_NS;
+        log(WARN, "XlorieFrameClock: test: not re-posting the frame callback (generation %u)", fc.generation);
+    } else
+        fcPost();
+
+    if (fcTest.rearms > 0 && now >= fcTest.nextRearmNs && fc.outstanding) {
+        fcTest.rearms--;
+        fcTest.nextRearmNs = now + FC_TEST_PERIOD_NS;
+        log(WARN, "XlorieFrameClock: test: re-arming a healthy chain");
+        fcRearm("test", 0);
+    }
+
     fcArmWatchdog(FC_STALL_NS);
     fcTick(now);
+
+    if (fcTest.ownerBlockNs && now >= fcTest.nextOwnerBlockNs) {
+        fcTest.nextOwnerBlockNs = now + FC_TEST_PERIOD_NS;
+        log(WARN, "XlorieFrameClock: test: blocking the choreographer thread for %" PRId64 " ms",
+            fcTest.ownerBlockNs / NS_PER_MS);
+        fcTestSleep(fcTest.ownerBlockNs);
+    }
 }
 
 static void fcFrameCallback64(int64_t frameTimeNanos, void *data) {
@@ -337,6 +387,12 @@ static void fcRefreshRateCallback(int64_t vsyncPeriodNanos, __unused void *data)
         log(INFO, "XlorieFrameClock: choreographer vsync period %" PRId64 " ns (%.1f Hz)", vsyncPeriodNanos,
             vsyncPeriodNanos > 0 ? 1e9 / (double) vsyncPeriodNanos : 0.0);
     __atomic_store_n(&fc.periodNs, vsyncPeriodNanos, __ATOMIC_RELAXED);
+}
+
+static int64_t fcTestEnv(const char *name, int64_t max) {
+    const char *value = getenv(name);
+    long long n = value ? strtoll(value, NULL, 10) : 0;
+    return n <= 0 ? 0 : n > max ? max : n;
 }
 
 void lorieFrameClockStart(void) {
@@ -379,6 +435,19 @@ void lorieFrameClockStart(void) {
     log(INFO, "XlorieFrameClock: owner tid %d, postFrameCallback64 %s, refresh rate callback %s, watchdog %s, "
               "resume check %s", fc.ownerTid, fc.post64 ? "yes" : "no", registerRefreshRate ? "yes" : "no",
         fc.timerFd >= 0 ? "yes" : "no", fc.kickFd >= 0 ? "yes" : "no");
+
+    fcTest.drops = (long) fcTestEnv("TERMUX_X11_CHOREO_TEST_DROP", 1000);
+    fcTest.rearms = (long) fcTestEnv("TERMUX_X11_CHOREO_TEST_REARM", 1000);
+    fcTest.ownerBlockNs = fcTestEnv("TERMUX_X11_CHOREO_TEST_BLOCK_MS", FC_TEST_MAX_SLEEP_NS / NS_PER_MS) * NS_PER_MS;
+    fcTest.xStallNs = fcTestEnv("TERMUX_X11_FRAMECLOCK_TEST_XSTALL_MS", FC_TEST_MAX_SLEEP_NS / NS_PER_MS) * NS_PER_MS;
+    // Staggered, so each fault's effect can be told apart from the others' in the 5 second lines.
+    fcTest.nextDropNs = fc.startNs + 10000 * NS_PER_MS;
+    fcTest.nextRearmNs = fc.startNs + 15000 * NS_PER_MS;
+    fcTest.nextXStallNs = fc.startNs + 20000 * NS_PER_MS;
+    fcTest.nextOwnerBlockNs = fc.startNs + 25000 * NS_PER_MS;
+    if (fcTest.drops || fcTest.rearms || fcTest.ownerBlockNs || fcTest.xStallNs)
+        log(WARN, "XlorieFrameClock: test: fault injection on: drop=%ld rearm=%ld block_ms=%" PRId64 " xstall_ms=%" PRId64,
+            fcTest.drops, fcTest.rearms, fcTest.ownerBlockNs / NS_PER_MS, fcTest.xStallNs / NS_PER_MS);
 
     fc.generation = 1;
     fcPost();
@@ -442,6 +511,13 @@ void lorieFrameClockNoteClear(bool wasWaiting) {
 
 void lorieFrameClockXWakeup(void) {
     fc.xWakeNs = lorieFrameClockNowNs();
+
+    if (fcTest.xStallNs && fc.xWakeNs >= fcTest.nextXStallNs) {
+        fcTest.nextXStallNs = fc.xWakeNs + FC_TEST_PERIOD_NS;
+        log(WARN, "XlorieFrameClock: test: blocking the X server main thread for %" PRId64 " ms",
+            fcTest.xStallNs / NS_PER_MS);
+        fcTestSleep(fcTest.xStallNs);
+    }
 }
 
 void lorieFrameClockXBlock(void) {

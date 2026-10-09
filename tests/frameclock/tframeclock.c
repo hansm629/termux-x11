@@ -156,6 +156,8 @@ static const char *report(void) {
 }
 
 static void reset(void) {
+    logCount = 0;
+    memset(&fcTest, 0, sizeof(fcTest));
     memset(&fc, 0, sizeof(fc));
     memset(&st, 0, sizeof(st));
     st.vsyncGapMinUs = UINT32_MAX;
@@ -469,6 +471,68 @@ static void testResumeOldCallbackLateIsStale(void) {
     CHECK(fieldOf(line, "stale_cb") == 1);
 }
 
+static void testInjectedDropRecovers(void) {
+    const char *line;
+    printf("inject: TERMUX_X11_CHOREO_TEST_DROP loses the chain once, the watchdog re-arms it\n");
+    setenv("TERMUX_X11_CHOREO_TEST_DROP", "1", 1);
+    reset();
+    unsetenv("TERMUX_X11_CHOREO_TEST_DROP");
+    CHECK(strstr(lastLogWith("XlorieFrameClock: test: fault injection on"), "drop=1") != NULL);
+    runFrames(1199, STEP);          // just under 10 s: nothing yet
+    CHECK(fc.generation == 1 && fieldOf(report(), "rearm") == 0);
+    runFrames(2, STEP);             // the callback past 10 s does not re-post
+    CHECK(strstr(lastLogWith("XlorieFrameClock: test:"), "not re-posting") != NULL);
+    CHECK(nposted == 0 && !fc.outstanding);
+    runFrames(13, STEP);            // ~108 ms of VSYNCs with nothing registered
+    CHECK(fc.generation == 2 && nposted == 1);
+    runFrames(1200, STEP);          // and only once
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 1 && fieldOf(line, "stale_cb") == 0 && fieldOf(line, "gen") == 2);
+    CHECK(strstr(lastLogWith("XlorieFrameClock: re-arming"), "(lost)") != NULL);
+}
+
+static void testInjectedRearmIsStale(void) {
+    const char *line;
+    int q;
+    printf("inject: TERMUX_X11_CHOREO_TEST_REARM leaves exactly one stale callback, one tick per VSYNC\n");
+    setenv("TERMUX_X11_CHOREO_TEST_REARM", "1", 1);
+    reset();
+    unsetenv("TERMUX_X11_CHOREO_TEST_REARM");
+    runFrames(1799, STEP);          // just under 15 s
+    report();
+    q = queued;
+    runFrames(600, STEP);
+    CHECK(queued == q + 600);
+    line = report();
+    CHECK(fieldOf(line, "rearm") == 1 && fieldOf(line, "forced_rearm") == 1 && fieldOf(line, "stale_cb") == 1);
+    CHECK(fieldOf(line, "cb") == 600);
+}
+
+static void testInjectedSleeps(void) {
+    printf("inject: the BLOCK_MS / XSTALL_MS sleeps fire once per period\n");
+    setenv("TERMUX_X11_CHOREO_TEST_BLOCK_MS", "1", 1);
+    setenv("TERMUX_X11_FRAMECLOCK_TEST_XSTALL_MS", "1", 1);
+    reset();
+    unsetenv("TERMUX_X11_CHOREO_TEST_BLOCK_MS");
+    unsetenv("TERMUX_X11_FRAMECLOCK_TEST_XSTALL_MS");
+    advance(20000 * NS_PER_MS);
+    lorieFrameClockXWakeup();
+    CHECK(strstr(lastLogWith("XlorieFrameClock: test:"), "X server main thread for 1 ms") != NULL);
+    logCount = 0;
+    lorieFrameClockXWakeup();       // not again within the period
+    CHECK(*lastLogWith("XlorieFrameClock: test:") == 0);
+    advance(5000 * NS_PER_MS);
+    vsync();
+    CHECK(strstr(lastLogWith("XlorieFrameClock: test:"), "choreographer thread for 1 ms") != NULL);
+}
+
+static void testInjectionOffByDefault(void) {
+    printf("inject: nothing is injected without the variables\n");
+    reset();
+    CHECK(!fcTest.drops && !fcTest.rearms && !fcTest.ownerBlockNs && !fcTest.xStallNs);
+    CHECK(*lastLogWith("XlorieFrameClock: test:") == 0);
+}
+
 int main(void) {
     testChainReposts();
     testBacklogCoalesces();
@@ -486,6 +550,10 @@ int main(void) {
     testTickCountIsKept();
     testStuckFlagRequeues();
     testResetQueue();
+    testInjectionOffByDefault();
+    testInjectedDropRecovers();
+    testInjectedRearmIsStale();
+    testInjectedSleeps();
     printf(failures ? "frameclock: %d FAILED\n" : "frameclock: PASS\n", failures);
     return failures != 0;
 }
