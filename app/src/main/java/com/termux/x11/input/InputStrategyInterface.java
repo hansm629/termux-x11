@@ -47,11 +47,18 @@ public interface InputStrategyInterface {
      */
     void onScroll(float distanceX, float distanceY);
 
+    /**
+     * Whether this strategy holds a mouse button down in the X server right now, i.e. a drag started by
+     * {@link #onPressAndHold} is in progress.
+     */
+    boolean isButtonHeld();
+
     class NullInputStrategy implements InputStrategyInterface {
         @Override public void onTap(int button) {}
         @Override public boolean onPressAndHold(int button, boolean force) { return false; }
         @Override public void onScroll(float distanceX, float distanceY) {}
         @Override public void onMotionEvent(MotionEvent event) {}
+        @Override public boolean isButtonHeld() { return false; }
     }
 
     /**
@@ -165,10 +172,17 @@ public interface InputStrategyInterface {
 
         @Override
         public void onMotionEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_UP && mHeldButton != InputStub.BUTTON_UNDEFINED) {
+            // A cancelled gesture ends the drag as well: the button must not stay down in the X server.
+            int action = event.getActionMasked();
+            if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && mHeldButton != InputStub.BUTTON_UNDEFINED) {
                 mInjector.sendMouseUp(mHeldButton, false);
                 mHeldButton = InputStub.BUTTON_UNDEFINED;
             }
+        }
+
+        @Override
+        public boolean isButtonHeld() {
+            return mHeldButton != InputStub.BUTTON_UNDEFINED;
         }
 
         private boolean isDoubleTap(float currentX, float currentY, long tapInterval) {
@@ -226,10 +240,17 @@ public interface InputStrategyInterface {
 
         @Override
         public void onMotionEvent(MotionEvent event) {
-            if (event.getActionMasked() == MotionEvent.ACTION_UP && mHeldButton != InputStub.BUTTON_UNDEFINED) {
+            // A cancelled gesture ends the drag as well: the button must not stay down in the X server.
+            int action = event.getActionMasked();
+            if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && mHeldButton != InputStub.BUTTON_UNDEFINED) {
                 mInjector.sendMouseUp(mHeldButton, true);
                 mHeldButton = InputStub.BUTTON_UNDEFINED;
             }
+        }
+
+        @Override
+        public boolean isButtonHeld() {
+            return mHeldButton != InputStub.BUTTON_UNDEFINED;
         }
     }
 }

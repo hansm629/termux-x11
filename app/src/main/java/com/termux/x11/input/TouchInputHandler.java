@@ -131,6 +131,15 @@ public class TouchInputHandler {
      * is performing a drag operation.
      */
     private boolean mIsDragging;
+
+    /** Follows the finger of a one-finger drag while the input strategy holds a mouse button down. */
+    private final HeldDragMotion mHeldDrag = new HeldDragMotion();
+
+    /**
+     * Set while the gesture detectors see an event whose cursor motion {@link #moveHeldDrag} already
+     * handled, so that onScroll does not move the cursor for it a second time.
+     */
+    private boolean mHeldDragOwnsMotion;
     private static DisplayManager mDisplayManager;
     private static int mDisplayRotation;
     private static final DisplayManager.DisplayListener mDisplayListener = new DisplayManager.DisplayListener() {
@@ -320,11 +329,16 @@ public class TouchInputHandler {
             else
                 mInputStrategy.onMotionEvent(event);
 
+            // A drag with a mouse button held follows the finger's own positions; the gesture detectors
+            // below still see every event, so taps, double taps and long presses work as before.
+            mHeldDragOwnsMotion = moveHeldDrag(event);
+
             // Avoid short-circuit logic evaluation - ensure all gesture detectors see all events so
             // that they generate correct notifications.
             mScroller.onTouchEvent(event);
             mTapDetector.onTouchEvent(event);
             mSwipePinchDetector.onTouchEvent(event);
+            mHeldDragOwnsMotion = false;
 
             // For hardware touchpad in DeX (captured mode), handle physical click buttons
             if ((event.getSource() & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD) {
@@ -550,6 +564,80 @@ public class TouchInputHandler {
         return !mInjector.pauseKeyInterceptingWithEsc || keyIntercepting;
     }
 
+    /**
+     * Moves the cursor of a one-finger drag while the input strategy holds a mouse button down: from each
+     * ACTION_MOVE's own position, by what the finger moved since the motion last given to the X server
+     * (here or in onScroll), and only if it moved at all. GestureDetector alone holds that motion back
+     * while the finger is still within the touch slop around where it went down and until the focus moved
+     * a whole pixel, which leaves the dragged window behind the finger. Scaling and the captured touchpad
+     * transformation are the ones onScroll applies.
+     *
+     * @return whether this event's cursor motion is handled here, so onScroll must not move the cursor
+     */
+    private boolean moveHeldDrag(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                // Nothing of this finger moved the cursor yet: GestureDetector measures from here too.
+                mHeldDrag.delivered(event.getPointerId(0), event.getX(0), event.getY(0));
+                return false;
+            case MotionEvent.ACTION_POINTER_DOWN:
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                mHeldDrag.reset();
+                return false;
+            case MotionEvent.ACTION_MOVE:
+                break;
+            default:
+                return false;
+        }
+
+        if (event.getPointerCount() != 1 || mSuppressCursorMovement || !mInputStrategy.isButtonHeld())
+            return false;
+
+        if (mHeldDrag.move(event.getPointerId(0), event.getX(0), event.getY(0))) {
+            if (mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy) {
+                float[] distance = {mHeldDrag.distanceX, mHeldDrag.distanceY};
+                transformCapturedTouchpadDistance(event, distance);
+                if (mInjector.scaleTouchpad) {
+                    distance[0] *= mRenderData.scale.x;
+                    distance[1] *= mRenderData.scale.y;
+                }
+                moveCursorByOffset(distance[0], distance[1]);
+            } else
+                moveCursorToScreenPoint(event.getX(0), event.getY(0));
+        }
+        return true;
+    }
+
+    /**
+     * Captured touchpads report physical X and Y whatever the screen orientation is: turn a distance
+     * they moved into one on the screen, and apply the captured pointer speed (trackpad mode only).
+     */
+    private void transformCapturedTouchpadDistance(MotionEvent e, float[] distance) {
+        if ((e.getSource() & InputDevice.SOURCE_TOUCHPAD) != InputDevice.SOURCE_TOUCHPAD
+                || !(mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy))
+            return;
+
+        float distanceX = distance[0], distanceY = distance[1], temp;
+        int transform = capturedPointerTransformation == CapturedPointerTransformation.AUTO ?
+                mDisplayRotation : capturedPointerTransformation;
+        switch (transform) {
+            case CapturedPointerTransformation.CLOCKWISE:
+                temp = distanceX; distanceX = -distanceY; distanceY = temp; break;
+            case CapturedPointerTransformation.COUNTER_CLOCKWISE:
+                temp = distanceX;
+                // noinspection SuspiciousNameCombination
+                distanceX = distanceY; distanceY = -temp; break;
+            case CapturedPointerTransformation.UPSIDE_DOWN:
+                distanceX = -distanceX; distanceY = -distanceY; break;
+            default:
+                break;
+        }
+        distance[0] = distanceX * mInjector.capturedPointerSpeedFactor;
+        distance[1] = distanceY * mInjector.capturedPointerSpeedFactor;
+    }
+
     private void moveCursorByOffset(float deltaX, float deltaY) {
         if (mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy)
             mInjector.sendCursorMove(-deltaX, -deltaY, true);
@@ -604,26 +692,10 @@ public class TouchInputHandler {
 
             // For captured touchpad pointer:
             // Automatic (for touchpad) mode is needed because touchpads ignore screen orientation and report physical X and Y
-            if ((e2.getSource() & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD
-                    && mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy) {
-                float temp;
-                int transform = capturedPointerTransformation == CapturedPointerTransformation.AUTO ?
-                        mDisplayRotation : capturedPointerTransformation;
-                switch (transform) {
-                    case CapturedPointerTransformation.CLOCKWISE:
-                        temp = distanceX; distanceX = -distanceY; distanceY = temp; break;
-                    case CapturedPointerTransformation.COUNTER_CLOCKWISE:
-                        temp = distanceX;
-                        // noinspection SuspiciousNameCombination
-                        distanceX = distanceY; distanceY = -temp; break;
-                    case CapturedPointerTransformation.UPSIDE_DOWN:
-                        distanceX = -distanceX; distanceY = -distanceY; break;
-                    default:
-                        break;
-                }
-                distanceX *= mInjector.capturedPointerSpeedFactor;
-                distanceY *= mInjector.capturedPointerSpeedFactor;
-            }
+            float[] distance = {distanceX, distanceY};
+            transformCapturedTouchpadDistance(e2, distance);
+            distanceX = distance[0];
+            distanceY = distance[1];
 
 
             if (pointerCount >= 3 && !mSwipeCompleted) {
@@ -650,17 +722,23 @@ public class TouchInputHandler {
             if (pointerCount != 1 || mSuppressCursorMovement)
                 return false;
 
+            // moveHeldDrag already moved the cursor for this event of a held-button drag.
+            if (mHeldDragOwnsMotion)
+                return true;
+
             if (mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy) {
                 if (mInjector.scaleTouchpad) {
                     distanceX *= mRenderData.scale.x;
                     distanceY *= mRenderData.scale.y;
                 }
                 moveCursorByOffset(distanceX, distanceY);
+                mHeldDrag.delivered(e2.getPointerId(0), e2.getX(0), e2.getY(0));
             }
             if (!(mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy) && mIsDragging) {
                 // Ensure the cursor follows the user's finger when the user is dragging under
                 // direct input mode.
                 moveCursorToScreenPoint(e2.getX(), e2.getY());
+                mHeldDrag.delivered(e2.getPointerId(0), e2.getX(0), e2.getY(0));
             }
             return true;
         }
