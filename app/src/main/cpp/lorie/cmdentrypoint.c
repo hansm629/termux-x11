@@ -238,6 +238,7 @@ static Bool handleClipboardData(__unused ClientPtr pClient, void *closure) {
 static Bool handleTouchEvent(__unused ClientPtr pClient, void *closure) {
     ValuatorMask mask;
     lorieEvent *e = closure;
+    lorieFlowNoteTouchHandled();
     double x = max(min((float) e->touch.x, pScreenPtr->width), 0);
     double y = max(min((float) e->touch.y, pScreenPtr->height), 0);
     valuator_mask_zero(&mask);
@@ -302,15 +303,18 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             }
             case EVENT_TOUCH: {
-                lorieFlowNoteInput(LORIE_FLOW_TOUCH, e.touch.type == XI_TouchBegin ? 0 : e.touch.type == XI_TouchEnd ? 2 : 1, false);
+                lorieFlowNoteReceive(lorieInputFlowKey(&e), lorieInputFlowShared());
+                lorieFlowNoteInput(LORIE_FLOW_TOUCH, e.touch.type == XI_TouchBegin ? 0 : e.touch.type == XI_TouchEnd ? 2 : 1, e.touch.id, false);
                 lorieEvent *copy = calloc(1, sizeof(lorieEvent));
                 memcpy(copy, &e, sizeof(e));
                 QueueWorkProc(handleTouchEvent, NULL, copy);
+                lorieFlowNoteTouchQueued();
                 lorieWakeServer();
                 break;
             }
             case EVENT_STYLUS: {
                 static int buttons_prev = 0;
+                lorieFlowNoteReceive(lorieInputFlowKey(&e), lorieInputFlowShared());
                 uint32_t released, pressed, diff;
                 DeviceIntPtr device = e.stylus.mouse ? lorieMouse : (e.stylus.eraser ? lorieEraser : loriePen);
                 if (!device) {
@@ -328,7 +332,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                     valuator_mask_set_double(&mask, 4, e.stylus.tilt_y);
                     valuator_mask_set_double(&mask, 5, e.stylus.orientation);
                 }
-                lorieFlowNoteInput(LORIE_FLOW_STYLUS, e.stylus.buttons, e.stylus.pressure > 0 || e.stylus.buttons);
+                lorieFlowNoteInput(LORIE_FLOW_STYLUS, e.stylus.buttons, 0, e.stylus.pressure > 0 || e.stylus.buttons);
                 QueuePointerEvents(device, MotionNotify, 0, POINTER_ABSOLUTE | POINTER_DESKTOP | (device == lorieMouse ? POINTER_NORAW : 0), &mask);
                 lorieFlowNoteInject();
 
@@ -358,6 +362,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
             }
             case EVENT_MOUSE: {
                 int flags;
+                lorieFlowNoteReceive(lorieInputFlowKey(&e), lorieInputFlowShared());
                 switch(e.mouse.detail) {
                     case 0: // BUTTON_UNDEFINED
                         flags = (e.mouse.relative) ? POINTER_RELATIVE | POINTER_ACCELERATE : POINTER_ABSOLUTE | POINTER_SCREEN | POINTER_NORAW;
@@ -367,18 +372,18 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                         }
                         valuator_mask_set_double(&mask, 0, (double) e.mouse.x);
                         valuator_mask_set_double(&mask, 1, (double) e.mouse.y);
-                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_MOTION, 0, false);
+                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_MOTION, 0, 0, false);
                         QueuePointerEvents(lorieMouse, MotionNotify, 0, flags, &mask);
                         lorieFlowNoteInject();
                         break;
                     case 1: // BUTTON_LEFT
                     case 2: // BUTTON_MIDDLE
                     case 3: // BUTTON_RIGHT
-                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_BUTTON, e.mouse.detail, e.mouse.down);
+                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_BUTTON, e.mouse.detail, 0, e.mouse.down);
                         QueuePointerEvents(lorieMouse, e.mouse.down ? ButtonPress : ButtonRelease, e.mouse.detail, POINTER_RELATIVE, NULL);
                         break;
                     case 4: // BUTTON_SCROLL
-                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_SCROLL, 0, false);
+                        lorieFlowNoteInput(LORIE_FLOW_MOUSE_SCROLL, 0, 0, false);
                         if (e.mouse.x) {
                             valuator_mask_zero(&mask);
                             valuator_mask_set_double(&mask, 2, (double) e.mouse.x / 120);
@@ -394,7 +399,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             }
             case EVENT_KEY:
-                lorieFlowNoteInput(LORIE_FLOW_KEY, 0, e.key.state);
+                lorieFlowNoteInput(LORIE_FLOW_KEY, 0, 0, e.key.state);
                 QueueKeyboardEvents(lorieKeyboard, e.key.state ? KeyPress : KeyRelease, e.key.key);
                 break;
             case EVENT_UNICODE: {

@@ -1287,10 +1287,10 @@ static void rendererNoteHandover(int64_t frameStartNs, uint64_t tick) {
         return; // Not a draw request from a tick (cursor, viewport, new surface), or one already drawn.
 
     lastHandledDrawTick = drawTick;
-    state->frameClock.handoverFrames++;
+    LORIE_STAT_ADD(state->frameClock.handoverFrames, 1);
     if (tick > drawTick) {
         uint32_t late = tick - drawTick > UINT32_MAX ? UINT32_MAX : (uint32_t) (tick - drawTick);
-        state->frameClock.handoverLate++;
+        LORIE_STAT_ADD(state->frameClock.handoverLate, 1);
         if (late > state->frameClock.handoverLateMaxTicks)
             state->frameClock.handoverLateMaxTicks = late;
     } else {
@@ -1315,41 +1315,52 @@ static void rendererFlowNoteFrame(int64_t frameStartNs) {
     int64_t pendingSinceNs = 0;
 
     if (draw)
-        rf->framesDraw++;
+        LORIE_STAT_ADD(rf->framesDraw, 1);
     else if (cursorPending)
-        rf->framesCursor++;
+        LORIE_STAT_ADD(rf->framesCursor, 1);
     else
-        rf->framesOther++;
+        LORIE_STAT_ADD(rf->framesOther, 1);
 
+    // frameStartNs was taken before these stamps were read, so the X server may have stamped a newer
+    // request (or cursor move) in between: that one is not what this frame is for, and it would make
+    // frameStartNs - stamp negative. Such samples are counted apart, never folded into the latencies.
     if (draw && requestNs > lastFrameStartNs) {
-        uint32_t us = (uint32_t) rendererNsToUs(frameStartNs - requestNs);
-        if (us > rf->reqToFrameMaxUs)
-            rf->reqToFrameMaxUs = us;
-        __atomic_fetch_add(&rf->reqToFrameSumUs, us, __ATOMIC_RELAXED);
-        rf->reqToFrameSamples++;
-        pendingSinceNs = requestNs;
+        if (requestNs > frameStartNs)
+            LORIE_STAT_ADD(rf->reqToFrameInvalid, 1);
+        else {
+            int64_t us64 = rendererNsToUs(frameStartNs - requestNs);
+            uint32_t us = us64 > UINT32_MAX ? UINT32_MAX : (uint32_t) us64;
+            LORIE_STAT_MAX(rf->reqToFrameMaxUs, us);
+            LORIE_STAT_ADD(rf->reqToFrameSumUs, us);
+            LORIE_STAT_ADD(rf->reqToFrameSamples, 1);
+            pendingSinceNs = requestNs;
+        }
     }
     if (cursorPending && cursorNs > lastFrameStartNs) {
-        uint32_t us = (uint32_t) rendererNsToUs(frameStartNs - cursorNs);
-        if (us > rf->cursorToFrameMaxUs)
-            rf->cursorToFrameMaxUs = us;
-        if (!pendingSinceNs || cursorNs < pendingSinceNs)
-            pendingSinceNs = cursorNs;
+        if (cursorNs > frameStartNs)
+            LORIE_STAT_ADD(rf->cursorToFrameInvalid, 1);
+        else {
+            int64_t us64 = rendererNsToUs(frameStartNs - cursorNs);
+            uint32_t us = us64 > UINT32_MAX ? UINT32_MAX : (uint32_t) us64;
+            LORIE_STAT_MAX(rf->cursorToFrameMaxUs, us);
+            if (!pendingSinceNs || cursorNs < pendingSinceNs)
+                pendingSinceNs = cursorNs;
+        }
     }
 
-    if (lastFrameStartNs) {
+    if (lastFrameStartNs && frameStartNs > lastFrameStartNs) {
         int64_t gapUs = rendererNsToUs(frameStartNs - lastFrameStartNs);
         int64_t pendingUs = pendingSinceNs ? rendererNsToUs(frameStartNs - pendingSinceNs) : 0;
-        rf->frameHist[gapUs < 4000 ? 0 : gapUs < 12000 ? 1 : gapUs < 25000 ? 2 : gapUs < 50000 ? 3 : gapUs < 100000 ? 4 : 5]++;
+        LORIE_STAT_ADD(rf->frameHist[gapUs < 4000 ? 0 : gapUs < 12000 ? 1 : gapUs < 25000 ? 2 : gapUs < 50000 ? 3 : gapUs < 100000 ? 4 : 5], 1);
         if (gapUs >= LORIE_LONG_FRAME_US) {
             if (pendingUs >= LORIE_LONG_FRAME_US) {
-                rf->gapLongPending++;
-                if (pendingUs > rf->gapPendingMaxUs)
-                    rf->gapPendingMaxUs = pendingUs > UINT32_MAX ? UINT32_MAX : (uint32_t) pendingUs;
+                uint32_t us = pendingUs > UINT32_MAX ? UINT32_MAX : (uint32_t) pendingUs;
+                LORIE_STAT_ADD(rf->gapLongPending, 1);
+                LORIE_STAT_MAX(rf->gapPendingMaxUs, us);
             } else {
-                rf->gapLongIdle++;
-                if (gapUs > rf->gapIdleMaxUs)
-                    rf->gapIdleMaxUs = gapUs > UINT32_MAX ? UINT32_MAX : (uint32_t) gapUs;
+                uint32_t us = gapUs > UINT32_MAX ? UINT32_MAX : (uint32_t) gapUs;
+                LORIE_STAT_ADD(rf->gapLongIdle, 1);
+                LORIE_STAT_MAX(rf->gapIdleMaxUs, us);
             }
         }
     }
@@ -1498,9 +1509,9 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     // Set first, read the serial second: a tick that cleared the flag before this store cannot go
     // unseen, since lorieRedraw raises the serial before it clears (frameclock.h).
     __atomic_store_n(&state->waitForNextFrame, true, __ATOMIC_SEQ_CST);
-    state->frameClock.waitSet++;
+    LORIE_STAT_ADD(state->frameClock.waitSet, 1);
     if (__atomic_load_n(&state->frameClock.tickSerial, __ATOMIC_SEQ_CST) != tickAtStart)
-        state->frameClock.waitSetOverTick++;
+        LORIE_STAT_ADD(state->frameClock.waitSetOverTick, 1);
     {
         int64_t heldUs = rendererNsToUs(rendererNowNs() - lockHeldStartNs);
         if (heldUs > 0 && (uint64_t) heldUs > state->frameClock.lockHeldMaxUs)
@@ -1615,13 +1626,13 @@ static void rendererFlowNoteShouldWait(bool waitingForBuffers) {
     if (!state)
         return; // Nowhere to count it: there is no shared state without a connection.
     if (!state->surfaceAvailable)
-        state->renderFlow.swNoSurface++;
+        LORIE_STAT_ADD(state->renderFlow.swNoSurface, 1);
     else if (state->waitForNextFrame)
-        state->renderFlow.swWaitFrame++;
+        LORIE_STAT_ADD(state->renderFlow.swWaitFrame, 1);
     else if (waitingForBuffers)
-        state->renderFlow.swBuffers++;
+        LORIE_STAT_ADD(state->renderFlow.swBuffers, 1);
     else
-        state->renderFlow.swIdle++;
+        LORIE_STAT_ADD(state->renderFlow.swIdle, 1);
 }
 
 // What was pending when pthread_cond_wait returned, first matching reason (flowstats.h).
@@ -1633,18 +1644,18 @@ static void rendererFlowNoteWake(void) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     if (stateChanged || windowChanged || presentModeChanged || buffersChanged)
-        state->renderFlow.wakeState++;
+        LORIE_STAT_ADD(state->renderFlow.wakeState, 1);
     else if (state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex)
-        state->renderFlow.wakeGpuCopy++;
+        LORIE_STAT_ADD(state->renderFlow.wakeGpuCopy, 1);
     else if (state->drawRequested || state->cursor.moved || state->cursor.updated) {
         if (state->waitForNextFrame || !state->surfaceAvailable)
-            state->renderFlow.wakeGated++;
+            LORIE_STAT_ADD(state->renderFlow.wakeGated, 1);
         else if (state->drawRequested)
-            state->renderFlow.wakeDraw++;
+            LORIE_STAT_ADD(state->renderFlow.wakeDraw, 1);
         else
-            state->renderFlow.wakeCursor++;
+            LORIE_STAT_ADD(state->renderFlow.wakeCursor, 1);
     } else
-        state->renderFlow.wakeNone++;
+        LORIE_STAT_ADD(state->renderFlow.wakeNone, 1);
 }
 
 static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
@@ -1731,9 +1742,11 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
                 int64_t limiterUs;
                 pthread_cond_timedwait(stateCond, &stateLock, &deadline);
                 limiterUs = rendererNsToUs(rendererNowNs() - limiterStartNs);
-                state->renderFlow.limiterWaits++;
-                if (limiterUs > 0 && (uint64_t) limiterUs > state->renderFlow.limiterWaitMaxUs)
-                    state->renderFlow.limiterWaitMaxUs = limiterUs > UINT32_MAX ? UINT32_MAX : (uint32_t) limiterUs;
+                LORIE_STAT_ADD(state->renderFlow.limiterWaits, 1);
+                if (limiterUs > 0) {
+                    uint32_t us = limiterUs > UINT32_MAX ? UINT32_MAX : (uint32_t) limiterUs;
+                    LORIE_STAT_MAX(state->renderFlow.limiterWaitMaxUs, us);
+                }
             }
         } else {
             rendererLastPreRedrawCoalesceWaitUs = -1;
@@ -1754,7 +1767,7 @@ __noreturn static void* rendererThread(void) {
     while (true) {
         while (rendererShouldWait(&waitingForBuffers)) {
             if (state)
-                state->renderFlow.waitEnter++;
+                LORIE_STAT_ADD(state->renderFlow.waitEnter, 1);
             pthread_cond_wait(stateCond, &stateLock);
             rendererFlowNoteWake();
         }

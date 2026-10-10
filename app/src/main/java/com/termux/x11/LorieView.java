@@ -24,7 +24,9 @@ import android.text.InputType;
 import android.text.Selection;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.view.InputDevice;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -1135,6 +1137,49 @@ private void updateRendererDisplayRefreshRate() {
     @FastNative static native void sendWindowChange(int width, int height, int framerate, String name);
     @FastNative static native void setDpi(int dpi); @FastNative static native void setViewport(int x, int y, int width, int height, int expectedWidth, int expectedHeight);
     @FastNative public native void sendMouseEvent(float x, float y, int whichButton, boolean buttonDown, boolean relative);
+    @FastNative static native void noteMotionEvent(int action, boolean drag, long eventTimeNanos, long oldestSampleNanos, int historySize, long sampleGapNanos);
+
+    private static long noteLastDragSampleMs = -1;
+
+    /**
+     * Input flow diagnostics (inputflow.c, XlorieInput): what Android handed the activity and when, before
+     * any of it is converted. Measurement only. Event times are in the SystemClock.uptimeMillis() time
+     * base, i.e. CLOCK_MONOTONIC, the clock the native side compares them with.
+     */
+    public static void noteMotion(MotionEvent e) {
+        int action = e.getActionMasked();
+        int source = e.getSource();
+        // A captured pointer (relative mouse, touchpad) moves the cursor with ACTION_MOVE: a drag only
+        // with a button held. On a touchscreen or a regular mouse ACTION_MOVE means a finger or a
+        // button is down.
+        boolean captured = (source & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE
+                || (source & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD;
+        boolean drag = action == MotionEvent.ACTION_MOVE && (!captured || e.getButtonState() != 0);
+        long eventTimeNanos = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                ? e.getEventTimeNanos() : e.getEventTime() * 1000000L;
+        int history = e.getHistorySize();
+        long oldestNanos = history > 0 ? e.getHistoricalEventTime(0) * 1000000L : eventTimeNanos;
+        long sampleGapNanos = 0;
+
+        // Gaps between the input samples themselves (historical ones included), all in milliseconds:
+        // how often Android produced them, whatever the batching.
+        if (drag) {
+            long previous = noteLastDragSampleMs;
+            for (int i = 0; i < history; i++) {
+                long t = e.getHistoricalEventTime(i);
+                if (previous >= 0)
+                    sampleGapNanos = Math.max(sampleGapNanos, (t - previous) * 1000000L);
+                previous = t;
+            }
+            long t = e.getEventTime();
+            if (previous >= 0)
+                sampleGapNanos = Math.max(sampleGapNanos, (t - previous) * 1000000L);
+            noteLastDragSampleMs = t;
+        } else
+            noteLastDragSampleMs = -1;
+
+        noteMotionEvent(action, drag, eventTimeNanos, oldestNanos, history, sampleGapNanos);
+    }
     @FastNative public native void sendTouchEvent(int action, int id, int x, int y);
     @FastNative public native void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouseMode);
     @FastNative static public native void requestStylusEnabled(boolean enabled);

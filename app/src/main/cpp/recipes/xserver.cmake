@@ -277,6 +277,7 @@ add_library(Xlorie SHARED
         "lorie/cmdentrypoint.c"
         "lorie/frameclock.c"
         "lorie/flowstats.c"
+        "lorie/inputflow.c"
         "lorie/clipboard.c"
         "lorie/InitOutput.c"
         "lorie/InitInput.c"

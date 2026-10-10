@@ -269,6 +269,10 @@ public class TouchInputHandler {
     }
 
     public boolean handleTouchEvent(View view0, View view, MotionEvent event) {
+        // Input flow diagnostics, once per event: the touchpad handler below gets the same events again.
+        if (mTouchpadHandler != null)
+            LorieView.noteMotion(event);
+
         // Regular touchpads and Dex touchpad (in captured mode) send events as finger too,
         // but they should be handled as touchscreens with trackpad mode.
         if (mTouchpadHandler != null && ((event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_FINGER &&

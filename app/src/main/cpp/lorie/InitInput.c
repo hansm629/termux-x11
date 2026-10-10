@@ -45,6 +45,8 @@ __unused DeviceIntPtr lorieMouse, lorieTouch, lorieKeyboard, loriePen, lorieEras
 
 void
 ProcessInputEvents(void) {
+    // The main thread taking up what the input thread queued (flowstats.h: inject_to_process).
+    lorieFlowNoteProcessInput();
     mieqProcessInputEvents();
 }
 

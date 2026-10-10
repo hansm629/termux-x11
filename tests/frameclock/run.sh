@@ -13,6 +13,6 @@ mkdir -p "$OUT"
 awk '/^static void rendererFlowNoteFrame\(/,/^}/' "$HERE/../../app/src/main/cpp/lorie/renderer.c" > "$OUT/rendererflow.inc"
 awk '/^static void rendererFlowNoteShouldWait\(/,/^}/' "$HERE/../../app/src/main/cpp/lorie/renderer.c" >> "$OUT/rendererflow.inc"
 "$CC" -std=gnu11 -g -O1 -Wall -Wno-unused-function -Werror=implicit-function-declaration \
-    -I"$HERE/fake" -I"$HERE/../../app/src/main/cpp/lorie" -I"$OUT" "$HERE/tflowstats.c" -o "$OUT/tflowstats"
+    -I"$HERE/fake" -I"$HERE/../../app/src/main/cpp/lorie" -I"$OUT" "$HERE/tflowstats.c" -o "$OUT/tflowstats" -pthread
 "$OUT/tflowstats"
 OUT="$OUT/syntax" sh "$HERE/syntax.sh"

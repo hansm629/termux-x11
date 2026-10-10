@@ -172,6 +172,51 @@ typedef union {
     } clipboardSend;
 } lorieEvent;
 
+/*
+ * Identifies a pointer event on both ends of the socket for the input flow log (flowstats.h), from the
+ * fields that carry its meaning only (never padding, which is not guaranteed to be the same). Events that
+ * are not pointer events are not logged.
+ */
+static inline uint32_t lorieInputFlowKey(const lorieEvent *e) {
+    uint32_t h = 2166136261u, words[3] = {0}, fx, fy;
+    int i, n = 0;
+    switch (e->type) {
+        case EVENT_MOUSE:
+            memcpy(&fx, &e->mouse.x, sizeof(fx));
+            memcpy(&fy, &e->mouse.y, sizeof(fy));
+            words[0] = fx; words[1] = fy;
+            words[2] = e->mouse.detail | (uint32_t) e->mouse.down << 8 | (uint32_t) e->mouse.relative << 16;
+            n = 3;
+            break;
+        case EVENT_TOUCH:
+            words[0] = e->touch.type | (uint32_t) e->touch.id << 16;
+            words[1] = e->touch.x | (uint32_t) e->touch.y << 16;
+            n = 2;
+            break;
+        case EVENT_STYLUS:
+            memcpy(&fx, &e->stylus.x, sizeof(fx));
+            memcpy(&fy, &e->stylus.y, sizeof(fy));
+            words[0] = fx; words[1] = fy;
+            words[2] = e->stylus.pressure | (uint32_t) e->stylus.buttons << 16 | (uint32_t) e->stylus.eraser << 24 |
+                       (uint32_t) e->stylus.mouse << 25;
+            n = 3;
+            break;
+        default:
+            return 0;
+    }
+    for (i = 0; i < n; i++) {
+        int b;
+        for (b = 0; b < 32; b += 8) {
+            h ^= (words[i] >> b) & 0xffu;
+            h *= 16777619u;
+        }
+    }
+    return h ^ e->type;
+}
+
+/* The X server's mapping of the activity's input flow stats (InitOutput.c). */
+volatile struct lorie_input_flow_stats *lorieInputFlowShared(void);
+
 typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
 /* Two 60Hz frames: a gap this long is a hitch a user can see, not just a missed vsync. */
@@ -260,6 +305,8 @@ struct lorie_shared_server_state {
     struct lorie_frame_clock_stats frameClock;
     /* Input -> damage -> draw request -> renderer (see flowstats.h). */
     struct lorie_render_flow_stats renderFlow;
+    /* Android MotionEvent -> activity -> socket -> X server (see flowstats.h, inputflow.c). */
+    struct lorie_input_flow_stats inputFlow;
 
     /*
      * GL_VENDOR | GL_RENDERER of the context the renderer actually draws with, published once so

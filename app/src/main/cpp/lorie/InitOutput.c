@@ -570,7 +570,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
     lorieFrameClockReport(&pvfb->state->frameClock, pvfb->state->renderedFrames,
                           pvfb->state->surfaceAvailable, lorieConnectionAlive(), pvfb->root.framerate);
-    lorieFlowReport(&pvfb->state->renderFlow, pvfb->state->renderedFrames,
+    lorieFlowReport(&pvfb->state->renderFlow, &pvfb->state->inputFlow, pvfb->state->renderedFrames,
                     pvfb->state->surfaceAvailable, lorieConnectionAlive());
 
     pvfb->state->presentStats.frameSamples = 0;
@@ -755,6 +755,10 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
 // Both called from the frame clock's AChoreographer callback (frameclock.c), off the X server thread.
 bool lorieScreenReady(void) {
     return pScreenPtr != NULL;
+}
+
+volatile struct lorie_input_flow_stats *lorieInputFlowShared(void) {
+    return pvfb->state ? &pvfb->state->inputFlow : NULL;
 }
 
 bool lorieSurfaceShown(void) {

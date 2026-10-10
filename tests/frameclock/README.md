@@ -97,6 +97,7 @@ tell the two apart.
 | `frames`, `frame_hist` | frames drawn, gaps between them |
 | `f_draw`, `f_cursor`, `f_other` | what each frame was for: a draw request, the cursor only, anything else (GPU copy, surface) |
 | `req_to_frame_max_us`/`_avg_us`, `cursor_to_frame_max_us` | request (or first cursor move) -> frame start |
+| `req_to_frame_invalid`, `cursor_to_frame_invalid` | stamps newer than the frame's own start (a request made right after it began): left out of the latencies |
 | `gap_long_idle`, `gap_idle_max_us` | frame gaps >= 33 ms with no request pending for that long: nothing to draw |
 | `gap_long_pending`, `gap_pending_max_us` | frame gaps >= 33 ms with a request pending >= 33 ms: the renderer was late |
 | `wait` | pthread_cond_wait calls of the render loop |
@@ -104,11 +105,58 @@ tell the two apart.
 | `sw_waitframe`, `sw_buffers`, `sw_nosurface`, `sw_idle` | why rendererShouldWait() sent it to sleep (`idle`: nothing to do) |
 | `limiter`, `limiter_max_us` | deliberate timed waits of the coalesce / high-refresh limiter |
 
+## Android -> activity -> socket -> X server (XlorieInput)
+
+Printed right after XlorieFlowR, same window. The activity side (`a_*`, inputflow.c) is counted in the
+activity and read through the shared state; the socket is timed by matching each pointer event the X
+server reads against a log the activity writes right before each `write()` (key over the event's
+fields, in order; the socket, its protocol and the event struct are unchanged). All times are
+CLOCK_MONOTONIC, which is also the time base of MotionEvent event times (SystemClock.uptimeMillis);
+`a_clock_bad` counts event times that do not fit it.
+
+Code path: `MainActivity` touch / hover / generic-motion / captured-pointer listeners ->
+`TouchInputHandler.handleTouchEvent` (noted here, once) -> input strategy / `GestureDetector` ->
+`onScroll` -> `moveCursorByOffset` / `moveCursorToScreenPoint` -> `InputEventSender.sendCursorMove`
+(or `sendTouchEvent` in direct touch mode, `sendStylusEvent`) -> `LorieView.sendMouseEvent` /
+`sendTouchEvent` / `sendStylusEvent` (activity.c) -> `write(conn_fd)` -> X server input thread
+`handleLorieEvents` -> `QueuePointerEvents` (touch: `QueueWorkProc(handleTouchEvent)` on the main
+thread, then `QueueTouchEvents`) -> main thread `ProcessInputEvents` delivers to clients.
+
+| field | stage | meaning |
+|---|---|---|
+| `a_events`, `a_moves`, `a_drag`, `a_hist` | Android | MotionEvents the activity got, MOVE / HOVER_MOVE among them, drag moves (finger / button down), batched historical samples |
+| `a_drag_sample_gap_max_us` | Android | gap between the input samples themselves (event times, historical included) of consecutive drag moves |
+| `a_drag_cb_gap_max_us` | Android | gap between the callbacks that delivered drag moves |
+| `a_ev_to_cb_max_us`, `a_oldest_to_cb_max_us` | Android | event time (oldest sample) -> callback |
+| `a_clock_bad` | Android | event times in the future or > 10 s old |
+| `a_send`, `a_send_drag`, `a_send_drag_gap_max_us` | activity | pointer events written to the socket; drag motion among them (same rule as `in_drag`) and its gaps |
+| `a_cb_to_send_max_us`, `a_write_max_us`, `a_write_fail` | activity | last MotionEvent callback -> motion write; time in `write()`; short writes |
+| `xmit`, `xmit_unmatched`, `xmit_max_us`, `xmit_avg_us` | socket | events matched to the activity's write and their write -> read time; reads it had no entry for |
+| `x_rx_drag`, `x_rx_drag_gap_max_us` | X server | the same as XlorieFlow's `in_drag` / `in_drag_gap_max_us`, repeated for the side by side |
+| `touch_queue_max_us` | X server | touch read -> handleTouchEvent on the main thread |
+| `x_process`, `inject_to_process_max_us` | X server | main thread runs that took up injected input; injection -> that run |
+
+Drag rules differ only where the input does: on a touchscreen in trackpad mode every finger move is an
+`a_drag`, but `a_send_drag` / `in_drag` need the X button held (double tap and drag). Compare `a_send_drag`
+with `in_drag` (same rule on both ends of the socket), and `a_drag` with both for the Android side.
+
+| pattern (one drag, same window) | stage |
+|---|---|
+| `a_drag_sample_gap_max_us` ~100 ms | no input samples were produced: the finger stopped, or before Android delivered anything |
+| samples regular, `a_drag_cb_gap_max_us` / `a_ev_to_cb_max_us` large | delivered to the activity late (input dispatch / batching / its main thread busy) |
+| callbacks regular, `a_send_drag_gap_max_us` or `a_cb_to_send_max_us` large | the activity's conversion / sending |
+| sends regular, `xmit_max_us` or `x_rx_drag_gap_max_us` large | socket / X server input thread |
+| received regular, `touch_queue_max_us` / `inject_to_process_max_us` large | X server input processing |
+| all of the above regular, `drag_nodmg_max_us` large | X clients / compositor (damage) |
+
+None of this follows a frame to the screen: `gap_long_idle` / `gap_long_pending` stop at the renderer's
+frame start, not at Android presenting it.
+
 ### Where a stutter is, one 5 second window at a time
 
 | pattern | stage |
 |---|---|
-| `in_drag_gap_max_us` large while dragging | input never reached the X server (activity / socket side) |
+| `in_drag_gap_max_us` large while dragging | input reached the X server late: XlorieInput says which side of the socket |
 | input regular, `in_to_cursor_max_us` large | the X server handled the input late |
 | input regular, `drag_nodmg_max_us` / `dmg_gap_max_us` large | nothing was drawn for it: X clients / compositor, or the X server main thread (`x_busy_max_us` in XlorieFrameClockSched) |
 | damage regular, `req` regular, `gap_long_pending` > 0 or `req_to_frame_max_us` large | renderer late with work; `wake_*` / `sw_*` / `limiter` say why |

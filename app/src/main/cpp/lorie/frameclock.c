@@ -652,6 +652,14 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
     uint32_t waitClears = FC_TAKE(waitClears), xBusyMaxUs = FC_TAKE(xBusyMaxUs);
     uint32_t lockWaitMaxUs = FC_TAKE(lockWaitMaxUs);
     uint64_t lockWaitSumUs = FC_TAKE(lockWaitSumUs);
+    // The renderer's counters too are taken (read and reset in one step) before printing, so nothing
+    // it adds between the two is lost or carried into the next window.
+#define RS_TAKE(field) __atomic_exchange_n(&rs->field, 0, __ATOMIC_RELAXED)
+    uint32_t waitSet = RS_TAKE(waitSet), waitSetOverTick = RS_TAKE(waitSetOverTick);
+    uint32_t handoverFrames = RS_TAKE(handoverFrames), handoverLate = RS_TAKE(handoverLate);
+    uint32_t handoverLateMaxTicks = RS_TAKE(handoverLateMaxTicks), handoverMaxUs = RS_TAKE(handoverMaxUs);
+    uint32_t lockHeldMaxUs = RS_TAKE(lockHeldMaxUs), bufferWaitMaxUs = RS_TAKE(bufferWaitMaxUs);
+#undef RS_TAKE
     bool anomaly;
     int i;
 
@@ -692,9 +700,9 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
     log(INFO, "XlorieFrameClockR: render=%d surface=%d connected=%d sgen=%u wait_set=%u wait_over_tick=%u "
               "wait_clear=%u handover=%u handover_late=%u handover_late_max_ticks=%u handover_max_us=%u "
               "lock_hold_max_us=%u buf_wait_max_us=%u",
-        renderedFrames, surfaceAvailable, connected, rs->surfaceGeneration, rs->waitSet, rs->waitSetOverTick,
-        waitClears, rs->handoverFrames, rs->handoverLate, rs->handoverLateMaxTicks, rs->handoverMaxUs,
-        rs->lockHeldMaxUs, rs->bufferWaitMaxUs);
+        renderedFrames, surfaceAvailable, connected, rs->surfaceGeneration, waitSet, waitSetOverTick,
+        waitClears, handoverFrames, handoverLate, handoverLateMaxTicks, handoverMaxUs,
+        lockHeldMaxUs, bufferWaitMaxUs);
 
     fcFormatThread(ownerStr, sizeof(ownerStr), "choreographer", fc.ownerTid, &owner, &prevOwner);
     fcFormatThread(xStr, sizeof(xStr), "x", fc.xTid, &x, &prevX);
@@ -702,9 +710,6 @@ void lorieFrameClockReport(volatile struct lorie_frame_clock_stats *rs, int rend
         ownerStr, xStr, xBusyMaxUs, lockWaitMaxUs, (double) lockWaitSumUs / 1000.0);
 
     out:
-    rs->waitSet = rs->waitSetOverTick = 0;
-    rs->handoverFrames = rs->handoverLate = rs->handoverLateMaxTicks = rs->handoverMaxUs = 0;
-    rs->lockHeldMaxUs = rs->bufferWaitMaxUs = 0;
     prevOwner = owner;
     prevX = x;
 }

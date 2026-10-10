@@ -16,6 +16,7 @@ extern void lorieSetMonitorResolution(int dpi);
 #include <linux/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <X11/extensions/XI2.h>
 #include "lorie.h"
 
 #pragma clang diagnostic ignored "-Wunknown-pragmas"
@@ -145,6 +146,7 @@ static int xcallback(int fd, int events, __unused void* data) {
         ALooper_removeFd(ALooper_forThread(), fd);
         close(conn_fd);
         conn_fd = -1;
+        lorieInputFlowAttach(NULL, 0, NULL);
         rendererSetSharedState(NULL);
         rendererRemoveAllBuffers();
         log(DEBUG, "disconnected");
@@ -194,6 +196,15 @@ static int xcallback(int fd, int events, __unused void* data) {
 
                     rendererSetSharedState(state);
 
+                    // A mapping of its own for the input flow stats (inputflow.c): the renderer's one is
+                    // unmapped by the renderer thread whenever the state changes again.
+                    if (state) {
+                        struct lorie_shared_server_state* flowState =
+                                mmap(NULL, sizeof(*flowState), PROT_READ|PROT_WRITE, MAP_SHARED, stateFd, 0);
+                        if (flowState != MAP_FAILED)
+                            lorieInputFlowAttach(flowState, sizeof(*flowState), &flowState->inputFlow);
+                    }
+
                     close(stateFd); // Closing file descriptor does not unmmap shared memory fragment.
                     break;
                 }
@@ -228,6 +239,7 @@ static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd) {
     if (conn_fd != -1) {
         ALooper_removeFd(ALooper_forThread(), conn_fd);
         close(conn_fd);
+        lorieInputFlowAttach(NULL, 0, NULL);
         rendererSetSharedState(NULL);
         rendererRemoveAllBuffers();
         log(DEBUG, "disconnected");
@@ -311,14 +323,22 @@ static void sendMouseEvent(__unused JNIEnv* env, __unused jobject cls, jfloat x,
         if (which_button > 0)
             (*env)->CallVoidMethod(env, globalThiz, MainActivity.resetIme);
         lorieEvent e = { .mouse = { .t = EVENT_MOUSE, .x = x, .y = y, .detail = which_button, .down = button_down, .relative = relative } };
-        write(conn_fd, &e, sizeof(e));
+        // The X server tells these apart the same way (handleLorieEvents); anything else is only logged.
+        int kind = e.mouse.detail == 0 ? LORIE_FLOW_MOUSE_MOTION : e.mouse.detail <= 3 ? LORIE_FLOW_MOUSE_BUTTON
+                 : e.mouse.detail == 4 ? LORIE_FLOW_MOUSE_SCROLL : -1;
+        int64_t sendNs = lorieInputFlowBeforeSend(kind, e.mouse.detail, 0, e.mouse.down, lorieInputFlowKey(&e));
+        ssize_t sent = write(conn_fd, &e, sizeof(e));
+        lorieInputFlowAfterSend(sendNs, sent == sizeof(e));
     }
 }
 
 static void sendTouchEvent(__unused JNIEnv* env, __unused jobject cls, jint action, jint id, jint x, jint y) {
     if (conn_fd != -1 && action != -1) {
         lorieEvent e = { .touch = { .t = EVENT_TOUCH, .type = action, .id = id, .x = x, .y = y } };
-        write(conn_fd, &e, sizeof(e));
+        int64_t sendNs = lorieInputFlowBeforeSend(LORIE_FLOW_TOUCH, action == XI_TouchBegin ? 0 : action == XI_TouchEnd ? 2 : 1,
+                                                  e.touch.id, false, lorieInputFlowKey(&e));
+        ssize_t sent = write(conn_fd, &e, sizeof(e));
+        lorieInputFlowAfterSend(sendNs, sent == sizeof(e));
     }
 }
 
@@ -328,8 +348,17 @@ static void sendStylusEvent(__unused JNIEnv *env, __unused jobject thiz, jfloat 
     if (conn_fd != -1) {
         (*env)->CallVoidMethod(env, globalThiz, MainActivity.resetIme);
         lorieEvent e = { .stylus = { .t = EVENT_STYLUS, .x = x, .y = y, .pressure = pressure, .tilt_x = tilt_x, .tilt_y = tilt_y, .orientation = orientation, .buttons = buttons, .eraser = eraser, .mouse = mouse } };
-        write(conn_fd, &e, sizeof(e));
+        int64_t sendNs = lorieInputFlowBeforeSend(LORIE_FLOW_STYLUS, e.stylus.buttons, 0, e.stylus.pressure > 0 || e.stylus.buttons,
+                                                  lorieInputFlowKey(&e));
+        ssize_t sent = write(conn_fd, &e, sizeof(e));
+        lorieInputFlowAfterSend(sendNs, sent == sizeof(e));
     }
+}
+
+// Input flow diagnostics: one MotionEvent as Android delivered it (LorieView.noteMotion, inputflow.c).
+static void noteMotionEvent(__unused JNIEnv *env, __unused jclass cls, jint action, jboolean drag, jlong eventTimeNanos,
+                            jlong oldestSampleNanos, jint historySize, jlong sampleGapNanos) {
+    lorieInputFlowNoteMotion(action, drag, eventTimeNanos, oldestSampleNanos, historySize, sampleGapNanos);
 }
 
 static void requestStylusEnabled(__unused JNIEnv *env, __unused jclass clazz, jboolean enabled) {
@@ -422,6 +451,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
             {"sendKeyEvent", "(IIZI)Z", (void *)&sendKeyEvent},
             {"sendTextEvent", "([B)V", (void *)&sendTextEvent},
             {"requestConnection", "()Z", (void *)&requestConnection},
+            {"noteMotionEvent", "(IZJJIJ)V", (void *)&noteMotionEvent},
     };
     (*vm)->AttachCurrentThread(vm, &env, NULL);
     jclass cls = (*env)->FindClass(env, "com/termux/x11/LorieView");
