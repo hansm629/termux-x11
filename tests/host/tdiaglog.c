@@ -23,7 +23,7 @@ static int fails;
 int main(void) {
     const char *out = getenv("OUT");
     char path[512], line[2048];
-    int i, reports = 0, deltaOk = 0, backendOk = 0;
+    int i, reports = 0, deltaOk = 0, backendOk = 0, selftestLines = 0;
 
     snprintf(path, sizeof path, "%s/diag-vulkan.log", out ? out : ".");
     logf = fopen(path, "w");
@@ -32,6 +32,11 @@ int main(void) {
     fakeState.diag.xOwnership = LORIE_OWNERSHIP_PER_ACCESS;
     fakeState.diag.xOwnershipTransitions = 1;
     fakeState.diag.vkInstanceCreated = fakeState.diag.vkDeviceCreated = 1;
+    fakeState.diag.vkSelftest = 1;              /* passed: 3 formats x 1000 iterations x 3 compares */
+    fakeState.diag.vkSelftestIterations = 1000;
+    fakeState.diag.vkSelftestCompares = 9000;
+    fakeState.diag.vkSelftestFormatsPassed = 7;
+    fakeState.diag.vkSelftestUs = 2100000;
     fakeState.diag.vkSurfaceCreated = fakeState.diag.vkSwapchainCreated = 1;
     for (i = 0; i < 4; i++) {
         fakeState.diag.vkAhbImportAttempts += 2; fakeState.diag.vkAhbImportSuccess += 2;
@@ -44,19 +49,28 @@ int main(void) {
     }
     fclose(logf);
     logf = fopen(path, "r");
-    while (fgets(line, sizeof line, logf))
+    while (fgets(line, sizeof line, logf)) {
+        if (strstr(line, "XlorieVkSelftest:")) {
+            CHECK(strstr(line, "XlorieVkSelftest: result=pass compares=9000(+") && strstr(line, " iterations=1000 formats_passed=0x7 ") &&
+                  strstr(line, " fail_step=NONE "), "self-test line: %s", line);
+            selftestLines++;
+        }
         if (strstr(line, "XlorieBackend:") && strstr(line, "x_ahb_cpu_acquires=480(+120)")) {
             CHECK(strstr(line, "XlorieBackend: requested=vulkan vk_fail_at=none active=VULKAN ownership=per_access "
                                "ownership_transitions=1 ")
                   && strstr(line, "x_state_lock_wait_us=16000(+4000)"), "vulkan backend line: %s", line);
             backendOk++;
         }
+    }
     fclose(logf);
+    CHECK(selftestLines == 4, "vulkan log: %d self-test lines", selftestLines);
     CHECK(backendOk == 1, "vulkan log: %d backend lines with the expected X ownership counters", backendOk);
 
     snprintf(path, sizeof path, "%s/diag-gles.log", out ? out : ".");
     logf = fopen(path, "w");
     fakeState.diag.active = LORIE_ACTIVE_GLES;
+    fakeState.diag.vkSelftest = 2;              /* failed: the fallback below */
+    fakeState.diag.vkSelftestFailStep = LORIE_VK_SELFTEST_STEP_COMPARE;
     fakeState.diag.xOwnership = LORIE_OWNERSHIP_PERSISTENT;     /* given back on the fallback */
     fakeState.diag.xOwnershipTransitions = 2;
     fakeState.diag.fallbackTotal++;                    /* one fallback, before the GLES reports */

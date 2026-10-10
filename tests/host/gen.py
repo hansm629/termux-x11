@@ -67,7 +67,7 @@ recipes = {
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {"),
     # the Vulkan backend: instance and device, AHardwareBuffer import - tvkinit.c, tvkimport.c (fakevk.h)
     "vk": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    VkQueue queue;\n};")
-        + span(VH, "struct lorie_vk_image {", "    uint32_t count, capacity;\n};")
+        + span(VH, "struct lorie_vk_image {", "    VkResult lastResult;\n};")
         + span(VH, "enum lorie_vk_use {", "    VkPipelineStageFlags srcStage, dstStage;\n};")
         + span(VC, "static const char *const lorieVkInstanceExtensions[] = {", "#define LORIE_VK_MAX_DEVICES 8")
         + "".join(func(VC, f) for f in (
@@ -80,7 +80,7 @@ recipes = {
             "VkImageUsageFlags lorieVkAhbImageUsage(uint64_t ahbUsage) {",
             "struct lorie_vk_image *lorieVkImageFind(struct lorie_vk_images *images, uint64_t id) {",
             "static void lorieVkImageDestroy(struct lorie_vk *vk, struct lorie_vk_image *img) {",
-            "static void lorieVkImportFailed(volatile struct lorie_shared_server_state *st, uint8_t reason, VkResult result,",
+            "static void lorieVkImportFailed(struct lorie_vk_images *images, volatile struct lorie_shared_server_state *st,",
             "struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id,",
             "void lorieVkImageRemove(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id) {",
             "void lorieVkImagesClear(struct lorie_vk *vk, struct lorie_vk_images *images) {",
@@ -88,7 +88,9 @@ recipes = {
             "static struct lorie_vk_barrier lorieVkBarrier(VkImage image) {",
             "struct lorie_vk_barrier lorieVkAcquireBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use) {",
             "struct lorie_vk_barrier lorieVkReleaseBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use) {",
-            "struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to) {")),
+            "struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to) {"))
+        + macro(VH, "LORIE_VK_SELFTEST_ITERATIONS")
+        + span(VC, "#define LORIE_VK_SELFTEST_WIDTH 67", "    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);\n    return false;\n}"),
 }
 
 for name, make in recipes.items():

@@ -258,6 +258,10 @@ struct lorie_backend_control {
     X(VK_SWAPCHAIN) X(VK_ROOT_NOT_AHB) X(VK_OWNERSHIP) X(VK_DEVICE_LOST) X(VK_SUBMIT) X(VK_PRESENT) \
     X(AHB_PROPERTIES) X(AHB_EXTERNAL_FORMAT_UNSUPPORTED_BY_STAGE1) X(AHB_FORMAT_UNSUPPORTED_BY_STAGE1) \
     X(AHB_IMAGE_USAGE_UNSUPPORTED) X(AHB_MEMORY_TYPE) X(AHB_IMPORT) X(VK_VERSION)
+#define LORIE_VK_SELFTEST_STEPS(X) X(NONE) X(SETUP) X(ALLOCATE) X(IMPORT) X(CPU_LOCK) X(SUBMIT) X(FENCE) X(COMPARE)
+#define LORIE_ENUM_STEP(n) LORIE_VK_SELFTEST_STEP_ ## n,
+enum { LORIE_VK_SELFTEST_STEPS(LORIE_ENUM_STEP) LORIE_VK_SELFTEST_STEP_COUNT };
+#undef LORIE_ENUM_STEP
 #define LORIE_ENUM_CLASS(n) LORIE_FALLBACK_CLASS_ ## n,
 #define LORIE_ENUM_REASON(n) LORIE_FALLBACK_ ## n,
 enum { LORIE_FALLBACK_CLASSES(LORIE_ENUM_CLASS) LORIE_FALLBACK_CLASS_COUNT };
@@ -284,6 +288,16 @@ struct lorie_renderer_diag {
     volatile uint32_t vkAcquireSuccess, vkAcquireSuboptimal, vkAcquireTimeout, vkAcquireNotReady, vkAcquireOutOfDate;
     volatile uint64_t vkAcquireWaitUs, vkSubmitCpuUs, vkFenceWaitUs, vkPresentCallUs;
     volatile uint8_t vkSelftest;                /* 0 not run, 1 passed, 2 failed */
+    /* the ownership self-test (vk.c lorieVkSelftest): byte-exact compares that passed, iterations per format and
+     * direction, formats that passed / could not be tested (bit 0 RGBA, 1 RGBX, 2 BGRA), its duration; where it
+     * failed: step (LORIE_VK_SELFTEST_STEP_*), AHB format, direction (1 CPU->Vulkan->CPU, 2 Vulkan->CPU->Vulkan),
+     * iteration, byte offset, expected and actual byte, VkResult */
+    volatile uint32_t vkSelftestCompares, vkSelftestIterations;
+    volatile uint8_t vkSelftestFormatsPassed, vkSelftestFormatsUnavailable;
+    volatile uint64_t vkSelftestUs;
+    volatile uint8_t vkSelftestFailStep, vkSelftestFailDirection, vkSelftestFailExpected, vkSelftestFailActual;
+    volatile uint32_t vkSelftestFailFormat, vkSelftestFailIteration, vkSelftestFailOffset;
+    volatile int32_t vkSelftestFailResult;
     volatile char vkDevice[96];                 /* VkPhysicalDeviceProperties.deviceName of the device used */
     volatile uint32_t vkDriverVersion, vkApiVersion;
     volatile char vkPresentMode[16];            /* the present mode the swapchain was created with */

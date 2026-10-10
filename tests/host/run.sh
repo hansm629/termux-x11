@@ -30,7 +30,7 @@ rm -rf "$OUT/vkinc" && mkdir -p "$OUT/vkinc" && cp -r "$VKINC/vulkan" "$OUT/vkin
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier"
+C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest"
 rm -f "$OUT/diag-vulkan.log" "$OUT/diag-gles.log"     # written by tdiaglog: never judge an earlier run's
 for t in $C_TESTS; do
     "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$OUT/vkinc" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }

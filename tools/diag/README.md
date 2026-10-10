@@ -12,6 +12,8 @@ XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
 XlorieVkTiming: acquire results, acquire/submit/fence/present times, self-test, device, present mode
+XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
+                fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
 ```
 
@@ -29,6 +31,13 @@ the CPU lock only for each access, under the lock shared with the renderer - whi
 when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu_acquires` and
 `x_state_lock_wait_us` count those per-access locks and their wait for the shared lock.
 
+`XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
+them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,
+`iterations` times each, a byte-exact compare each time. `compares` counts the compares that passed;
+`formats_passed` / `formats_unavailable` are bit masks (1 RGBA, 2 RGBX, 4 BGRA - only BGRA may be
+unavailable). On a failure the `fail_*` fields say where: the step, the AHB format, the direction (1 or 2),
+the iteration, the byte and its expected and actual value, and the VkResult.
+
 ## Scripts
 
 `renderer-status.sh [--file LOG]` - prints the latest of those lines (and the GLES driver line).
@@ -36,7 +45,8 @@ when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu
 `renderer-proof.sh --expect vulkan|gles [--reports N] [--file LOG]` - judges the last N reports (default 3,
 15 seconds) and prints every check with its numbers; exit 0 PASS, 1 FAIL, 2 not enough reports.
 
-- `--expect vulkan`: `active=VULKAN` and `ownership=per_access` in all N reports; `ahb_import_success`
+- `--expect vulkan`: `active=VULKAN`, `ownership=per_access` and the ownership self-test `result=pass` in
+  all N reports; `ahb_import_success`
   total > 0; over the reports
   `imported_source_draws`, `queue_submits`, `queue_present_success`, `frames_presented` > 0;
   `gles_copy_frames`, `egl_swap_buffers` and the fallback total did not move.

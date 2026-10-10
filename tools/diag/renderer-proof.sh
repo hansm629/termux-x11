@@ -3,7 +3,8 @@
 # renderer-status.sh) - the counters only the backend's own successful API calls move. Sums each counter's
 # per-report increase over the last N reports (5 s each) and checks:
 #
-#   --expect vulkan   active=VULKAN and ownership=per_access in every one of the N reports, and over them
+#   --expect vulkan   active=VULKAN, ownership=per_access and the ownership self-test result=pass in every one
+#                     of the N reports, and over them
 #                     ahb_import_success (total) > 0, imported_source_draws > 0, queue_submits > 0,
 #                     queue_present_success > 0, frames_presented > 0,
 #                     gles_copy_frames = 0, egl_swap_buffers = 0, fallback total = 0
@@ -17,7 +18,7 @@
 #   --reports N  how many of the latest reports to judge (default 3, i.e. 15 s)
 #   --file LOG   read a saved log instead of `logcat -d`
 set -e
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 EXPECT= FILE= N=3
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,6 +44,7 @@ SRC | awk -v expect="$EXPECT" -v N="$N" '
     /XlorieGles: /    { ng++; Gl[ng] = $0 }
     /XlorieVk: /      { nv++; V[nv] = $0 }
     /XlorieFallback: / { nf++; F[nf] = $0 }
+    /XlorieVkSelftest: / { nst++; ST[nst] = $0 }
     function take(line, prefix,    n, i, tok, k, rest, tot, d) {
         n = split(line, tok, " ")
         for (i = 1; i <= n; i++) {
@@ -77,12 +79,20 @@ SRC | awk -v expect="$EXPECT" -v N="$N" '
             seenown = seenown (seenown ? "," : "") o
             if (o != wantown) allown = 0
         }
+        allst = nst >= N; seenst = ""
+        for (i = nst - N + 1; i >= 1 && i <= nst; i++) {
+            q = ST[i]; sub(/.*XlorieVkSelftest: result=/, "", q); sub(/ .*/, "", q)
+            seenst = seenst (seenst ? "," : "") q
+            if (q != "pass") allst = 0
+        }
+        if (nst < N) seenst = seenst (seenst ? "," : "") "missing"
         for (i = ng - N + 1; i <= ng; i++) take(Gl[i], "gles.")
         for (i = nv - N + 1; i <= nv; i++) take(V[i], "vk.")
         for (i = nf - N + 1; i <= nf; i++) take(F[i], "fb.")
         check("active=" want " in all " N " reports", allactive, seen)
         check("X server AHB ownership=" wantown " in all " N " reports", allown, seenown)
         if (expect == "vulkan") {
+            check("ownership self-test result=pass in all " N " reports", allst, seenst)
             check("vk ahb_import_success total > 0", total["vk.ahb_import_success"] > 0, total["vk.ahb_import_success"])
             check("vk imported_source_draws > 0", delta["vk.imported_source_draws"] > 0, delta["vk.imported_source_draws"])
             check("vk queue_submits > 0", delta["vk.queue_submits"] > 0, delta["vk.queue_submits"])

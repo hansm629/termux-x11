@@ -20,10 +20,11 @@ def check(cond, what):
         fails += 1
         print("  FAIL " + what)
 
-def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None):
+def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None, selftest=None):
     """One 5 s report, as the X server logs it. gles/vk give deltas; totals default to 10x the delta. The X
     server's AHB ownership defaults to the one that goes with `active`."""
     ownership = ownership or ("per_access" if active == "VULKAN" else "persistent")
+    selftest = selftest or ("pass" if active == "VULKAN" else "none")
     totals = totals or {}
     def kv(k, d):
         return "%s=%d(+%d)" % (k, totals.get(k, d * 10), d)
@@ -36,6 +37,9 @@ def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None):
                  "ahb_import_success", "imported_source_draws", "imported_destination_draws", "copy_commands",
                  "blit_commands", "render_commands", "queue_submits", "queue_present_success", "frames_presented")),
              p + 'XlorieVkTiming: acquire_success=0(+0) selftest=pass device="Adreno (TM) 840" present_mode="FIFO"',
+             p + "XlorieVkSelftest: result=%s compares=9000(+0) iterations=1000 formats_passed=0x7 formats_unavailable=0x0 "
+                 "us=2100000 fail_step=NONE fail_format=0 fail_direction=0 fail_iteration=0 fail_offset=0 fail_expected=0x00 "
+                 "fail_actual=0x00 fail_vkresult=0" % selftest,
              p + "XlorieFallback: total=%d(+%d) fatal_backend=0 resource_local=0 injected=0 last_class=none last_reason=none "
                  "last_vkresult=0 last_resource_id=0 last_resource_format=0 last_resource_usage=0x0 reasons=none" % (
                      fb_total_delta, fb_total_delta)]
@@ -76,6 +80,8 @@ cases = [
     ("gles with a Vulkan present in the window", reports(3, active="GLES", gles=GL, vk={"queue_present_success": 1, "frames_presented": 1}), "gles", 1),
     ("vulkan while the X server keeps 3c98ffa's CPU locks", reports(3, active="VULKAN", gles={}, vk=VK, ownership="persistent"), "vulkan", 1),
     ("gles while the X server is per-access", reports(3, active="GLES", gles=GL, vk={}, ownership="per_access"), "gles", 1),
+    ("vulkan after a failed ownership self-test", reports(3, active="VULKAN", gles={}, vk=VK, selftest="fail"), "vulkan", 1),
+    ("vulkan without the self-test line", [l for l in vk_good if "XlorieVkSelftest" not in l], "vulkan", 1),
     ("an X server without the ownership field", [l.replace(" ownership=per_access", "") for l in vk_good], "vulkan", 1),
     ("backend changed within the window", report(0, active="GLES", gles=GL, vk={}) + reports(2, active="VULKAN", gles={}, vk=VK), "vulkan", 1),
     ("too few reports", reports(1, active="VULKAN", gles={}, vk=VK), "vulkan", 2),
@@ -87,7 +93,7 @@ for name, lines, expect, want in cases:
     check(("RESULT: PASS" in out) == (want == 0), "%s: result line does not match the exit status" % name)
 
 code, out = run("renderer-status.sh", vk_good)
-check(code == 0 and all(k in out for k in ("XlorieBackend:", "active=VULKAN", "ownership=per_access", "XlorieGles:", "XlorieVk:", "XlorieVkTiming:", "XlorieFallback:")),
+check(code == 0 and all(k in out for k in ("XlorieBackend:", "active=VULKAN", "ownership=per_access", "XlorieVkSelftest: result=pass", "XlorieGles:", "XlorieVk:", "XlorieVkTiming:", "XlorieFallback:")),
       "renderer-status: %d\n%s" % (code, out))
 check(out.count("XlorieVk:") == 1, "renderer-status printed more than the latest report")
 code, out = run("renderer-status.sh", ["nothing here"])

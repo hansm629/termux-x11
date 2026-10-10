@@ -213,9 +213,9 @@ CONTROLS = [
     ("a failed import leaving its objects behind", "vk.c",
      """    fail:
     lorieVkImageDestroy(vk, &img);
-    lorieVkImportFailed(st, reason, r, id, &desc);""",
+    lorieVkImportFailed(images, st, reason, r, id, &desc);""",
      """    fail:
-    lorieVkImportFailed(st, reason, r, id, &desc);""",
+    lorieVkImportFailed(images, st, reason, r, id, &desc);""",
      "tvkimport"),
     ("an import counted as a success before it is one", "vk.c",
      """    LORIE_DIAG_ADD(st, vkAhbImportAttempts, 1);
@@ -226,13 +226,13 @@ CONTROLS = [
      "tvkimport"),
     ("injected at import, the buffer's properties still asked for", "vk.c",
      """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
-        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        lorieVkImportFailed(images, st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
         return NULL;
     }""",
      """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
         VkAndroidHardwareBufferPropertiesANDROID unused = { .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID };
         vk->GetAndroidHardwareBufferPropertiesANDROID(vk->device, ahb, &unused);
-        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        lorieVkImportFailed(images, st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
         return NULL;
     }""",
      "tvkimport"),
@@ -269,6 +269,48 @@ CONTROLS = [
      """            *access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
      """            *access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
      "tvkbarrier"),
+    ("the self-test comparing all but the alpha/X byte", "vk.c",
+     """                if (got[y * rowBytes + i] != expect[y * w + i])""",
+     """                if (i % 4 != 3 && got[y * rowBytes + i] != expect[y * w + i])""",
+     "tvkselftest"),
+    ("the self-test counting a compare before it passed", "vk.c",
+     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+                goto fail;
+            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);""",
+     """            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
+            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+                goto fail;""",
+     "tvkselftest"),
+    ("the self-test ignoring a mismatch", "vk.c",
+     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+                goto fail;""",
+     """            lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got);""",
+     "tvkselftest"),
+    ("the self-test writing the same pattern every iteration", "vk.c",
+     """            lorieVkSelftestPattern(t.expect, it % 5, it);""",
+     """            lorieVkSelftestPattern(t.expect, 1, 0);""",
+     "tvkselftest"),
+    ("the self-test reading before the fence was waited for", "vk.c",
+     """    if ((r = vk->WaitForFences(vk->device, 1, &t->fence, VK_TRUE, LORIE_VK_SELFTEST_TIMEOUT_NS)) != VK_SUCCESS)
+        return r;""",
+     "",
+     "tvkselftest"),
+    ("the self-test not giving the copy's destination back", "vk.c",
+     """            lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));""",
+     "",
+     "tvkselftest"),
+    ("the self-test reading a download not made visible to the host", "vk.c",
+     """                                                              .dstAccessMask = VK_ACCESS_HOST_READ_BIT,""",
+     """                                                              .dstAccessMask = 0,""",
+     "tvkselftest"),
+    ("an acquire from UNDEFINED, run through the self-test", "vk.c",
+     """    b.barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;""",
+     """    b.barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;""",
+     "tvkselftest"),
+    ("RGBX allowed to be unavailable", "vk.c",
+     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true },""",
+     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, false },""",
+     "tvkselftest"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

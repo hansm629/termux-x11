@@ -700,6 +700,7 @@ static const char *lorieActiveName(uint8_t a) {
 #define LORIE_NAME(n) #n,
 static const char *const lorieFallbackClassNames[] = { LORIE_FALLBACK_CLASSES(LORIE_NAME) };
 static const char *const lorieFallbackReasonNames[] = { LORIE_FALLBACK_REASONS(LORIE_NAME) };
+static const char *const lorieSelftestStepNames[] = { LORIE_VK_SELFTEST_STEPS(LORIE_NAME) };
 #undef LORIE_NAME
 
 static void lorieLogRendererDiag(void) {
@@ -739,6 +740,14 @@ static void lorieLogRendererDiag(void) {
         TD(vkAcquireOutOfDate), TD(vkAcquireWaitUs), TD(vkSubmitCpuUs), TD(vkFenceWaitUs), TD(vkPresentCallUs),
         d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none",
         (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode);
+    log(INFO, "XlorieVkSelftest: result=%s compares=%llu(+%llu) iterations=%u formats_passed=0x%x formats_unavailable=0x%x "
+              "us=%llu fail_step=%s fail_format=%u fail_direction=%u fail_iteration=%u fail_offset=%u fail_expected=0x%02x "
+              "fail_actual=0x%02x fail_vkresult=%d",
+        d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none", TD(vkSelftestCompares), d.vkSelftestIterations,
+        d.vkSelftestFormatsPassed, d.vkSelftestFormatsUnavailable, (unsigned long long) d.vkSelftestUs,
+        lorieSelftestStepNames[d.vkSelftestFailStep % LORIE_VK_SELFTEST_STEP_COUNT], d.vkSelftestFailFormat,
+        d.vkSelftestFailDirection, d.vkSelftestFailIteration, d.vkSelftestFailOffset, d.vkSelftestFailExpected,
+        d.vkSelftestFailActual, d.vkSelftestFailResult);
     reasons[0] = 0;
     for (i = 1; i < LORIE_FALLBACK_REASON_COUNT; i++)
         if (d.fallbackByReason[i] && used < sizeof(reasons))

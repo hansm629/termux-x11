@@ -1,6 +1,6 @@
 #!/bin/sh
-# Prints the X server's latest renderer diagnostics: the XlorieBackend, XlorieGles, XlorieVk, XlorieVkTiming
-# and XlorieFallback lines it logs every 5 seconds, and the renderer's GLES driver line. Nothing is
+# Prints the X server's latest renderer diagnostics: the XlorieBackend, XlorieGles, XlorieVk, XlorieVkTiming,
+# XlorieVkSelftest and XlorieFallback lines it logs every 5 seconds, and the renderer's GLES driver line. Nothing is
 # computed or assumed here - these are the lines as the X server wrote them.
 #
 # usage: renderer-status.sh [--file LOG]
@@ -25,11 +25,11 @@ fi
 SRC | awk '
     /XlorieFrames: renderer GLES driver:/ { drv = $0 }
     /XlorieBackend: / { b = $0 } /XlorieGles: / { g = $0 } /XlorieVk: / { v = $0 }
-    /XlorieVkTiming: / { t = $0 } /XlorieFallback: / { f = $0 }
+    /XlorieVkTiming: / { t = $0 } /XlorieVkSelftest: / { s = $0 } /XlorieFallback: / { f = $0 }
     END {
         n = 0
         if (drv) { print drv; n++ }
         if (b) { print b; n++ } if (g) { print g; n++ } if (v) { print v; n++ }
-        if (t) { print t; n++ } if (f) { print f; n++ }
+        if (t) { print t; n++ } if (s) { print s; n++ } if (f) { print f; n++ }
         if (!b) { print "renderer-status: no XlorieBackend line found (X server not running this build, or no renderer connected yet)"; exit 1 }
     }'

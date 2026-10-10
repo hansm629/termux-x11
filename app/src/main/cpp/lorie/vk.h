@@ -27,7 +27,12 @@ struct lorie_shared_server_state;
     X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceImageFormatProperties2)
 #define LORIE_VK_DEVICE_FNS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) \
     X(GetAndroidHardwareBufferPropertiesANDROID) X(CreateImage) X(DestroyImage) X(AllocateMemory) X(FreeMemory) \
-    X(BindImageMemory) X(CreateImageView) X(DestroyImageView)
+    X(BindImageMemory) X(CreateImageView) X(DestroyImageView) \
+    X(CreateCommandPool) X(DestroyCommandPool) X(AllocateCommandBuffers) X(ResetCommandBuffer) \
+    X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdCopyBufferToImage) \
+    X(CmdCopyImageToBuffer) X(QueueSubmit) X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) \
+    X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory) X(MapMemory) \
+    X(UnmapMemory) X(FlushMappedMemoryRanges) X(InvalidateMappedMemoryRanges)
 
 struct lorie_vk {
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
@@ -74,6 +79,8 @@ struct lorie_vk_image {
 struct lorie_vk_images {
     struct lorie_vk_image *items;
     uint32_t count, capacity;
+    uint8_t lastReason;         /* why the last refused import was refused (LORIE_FALLBACK_*) */
+    VkResult lastResult;
 };
 
 /*
@@ -109,6 +116,21 @@ struct lorie_vk_barrier lorieVkAcquireBarrier(const struct lorie_vk *vk, VkImage
 struct lorie_vk_barrier lorieVkReleaseBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use);
 // Within the renderer's queue, from one use to another.
 struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to);
+
+/*
+ * The device self-test of the ownership policy above, run before the backend uses any X server buffer. For
+ * RGBA, RGBX and BGRA, on two AHardwareBuffers allocated and locked as the X server's are, each reused for
+ * every iteration, `iterations` times each way:
+ *   CPU -> Vulkan -> CPU    the CPU writes a pattern into one, Vulkan copies it into the other, the CPU reads it
+ *   Vulkan -> CPU -> Vulkan Vulkan uploads a pattern, the CPU reads it and writes another, Vulkan reads that back
+ * with every acquire and release as above, the pattern changing every iteration (zero, all-one, checkerboard,
+ * row-dependent, pseudo-random), each read compared byte for byte. The compare counter moves only on a passing
+ * compare; one mismatch, or any failed step, fails it. RGBA and RGBX must pass; BGRA may be unavailable (not
+ * allocatable, or a format the backend does not import), which is recorded, never counted as passed. On failure
+ * the fallback is recorded (FATAL_BACKEND, VK_SELFTEST) with where it failed; nothing else is tried.
+ */
+#define LORIE_VK_SELFTEST_ITERATIONS 1000
+bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations);
 
 // libvulkan.so's vkGetInstanceProcAddr, or NULL with the fallback recorded (VK_LOADER).
 PFN_vkGetInstanceProcAddr lorieVkLoader(volatile struct lorie_shared_server_state *st);

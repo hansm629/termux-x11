@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include "lorie.h"
@@ -258,10 +259,14 @@ static void lorieVkImageDestroy(struct lorie_vk *vk, struct lorie_vk_image *img)
 }
 
 // A buffer that cannot be imported: the fallback (RESOURCE_LOCAL unless injected), and which buffer it was.
-static void lorieVkImportFailed(volatile struct lorie_shared_server_state *st, uint8_t reason, VkResult result,
-                                uint64_t id, const AHardwareBuffer_Desc *desc) {
+static void lorieVkImportFailed(struct lorie_vk_images *images, volatile struct lorie_shared_server_state *st,
+                                uint8_t reason, VkResult result, uint64_t id, const AHardwareBuffer_Desc *desc) {
     loge("cannot import AHardwareBuffer %llu (%ux%u format %u usage %#llx): reason %u", (unsigned long long) id,
          desc->width, desc->height, desc->format, (unsigned long long) desc->usage, reason);
+    if (images) {
+        images->lastReason = reason ? reason : LORIE_FALLBACK_AHB_IMPORT;
+        images->lastResult = result;
+    }
     if (!st)
         return;
     st->diag.lastResourceId = id;
@@ -292,13 +297,13 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
     if (found)
         return found;
     if (!ahb) {
-        lorieVkImportFailed(st, LORIE_FALLBACK_AHB_PROPERTIES, VK_ERROR_INVALID_EXTERNAL_HANDLE, id, &desc);
+        lorieVkImportFailed(images, st, LORIE_FALLBACK_AHB_PROPERTIES, VK_ERROR_INVALID_EXTERNAL_HANDLE, id, &desc);
         return NULL;
     }
     LORIE_DIAG_ADD(st, vkAhbImportAttempts, 1);
     AHardwareBuffer_describe(ahb, &desc);
     if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
-        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        lorieVkImportFailed(images, st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
         return NULL;
     }
 
@@ -431,7 +436,7 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
 
     fail:
     lorieVkImageDestroy(vk, &img);
-    lorieVkImportFailed(st, reason, r, id, &desc);
+    lorieVkImportFailed(images, st, reason, r, id, &desc);
     return NULL;
 }
 
@@ -531,4 +536,377 @@ struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from,
     lorieVkUseScope(from, &b.barrier.oldLayout, &b.srcStage, &access, &b.barrier.srcAccessMask);
     lorieVkUseScope(to, &b.barrier.newLayout, &b.dstStage, &b.barrier.dstAccessMask, &writes);
     return b;
+}
+
+#define LORIE_VK_SELFTEST_WIDTH 67      // a width no row alignment divides: the buffers' rows have padding
+#define LORIE_VK_SELFTEST_HEIGHT 45
+#define LORIE_VK_SELFTEST_TIMEOUT_NS 1000000000ULL
+
+static const struct { uint32_t format; uint8_t bit; bool required; } lorieVkSelftestFormats[] = {
+        { AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, true },
+        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true },
+        { AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, 4, false },
+};
+
+struct lorie_vk_selftest {
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkFence fence;
+    VkBuffer buffer[2];         // [0] uploaded from, [1] read back into
+    VkDeviceMemory memory;
+    uint8_t *mapped;
+    bool coherent;
+    VkDeviceSize size, stride;  // one buffer's size; buffer[1] starts at `stride`
+    struct lorie_vk_images images;
+    AHardwareBuffer *ahb[2];
+    uint8_t *expect, *write;
+};
+
+// Iteration `it`'s pattern of kind `kind`: zero, all-one, checkerboard, row-dependent or pseudo-random, tightly
+// packed, 4 bytes a pixel.
+static void lorieVkSelftestPattern(uint8_t *out, uint32_t kind, uint32_t it) {
+    uint32_t x, y, k, r = it * 2654435761u + 0x9e3779b9u;
+    for (y = 0; y < LORIE_VK_SELFTEST_HEIGHT; y++)
+        for (x = 0; x < LORIE_VK_SELFTEST_WIDTH; x++)
+            for (k = 0; k < 4; k++) {
+                uint8_t v;
+                switch (kind % 5) {
+                    case 0: v = 0; break;
+                    case 1: v = 0xff; break;
+                    case 2: v = (((x >> 2) ^ (y >> 2) ^ it) & 1) ? (uint8_t) (0x12 + k * 0x22) : (uint8_t) (0xed - k * 0x22); break;
+                    case 3: v = (uint8_t) (y * 7 + x * 3 + k * 61 + it); break;
+                    default: r ^= r << 13; r ^= r >> 17; r ^= r << 5; v = (uint8_t) r; break;
+                }
+                out[(y * LORIE_VK_SELFTEST_WIDTH + x) * 4 + k] = v;
+            }
+}
+
+// The first byte of `got` (rows `rowBytes` apart) that differs from tightly packed `expect`, or -1.
+static int64_t lorieVkSelftestDiff(const uint8_t *got, size_t rowBytes, const uint8_t *expect) {
+    uint32_t y, i;
+    const size_t w = LORIE_VK_SELFTEST_WIDTH * 4;
+    for (y = 0; y < LORIE_VK_SELFTEST_HEIGHT; y++)
+        if (memcmp(got + y * rowBytes, expect + y * w, w))
+            for (i = 0; i < w; i++)
+                if (got[y * rowBytes + i] != expect[y * w + i])
+                    return (int64_t) (y * w + i);
+    return -1;
+}
+
+// The CPU's turn, as the X server takes it: lock, compare with `expect` if given, write `write` if given, unlock.
+static uint8_t lorieVkSelftestCpu(AHardwareBuffer *b, const uint8_t *expect, const uint8_t *write, int64_t *diff, uint8_t *got) {
+    AHardwareBuffer_Desc d;
+    uint8_t *p = NULL;
+    uint32_t y;
+
+    AHardwareBuffer_describe(b, &d);
+    if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, (void **) &p) || !p)
+        return LORIE_VK_SELFTEST_STEP_CPU_LOCK;
+    if (expect && (*diff = lorieVkSelftestDiff(p, (size_t) d.stride * 4, expect)) >= 0) {
+        uint32_t row = (uint32_t) (*diff / (LORIE_VK_SELFTEST_WIDTH * 4)), col = (uint32_t) (*diff % (LORIE_VK_SELFTEST_WIDTH * 4));
+        *got = p[(size_t) row * d.stride * 4 + col];
+        AHardwareBuffer_unlock(b, NULL);
+        return LORIE_VK_SELFTEST_STEP_COMPARE;
+    }
+    if (write)
+        for (y = 0; y < LORIE_VK_SELFTEST_HEIGHT; y++)
+            memcpy(p + (size_t) y * d.stride * 4, write + (size_t) y * LORIE_VK_SELFTEST_WIDTH * 4, LORIE_VK_SELFTEST_WIDTH * 4);
+    return AHardwareBuffer_unlock(b, NULL) ? LORIE_VK_SELFTEST_STEP_CPU_LOCK : LORIE_VK_SELFTEST_STEP_NONE;
+}
+
+static void lorieVkCmdBarrier(struct lorie_vk *vk, VkCommandBuffer cmd, struct lorie_vk_barrier b) {
+    vk->CmdPipelineBarrier(cmd, b.srcStage, b.dstStage, 0, 0, NULL, 0, NULL, 1, &b.barrier);
+}
+
+static VkResult lorieVkSelftestBegin(struct lorie_vk *vk, struct lorie_vk_selftest *t) {
+    VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkResult r = vk->ResetCommandBuffer(t->cmd, 0);
+    return r != VK_SUCCESS ? r : vk->BeginCommandBuffer(t->cmd, &begin);
+}
+
+// Ends, submits and waits for the command buffer: its releases are complete when this returns VK_SUCCESS.
+static VkResult lorieVkSelftestSubmit(struct lorie_vk *vk, struct lorie_vk_selftest *t, uint8_t *step) {
+    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &t->cmd };
+    VkResult r;
+    *step = LORIE_VK_SELFTEST_STEP_SUBMIT;
+    if ((r = vk->EndCommandBuffer(t->cmd)) != VK_SUCCESS || (r = vk->QueueSubmit(vk->queue, 1, &submit, t->fence)) != VK_SUCCESS)
+        return r;
+    *step = LORIE_VK_SELFTEST_STEP_FENCE;
+    if ((r = vk->WaitForFences(vk->device, 1, &t->fence, VK_TRUE, LORIE_VK_SELFTEST_TIMEOUT_NS)) != VK_SUCCESS)
+        return r;
+    if ((r = vk->ResetFences(vk->device, 1, &t->fence)) != VK_SUCCESS)
+        return r;
+    *step = LORIE_VK_SELFTEST_STEP_NONE;
+    return VK_SUCCESS;
+}
+
+static VkResult lorieVkSelftestSetup(struct lorie_vk *vk, struct lorie_vk_selftest *t) {
+    VkCommandPoolCreateInfo poolInfo = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk->queueFamily };
+    VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkBufferCreateInfo bufferInfo = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size = (VkDeviceSize) LORIE_VK_SELFTEST_WIDTH * LORIE_VK_SELFTEST_HEIGHT * 4,
+                                      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkMemoryRequirements req;
+    uint32_t i, type = UINT32_MAX;
+    VkResult r;
+
+    if ((r = vk->CreateCommandPool(vk->device, &poolInfo, NULL, &t->pool)) != VK_SUCCESS)
+        return t->pool = VK_NULL_HANDLE, r;
+    {
+        VkCommandBufferAllocateInfo info = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = t->pool,
+                                             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        if ((r = vk->AllocateCommandBuffers(vk->device, &info, &t->cmd)) != VK_SUCCESS)
+            return r;
+    }
+    if ((r = vk->CreateFence(vk->device, &fenceInfo, NULL, &t->fence)) != VK_SUCCESS)
+        return t->fence = VK_NULL_HANDLE, r;
+    for (i = 0; i < 2; i++)
+        if ((r = vk->CreateBuffer(vk->device, &bufferInfo, NULL, &t->buffer[i])) != VK_SUCCESS)
+            return t->buffer[i] = VK_NULL_HANDLE, r;
+    vk->GetBufferMemoryRequirements(vk->device, t->buffer[0], &req);
+    t->size = bufferInfo.size;
+    t->stride = (req.size + req.alignment - 1) / req.alignment * req.alignment;
+    // Host-visible, coherent if there is one.
+    for (i = 0; i < vk->memoryProperties.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = vk->memoryProperties.memoryTypes[i].propertyFlags;
+        if (!(req.memoryTypeBits & (1u << i)) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            continue;
+        if (type == UINT32_MAX || (!(vk->memoryProperties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+                                   (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)))
+            type = i;
+    }
+    if (type == UINT32_MAX)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    t->coherent = vk->memoryProperties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    {
+        VkMemoryAllocateInfo info = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = t->stride * 2,
+                                      .memoryTypeIndex = type };
+        if ((r = vk->AllocateMemory(vk->device, &info, NULL, &t->memory)) != VK_SUCCESS)
+            return t->memory = VK_NULL_HANDLE, r;
+    }
+    if ((r = vk->BindBufferMemory(vk->device, t->buffer[0], t->memory, 0)) != VK_SUCCESS ||
+        (r = vk->BindBufferMemory(vk->device, t->buffer[1], t->memory, t->stride)) != VK_SUCCESS ||
+        (r = vk->MapMemory(vk->device, t->memory, 0, VK_WHOLE_SIZE, 0, (void **) &t->mapped)) != VK_SUCCESS)
+        return r;
+    if (!(t->expect = malloc(t->size)) || !(t->write = malloc(t->size)))
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return VK_SUCCESS;
+}
+
+static void lorieVkSelftestFreeBuffers(struct lorie_vk *vk, struct lorie_vk_selftest *t) {
+    int i;
+    lorieVkImagesClear(vk, &t->images);
+    for (i = 0; i < 2; i++)
+        if (t->ahb[i]) {
+            AHardwareBuffer_release(t->ahb[i]);
+            t->ahb[i] = NULL;
+        }
+}
+
+static void lorieVkSelftestCleanup(struct lorie_vk *vk, struct lorie_vk_selftest *t) {
+    int i;
+    vk->DeviceWaitIdle(vk->device);     // after a failure, work may still be pending on what is freed below
+    lorieVkSelftestFreeBuffers(vk, t);
+    if (t->mapped)
+        vk->UnmapMemory(vk->device, t->memory);
+    for (i = 0; i < 2; i++)
+        if (t->buffer[i])
+            vk->DestroyBuffer(vk->device, t->buffer[i], NULL);
+    if (t->memory)
+        vk->FreeMemory(vk->device, t->memory, NULL);
+    if (t->fence)
+        vk->DestroyFence(vk->device, t->fence, NULL);
+    if (t->pool)
+        vk->DestroyCommandPool(vk->device, t->pool, NULL);   // frees its command buffer
+    free(t->expect);
+    free(t->write);
+    memset(t, 0, sizeof(*t));
+}
+
+// Non-coherent memory made visible to the device (after host writes) or to the host (after device writes); the
+// whole of it, which keeps the range a multiple of nonCoherentAtomSize.
+static VkResult lorieVkSelftestSyncHost(struct lorie_vk *vk, struct lorie_vk_selftest *t, bool toDevice) {
+    VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = t->memory,
+                                  .offset = 0, .size = VK_WHOLE_SIZE };
+    if (t->coherent)
+        return VK_SUCCESS;
+    return toDevice ? vk->FlushMappedMemoryRanges(vk->device, 1, &range) : vk->InvalidateMappedMemoryRanges(vk->device, 1, &range);
+}
+
+bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {
+    struct lorie_vk_selftest t = {0};
+    struct timespec t0, t1;
+    const VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    const VkExtent3D extent = { LORIE_VK_SELFTEST_WIDTH, LORIE_VK_SELFTEST_HEIGHT, 1 };
+    uint8_t step = LORIE_VK_SELFTEST_STEP_NONE, direction = 0, expected = 0, got = 0, passed = 0, unavailable = 0;
+    uint32_t f, it = 0, format = 0;
+    int64_t diff = -1;
+    VkResult r = VK_SUCCESS;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (st) {
+        st->diag.vkSelftest = 0;
+        st->diag.vkSelftestIterations = iterations;
+    }
+    if ((r = lorieVkSelftestSetup(vk, &t)) != VK_SUCCESS) {
+        step = LORIE_VK_SELFTEST_STEP_SETUP;
+        goto fail;
+    }
+
+    for (f = 0; f < sizeof(lorieVkSelftestFormats) / sizeof(*lorieVkSelftestFormats); f++) {
+        AHardwareBuffer_Desc desc = { .width = LORIE_VK_SELFTEST_WIDTH, .height = LORIE_VK_SELFTEST_HEIGHT, .layers = 1,
+                                      .format = lorieVkSelftestFormats[f].format,
+                                      .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                               AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
+        struct lorie_vk_image *img[2] = { NULL, NULL };
+        int i;
+
+        format = desc.format;
+        direction = 0;      // where a failure is reported: not in a direction or an iteration before both start
+        it = 0;
+        for (i = 0; i < 2; i++) {
+            if (AHardwareBuffer_allocate(&desc, &t.ahb[i]) || !t.ahb[i]) {
+                t.ahb[i] = NULL;
+                step = LORIE_VK_SELFTEST_STEP_ALLOCATE;
+                break;
+            }
+            // Ids no LorieBuffer has (they count up from 1): this cache is the self-test's own anyway.
+            if (!(img[i] = lorieVkImport(vk, &t.images, UINT64_MAX - i, t.ahb[i],
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, NULL))) {
+                step = LORIE_VK_SELFTEST_STEP_IMPORT;
+                r = t.images.lastResult;
+                break;
+            }
+        }
+        if (step) {
+            // BGRA may be missing: not allocatable, or a format the backend does not import.
+            uint8_t why = t.images.lastReason;
+            if (!lorieVkSelftestFormats[f].required && (step == LORIE_VK_SELFTEST_STEP_ALLOCATE ||
+                (why == LORIE_FALLBACK_AHB_EXTERNAL_FORMAT_UNSUPPORTED_BY_STAGE1 || why == LORIE_FALLBACK_AHB_FORMAT_UNSUPPORTED_BY_STAGE1 ||
+                 why == LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED))) {
+                log("self-test: AHB format %u unavailable (step %u, reason %u)", format, step, why);
+                unavailable |= lorieVkSelftestFormats[f].bit;
+                step = LORIE_VK_SELFTEST_STEP_NONE;
+                r = VK_SUCCESS;
+                lorieVkSelftestFreeBuffers(vk, &t);
+                continue;
+            }
+            goto fail;
+        }
+
+        // CPU -> Vulkan -> CPU
+        direction = 1;
+        for (it = 0; it < iterations; it++) {
+            lorieVkSelftestPattern(t.expect, it % 5, it);
+            if ((step = lorieVkSelftestCpu(t.ahb[0], NULL, t.expect, &diff, &got)))
+                goto fail;
+            if ((r = lorieVkSelftestBegin(vk, &t)) != VK_SUCCESS) {
+                step = LORIE_VK_SELFTEST_STEP_SUBMIT;
+                goto fail;
+            }
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));
+            vk->CmdCopyImage(t.cmd, img[0]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img[1]->image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &(VkImageCopy) { layers, {0}, layers, {0}, extent });
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));
+            if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
+                goto fail;
+            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+                goto fail;
+            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
+        }
+
+        // Vulkan -> CPU -> Vulkan
+        direction = 2;
+        for (it = 0; it < iterations; it++) {
+            lorieVkSelftestPattern(t.mapped, it % 5, it ^ 0x5a5a5a5au);
+            memcpy(t.expect, t.mapped, t.size);
+            if ((r = lorieVkSelftestSyncHost(vk, &t, true)) != VK_SUCCESS || (r = lorieVkSelftestBegin(vk, &t)) != VK_SUCCESS) {
+                step = LORIE_VK_SELFTEST_STEP_SUBMIT;
+                goto fail;
+            }
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_DST));
+            vk->CmdCopyBufferToImage(t.cmd, t.buffer[0], img[0]->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                     &(VkBufferImageCopy) { 0, 0, 0, layers, {0}, extent });
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_DST));
+            if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
+                goto fail;
+            lorieVkSelftestPattern(t.write, (it + 2) % 5, it + 1);
+            if ((step = lorieVkSelftestCpu(t.ahb[0], t.expect, t.write, &diff, &got)))
+                goto fail;
+            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
+
+            if ((r = lorieVkSelftestBegin(vk, &t)) != VK_SUCCESS) {
+                step = LORIE_VK_SELFTEST_STEP_SUBMIT;
+                goto fail;
+            }
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+            vk->CmdCopyImageToBuffer(t.cmd, img[0]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.buffer[1], 1,
+                                     &(VkBufferImageCopy) { 0, 0, 0, layers, {0}, extent });
+            lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+            // A fence makes only device accesses part of its dependency: the copy is made visible to the host here.
+            vk->CmdPipelineBarrier(t.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1,
+                                   &(VkBufferMemoryBarrier) { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                                              .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                              .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                                                              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                              .buffer = t.buffer[1], .size = VK_WHOLE_SIZE }, 0, NULL);
+            if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
+                goto fail;
+            if ((r = lorieVkSelftestSyncHost(vk, &t, false)) != VK_SUCCESS) {
+                step = LORIE_VK_SELFTEST_STEP_FENCE;
+                goto fail;
+            }
+            if ((diff = lorieVkSelftestDiff(t.mapped + t.stride, LORIE_VK_SELFTEST_WIDTH * 4, t.write)) >= 0) {
+                got = t.mapped[t.stride + diff];
+                memcpy(t.expect, t.write, t.size);
+                step = LORIE_VK_SELFTEST_STEP_COMPARE;
+                goto fail;
+            }
+            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
+        }
+
+        passed |= lorieVkSelftestFormats[f].bit;
+        lorieVkSelftestFreeBuffers(vk, &t);
+    }
+
+    lorieVkSelftestCleanup(vk, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (st) {
+        st->diag.vkSelftestFormatsPassed = passed;
+        st->diag.vkSelftestFormatsUnavailable = unavailable;
+        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
+        st->diag.vkSelftest = 1;
+    }
+    log("ownership self-test passed: formats %#x, unavailable %#x, %u iterations each way", passed, unavailable, iterations);
+    return true;
+
+    fail:
+    if (step == LORIE_VK_SELFTEST_STEP_COMPARE && diff >= 0)
+        expected = t.expect[diff];
+    loge("ownership self-test FAILED: step %u, AHB format %u, direction %u, iteration %u, byte %lld expected %#x got %#x, VkResult %d",
+         step, format, direction, it, (long long) diff, expected, got, r);
+    lorieVkSelftestCleanup(vk, &t);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (st) {
+        st->diag.vkSelftestFormatsPassed = passed;
+        st->diag.vkSelftestFormatsUnavailable = unavailable;
+        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
+        st->diag.vkSelftestFailStep = step;
+        st->diag.vkSelftestFailFormat = format;
+        st->diag.vkSelftestFailDirection = direction;
+        st->diag.vkSelftestFailIteration = it;
+        st->diag.vkSelftestFailOffset = diff >= 0 ? (uint32_t) diff : 0;
+        st->diag.vkSelftestFailExpected = expected;
+        st->diag.vkSelftestFailActual = got;
+        st->diag.vkSelftestFailResult = r;
+        st->diag.vkSelftest = 2;
+    }
+    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);
+    return false;
 }

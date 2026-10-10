@@ -1,12 +1,21 @@
-/* The fake Vulkan the vk.c host tests run on (tvkinit.c, tvkimport.c): reached only through the
- * vkGetInstanceProcAddr given to lorieVkCreateDevice, as libvulkan.so's would be, configured per case through
- * `cfg` (good() sets up a usable phone), and recording what it was called with in `calls` and `imp`. Also the
- * NDK's AHardwareBuffer as far as vk.c uses it, and the real vk.h/vk.c code (gen.py "vk"). */
+/* The fake Vulkan the vk.c host tests run on (tvkinit.c, tvkimport.c, tvkbarrier.c, tvkselftest.c): reached
+ * only through the vkGetInstanceProcAddr given to lorieVkCreateDevice, as libvulkan.so's would be, configured
+ * per case through `cfg` (good() sets up a usable phone), and recording what it was called with in `calls` and
+ * `imp`. Also the NDK's AHardwareBuffer as far as vk.c uses it, and the real vk.h/vk.c code (gen.py "vk").
+ *
+ * A small device behind them (`emu`) runs what is submitted, so the ownership self-test can be run for real: an
+ * AHardwareBuffer has the CPU's memory (rows `stride` pixels apart) and the device's (tightly packed). Only an
+ * acquire from VK_QUEUE_FAMILY_FOREIGN_EXT in GENERAL brings the CPU's contents to the device (from UNDEFINED
+ * they are discarded); only a release to FOREIGN in GENERAL brings the device's back. Copies need the buffer
+ * owned and in the copy's layout. The CPU locking a buffer the renderer owns, or before a submission's fence
+ * was waited for, is a violation. A test can fail an allocation, a lock, a submission or a fence wait, or make
+ * the n-th copy write one wrong byte. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
@@ -32,17 +41,98 @@ typedef struct AHardwareBuffer {
     uint32_t memoryTypeBits;
     VkDeviceSize allocationSize;
     VkResult propertiesResult;
+    /* the small device: memory as the CPU and as the device see it, who owns it, its layout on the device */
+    uint8_t *cpu, *gpu;
+    uint64_t lockedHash;            /* the CPU's memory when it was locked: an unlock that changed it was a write */
+    bool owned, locked;
+    VkImageLayout layout;
 } AHardwareBuffer;
+typedef struct ARect { int32_t left, top, right, bottom; } ARect;
+
+static int fails;
+#define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL " __VA_ARGS__); printf("\n"); } } while (0)
+
+static struct {
+    /* set by a test */
+    bool allocFail[8];              /* by AHB format */
+    bool bgraExternal;              /* Vulkan reports an external format for BGRA */
+    long lockFail, corruptCopy;     /* the n-th lock fails; the n-th copy writes one wrong byte (1-based, 0: none) */
+    uint32_t corruptByte;
+    VkResult submitResult, fenceResult;
+    /* kept */
+    long copies, locks;
+    bool fencePending;
+    int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
+    int flushes, invalidates, downloads, hostBarriers, cpuWrites;
+} emu;
+static uint64_t hashOf(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    while (n--)
+        h = (h ^ *p++) * 1099511628211ULL;
+    return h;
+}
+
+static void violation(const char *what) {
+    emu.violations++;
+    CHECK(0, "fake device: %s", what);
+}
 static void AHardwareBuffer_describe(const AHardwareBuffer *b, AHardwareBuffer_Desc *d) { *d = b->desc; }
+static int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *d, AHardwareBuffer **out) {
+    AHardwareBuffer *b;
+    if (emu.allocFail[d->format & 7] || !(b = calloc(1, sizeof *b)))
+        return -12;
+    b->desc = *d;
+    b->desc.stride = (d->width + 31) & ~31u;
+    b->vkFormat = d->format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? (emu.bgraExternal ? VK_FORMAT_UNDEFINED : VK_FORMAT_B8G8R8A8_UNORM)
+                : VK_FORMAT_R8G8B8A8_UNORM;
+    b->memoryTypeBits = 0x7;
+    b->allocationSize = (VkDeviceSize) b->desc.stride * d->height * 4;
+    b->cpu = malloc((size_t) b->desc.stride * d->height * 4);
+    b->gpu = malloc((size_t) d->width * d->height * 4);
+    memset(b->cpu, 0xa5, (size_t) b->desc.stride * d->height * 4);
+    memset(b->gpu, 0x5a, (size_t) d->width * d->height * 4);
+    emu.ahbLive++;
+    *out = b;
+    return 0;
+}
+static void AHardwareBuffer_release(AHardwareBuffer *b) {
+    CHECK(!b->locked && !b->owned, "fake device: buffer released while %s", b->locked ? "locked" : "owned by the renderer");
+    free(b->cpu);
+    free(b->gpu);
+    free(b);
+    emu.ahbLive--;
+}
+static int AHardwareBuffer_lock(AHardwareBuffer *b, uint64_t usage, int32_t fence, const ARect *rect, void **out) {
+    (void) usage; (void) rect;
+    CHECK(fence == -1, "fake device: lock with a fence");
+    if (++emu.locks == emu.lockFail)
+        return -5;
+    if (emu.fencePending)
+        violation("CPU lock before the submission's fence was waited for");
+    if (b->owned)
+        violation("CPU lock of a buffer the renderer owns");
+    if (b->locked)
+        violation("CPU lock of a locked buffer");
+    b->locked = true;
+    b->lockedHash = hashOf(b->cpu, (size_t) b->desc.stride * b->desc.height * 4);
+    *out = b->cpu;
+    return 0;
+}
+static int AHardwareBuffer_unlock(AHardwareBuffer *b, int32_t *fence) {
+    CHECK(!fence, "fake device: unlock asking for a fence");
+    if (!b->locked)
+        violation("CPU unlock of a buffer not locked");
+    else if (hashOf(b->cpu, (size_t) b->desc.stride * b->desc.height * 4) != b->lockedHash)
+        emu.cpuWrites++;
+    b->locked = false;
+    return 0;
+}
 
 #include "diagtypes_src.inc"
 struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie_backend_control backend; };
 #define log(...) ((void) 0)
 #define loge(...) ((void) 0)
 #include "vk_src.inc"
-
-static int fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL " __VA_ARGS__); printf("\n"); } } while (0)
 
 /* ---- the fake Vulkan ---- */
 struct fake_device {
@@ -165,6 +255,7 @@ static VKAPI_ATTR void VKAPI_CALL fGetDeviceQueue(VkDevice d, uint32_t family, u
 static VKAPI_ATTR VkResult VKAPI_CALL fDeviceWaitIdle(VkDevice d) {
     (void) d;
     calls.waitIdle++;
+    emu.fencePending = false;
     return VK_SUCCESS;
 }
 /* ---- what an import calls: every object counted while alive, every argument kept ---- */
@@ -182,6 +273,15 @@ static struct {
     int viewCount;
 } imp;
 static uintptr_t nextHandle = 0x1000;
+static struct { VkDeviceMemory memory; AHardwareBuffer *ahb; uint8_t *host; } memories[64];
+static struct { VkImage image; AHardwareBuffer *ahb; } boundImages[64];
+static struct { VkBuffer buffer; VkDeviceSize size; uint8_t *bytes; } buffers[16];
+static AHardwareBuffer *ahbOf(VkImage image) {
+    for (int i = 0; i < 64; i++)
+        if (boundImages[i].image == image)
+            return boundImages[i].ahb;
+    return NULL;
+}
 static const void *findNext(const void *chain, VkStructureType type) {
     for (const VkBaseInStructure *p = chain; p; p = p->pNext)
         if (p->sType == type)
@@ -236,6 +336,9 @@ static VKAPI_ATTR void VKAPI_CALL fDestroyImage(VkDevice d, VkImage i, const VkA
     (void) d; (void) a;
     CHECK(i, "vkDestroyImage of a null image");
     imp.images--;
+    for (int j = 0; j < 64; j++)
+        if (boundImages[j].image == i)
+            memset(&boundImages[j], 0, sizeof boundImages[j]);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fAllocateMemory(VkDevice d, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     const VkImportAndroidHardwareBufferInfoANDROID *import =
@@ -250,12 +353,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL fAllocateMemory(VkDevice d, const VkMemory
         return cfg.allocateMemory;
     imp.memories++;
     *out = (VkDeviceMemory) nextHandle++;
+    for (int i = 0; i < 64; i++)
+        if (!memories[i].memory) {
+            memories[i].memory = *out;
+            memories[i].ahb = import ? (AHardwareBuffer *) import->buffer : NULL;
+            memories[i].host = import ? NULL : calloc(1, info->allocationSize);
+            break;
+        }
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fFreeMemory(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) {
     (void) d; (void) a;
     CHECK(m, "vkFreeMemory of null memory");
     imp.memories--;
+    for (int i = 0; i < 64; i++)
+        if (memories[i].memory == m) {
+            free(memories[i].host);
+            memset(&memories[i], 0, sizeof memories[i]);
+        }
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fBindImageMemory(VkDevice d, VkImage i, VkDeviceMemory m, VkDeviceSize offset) {
     (void) d; (void) m;
@@ -264,6 +379,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL fBindImageMemory(VkDevice d, VkImage i, Vk
     if (cfg.bindMemory != VK_SUCCESS)
         return cfg.bindMemory;
     imp.binds++;
+    for (int k = 0; k < 64; k++)
+        if (memories[k].memory == m)
+            for (int j = 0; j < 64; j++)
+                if (!boundImages[j].image || boundImages[j].image == i) {
+                    boundImages[j].image = i;
+                    boundImages[j].ahb = memories[k].ahb;
+                    break;
+                }
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateImageView(VkDevice d, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *a, VkImageView *out) {
@@ -281,11 +404,296 @@ static VKAPI_ATTR void VKAPI_CALL fDestroyImageView(VkDevice d, VkImageView v, c
     CHECK(v, "vkDestroyImageView of a null view");
     imp.views--;
 }
+/* ---- what the self-test records and submits, run by the small device ---- */
+enum { OP_IMAGE_BARRIER, OP_BUFFER_BARRIER, OP_COPY_IMAGE, OP_BUFFER_TO_IMAGE, OP_IMAGE_TO_BUFFER };
+struct fake_op {
+    int kind;
+    VkImageMemoryBarrier image;
+    VkBufferMemoryBarrier buffer;
+    VkPipelineStageFlags src, dst;
+    VkImage a, b;
+    VkBuffer buf;
+    VkImageLayout la, lb;
+    VkExtent3D extent;
+};
+static struct { struct fake_op ops[16]; int n; bool recording; } cmdObj;
+static uint8_t *bufferBytes(VkBuffer b) {
+    for (int i = 0; i < 16; i++)
+        if (buffers[i].buffer == b)
+            return buffers[i].bytes;
+    return NULL;
+}
+static void record(struct fake_op op) {
+    if (!cmdObj.recording || cmdObj.n == 16)
+        violation("command recorded outside a command buffer being recorded, or too many");
+    else
+        cmdObj.ops[cmdObj.n++] = op;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateCommandPool(VkDevice d, const VkCommandPoolCreateInfo *i, const VkAllocationCallbacks *a, VkCommandPool *p) {
+    (void) d; (void) a;
+    CHECK(i->queueFamilyIndex == 1 && (i->flags & VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT), "fake device: command pool");
+    emu.pools++;
+    *p = (VkCommandPool) nextHandle++;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) {
+    (void) d; (void) p; (void) a;
+    emu.pools--;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *i, VkCommandBuffer *c) {
+    (void) d;
+    CHECK(i->commandBufferCount == 1, "fake device: one command buffer");
+    *c = (VkCommandBuffer) &cmdObj;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fResetCommandBuffer(VkCommandBuffer c, VkCommandBufferResetFlags f) {
+    (void) c; (void) f;
+    cmdObj.n = 0;
+    cmdObj.recording = false;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fBeginCommandBuffer(VkCommandBuffer c, const VkCommandBufferBeginInfo *i) {
+    (void) c; (void) i;
+    cmdObj.n = 0;
+    cmdObj.recording = true;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fEndCommandBuffer(VkCommandBuffer c) {
+    (void) c;
+    cmdObj.recording = false;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+        VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b,
+        uint32_t ni, const VkImageMemoryBarrier *im) {
+    (void) c; (void) f; (void) m;
+    CHECK(nm == 0, "fake device: global memory barrier");
+    for (uint32_t i = 0; i < nb; i++)
+        record((struct fake_op) { .kind = OP_BUFFER_BARRIER, .buffer = b[i], .src = src, .dst = dst });
+    for (uint32_t i = 0; i < ni; i++)
+        record((struct fake_op) { .kind = OP_IMAGE_BARRIER, .image = im[i], .src = src, .dst = dst });
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdCopyImage(VkCommandBuffer c, VkImage s, VkImageLayout sl, VkImage t, VkImageLayout tl,
+                                                uint32_t n, const VkImageCopy *r) {
+    (void) c;
+    CHECK(n == 1, "fake device: one region");
+    record((struct fake_op) { .kind = OP_COPY_IMAGE, .a = s, .la = sl, .b = t, .lb = tl, .extent = r->extent });
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdCopyBufferToImage(VkCommandBuffer c, VkBuffer s, VkImage t, VkImageLayout tl, uint32_t n,
+                                                        const VkBufferImageCopy *r) {
+    (void) c;
+    CHECK(n == 1 && r->bufferOffset == 0 && r->bufferRowLength == 0 && r->bufferImageHeight == 0, "fake device: a tightly packed region");
+    record((struct fake_op) { .kind = OP_BUFFER_TO_IMAGE, .buf = s, .b = t, .lb = tl, .extent = r->imageExtent });
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdCopyImageToBuffer(VkCommandBuffer c, VkImage s, VkImageLayout sl, VkBuffer t, uint32_t n,
+                                                        const VkBufferImageCopy *r) {
+    (void) c;
+    CHECK(n == 1 && r->bufferOffset == 0 && r->bufferRowLength == 0 && r->bufferImageHeight == 0, "fake device: a tightly packed region");
+    record((struct fake_op) { .kind = OP_IMAGE_TO_BUFFER, .a = s, .la = sl, .buf = t, .extent = r->imageExtent });
+}
+static void pack(AHardwareBuffer *b) {
+    for (uint32_t y = 0; y < b->desc.height; y++)
+        memcpy(b->gpu + (size_t) y * b->desc.width * 4, b->cpu + (size_t) y * b->desc.stride * 4, b->desc.width * 4);
+}
+static void unpack(AHardwareBuffer *b) {
+    for (uint32_t y = 0; y < b->desc.height; y++)
+        memcpy(b->cpu + (size_t) y * b->desc.stride * 4, b->gpu + (size_t) y * b->desc.width * 4, b->desc.width * 4);
+}
+static void copied(uint8_t *dst) {
+    if (++emu.copies == emu.corruptCopy)
+        dst[emu.corruptByte] ^= 0x01;
+}
+static bool usable(AHardwareBuffer *b, VkImageLayout l, VkImageLayout want, VkExtent3D e) {
+    if (!b || !b->owned || b->layout != l || l != want) {
+        violation("copy with an image not owned, or not in the copy's layout");
+        return false;
+    }
+    if (e.width != b->desc.width || e.height != b->desc.height || e.depth != 1) {
+        violation("copy of a part of the image");
+        return false;
+    }
+    return true;
+}
+static void run(const struct fake_op *op) {
+    AHardwareBuffer *a = op->a ? ahbOf(op->a) : NULL, *b = op->b ? ahbOf(op->b) : NULL, *x;
+    const VkImageMemoryBarrier *m = &op->image;
+    switch (op->kind) {
+    case OP_IMAGE_BARRIER:
+        if (!(x = ahbOf(m->image))) {
+            violation("barrier on an unknown image");
+            return;
+        }
+        if (m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT && m->dstQueueFamilyIndex == 1) {
+            if (x->owned || x->locked)
+                violation("acquire of a buffer the renderer owns or the CPU holds");
+            if (m->oldLayout == VK_IMAGE_LAYOUT_GENERAL)
+                pack(x);
+            else if (m->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+                memset(x->gpu, 0xee, (size_t) x->desc.width * x->desc.height * 4), emu.acquiresFromUndefined++;
+            else
+                violation("acquire from a layout the buffer is never released in");
+            x->owned = true;
+            x->layout = m->newLayout;
+            emu.acquires++;
+        } else if (m->srcQueueFamilyIndex == 1 && m->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+            if (!x->owned || m->oldLayout != x->layout)
+                violation("release of a buffer not owned, or from another layout");
+            x->owned = false;
+            if (m->newLayout == VK_IMAGE_LAYOUT_GENERAL)
+                unpack(x), emu.releases++;
+            else
+                violation("release in a layout other than GENERAL");
+        } else if (m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED && m->dstQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED) {
+            if (!x->owned || (m->oldLayout != x->layout && m->oldLayout != VK_IMAGE_LAYOUT_UNDEFINED))
+                violation("layout transition of a buffer not owned, or from another layout");
+            if (m->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+                memset(x->gpu, 0xee, (size_t) x->desc.width * x->desc.height * 4);
+            x->layout = m->newLayout;
+        } else
+            violation("ownership transfer with a queue family other than FOREIGN and the renderer's");
+        return;
+    case OP_BUFFER_BARRIER:
+        return;
+    case OP_COPY_IMAGE:
+        if (usable(a, op->la, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, op->extent) && usable(b, op->lb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, op->extent)) {
+            memcpy(b->gpu, a->gpu, (size_t) a->desc.width * a->desc.height * 4);
+            copied(b->gpu);
+        }
+        return;
+    case OP_BUFFER_TO_IMAGE:
+        if (usable(b, op->lb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, op->extent)) {
+            memcpy(b->gpu, bufferBytes(op->buf), (size_t) b->desc.width * b->desc.height * 4);
+            copied(b->gpu);
+        }
+        return;
+    case OP_IMAGE_TO_BUFFER:
+        if (usable(a, op->la, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, op->extent)) {
+            memcpy(bufferBytes(op->buf), a->gpu, (size_t) a->desc.width * a->desc.height * 4);
+            copied(bufferBytes(op->buf));
+        }
+        emu.downloads++;
+        return;
+    }
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) {
+    (void) q;
+    if (emu.submitResult != VK_SUCCESS)
+        return emu.submitResult;
+    CHECK(n == 1 && s->commandBufferCount == 1 && s->pCommandBuffers[0] == (VkCommandBuffer) &cmdObj && !cmdObj.recording,
+          "fake device: submission of a command buffer still being recorded");
+    if (emu.fencePending)
+        violation("submission while the previous one's fence was not waited for");
+    for (int i = 0; i < cmdObj.n; i++) {
+        run(&cmdObj.ops[i]);
+        /* the host reads a download after the fence: only a barrier to HOST_READ makes it visible there */
+        if (cmdObj.ops[i].kind == OP_IMAGE_TO_BUFFER) {
+            bool barrier = false;
+            for (int j = i + 1; j < cmdObj.n; j++)
+                if (cmdObj.ops[j].kind == OP_BUFFER_BARRIER && cmdObj.ops[j].buffer.buffer == cmdObj.ops[i].buf &&
+                    (cmdObj.ops[j].buffer.srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                    (cmdObj.ops[j].buffer.dstAccessMask & VK_ACCESS_HOST_READ_BIT) &&
+                    (cmdObj.ops[j].src & VK_PIPELINE_STAGE_TRANSFER_BIT) && (cmdObj.ops[j].dst & VK_PIPELINE_STAGE_HOST_BIT))
+                    barrier = true;
+            if (barrier)
+                emu.hostBarriers++;
+            else
+                violation("a copy into host memory with no barrier making it visible to the host");
+        }
+    }
+    emu.fencePending = f != VK_NULL_HANDLE;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateFence(VkDevice d, const VkFenceCreateInfo *i, const VkAllocationCallbacks *a, VkFence *f) {
+    (void) d; (void) i; (void) a;
+    emu.fences++;
+    *f = (VkFence) nextHandle++;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyFence(VkDevice d, VkFence f, const VkAllocationCallbacks *a) {
+    (void) d; (void) f; (void) a;
+    emu.fences--;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fWaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
+    (void) d; (void) n; (void) f; (void) all;
+    CHECK(timeout != UINT64_MAX, "fake device: an unbounded fence wait");
+    if (emu.fenceResult != VK_SUCCESS)
+        return emu.fenceResult;
+    emu.fencePending = false;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fResetFences(VkDevice d, uint32_t n, const VkFence *f) {
+    (void) d; (void) n; (void) f;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateBuffer(VkDevice d, const VkBufferCreateInfo *i, const VkAllocationCallbacks *a, VkBuffer *b) {
+    (void) d; (void) a;
+    emu.buffers++;
+    *b = (VkBuffer) nextHandle++;
+    for (int k = 0; k < 16; k++)
+        if (!buffers[k].buffer) {
+            buffers[k].buffer = *b;
+            buffers[k].size = i->size;
+            buffers[k].bytes = NULL;
+            break;
+        }
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a) {
+    (void) d; (void) a;
+    emu.buffers--;
+    for (int k = 0; k < 16; k++)
+        if (buffers[k].buffer == b)
+            memset(&buffers[k], 0, sizeof buffers[k]);
+}
+static VKAPI_ATTR void VKAPI_CALL fGetBufferMemoryRequirements(VkDevice d, VkBuffer b, VkMemoryRequirements *r) {
+    (void) d;
+    for (int k = 0; k < 16; k++)
+        if (buffers[k].buffer == b)
+            *r = (VkMemoryRequirements) { buffers[k].size, 256, 0x7 };
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize offset) {
+    (void) d;
+    for (int k = 0; k < 16; k++)
+        if (buffers[k].buffer == b)
+            for (int j = 0; j < 64; j++)
+                if (memories[j].memory == m)
+                    buffers[k].bytes = memories[j].host + offset;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fMapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags f, void **out) {
+    (void) d; (void) size; (void) f;
+    for (int j = 0; j < 64; j++)
+        if (memories[j].memory == m && memories[j].host) {
+            emu.mapped++;
+            *out = memories[j].host + offset;
+            return VK_SUCCESS;
+        }
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+static VKAPI_ATTR void VKAPI_CALL fUnmapMemory(VkDevice d, VkDeviceMemory m) {
+    (void) d; (void) m;
+    emu.mapped--;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fFlushMappedMemoryRanges(VkDevice d, uint32_t n, const VkMappedMemoryRange *r) {
+    (void) d; (void) n; (void) r;
+    emu.flushes++;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fInvalidateMappedMemoryRanges(VkDevice d, uint32_t n, const VkMappedMemoryRange *r) {
+    (void) d; (void) n; (void) r;
+    emu.invalidates++;
+    return VK_SUCCESS;
+}
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetDeviceProcAddr(VkDevice d, const char *name) {
     (void) d;
 #define F(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction) f ## n;
     F(DestroyDevice) F(GetDeviceQueue) F(DeviceWaitIdle) F(GetAndroidHardwareBufferPropertiesANDROID) F(CreateImage)
     F(DestroyImage) F(AllocateMemory) F(FreeMemory) F(BindImageMemory) F(CreateImageView) F(DestroyImageView)
+    F(CreateCommandPool) F(DestroyCommandPool) F(AllocateCommandBuffers) F(ResetCommandBuffer) F(BeginCommandBuffer)
+    F(EndCommandBuffer) F(CmdPipelineBarrier) F(CmdCopyImage) F(CmdCopyBufferToImage) F(CmdCopyImageToBuffer)
+    F(QueueSubmit) F(CreateFence) F(DestroyFence) F(WaitForFences) F(ResetFences) F(CreateBuffer) F(DestroyBuffer)
+    F(GetBufferMemoryRequirements) F(BindBufferMemory) F(MapMemory) F(UnmapMemory) F(FlushMappedMemoryRanges)
+    F(InvalidateMappedMemoryRanges)
 #undef F
     return NULL;
 }
@@ -313,6 +721,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetInstanceProcAddr(VkInstance 
 /* A phone: Vulkan 1.1 loader and device, a compute-only family before the graphics one, all extensions. */
 static void good(void) {
     memset(&cfg, 0, sizeof cfg);
+    memset(&emu, 0, sizeof emu);
     cfg.instanceVersion = VK_API_VERSION_1_1;
     cfg.instanceExt[0] = VK_KHR_SURFACE_EXTENSION_NAME;
     cfg.instanceExt[1] = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
