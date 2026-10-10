@@ -449,3 +449,86 @@ void lorieVkImagesClear(struct lorie_vk *vk, struct lorie_vk_images *images) {
     free(images->items);
     memset(images, 0, sizeof(*images));
 }
+
+// The layout, pipeline stage and accesses of each use, and those of its accesses that write.
+static void lorieVkUseScope(enum lorie_vk_use use, VkImageLayout *layout, VkPipelineStageFlags *stage,
+                            VkAccessFlags *access, VkAccessFlags *writes) {
+    switch (use) {
+        case LORIE_VK_USE_SAMPLE:
+            *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            *stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            *access = VK_ACCESS_SHADER_READ_BIT;
+            *writes = 0;
+            return;
+        case LORIE_VK_USE_RENDER:
+            *layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            *stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            *access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            *writes = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            return;
+        case LORIE_VK_USE_TRANSFER_SRC:
+            *layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            *stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            *access = VK_ACCESS_TRANSFER_READ_BIT;
+            *writes = 0;
+            return;
+        case LORIE_VK_USE_TRANSFER_DST:
+        default:
+            *layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            *stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            *access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            *writes = VK_ACCESS_TRANSFER_WRITE_BIT;
+            return;
+    }
+}
+
+static struct lorie_vk_barrier lorieVkBarrier(VkImage image) {
+    return (struct lorie_vk_barrier) { .barrier = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .image = image,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } } };
+}
+
+/*
+ * An acquire operation: its source access mask is ignored, and should be 0, and the first synchronization scope
+ * does not apply to it (Queue Family Ownership Transfer); the foreign release it follows - AHardwareBuffer_unlock
+ * by the X server - happened before this submission, which orders it (Host Write Ordering Guarantees). The
+ * layout transition from GENERAL happens between the two, and the image is then visible to `use`.
+ */
+struct lorie_vk_barrier lorieVkAcquireBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use) {
+    struct lorie_vk_barrier b = lorieVkBarrier(image);
+    VkAccessFlags writes;
+    lorieVkUseScope(use, &b.barrier.newLayout, &b.dstStage, &b.barrier.dstAccessMask, &writes);
+    b.barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.barrier.srcAccessMask = 0;
+    b.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    b.barrier.dstQueueFamilyIndex = vk->queueFamily;
+    b.srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    return b;
+}
+
+/*
+ * A release operation: it happens after the availability operation, so the writes of `use` are made available
+ * through the source access mask; its destination access mask is ignored, and should be 0, and the second
+ * synchronization scope does not apply to it. The caller waits for the submission's fence before the X server
+ * may lock the buffer.
+ */
+struct lorie_vk_barrier lorieVkReleaseBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use) {
+    struct lorie_vk_barrier b = lorieVkBarrier(image);
+    VkAccessFlags access;
+    lorieVkUseScope(use, &b.barrier.oldLayout, &b.srcStage, &access, &b.barrier.srcAccessMask);
+    b.barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.barrier.dstAccessMask = 0;
+    b.barrier.srcQueueFamilyIndex = vk->queueFamily;
+    b.barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    b.dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    return b;
+}
+
+struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to) {
+    struct lorie_vk_barrier b = lorieVkBarrier(image);
+    VkAccessFlags access, writes;
+    lorieVkUseScope(from, &b.barrier.oldLayout, &b.srcStage, &access, &b.barrier.srcAccessMask);
+    lorieVkUseScope(to, &b.barrier.newLayout, &b.dstStage, &b.barrier.dstAccessMask, &writes);
+    return b;
+}

@@ -236,6 +236,39 @@ CONTROLS = [
         return NULL;
     }""",
      "tvkimport"),
+    ("an acquire from VK_IMAGE_LAYOUT_UNDEFINED", "vk.c",
+     """    b.barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;""",
+     """    b.barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;""",
+     "tvkbarrier"),
+    ("an acquire from VK_QUEUE_FAMILY_EXTERNAL", "vk.c",
+     """    b.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;""",
+     """    b.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;""",
+     "tvkbarrier"),
+    ("a release to VK_QUEUE_FAMILY_EXTERNAL", "vk.c",
+     """    b.barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;""",
+     """    b.barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;""",
+     "tvkbarrier"),
+    ("a release leaving the image in the layout of its use", "vk.c",
+     """    b.barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;""",
+     """    b.barrier.newLayout = b.barrier.oldLayout;""",
+     "tvkbarrier"),
+    ("a release not making the writes available", "vk.c",
+     """    b.barrier.dstAccessMask = 0;
+    b.barrier.srcQueueFamilyIndex = vk->queueFamily;""",
+     """    b.barrier.dstAccessMask = 0;
+    b.barrier.srcAccessMask = 0;
+    b.barrier.srcQueueFamilyIndex = vk->queueFamily;""",
+     "tvkbarrier"),
+    ("an acquire with a source access mask", "vk.c",
+     """    b.barrier.srcAccessMask = 0;
+    b.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;""",
+     """    b.barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;""",
+     "tvkbarrier"),
+    ("rendering that loads the attachment without reading it", "vk.c",
+     """            *access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
+     """            *access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
+     "tvkbarrier"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

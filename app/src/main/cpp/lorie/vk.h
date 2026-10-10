@@ -56,8 +56,7 @@ struct lorie_vk {
  * the swizzle rule is GLES's: rgbaOrder says the declared format is not BGRA (LorieBuffer_isRgba).
  *
  * The image is created with initialLayout VK_IMAGE_LAYOUT_UNDEFINED, as the specification requires of an image
- * with external memory. How it is taken over from, and given back to, the X server (ownership and layouts) is
- * not decided here.
+ * with external memory. It is taken over from, and given back to, the X server by the barriers below.
  */
 struct lorie_vk_image {
     uint64_t id;
@@ -76,6 +75,40 @@ struct lorie_vk_images {
     struct lorie_vk_image *items;
     uint32_t count, capacity;
 };
+
+/*
+ * Ownership of the X server's AHardwareBuffers. The specification makes AHardwareBuffer_lock/_unlock an
+ * acquire/release of ownership by a foreign device (Android Hardware Buffer, External Resource Sharing), so
+ * the renderer must acquire every image from VK_QUEUE_FAMILY_FOREIGN_EXT before using it, and release it back
+ * when done, its release complete (the frame's fence) before the X server may lock the buffer again.
+ *
+ * Which layout an AHardwareBuffer is in while foreign owned, the normative specification does not say: its
+ * implied-layout table lists D3D11 handles only; GENERAL rests on VK_KHR_external_memory's resolved issue 3
+ * (informative: "Vulkan-incompatible APIs will require the image to be in the GENERAL layout whenever they are
+ * accessing them"). Stage 1 therefore takes, as an implementation policy and not as a specification rule:
+ *
+ *     foreign (X server / CPU) owned  =  VK_QUEUE_FAMILY_FOREIGN_EXT, VK_IMAGE_LAYOUT_GENERAL
+ *
+ * Every acquire starts from GENERAL - never from VK_IMAGE_LAYOUT_UNDEFINED, which may discard the contents the
+ * CPU defined - and every release ends in GENERAL. Within the renderer's queue an image is in the layout of
+ * its use. The device self-test checks the policy byte for byte; nothing else is tried if it fails.
+ */
+enum lorie_vk_use {
+    LORIE_VK_USE_SAMPLE,        // read by a fragment shader
+    LORIE_VK_USE_RENDER,        // colour attachment, loaded and stored
+    LORIE_VK_USE_TRANSFER_SRC,
+    LORIE_VK_USE_TRANSFER_DST,
+};
+struct lorie_vk_barrier {
+    VkImageMemoryBarrier barrier;
+    VkPipelineStageFlags srcStage, dstStage;
+};
+// Acquire from the foreign owner for `use`: FOREIGN/GENERAL to the renderer's queue family in use's layout.
+struct lorie_vk_barrier lorieVkAcquireBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use);
+// Release to the foreign owner after `use`: from use's layout to FOREIGN/GENERAL.
+struct lorie_vk_barrier lorieVkReleaseBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use);
+// Within the renderer's queue, from one use to another.
+struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to);
 
 // libvulkan.so's vkGetInstanceProcAddr, or NULL with the fallback recorded (VK_LOADER).
 PFN_vkGetInstanceProcAddr lorieVkLoader(volatile struct lorie_shared_server_state *st);
