@@ -382,12 +382,14 @@ static RRModePtr lorieCvt(int width, int height, int framerate) {
 }
 
 static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {
+    lorieFlowNoteCursorMove(pvfb->state->cursor.moved, &pvfb->state->renderFlow);
     pvfb->state->cursor.x = x;
     pvfb->state->cursor.y = y;
     pvfb->state->cursor.moved = TRUE;
     // No need to explicitly lock the mutex, it will cause waiting for rendering to be finished.
     // We are simply signaling the renderer in the case if it sleeps.
     pthread_cond_signal(rendererCond);
+    lorieFlowNoteSignal(true);
 }
 
 static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
@@ -480,15 +482,19 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     lorieFrameClockNoteClear(pvfb->state->waitForNextFrame);
     __atomic_store_n(&pvfb->state->waitForNextFrame, false, __ATOMIC_SEQ_CST);
 
-    if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
+    if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable) {
+        lorieFlowNoteDamageSkipped();
         return TRUE;
+    }
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
     priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
 
-    if (!priv)
+    if (!priv) {
         // Impossible situation, but let's skip this step
+        lorieFlowNoteDamageSkipped();
         return TRUE;
+    }
 
     if (nonEmpty && priv->buffer) {
         // We should unlock and lock buffer in order to update texture content on some devices
@@ -504,10 +510,13 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         }
 
         DamageEmpty(pvfb->damage);
+        // Before drawRequested goes up, so a renderer that sees it also sees when it did (flowstats.h).
+        lorieFlowNoteDamage(true, pvfb->state->drawRequested, &pvfb->state->renderFlow);
         if (!pvfb->state->drawRequested)
             __atomic_store_n(&pvfb->state->frameClock.drawTickSerial, tick, __ATOMIC_RELEASE);
         pvfb->state->drawRequested = TRUE;
-    }
+    } else
+        lorieFlowNoteDamage(false, pvfb->state->drawRequested, &pvfb->state->renderFlow);
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
         pvfb->state->rootWindowTextureID = LorieBuffer_description(priv->buffer)->id;
@@ -517,6 +526,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         // for all drawing operations to be finished.
         // Renderer thread will check the `drawRequested` flag right before going to sleep.
         pthread_cond_signal(rendererCond);
+        lorieFlowNoteSignal(false);
     }
 
     return TRUE;
@@ -560,6 +570,8 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
     lorieFrameClockReport(&pvfb->state->frameClock, pvfb->state->renderedFrames,
                           pvfb->state->surfaceAvailable, lorieConnectionAlive(), pvfb->root.framerate);
+    lorieFlowReport(&pvfb->state->renderFlow, pvfb->state->renderedFrames,
+                    pvfb->state->surfaceAvailable, lorieConnectionAlive());
 
     pvfb->state->presentStats.frameSamples = 0;
     pvfb->state->presentStats.frameSumUs = 0;

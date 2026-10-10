@@ -9,10 +9,14 @@ VSYNC -> AChoreographer callback (owner thread: the X server process' main Loope
       -> renderer (activity process) draws, sets waitForNextFrame
 ```
 
+`app/src/main/cpp/lorie/flowstats.c` measures what feeds those frames: input -> X server -> damage ->
+draw request -> renderer wakeup (XlorieFlow lines below).
+
 ## Host tests
 
 `sh tests/frameclock/run.sh` (Termux: `CC=clang`) builds `tframeclock.c` against test doubles of the
-Android APIs and runs it, then `syntax.sh` checks every touched lorie source for Android arm64 and
+Android APIs and runs it, `tflowstats.c` (flowstats.c, plus the renderer's flow counters cut out of
+renderer.c), then `syntax.sh` checks every touched lorie source for Android arm64 and
 armv7 with the CI's error flags, against a patched copy of the xserver tree (the submodule must be a
 real checkout; it is never patched in place).
 
@@ -59,6 +63,64 @@ waiting for state->lock). Cgroup changes of either thread are logged when they h
 | callbacks regular, `cb_to_redraw` large, `queue_coalesced`/`ticks_max` up, `x_busy_max_us` large | X server main thread (`lock_wait_*` up: waiting for the renderer) |
 | callbacks and redraws regular, `handover_late` / `wait_over_tick` up | renderer hand-off (waitForNextFrame) |
 | all of the above regular, renderer `frame avg` still bad | inside the renderer frame (XloriePerf root_wait/swap) |
+
+## Input -> damage -> draw request -> renderer (XlorieFlow / XlorieFlowR)
+
+Printed right after the frame clock lines, same 5 second window, same gap buckets
+(`<4/<12/<25/<50/<100/>=100 ms`), so each stage's cadence can be put next to the next one's.
+
+Note: `XlorieFrames` (frame avg/max/hitches) measures renderer frame to renderer frame. A stretch with
+nothing new to draw counts there exactly like a stall; `gap_long_idle` / `gap_long_pending` below
+tell the two apart.
+
+`XlorieFlow:` X server side, in pipeline order
+
+| field | stage | meaning |
+|---|---|---|
+| `in_motion`, `in_drag`, `in_btn`, `in_scroll`, `in_touch`, `in_stylus`, `in_key` | input | events read from the activity's socket (input thread); `in_drag` = motion with a button / touch down |
+| `in_gap_max_us`, `in_hist` | input | gaps between motion events (pauses included) |
+| `in_drag_gap_max_us` | input | gaps between motion events *within* one drag |
+| `inject`, `inject_gap_max_us` | inject | events handed to the X server (QueuePointerEvents / QueueTouchEvents) |
+| `cursor`, `cursor_gap_max_us`, `in_to_cursor_max_us` | cursor | lorieMoveCursor runs; first unhandled motion -> sprite moved |
+| `dmg_check`, `dmg_on`, `dmg_off`, `dmg_skip` | damage | lorieRedraw ticks that looked at root damage: non-empty / empty / skipped (no connection or surface) |
+| `dmg_gap_max_us`, `dmg_hist` | damage | gaps between ticks with damage |
+| `in_to_dmg_max_us` | damage | first undrawn drag motion -> the tick that found damage |
+| `drag_nodmg_max_us` | damage | longest time drag motion kept waiting with no damage at all (released drags included) |
+| `req`, `req_already` | request | drawRequested false -> true / damage while the previous request was still pending |
+| `req_gap_max_us`, `req_hist` | request | gaps between draw requests |
+| `sig_draw`, `sig_cursor` | request | rendererCond signals from lorieRedraw / lorieMoveCursor |
+
+`XlorieFlowR:` renderer side (shared state)
+
+| field | meaning |
+|---|---|
+| `frames`, `frame_hist` | frames drawn, gaps between them |
+| `f_draw`, `f_cursor`, `f_other` | what each frame was for: a draw request, the cursor only, anything else (GPU copy, surface) |
+| `req_to_frame_max_us`/`_avg_us`, `cursor_to_frame_max_us` | request (or first cursor move) -> frame start |
+| `gap_long_idle`, `gap_idle_max_us` | frame gaps >= 33 ms with no request pending for that long: nothing to draw |
+| `gap_long_pending`, `gap_pending_max_us` | frame gaps >= 33 ms with a request pending >= 33 ms: the renderer was late |
+| `wait` | pthread_cond_wait calls of the render loop |
+| `wake_draw`, `wake_cursor`, `wake_gpucopy`, `wake_state`, `wake_gated`, `wake_none` | what was pending when it returned (`gated`: work, but waitForNextFrame or no surface) |
+| `sw_waitframe`, `sw_buffers`, `sw_nosurface`, `sw_idle` | why rendererShouldWait() sent it to sleep (`idle`: nothing to do) |
+| `limiter`, `limiter_max_us` | deliberate timed waits of the coalesce / high-refresh limiter |
+
+### Where a stutter is, one 5 second window at a time
+
+| pattern | stage |
+|---|---|
+| `in_drag_gap_max_us` large while dragging | input never reached the X server (activity / socket side) |
+| input regular, `in_to_cursor_max_us` large | the X server handled the input late |
+| input regular, `drag_nodmg_max_us` / `dmg_gap_max_us` large | nothing was drawn for it: X clients / compositor, or the X server main thread (`x_busy_max_us` in XlorieFrameClockSched) |
+| damage regular, `req` regular, `gap_long_pending` > 0 or `req_to_frame_max_us` large | renderer late with work; `wake_*` / `sw_*` / `limiter` say why |
+| `gap_long_idle` only, damage gaps match the frame gaps | idle: nothing new to show, not a renderer hitch |
+
+### Tests, each compared stage by stage in the same windows
+
+| test | expect when healthy |
+|---|---|
+| A. glmark2 only | `in_*` ~ 0; `dmg_on` ~ glmark2's frame rate, `dmg_hist` in its bucket; `req` + `req_already` ~ `dmg_on`; `frames` ~ `req`; `gap_long_pending` = 0 |
+| B. window drag only | `in_drag` at the touch/pointer rate, small `in_drag_gap_max_us`; `dmg_on` follows the drag, `drag_nodmg_max_us` a frame or two; `frames` ~ `req` |
+| C. glmark2 + window drag | as A and B together; the first stage whose cadence breaks (input, cursor, damage, request, renderer) is where the stutter is |
 
 ## Fault injection
 

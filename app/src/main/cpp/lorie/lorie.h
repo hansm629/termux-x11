@@ -15,6 +15,7 @@
 #include "linux/input-event-codes.h"
 #include "buffer.h"
 #include "frameclock.h"
+#include "flowstats.h"
 
 #define PORT 7892
 #define MAGIC "0xDEADBEEF"
@@ -257,6 +258,8 @@ struct lorie_shared_server_state {
 
     /* Frame clock hand-off between lorieRedraw and the renderer (see frameclock.h). */
     struct lorie_frame_clock_stats frameClock;
+    /* Input -> damage -> draw request -> renderer (see flowstats.h). */
+    struct lorie_render_flow_stats renderFlow;
 
     /*
      * GL_VENDOR | GL_RENDERER of the context the renderer actually draws with, published once so

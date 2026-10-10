@@ -44,7 +44,7 @@ DEFS="-DHAVE_DIX_CONFIG_H -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XSERVER64=1 -DEGL_N
 status=0
 cd "$CPP"
 for target in aarch64-linux-android26 armv7a-linux-androideabi26 i686-linux-android26; do
-    for f in lorie/frameclock.c lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/buffer.c; do
+    for f in lorie/frameclock.c lorie/flowstats.c lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/buffer.c; do
         out=$("$CLANG" --target=$target -fsyntax-only -std=gnu11 -Wno-everything $ERRS $DEFS \
               -include lorie/shm/shm.h $INC "$f" 2>&1 | grep -E "error" || true)
         # The frame clock's own 64 bit atomics must stay lock-free on every ABI (shared across processes).
@@ -63,7 +63,7 @@ if [ "${WARN:-0}" = 1 ]; then
     "$CLANG" --target=aarch64-linux-android26 -fsyntax-only -std=gnu11 -Wall -Wpointer-arith -Wformat=2 \
         -Wstrict-prototypes -Wbad-function-cast -Wold-style-definition -Wunused -Wmissing-format-attribute \
         -Wredundant-decls -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-missing-prototypes \
-        $DEFS -include lorie/shm/shm.h $INC lorie/frameclock.c 2>&1 | grep -E "warning|error" || true
+        $DEFS -include lorie/shm/shm.h $INC lorie/frameclock.c lorie/flowstats.c 2>&1 | grep -E "warning|error" || true
 fi
 [ $status = 0 ] && echo "syntax (Android arm64 + armv7 + x86, CI error flags, aligned atomics): PASS"
 exit $status
