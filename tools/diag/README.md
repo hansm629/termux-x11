@@ -33,7 +33,9 @@ when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,
-`iterations` times each, a byte-exact compare each time. `compares` counts the compares that passed;
+`iterations` times each, a byte-exact compare each time (RGBX's X byte excepted: undefined to Vulkan after
+an external write). The Vulkan backend runs the quick one (5 iterations) when it starts, the full one (1000)
+only when the X server is started with `TERMUX_X11_RENDERER_VK_SELFTEST=full`. `compares` counts the compares that passed;
 `formats_passed` / `formats_unavailable` are bit masks (1 RGBA, 2 RGBX, 4 BGRA - only BGRA may be
 unavailable). On a failure the `fail_*` fields say where: the step, the AHB format, the direction (1 or 2),
 the iteration, the byte and its expected and actual value, and the VkResult.
@@ -45,7 +47,8 @@ the iteration, the byte and its expected and actual value, and the VkResult.
 `renderer-proof.sh --expect vulkan|gles [--reports N] [--file LOG]` - judges the last N reports (default 3,
 15 seconds) and prints every check with its numbers; exit 0 PASS, 1 FAIL, 2 not enough reports.
 
-- `--expect vulkan`: `active=VULKAN`, `ownership=per_access` and the ownership self-test `result=pass` in
+- `--expect vulkan`: `active=VULKAN`, `ownership=per_access` and the full ownership self-test passed
+  (`result=pass`, `iterations` >= 1000 - start the X server with `TERMUX_X11_RENDERER_VK_SELFTEST=full`) in
   all N reports; `ahb_import_success`
   total > 0; over the reports
   `imported_source_draws`, `queue_submits`, `queue_present_success`, `frames_presented` > 0;

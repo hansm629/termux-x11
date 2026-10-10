@@ -336,6 +336,14 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
         goto fail;
     }
     img.format = formatProps.format;
+    // Only formats the ownership self-test passed on this device (BGRA may have been unavailable to it).
+    if (!(vk->verifiedFormats & (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? 1 :
+                                 desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM ? 2 :
+                                 desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? 4 : 0))) {
+        reason = LORIE_FALLBACK_AHB_FORMAT_UNSUPPORTED_BY_STAGE1;
+        r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto fail;
+    }
 
     // The image exactly as it will be made, asked about as an import of an AHardwareBuffer.
     {
@@ -542,10 +550,11 @@ struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from,
 #define LORIE_VK_SELFTEST_HEIGHT 45
 #define LORIE_VK_SELFTEST_TIMEOUT_NS 1000000000ULL
 
-static const struct { uint32_t format; uint8_t bit; bool required; } lorieVkSelftestFormats[] = {
-        { AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, true },
-        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true },
-        { AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, 4, false },
+// alphaDefined: whether the 4th byte is compared (not for RGBX, see vk.h)
+static const struct { uint32_t format; uint8_t bit; bool required, alphaDefined; } lorieVkSelftestFormats[] = {
+        { AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, true, true },
+        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true, false },
+        { AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, 4, false, true },
 };
 
 struct lorie_vk_selftest {
@@ -581,20 +590,22 @@ static void lorieVkSelftestPattern(uint8_t *out, uint32_t kind, uint32_t it) {
             }
 }
 
-// The first byte of `got` (rows `rowBytes` apart) that differs from tightly packed `expect`, or -1.
-static int64_t lorieVkSelftestDiff(const uint8_t *got, size_t rowBytes, const uint8_t *expect) {
+// The first byte of `got` (rows `rowBytes` apart) that differs from tightly packed `expect`, or -1; each pixel's
+// 4th byte only if `alphaDefined`.
+static int64_t lorieVkSelftestDiff(const uint8_t *got, size_t rowBytes, const uint8_t *expect, bool alphaDefined) {
     uint32_t y, i;
     const size_t w = LORIE_VK_SELFTEST_WIDTH * 4;
     for (y = 0; y < LORIE_VK_SELFTEST_HEIGHT; y++)
         if (memcmp(got + y * rowBytes, expect + y * w, w))
             for (i = 0; i < w; i++)
-                if (got[y * rowBytes + i] != expect[y * w + i])
+                if ((alphaDefined || i % 4 != 3) && got[y * rowBytes + i] != expect[y * w + i])
                     return (int64_t) (y * w + i);
     return -1;
 }
 
 // The CPU's turn, as the X server takes it: lock, compare with `expect` if given, write `write` if given, unlock.
-static uint8_t lorieVkSelftestCpu(AHardwareBuffer *b, const uint8_t *expect, const uint8_t *write, int64_t *diff, uint8_t *got) {
+static uint8_t lorieVkSelftestCpu(AHardwareBuffer *b, const uint8_t *expect, const uint8_t *write, bool alphaDefined,
+                                  int64_t *diff, uint8_t *got) {
     AHardwareBuffer_Desc d;
     uint8_t *p = NULL;
     uint32_t y;
@@ -602,7 +613,7 @@ static uint8_t lorieVkSelftestCpu(AHardwareBuffer *b, const uint8_t *expect, con
     AHardwareBuffer_describe(b, &d);
     if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, (void **) &p) || !p)
         return LORIE_VK_SELFTEST_STEP_CPU_LOCK;
-    if (expect && (*diff = lorieVkSelftestDiff(p, (size_t) d.stride * 4, expect)) >= 0) {
+    if (expect && (*diff = lorieVkSelftestDiff(p, (size_t) d.stride * 4, expect, alphaDefined)) >= 0) {
         uint32_t row = (uint32_t) (*diff / (LORIE_VK_SELFTEST_WIDTH * 4)), col = (uint32_t) (*diff % (LORIE_VK_SELFTEST_WIDTH * 4));
         *got = p[(size_t) row * d.stride * 4 + col];
         AHardwareBuffer_unlock(b, NULL);
@@ -747,6 +758,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     VkResult r = VK_SUCCESS;
 
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    vk->verifiedFormats = 7;    // its own buffers, to be verified; afterwards only the formats that passed
     if (st) {
         st->diag.vkSelftest = 0;
         st->diag.vkSelftestIterations = iterations;
@@ -801,7 +813,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
         direction = 1;
         for (it = 0; it < iterations; it++) {
             lorieVkSelftestPattern(t.expect, it % 5, it);
-            if ((step = lorieVkSelftestCpu(t.ahb[0], NULL, t.expect, &diff, &got)))
+            if ((step = lorieVkSelftestCpu(t.ahb[0], NULL, t.expect, true, &diff, &got)))
                 goto fail;
             if ((r = lorieVkSelftestBegin(vk, &t)) != VK_SUCCESS) {
                 step = LORIE_VK_SELFTEST_STEP_SUBMIT;
@@ -815,7 +827,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
             lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));
             if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
                 goto fail;
-            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, lorieVkSelftestFormats[f].alphaDefined, &diff, &got)))
                 goto fail;
             LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
         }
@@ -836,7 +848,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
             if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
                 goto fail;
             lorieVkSelftestPattern(t.write, (it + 2) % 5, it + 1);
-            if ((step = lorieVkSelftestCpu(t.ahb[0], t.expect, t.write, &diff, &got)))
+            if ((step = lorieVkSelftestCpu(t.ahb[0], t.expect, t.write, lorieVkSelftestFormats[f].alphaDefined, &diff, &got)))
                 goto fail;
             LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
 
@@ -862,7 +874,8 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
                 step = LORIE_VK_SELFTEST_STEP_FENCE;
                 goto fail;
             }
-            if ((diff = lorieVkSelftestDiff(t.mapped + t.stride, LORIE_VK_SELFTEST_WIDTH * 4, t.write)) >= 0) {
+            if ((diff = lorieVkSelftestDiff(t.mapped + t.stride, LORIE_VK_SELFTEST_WIDTH * 4, t.write,
+                                            lorieVkSelftestFormats[f].alphaDefined)) >= 0) {
                 got = t.mapped[t.stride + diff];
                 memcpy(t.expect, t.write, t.size);
                 step = LORIE_VK_SELFTEST_STEP_COMPARE;
@@ -876,6 +889,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     }
 
     lorieVkSelftestCleanup(vk, &t);
+    vk->verifiedFormats = passed;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (st) {
         st->diag.vkSelftestFormatsPassed = passed;
@@ -892,6 +906,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     loge("ownership self-test FAILED: step %u, AHB format %u, direction %u, iteration %u, byte %lld expected %#x got %#x, VkResult %d",
          step, format, direction, it, (long long) diff, expected, got, r);
     lorieVkSelftestCleanup(vk, &t);
+    vk->verifiedFormats = 0;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (st) {
         st->diag.vkSelftestFormatsPassed = passed;

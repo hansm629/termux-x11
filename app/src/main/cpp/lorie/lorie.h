@@ -247,6 +247,8 @@ struct lorie_backend_control {
     volatile uint8_t requestedInvalid;          /* X: the variable was set, to none of the three */
     volatile uint8_t vkFailAt;                  /* X: LORIE_VK_FAIL_AT_* */
     volatile uint8_t vkFailAtInvalid;           /* X: the variable was set, to none of the seven */
+    volatile uint8_t vkSelftestFull;            /* X: TERMUX_X11_RENDERER_VK_SELFTEST=full - the full ownership self-test */
+    volatile uint8_t vkSelftestInvalid;         /* X: the variable was set, to something else */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };

@@ -48,6 +48,7 @@ struct lorie_vk {
     uint32_t queueFamily;
     VkDevice device;
     VkQueue queue;
+    uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */
 };
 
 /*
@@ -124,12 +125,19 @@ struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from,
  *   CPU -> Vulkan -> CPU    the CPU writes a pattern into one, Vulkan copies it into the other, the CPU reads it
  *   Vulkan -> CPU -> Vulkan Vulkan uploads a pattern, the CPU reads it and writes another, Vulkan reads that back
  * with every acquire and release as above, the pattern changing every iteration (zero, all-one, checkerboard,
- * row-dependent, pseudo-random), each read compared byte for byte. The compare counter moves only on a passing
- * compare; one mismatch, or any failed step, fails it. RGBA and RGBX must pass; BGRA may be unavailable (not
- * allocatable, or a format the backend does not import), which is recorded, never counted as passed. On failure
- * the fallback is recorded (FATAL_BACKEND, VK_SELFTEST) with where it failed; nothing else is tried.
+ * row-dependent, pseudo-random), each read compared byte for byte - except an RGBX buffer's X byte: the
+ * specification makes the X/A component Vulkan reads after an external write undefined (AHardwareBuffer
+ * Format Equivalence, note 1), so it cannot be compared; the renderer reads it as one (sampleView) instead.
+ * The compare counter moves only on a passing compare; one mismatch, or any failed step, fails it. RGBA and
+ * RGBX must pass; BGRA may be unavailable (not allocatable, or a format the backend does not import), which is
+ * recorded, never counted as passed. Only the formats that passed are imported afterwards (verifiedFormats):
+ * an X server buffer of an unverified format is refused like an unsupported one. On failure the fallback is
+ * recorded (FATAL_BACKEND, VK_SELFTEST) with where it failed; nothing else is tried.
  */
 #define LORIE_VK_SELFTEST_ITERATIONS 1000
+// The quick one the backend runs when it starts, unless the full one is asked for: every pattern kind once each
+// way (TERMUX_X11_RENDERER_VK_SELFTEST=full asks for LORIE_VK_SELFTEST_ITERATIONS).
+#define LORIE_VK_SELFTEST_QUICK_ITERATIONS 5
 bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations);
 
 // libvulkan.so's vkGetInstanceProcAddr, or NULL with the fallback recorded (VK_LOADER).

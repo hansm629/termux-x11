@@ -20,7 +20,7 @@ def check(cond, what):
         fails += 1
         print("  FAIL " + what)
 
-def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None, selftest=None):
+def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None, selftest=None, iterations=1000):
     """One 5 s report, as the X server logs it. gles/vk give deltas; totals default to 10x the delta. The X
     server's AHB ownership defaults to the one that goes with `active`."""
     ownership = ownership or ("per_access" if active == "VULKAN" else "persistent")
@@ -29,7 +29,7 @@ def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None, s
     def kv(k, d):
         return "%s=%d(+%d)" % (k, totals.get(k, d * 10), d)
     p = "10-07 12:00:%02d.000  100  101 I LorieNative: " % t
-    lines = [p + "XlorieBackend: requested=auto vk_fail_at=none active=%s ownership=%s ownership_transitions=1 ownership_refused=0 "
+    lines = [p + "XlorieBackend: requested=auto vk_fail_at=none vk_selftest=full active=%s ownership=%s ownership_transitions=1 ownership_refused=0 "
                  "x_ahb_cpu_acquires=40(+4) x_state_lock_wait_us=900(+90)" % (active, ownership),
              p + "XlorieGles: " + " ".join(kv(k, gles.get(k, 0)) for k in ("egl_image_imports", "gles_copy_frames", "egl_swap_buffers")),
              p + "XlorieVk: " + " ".join(kv(k, vk.get(k, 0)) for k in (
@@ -37,9 +37,9 @@ def report(t, active, gles, vk, fb_total_delta=0, totals=None, ownership=None, s
                  "ahb_import_success", "imported_source_draws", "imported_destination_draws", "copy_commands",
                  "blit_commands", "render_commands", "queue_submits", "queue_present_success", "frames_presented")),
              p + 'XlorieVkTiming: acquire_success=0(+0) selftest=pass device="Adreno (TM) 840" present_mode="FIFO"',
-             p + "XlorieVkSelftest: result=%s compares=9000(+0) iterations=1000 formats_passed=0x7 formats_unavailable=0x0 "
+             p + "XlorieVkSelftest: result=%s compares=%d(+0) iterations=%d formats_passed=0x7 formats_unavailable=0x0 "
                  "us=2100000 fail_step=NONE fail_format=0 fail_direction=0 fail_iteration=0 fail_offset=0 fail_expected=0x00 "
-                 "fail_actual=0x00 fail_vkresult=0" % selftest,
+                 "fail_actual=0x00 fail_vkresult=0" % (selftest, iterations * 9, iterations),
              p + "XlorieFallback: total=%d(+%d) fatal_backend=0 resource_local=0 injected=0 last_class=none last_reason=none "
                  "last_vkresult=0 last_resource_id=0 last_resource_format=0 last_resource_usage=0x0 reasons=none" % (
                      fb_total_delta, fb_total_delta)]
@@ -81,6 +81,7 @@ cases = [
     ("vulkan while the X server keeps 3c98ffa's CPU locks", reports(3, active="VULKAN", gles={}, vk=VK, ownership="persistent"), "vulkan", 1),
     ("gles while the X server is per-access", reports(3, active="GLES", gles=GL, vk={}, ownership="per_access"), "gles", 1),
     ("vulkan after a failed ownership self-test", reports(3, active="VULKAN", gles={}, vk=VK, selftest="fail"), "vulkan", 1),
+    ("vulkan after only the quick self-test", reports(3, active="VULKAN", gles={}, vk=VK, iterations=5), "vulkan", 1),
     ("vulkan without the self-test line", [l for l in vk_good if "XlorieVkSelftest" not in l], "vulkan", 1),
     ("an X server without the ownership field", [l.replace(" ownership=per_access", "") for l in vk_good], "vulkan", 1),
     ("backend changed within the window", report(0, active="GLES", gles=GL, vk={}) + reports(2, active="VULKAN", gles={}, vk=VK), "vulkan", 1),

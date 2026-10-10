@@ -269,22 +269,30 @@ CONTROLS = [
      """            *access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
      """            *access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;""",
      "tvkbarrier"),
-    ("the self-test comparing all but the alpha/X byte", "vk.c",
-     """                if (got[y * rowBytes + i] != expect[y * w + i])""",
+    ("the self-test comparing no alpha byte, RGBA's included", "vk.c",
+     """                if ((alphaDefined || i % 4 != 3) && got[y * rowBytes + i] != expect[y * w + i])""",
      """                if (i % 4 != 3 && got[y * rowBytes + i] != expect[y * w + i])""",
      "tvkselftest"),
+    ("the self-test comparing RGBX's undefined X byte", "vk.c",
+     """                if ((alphaDefined || i % 4 != 3) && got[y * rowBytes + i] != expect[y * w + i])""",
+     """                if (got[y * rowBytes + i] != expect[y * w + i])""",
+     "tvkselftest"),
+    ("an import of a format the self-test did not verify", "vk.c",
+     """    if (!(vk->verifiedFormats & (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? 1 :""",
+     """    if (0 && !(vk->verifiedFormats & (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? 1 :""",
+     "tvkimport"),
     ("the self-test counting a compare before it passed", "vk.c",
-     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, lorieVkSelftestFormats[f].alphaDefined, &diff, &got)))
                 goto fail;
             LORIE_DIAG_ADD(st, vkSelftestCompares, 1);""",
      """            LORIE_DIAG_ADD(st, vkSelftestCompares, 1);
-            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, lorieVkSelftestFormats[f].alphaDefined, &diff, &got)))
                 goto fail;""",
      "tvkselftest"),
     ("the self-test ignoring a mismatch", "vk.c",
-     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got)))
+     """            if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, lorieVkSelftestFormats[f].alphaDefined, &diff, &got)))
                 goto fail;""",
-     """            lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, &diff, &got);""",
+     """            lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, lorieVkSelftestFormats[f].alphaDefined, &diff, &got);""",
      "tvkselftest"),
     ("the self-test writing the same pattern every iteration", "vk.c",
      """            lorieVkSelftestPattern(t.expect, it % 5, it);""",
@@ -308,8 +316,8 @@ CONTROLS = [
      """    b.barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;""",
      "tvkselftest"),
     ("RGBX allowed to be unavailable", "vk.c",
-     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true },""",
-     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, false },""",
+     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true, false },""",
+     """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, false, false },""",
      "tvkselftest"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """

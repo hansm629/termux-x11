@@ -34,6 +34,7 @@ static void device(void) {
     memset(&st, 0, sizeof st);
     good();
     CHECK(lorieVkCreateDevice(&vk, fGetInstanceProcAddr, &st), "no device to import into");
+    vk.verifiedFormats = 7;     /* as after an ownership self-test that passed every format */
     memset(&imp, 0, sizeof imp);
 }
 
@@ -230,6 +231,20 @@ int main(void) {
     device();
     refused("no buffer", lorieVkImport(&vk, &images, 36, NULL, 0, &st), &(AHardwareBuffer) {0}, 36,
             LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_PROPERTIES);
+
+    /* a format the ownership self-test did not verify (BGRA unavailable to it): refused, the others not */
+    device();
+    vk.verifiedFormats = 3;
+    b = buffer(AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, X_USAGE);
+    refused("BGRA not verified", lorieVkImport(&vk, &images, 50, &b, 0, &st), &b, 50, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL,
+            LORIE_FALLBACK_AHB_FORMAT_UNSUPPORTED_BY_STAGE1);
+    b2 = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, X_USAGE);
+    CHECK(lorieVkImport(&vk, &images, 51, &b2, 0, &st), "RGBX refused with only BGRA unverified");
+    device();
+    vk.verifiedFormats = 0;
+    b = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, X_USAGE);
+    refused("nothing verified", lorieVkImport(&vk, &images, 52, &b, 0, &st), &b, 52, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL,
+            LORIE_FALLBACK_AHB_FORMAT_UNSUPPORTED_BY_STAGE1);
 
     /* injected: no call made */
     device();

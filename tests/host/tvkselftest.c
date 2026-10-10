@@ -7,8 +7,10 @@
  *   behind; the pattern changes every iteration (every CPU write changes the buffer) and the CPU always writes
  *   something other than it read.
  *   BGRA not allocatable, or of an external format: unavailable, not passed. RGBX not allocatable: failed.
- *   One wrong byte - in a copy either way, in the alpha/X byte too - fails it at that iteration, with the
- *   format, direction, byte, expected and actual value, the compares before it counted and no more. A failed
+ *   Afterwards only the formats that passed may be imported. The quick run: every pattern kind once each way.
+ *   One wrong byte - in a copy either way, RGBA's alpha byte included - fails it at that iteration, with the
+ *   format, direction, byte, expected and actual value, the compares before it counted and no more; RGBX's
+ *   X byte, undefined to Vulkan after an external write, is not compared and fails nothing. A failed
  *   lock, submission or fence wait fails it at its step. Every failure records one fallback (FATAL_BACKEND,
  *   VK_SELFTEST) and leaves nothing behind. Non-coherent memory is flushed and invalidated. */
 #include "fakevk.h"
@@ -89,9 +91,16 @@ int main(void) {
     ok = lorieVkSelftest(&vk, &st, N);
     passed("all formats", ok, N, 7, 0);
 
+    CHECK(vk.verifiedFormats == 7, "all formats: %#x verified", vk.verifiedFormats);
+
     device();
     ok = lorieVkSelftest(&vk, &st, 256);
     passed("256 iterations", ok, 256, 7, 0);
+
+    device();
+    ok = lorieVkSelftest(&vk, &st, LORIE_VK_SELFTEST_QUICK_ITERATIONS);
+    passed("the quick run", ok, LORIE_VK_SELFTEST_QUICK_ITERATIONS, 7, 0);
+    CHECK(LORIE_VK_SELFTEST_QUICK_ITERATIONS >= 5, "the quick run does not use every pattern kind");
 
     device();
     vk.memoryProperties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
@@ -103,6 +112,7 @@ int main(void) {
     emu.allocFail[AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM] = true;
     ok = lorieVkSelftest(&vk, &st, N);
     passed("BGRA not allocatable", ok, N, 3, 4);
+    CHECK(vk.verifiedFormats == 3, "BGRA not allocatable: %#x verified", vk.verifiedFormats);
 
     device();
     emu.bgraExternal = true;
@@ -113,7 +123,8 @@ int main(void) {
     emu.allocFail[AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM] = true;
     ok = lorieVkSelftest(&vk, &st, N);
     failed("RGBX not allocatable", ok, LORIE_VK_SELFTEST_STEP_ALLOCATE, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 0, 0, 3 * N);
-    CHECK(st.diag.vkSelftestFormatsPassed == 1, "RGBX not allocatable: formats passed %#x", st.diag.vkSelftestFormatsPassed);
+    CHECK(st.diag.vkSelftestFormatsPassed == 1 && vk.verifiedFormats == 0, "RGBX not allocatable: formats passed %#x, %#x verified",
+          st.diag.vkSelftestFormatsPassed, vk.verifiedFormats);
 
     /* RGBA, CPU -> Vulkan -> CPU, iteration 500 (an all-zero pattern): its copy is the 501st */
     device();
@@ -136,17 +147,34 @@ int main(void) {
           "a wrong byte uploaded: byte %u expected %#x actual %#x", st.diag.vkSelftestFailOffset, st.diag.vkSelftestFailExpected,
           st.diag.vkSelftestFailActual);
 
-    /* RGBX, Vulkan -> CPU -> Vulkan, iteration 7: the download of what the CPU wrote is wrong in the X byte */
+    /* RGBX, Vulkan -> CPU -> Vulkan, iteration 7: the download of what the CPU wrote has a wrong red byte */
     device();
     emu.corruptCopy = 3 * N + N + 2 * 7 + 2;
-    emu.corruptByte = 3;
+    emu.corruptByte = 4;
     ok = lorieVkSelftest(&vk, &st, N);
-    failed("a wrong X byte read back", ok, LORIE_VK_SELFTEST_STEP_COMPARE, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, 7,
+    failed("a wrong RGBX red byte read back", ok, LORIE_VK_SELFTEST_STEP_COMPARE, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, 7,
            3 * N + N + 2 * 7 + 1);
     lorieVkSelftestPattern(a, (7 + 2) % 5, 7 + 1);
-    CHECK(st.diag.vkSelftestFailOffset == 3 && st.diag.vkSelftestFailExpected == a[3] && st.diag.vkSelftestFailActual == (a[3] ^ 1),
-          "a wrong X byte read back: byte %u expected %#x actual %#x", st.diag.vkSelftestFailOffset, st.diag.vkSelftestFailExpected,
-          st.diag.vkSelftestFailActual);
+    CHECK(st.diag.vkSelftestFailOffset == 4 && st.diag.vkSelftestFailExpected == a[4] && st.diag.vkSelftestFailActual == (a[4] ^ 1),
+          "a wrong RGBX red byte read back: byte %u expected %#x actual %#x", st.diag.vkSelftestFailOffset,
+          st.diag.vkSelftestFailExpected, st.diag.vkSelftestFailActual);
+
+    /* the same in RGBX's X byte: undefined to Vulkan, not compared, not a failure */
+    device();
+    emu.corruptCopy = 3 * N + N + 2 * 7 + 2;
+    emu.corruptByte = 7;
+    ok = lorieVkSelftest(&vk, &st, N);
+    passed("a different RGBX X byte", ok, N, 7, 0);
+
+    /* RGBA's alpha byte is compared: CPU -> Vulkan -> CPU, iteration 2 */
+    device();
+    emu.corruptCopy = 3;
+    emu.corruptByte = 4 * 67 * 3 + 7;
+    ok = lorieVkSelftest(&vk, &st, N);
+    failed("a wrong RGBA alpha byte", ok, LORIE_VK_SELFTEST_STEP_COMPARE, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, 2, 2);
+    lorieVkSelftestPattern(a, 2, 2);
+    CHECK(st.diag.vkSelftestFailOffset == 4 * 67 * 3 + 7 && st.diag.vkSelftestFailExpected == a[4 * 67 * 3 + 7],
+          "a wrong RGBA alpha byte: byte %u expected %#x", st.diag.vkSelftestFailOffset, st.diag.vkSelftestFailExpected);
 
     /* a lock, a submission, a fence wait */
     device();

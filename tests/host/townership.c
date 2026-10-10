@@ -616,6 +616,15 @@ int main(void) {
     invalid = 0;
     CHECK(lorieRequestedBackend("vk", &invalid) == LORIE_BACKEND_AUTO && invalid, "vk: not flagged");
 
+    /* TERMUX_X11_RENDERER_VK_SELFTEST: full, or the quick one */
+    invalid = 0;
+    CHECK(lorieRequestedVkSelftest(NULL, &invalid) == 0 && !invalid, "self-test unset");
+    CHECK(lorieRequestedVkSelftest("", &invalid) == 0 && !invalid, "self-test empty");
+    CHECK(lorieRequestedVkSelftest("full", &invalid) == 1 && !invalid, "self-test full");
+    CHECK(lorieRequestedVkSelftest("Full", &invalid) == 0 && invalid, "self-test Full: not flagged");
+    invalid = 0;
+    CHECK(lorieRequestedVkSelftest("quick", &invalid) == 0 && invalid, "self-test quick: not flagged (unset is quick)");
+
     /* TERMUX_X11_RENDERER_VK_FAIL_AT: the seven points, lowercase; nothing else injects */
     {
         static const struct { const char *value; uint8_t point; bool invalid; } t[] = {
