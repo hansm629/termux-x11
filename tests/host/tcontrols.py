@@ -182,6 +182,60 @@ CONTROLS = [
      """        if (!(reason = lorieVkDeviceUnsuitable(vk, devices[i], &family)) || 1)
             break;""",
      "tvkinit"),
+    ("an external-format buffer let through to the format check", "vk.c",
+     """    if (formatProps.format == VK_FORMAT_UNDEFINED) {""",
+     """    if (0) {""",
+     "tvkimport"),
+    ("the format query's importable bit not required", "vk.c",
+     """            !(externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||""",
+     "",
+     "tvkimport"),
+    ("the buffer's size not checked against the format query", "vk.c",
+     """            formatOut.imageFormatProperties.maxExtent.width < desc.width ||""",
+     "",
+     "tvkimport"),
+    ("the first allowed memory type used, device-local or not", "vk.c",
+     """        if ((props.memoryTypeBits & (1u << i)) && (memoryType == UINT32_MAX ||""",
+     """        if ((props.memoryTypeBits & (1u << i)) && (memoryType == UINT32_MAX || 0 &&""",
+     "tvkimport"),
+    ("the import not a dedicated allocation", "vk.c",
+     """                .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .pNext = &dedicated, .buffer = ahb };""",
+     """                .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb };""",
+     "tvkimport"),
+    ("RGBX alpha sampled as stored", "vk.c",
+     """                                img.rgbx ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY },""",
+     """                                VK_COMPONENT_SWIZZLE_IDENTITY },""",
+     "tvkimport"),
+    ("an attachment view for a buffer that cannot be rendered to", "vk.c",
+     """        if ((img.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&""",
+     """        if (1 &&""",
+     "tvkimport"),
+    ("a failed import leaving its objects behind", "vk.c",
+     """    fail:
+    lorieVkImageDestroy(vk, &img);
+    lorieVkImportFailed(st, reason, r, id, &desc);""",
+     """    fail:
+    lorieVkImportFailed(st, reason, r, id, &desc);""",
+     "tvkimport"),
+    ("an import counted as a success before it is one", "vk.c",
+     """    LORIE_DIAG_ADD(st, vkAhbImportAttempts, 1);
+    AHardwareBuffer_describe(ahb, &desc);""",
+     """    LORIE_DIAG_ADD(st, vkAhbImportAttempts, 1);
+    LORIE_DIAG_ADD(st, vkAhbImportSuccess, 1);
+    AHardwareBuffer_describe(ahb, &desc);""",
+     "tvkimport"),
+    ("injected at import, the buffer's properties still asked for", "vk.c",
+     """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
+        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        return NULL;
+    }""",
+     """    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
+        VkAndroidHardwareBufferPropertiesANDROID unused = { .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID };
+        vk->GetAndroidHardwareBufferPropertiesANDROID(vk->device, ahb, &unused);
+        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        return NULL;
+    }""",
+     "tvkimport"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

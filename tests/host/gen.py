@@ -65,8 +65,9 @@ recipes = {
         "void lorieRendererDisconnected(void) {",
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {"),
-    # the Vulkan backend's instance and device - tvkinit.c
-    "vkinit": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    VkQueue queue;\n};")
+    # the Vulkan backend: instance and device, AHardwareBuffer import - tvkinit.c, tvkimport.c (fakevk.h)
+    "vk": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    VkQueue queue;\n};")
+        + span(VH, "struct lorie_vk_image {", "    uint32_t count, capacity;\n};")
         + span(VC, "static const char *const lorieVkInstanceExtensions[] = {", "#define LORIE_VK_MAX_DEVICES 8")
         + "".join(func(VC, f) for f in (
             "void lorieVkFallback(volatile struct lorie_shared_server_state *st, uint8_t cls, uint8_t reason, VkResult result) {",
@@ -74,7 +75,14 @@ recipes = {
             "static bool lorieVkHasExtension(const VkExtensionProperties *ext, uint32_t count, const char *name) {",
             "static uint8_t lorieVkDeviceUnsuitable(struct lorie_vk *vk, VkPhysicalDevice pd, uint32_t *queueFamily) {",
             "void lorieVkDestroyDevice(struct lorie_vk *vk) {",
-            "bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, volatile struct lorie_shared_server_state *st) {")),
+            "bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, volatile struct lorie_shared_server_state *st) {",
+            "VkImageUsageFlags lorieVkAhbImageUsage(uint64_t ahbUsage) {",
+            "struct lorie_vk_image *lorieVkImageFind(struct lorie_vk_images *images, uint64_t id) {",
+            "static void lorieVkImageDestroy(struct lorie_vk *vk, struct lorie_vk_image *img) {",
+            "static void lorieVkImportFailed(volatile struct lorie_shared_server_state *st, uint8_t reason, VkResult result,",
+            "struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id,",
+            "void lorieVkImageRemove(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id) {",
+            "void lorieVkImagesClear(struct lorie_vk *vk, struct lorie_vk_images *images) {")),
 }
 
 for name, make in recipes.items():

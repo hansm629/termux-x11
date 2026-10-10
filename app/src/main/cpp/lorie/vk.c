@@ -227,3 +227,225 @@ bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, vo
     lorieVkDestroyDevice(vk);
     return false;
 }
+
+VkImageUsageFlags lorieVkAhbImageUsage(uint64_t ahbUsage) {
+    VkImageUsageFlags usage = 0;
+    if (ahbUsage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE)
+        usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (ahbUsage & AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER)
+        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    return usage;
+}
+
+struct lorie_vk_image *lorieVkImageFind(struct lorie_vk_images *images, uint64_t id) {
+    uint32_t i;
+    for (i = 0; i < images->count; i++)
+        if (images->items[i].id == id)
+            return &images->items[i];
+    return NULL;
+}
+
+static void lorieVkImageDestroy(struct lorie_vk *vk, struct lorie_vk_image *img) {
+    if (img->attachView)
+        vk->DestroyImageView(vk->device, img->attachView, NULL);
+    if (img->sampleView)
+        vk->DestroyImageView(vk->device, img->sampleView, NULL);
+    if (img->image)
+        vk->DestroyImage(vk->device, img->image, NULL);
+    if (img->memory)
+        vk->FreeMemory(vk->device, img->memory, NULL);
+    memset(img, 0, sizeof(*img));
+}
+
+// A buffer that cannot be imported: the fallback (RESOURCE_LOCAL unless injected), and which buffer it was.
+static void lorieVkImportFailed(volatile struct lorie_shared_server_state *st, uint8_t reason, VkResult result,
+                                uint64_t id, const AHardwareBuffer_Desc *desc) {
+    loge("cannot import AHardwareBuffer %llu (%ux%u format %u usage %#llx): reason %u", (unsigned long long) id,
+         desc->width, desc->height, desc->format, (unsigned long long) desc->usage, reason);
+    if (!st)
+        return;
+    st->diag.lastResourceId = id;
+    st->diag.lastResourceUsage = desc->usage;
+    st->diag.lastResourceFormat = desc->format;
+    if (reason)
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, reason, result);
+}
+
+struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id,
+                                     struct AHardwareBuffer *ahb, VkImageUsageFlags extraUsage,
+                                     volatile struct lorie_shared_server_state *st) {
+    struct lorie_vk_image *found = lorieVkImageFind(images, id), img = {0};
+    AHardwareBuffer_Desc desc = {0};
+    VkAndroidHardwareBufferFormatPropertiesANDROID formatProps = {
+            .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID };
+    VkAndroidHardwareBufferPropertiesANDROID props = {
+            .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, .pNext = &formatProps };
+    VkPhysicalDeviceExternalImageFormatInfo externalInfo = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID };
+    VkExternalImageFormatProperties externalProps = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+    VkImageFormatProperties2 formatOut = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &externalProps };
+    uint32_t i, memoryType = UINT32_MAX;
+    uint8_t reason = LORIE_FALLBACK_NONE;
+    VkResult r = VK_SUCCESS;
+
+    if (found)
+        return found;
+    if (!ahb) {
+        lorieVkImportFailed(st, LORIE_FALLBACK_AHB_PROPERTIES, VK_ERROR_INVALID_EXTERNAL_HANDLE, id, &desc);
+        return NULL;
+    }
+    LORIE_DIAG_ADD(st, vkAhbImportAttempts, 1);
+    AHardwareBuffer_describe(ahb, &desc);
+    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_IMPORT, LORIE_FALLBACK_AHB_IMPORT)) {
+        lorieVkImportFailed(st, LORIE_FALLBACK_NONE, VK_SUCCESS, id, &desc);
+        return NULL;
+    }
+
+    img.id = id;
+    img.width = desc.width;
+    img.height = desc.height;
+    img.ahbFormat = desc.format;
+    img.ahbUsage = desc.usage;
+    img.rgbaOrder = desc.format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
+    img.rgbx = desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+    img.usage = lorieVkAhbImageUsage(desc.usage) | extraUsage;
+    if (!(img.usage & VK_IMAGE_USAGE_SAMPLED_BIT) || desc.layers != 1) {
+        reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;
+        r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto fail;
+    }
+
+    if ((r = vk->GetAndroidHardwareBufferPropertiesANDROID(vk->device, ahb, &props)) != VK_SUCCESS) {
+        reason = LORIE_FALLBACK_AHB_PROPERTIES;
+        goto fail;
+    }
+    if (formatProps.format == VK_FORMAT_UNDEFINED) {
+        reason = LORIE_FALLBACK_AHB_EXTERNAL_FORMAT_UNSUPPORTED_BY_STAGE1;
+        r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto fail;
+    }
+    if (formatProps.format != VK_FORMAT_R8G8B8A8_UNORM && formatProps.format != VK_FORMAT_B8G8R8A8_UNORM) {
+        reason = LORIE_FALLBACK_AHB_FORMAT_UNSUPPORTED_BY_STAGE1;
+        r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto fail;
+    }
+    img.format = formatProps.format;
+
+    // The image exactly as it will be made, asked about as an import of an AHardwareBuffer.
+    {
+        VkPhysicalDeviceImageFormatInfo2 info = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &externalInfo,
+                .format = img.format, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = img.usage };
+        r = vk->GetPhysicalDeviceImageFormatProperties2(vk->physicalDevice, &info, &formatOut);
+        if (r != VK_SUCCESS ||
+            !(externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+            formatOut.imageFormatProperties.maxExtent.width < desc.width ||
+            formatOut.imageFormatProperties.maxExtent.height < desc.height) {
+            reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;
+            r = r != VK_SUCCESS ? r : VK_ERROR_FORMAT_NOT_SUPPORTED;
+            goto fail;
+        }
+    }
+
+    // Any memory type the buffer allows, device-local first.
+    for (i = 0; i < vk->memoryProperties.memoryTypeCount; i++)
+        if ((props.memoryTypeBits & (1u << i)) && (memoryType == UINT32_MAX ||
+            (!(vk->memoryProperties.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             (vk->memoryProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))))
+            memoryType = i;
+    if (memoryType == UINT32_MAX) {
+        reason = LORIE_FALLBACK_AHB_MEMORY_TYPE;
+        r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        goto fail;
+    }
+
+    {
+        VkExternalMemoryImageCreateInfo external = {
+                .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID };
+        VkImageCreateInfo info = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external, .imageType = VK_IMAGE_TYPE_2D,
+                .format = img.format, .extent = { desc.width, desc.height, 1 }, .mipLevels = 1, .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = img.usage,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        if ((r = vk->CreateImage(vk->device, &info, NULL, &img.image)) != VK_SUCCESS) {
+            img.image = VK_NULL_HANDLE;
+            reason = LORIE_FALLBACK_AHB_IMPORT;
+            goto fail;
+        }
+    }
+    {
+        VkMemoryDedicatedAllocateInfo dedicated = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = img.image };
+        VkImportAndroidHardwareBufferInfoANDROID import = {
+                .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .pNext = &dedicated, .buffer = ahb };
+        VkMemoryAllocateInfo info = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &import,
+                .allocationSize = props.allocationSize, .memoryTypeIndex = memoryType };
+        if ((r = vk->AllocateMemory(vk->device, &info, NULL, &img.memory)) != VK_SUCCESS) {
+            img.memory = VK_NULL_HANDLE;
+            reason = LORIE_FALLBACK_AHB_IMPORT;
+            goto fail;
+        }
+    }
+    if ((r = vk->BindImageMemory(vk->device, img.image, img.memory, 0)) != VK_SUCCESS) {
+        reason = LORIE_FALLBACK_AHB_IMPORT;
+        goto fail;
+    }
+    {
+        VkImageViewCreateInfo info = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img.image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = img.format,
+                .components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                img.rgbx ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY },
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if ((r = vk->CreateImageView(vk->device, &info, NULL, &img.sampleView)) != VK_SUCCESS) {
+            img.sampleView = VK_NULL_HANDLE;
+            reason = LORIE_FALLBACK_AHB_IMPORT;
+            goto fail;
+        }
+        info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        if ((img.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+            (r = vk->CreateImageView(vk->device, &info, NULL, &img.attachView)) != VK_SUCCESS) {
+            img.attachView = VK_NULL_HANDLE;
+            reason = LORIE_FALLBACK_AHB_IMPORT;
+            goto fail;
+        }
+    }
+
+    if (images->count == images->capacity) {
+        uint32_t capacity = images->capacity ? images->capacity * 2 : 16;
+        struct lorie_vk_image *items = realloc(images->items, capacity * sizeof(*items));
+        if (!items) {
+            reason = LORIE_FALLBACK_AHB_IMPORT;
+            r = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+        }
+        images->items = items;
+        images->capacity = capacity;
+    }
+    images->items[images->count] = img;
+    LORIE_DIAG_ADD(st, vkAhbImportSuccess, 1);
+    return &images->items[images->count++];
+
+    fail:
+    lorieVkImageDestroy(vk, &img);
+    lorieVkImportFailed(st, reason, r, id, &desc);
+    return NULL;
+}
+
+void lorieVkImageRemove(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id) {
+    struct lorie_vk_image *img = lorieVkImageFind(images, id);
+    if (!img)
+        return;
+    lorieVkImageDestroy(vk, img);
+    *img = images->items[--images->count];
+}
+
+void lorieVkImagesClear(struct lorie_vk *vk, struct lorie_vk_images *images) {
+    while (images->count)
+        lorieVkImageRemove(vk, images, images->items[0].id);
+    free(images->items);
+    memset(images, 0, sizeof(*images));
+}
