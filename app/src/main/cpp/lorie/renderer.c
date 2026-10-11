@@ -2092,14 +2092,22 @@ __noreturn static void* rendererThread(void) {
             stateChanged = false;
             waitingForBuffers = false;
 
+            // Another X server session (or none): nothing Vulkan holds of the last one is used again. Its buffers'
+            // ids start over in a new X server, so every imported image goes now (the device idle first), not only
+            // once the old buffers are released; and its ownership answer was the old session's.
+            if (vkReady) {
+                vk.DeviceWaitIdle(vk.device);
+                lorieVkImagesClear(&vk, &vkImages);
+            }
+            vkOwned = false;
+
             if (state) {
                 // A new X server session: Vulkan may be tried again, the X server's ownership asked for again.
-                vkFailed = vkOwned = false;
+                vkFailed = false;
                 state->surfaceAvailable = win != defaultWin && (vkActive || sfc != defaultSfc);
                 rendererPublishActive();
                 backendSelect = true;
             } else if (vkActive) {
-                vkOwned = false;
                 rendererVkClear();
             } else if (win != defaultWin) {
                 glClearColor(0, 0, 0, 0);

@@ -10,7 +10,8 @@ server's PER_ACCESS answer is still its own before touching a buffer, submits an
 publishing the completed copies, publishes them before letting the lock go, and presents after; the copies
 alone likewise; a failure is torn down before the X server is asked for its ownership back, and that before
 GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
-change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer.
+change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer; another
+X server session (or none) drops every imported image and the ownership answer of the last one first.
 
 usage: twiring.py <lorie source dir>
 """
@@ -73,6 +74,9 @@ in_order("window change", refresh, "lorieVkSwapchainDestroy(&vk, &vkr);", "relea
 loop = func(R, "__noreturn static void* rendererThread(void) {")
 in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "rendererSelectBackend();", "pthread_mutex_unlock(&stateLock);",
          "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
+# another session: the last one's imported images and ownership answer are dropped before anything else runs
+in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
+         "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")
 
 print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit) and the renderer's Vulkan order: %s (%d failures)" % (
     "FAIL" if fails else "PASS", fails))

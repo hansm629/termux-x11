@@ -411,6 +411,23 @@ CONTROLS = [
      """    vkFailed = true;
     if (state) {""",
      "twiring"),
+    ("the last session's imported images kept for the next", "renderer.c",
+     """                vk.DeviceWaitIdle(vk.device);
+                lorieVkImagesClear(&vk, &vkImages);
+            }
+            vkOwned = false;""",
+     """            }
+            vkOwned = false;""",
+     "twiring"),
+    ("the last session's ownership answer kept for the next", "renderer.c",
+     """            }
+            vkOwned = false;
+
+            if (state) {""",
+     """            }
+
+            if (state) {""",
+     "twiring"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();
