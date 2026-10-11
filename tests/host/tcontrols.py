@@ -544,6 +544,17 @@ CONTROLS = [
         LorieBuffer_release(priv->buffer);""",
      "",
      "tpresentcopy"),
+    ("the self-test's duration from unsigned parts", "vk.c",
+     """    int64_t ns = ((int64_t) t1->tv_sec - (int64_t) t0->tv_sec) * 1000000000 + ((int64_t) t1->tv_nsec - (int64_t) t0->tv_nsec);
+    return ns > 0 ? (uint64_t) ns / 1000 : 0;""",
+     """    return (uint64_t) (t1->tv_sec - t0->tv_sec) * 1000000 + (uint64_t) (t1->tv_nsec - t0->tv_nsec) / 1000;""",
+     "tvkselftest"),
+    ("a failed self-test's duration taken as before", "vk.c",
+     """        st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);
+        st->diag.vkSelftestFailStep = step;""",
+     """        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
+        st->diag.vkSelftestFailStep = step;""",
+     "twiring"),
 ]
 
 def copy_sources(dst):

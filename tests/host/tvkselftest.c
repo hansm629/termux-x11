@@ -12,7 +12,9 @@
  *   format, direction, byte, expected and actual value, the compares before it counted and no more; RGBX's
  *   X byte, undefined to Vulkan after an external write, is not compared and fails nothing. A failed
  *   lock, submission or fence wait fails it at its step. Every failure records one fallback (FATAL_BACKEND,
- *   VK_SELFTEST) and leaves nothing behind. Non-coherent memory is flushed and invalidated. */
+ *   VK_SELFTEST) and leaves nothing behind. Non-coherent memory is flushed and invalidated.
+ *   Its duration (vkSelftestUs, lorieVkElapsedUs): microseconds across a second boundary, where tv_nsec is
+ *   smaller at the end, as within one; never a wrapped value. */
 #include "fakevk.h"
 
 #define N LORIE_VK_SELFTEST_ITERATIONS
@@ -92,6 +94,7 @@ int main(void) {
     passed("all formats", ok, N, 7, 0);
 
     CHECK(vk.verifiedFormats == 7, "all formats: %#x verified", vk.verifiedFormats);
+    CHECK(st.diag.vkSelftestUs < 600000000ULL, "all formats: took %llu us", (unsigned long long) st.diag.vkSelftestUs);
 
     device();
     ok = lorieVkSelftest(&vk, &st, 256);
@@ -191,6 +194,22 @@ int main(void) {
     ok = lorieVkSelftest(&vk, &st, N);
     failed("a fence wait times out", ok, LORIE_VK_SELFTEST_STEP_FENCE, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, 0, 0);
     CHECK(st.diag.vkSelftestFailResult == VK_TIMEOUT, "a fence wait times out: VkResult %d", st.diag.vkSelftestFailResult);
+
+    /* its duration */
+    {
+        static const struct { struct timespec t0, t1; uint64_t us; } t[] = {
+            { { 5, 500 }, { 5, 2500 }, 2 },
+            { { 1, 999999000 }, { 2, 1000 }, 2 },           /* across a second: tv_nsec smaller at the end */
+            { { 10, 999999999 }, { 12, 0 }, 1000000 },
+            { { 100, 0 }, { 100, 0 }, 0 },
+            { { 7, 300 }, { 6, 999999000 }, 0 },            /* the end before the start: nothing, not a wrapped value */
+        };
+        for (unsigned k = 0; k < sizeof t / sizeof *t; k++) {
+            uint64_t us = lorieVkElapsedUs(&t[k].t0, &t[k].t1);
+            CHECK(us == t[k].us, "duration %lld.%09ld to %lld.%09ld: %llu us, not %llu", (long long) t[k].t0.tv_sec, t[k].t0.tv_nsec,
+                  (long long) t[k].t1.tv_sec, t[k].t1.tv_nsec, (unsigned long long) us, (unsigned long long) t[k].us);
+        }
+    }
 
     lorieVkDestroyDevice(&vk);
     printf("TVKSELFTEST ownership self-test on a small device: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

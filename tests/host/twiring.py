@@ -11,7 +11,8 @@ publishing the completed copies, publishes them before letting the lock go, and 
 alone likewise; a failure is torn down before the X server is asked for its ownership back, and that before
 GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
 change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer; another
-X server session (or none) drops every imported image and the ownership answer of the last one first.
+X server session (or none) drops every imported image and the ownership answer of the last one first. The
+self-test's duration is lorieVkElapsedUs's (tvkselftest.c tests it) on both ways out.
 
 usage: twiring.py <lorie source dir>
 """
@@ -79,6 +80,10 @@ in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "ren
 # another session: the last one's imported images and ownership answer are dropped before anything else runs
 in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
          "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")
+
+selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {")
+check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,
+      "the self-test's duration not lorieVkElapsedUs's on both ways out")
 
 print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit) and the renderer's Vulkan order: %s (%d failures)" % (
     "FAIL" if fails else "PASS", fails))

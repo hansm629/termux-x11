@@ -750,6 +750,13 @@ static VkResult lorieVkSelftestSyncHost(struct lorie_vk *vk, struct lorie_vk_sel
     return toDevice ? vk->FlushMappedMemoryRanges(vk->device, 1, &range) : vk->InvalidateMappedMemoryRanges(vk->device, 1, &range);
 }
 
+// Microseconds from t0 to t1, both CLOCK_MONOTONIC: the difference in nanoseconds taken signed first, since t1's
+// tv_nsec is below t0's whenever a second boundary lies between them (0 for a t1 before t0, never a wrapped value).
+static uint64_t lorieVkElapsedUs(const struct timespec *t0, const struct timespec *t1) {
+    int64_t ns = ((int64_t) t1->tv_sec - (int64_t) t0->tv_sec) * 1000000000 + ((int64_t) t1->tv_nsec - (int64_t) t0->tv_nsec);
+    return ns > 0 ? (uint64_t) ns / 1000 : 0;
+}
+
 bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {
     struct lorie_vk_selftest t = {0};
     struct timespec t0, t1;
@@ -897,7 +904,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     if (st) {
         st->diag.vkSelftestFormatsPassed = passed;
         st->diag.vkSelftestFormatsUnavailable = unavailable;
-        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
+        st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);
         st->diag.vkSelftest = 1;
     }
     log("ownership self-test passed: formats %#x, unavailable %#x, %u iterations each way", passed, unavailable, iterations);
@@ -914,7 +921,7 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     if (st) {
         st->diag.vkSelftestFormatsPassed = passed;
         st->diag.vkSelftestFormatsUnavailable = unavailable;
-        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
+        st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);
         st->diag.vkSelftestFailStep = step;
         st->diag.vkSelftestFailFormat = format;
         st->diag.vkSelftestFailDirection = direction;
