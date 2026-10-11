@@ -2,7 +2,8 @@
 """Checks that the X server calls the AHB ownership code where the handshake needs it (townership.c tests
 the code itself): every frame's lorieRedraw takes up the renderer's request before anything can return
 early; a new renderer connection and a lost one both go back to 3c98ffa's ownership; the requested backend
-is read from TERMUX_X11_RENDERER_BACKEND when the server state is made.
+is read from TERMUX_X11_RENDERER_BACKEND when the server state is made; under PER_ACCESS lorieRedraw allows the
+tick's frame before its vblanks queue the Present copies.
 
 And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c, tvkrenderer.c and tpresentcopy.c test the
 steps): a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
@@ -39,6 +40,11 @@ def before_first_return(body, call):
 redraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {")
 check(before_first_return(redraw, "lorieProcessOwnershipRequest();"),
       "lorieRedraw does not take up the ownership request before its first return")
+
+# Vulkan: the tick's frame allowed before the vblanks queue their Present copies, so they go in that frame
+check(redraw.find("if (lorieAhbPerAccess())\n        pvfb->state->waitForNextFrame = false;") >= 0 and
+      redraw.find("if (lorieAhbPerAccess())\n        pvfb->state->waitForNextFrame = false;") < redraw.find("loriePerformVblanks();"),
+      "lorieRedraw does not allow a Vulkan frame before its vblanks queue the Present copies")
 
 connected = func(I, "void lorieActivityConnected(void) {")
 check("lorieResetOwnership();" in connected, "a new renderer connection does not reset the ownership")

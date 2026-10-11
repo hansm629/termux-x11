@@ -1992,10 +1992,17 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         return rendererVkFail();
     }
 
-    // A swapchain reported out of date is made again first. A new size or format comes as a new surface
-    // (rendererSetWindow, from surfaceChanged), which makes the swapchain again anyway.
+    // A swapchain reported out of date, or wanting another present mode, is made again first. A new size or format
+    // comes as a new surface (rendererSetWindow, from surfaceChanged), which makes the swapchain again anyway.
     if (vkr.recreate && !lorieVkSwapchainCreate(&vk, &vkr, win, state))
         return rendererVkFail();
+    // FIFO: the image below may come only with the display's next refresh, and the copies queued do not wait for
+    // it - they go in a submission of their own first. Otherwise they go in the frame's.
+    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+        rendererVkApplyPendingGpuCopies();
+        if (!vkActive)
+            return;     // failed (rendererVkFail)
+    }
     status = lorieVkAcquire(&vk, &vkr, &index, state);
     if (status == LORIE_VK_FRAME_SKIP)
         return;     // drawRequested stays: tried again

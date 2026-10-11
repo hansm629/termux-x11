@@ -657,6 +657,10 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     lorieProcessOwnershipRequest();
 
     pvfb->current_msc++;
+    // Vulkan (PER_ACCESS): the frame this tick allows is allowed before the vblanks run, so that the Present copies
+    // they queue go into that frame's submission instead of one of their own ahead of it. GLES keeps 3c98ffa's order.
+    if (lorieAhbPerAccess())
+        pvfb->state->waitForNextFrame = false;
     loriePerformVblanks();
 
     pvfb->state->waitForNextFrame = false;

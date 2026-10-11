@@ -667,6 +667,24 @@ CONTROLS = [
      """    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n""",
      """    if (state && __atomic_exchange_n""",
      "tpresentcopy"),
+    ("Vulkan's tick frame allowed only after the vblanks queued their copies", "InitOutput.c",
+     """    if (lorieAhbPerAccess())
+        pvfb->state->waitForNextFrame = false;
+    loriePerformVblanks();""",
+     """    loriePerformVblanks();""",
+     "twiring"),
+    ("FIFO copies held up by the frame's swapchain image", "renderer.c",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+        rendererVkApplyPendingGpuCopies();""",
+     """    if (0) {
+        rendererVkApplyPendingGpuCopies();""",
+     "tpresentcopy"),
+    ("copies in a submission of their own whatever the present mode", "renderer.c",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+        rendererVkApplyPendingGpuCopies();""",
+     """    if (1) {
+        rendererVkApplyPendingGpuCopies();""",
+     "tpresentcopy"),
 ]
 
 def copy_sources(dst):

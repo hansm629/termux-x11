@@ -136,7 +136,7 @@ static volatile struct lorie_shared_server_state *state;
 static struct lorie_vk vk;
 static struct lorie_vk_images vkImages;
 static struct lorie_vk_renderer vkr;
-static bool vkOwned, backendSelect;
+static bool vkOwned, backendSelect, vkActive = true;    /* the mock rendererVkFail tears nothing down */
 static uint32_t vkOwnershipSeq;
 static volatile int viewportX, viewportY, viewportW = 1080, viewportH = 2400, expectedW, expectedH;
 #define CVT_H_GRANULARITY 8
@@ -315,6 +315,7 @@ int main(void) {
     BoxRec boxes[17] = { { 0, 0, 50, 20 }, { 60, 30, 200, 100 } };
     RegionRec two = { 2, boxes };
     LorieGpuCopyEntry *e;
+    uint32_t submits0;
     uint64_t serial = 0;
     void *dstBuffer = NULL;
     bool waiting = false;
@@ -325,6 +326,8 @@ int main(void) {
     alarm(30);          /* a wait that never ends fails the test (in a few seconds otherwise) instead of hanging it */
     pthread_spin_init(&bufferLock, PTHREAD_PROCESS_PRIVATE);
     good();
+    emu.presentModes[1] = VK_PRESENT_MODE_MAILBOX_KHR;    /* immediate: MAILBOX, copies in the frame's submission */
+    emu.presentModeCount = 2;
     state = pvfb->state = &st;
     CHECK(lorieVkCreateDevice(&vk, fGetInstanceProcAddr, &st), "no device");
     vk.verifiedFormats = 7;
@@ -404,7 +407,10 @@ int main(void) {
     lorieGpuCopyAck(&srcPix, dstBuffer);
     CHECK(src->refs == 0 && src->gpuCopyPending == 0 && vfb.rootGpuCopyPending == 0, "acknowledged: something still held");
 
-    /* a frame: a BGRA client's whole window into a redirected window's pixmap, then the root on screen */
+    /* a frame: a BGRA client's whole window into a redirected window's pixmap, then the root on screen - in one
+     * submission (MAILBOX) */
+    CHECK(vkr.presentMode == VK_PRESENT_MODE_MAILBOX_KHR, "the swapchain not MAILBOX");
+    submits0 = st.diag.vkQueueSubmits;
     CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &serial, &dstBuffer), "into a redirected window: not queued");
     e = &st.gpuCopyQueue.entries[1];
     CHECK(serial == 2 && e->numRects == 1 && e->rects[0].x1 == 0 && e->rects[0].y1 == 0 && e->rects[0].x2 == 64 && e->rects[0].y2 == 32 &&
@@ -436,6 +442,7 @@ int main(void) {
     CHECK(lorieGpuCopyIsDone(2), "frame: not done");
     lorieGpuCopyAck(&bgraPix, dstBuffer);
     CHECK(bgra->refs == 0 && redirected->refs == 0 && redirected->gpuCopyPending == 0, "frame acknowledged: something still held");
+    CHECK(st.diag.vkQueueSubmits == submits0 + 1, "frame with a copy (MAILBOX): %u submissions, want 1", st.diag.vkQueueSubmits - submits0);
 
     /* a plain desktop frame: nothing queued, no copy drawn; the X server, meanwhile, on its own thread */
     {
@@ -684,6 +691,26 @@ int main(void) {
               "many: a removal moved another image");
         for (int k = 1; k < SOURCES; k++)
             CHECK(lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k], "many: source %d moved by a removal", k);
+    }
+
+    /* FIFO (smooth): the copies first, in a submission of their own, then the frame - the copies not held up by an
+     * image the display may give back only at its next refresh */
+    {
+        RegionRec one = { 1, boxes };
+        own(30);
+        vkr.smooth = true;
+        vkr.recreate = true;                    /* as rendererVkApplyPresentMode */
+        submits0 = st.diag.vkQueueSubmits;
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "FIFO: not queued");
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR && st.diag.vkQueueSubmits == submits0 + 2 && lorieGpuCopyIsDone(serial) &&
+              vkFailures == 0 && emu.violations == 0, "FIFO frame with a copy: %u submissions (want 2), done %d",
+              st.diag.vkQueueSubmits - submits0, lorieGpuCopyIsDone(serial));
+        st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+        vkr.smooth = false;
+        vkr.recreate = true;
     }
 
     /* a list another renderer process (alive) left: not cleared by this one; a frame of this one waits until it is over */
