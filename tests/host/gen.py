@@ -70,6 +70,7 @@ recipes = {
     "vk": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */\n};")
         + span(VH, "struct lorie_vk_image {", "    VkResult lastResult;\n};")
         + span(VH, "enum lorie_vk_use {", "    VkPipelineStageFlags srcStage, dstStage;\n};")
+        + span(VH, "#define LORIE_VK_MAX_SWAPCHAIN_IMAGES 8", "enum { LORIE_VK_FRAME_OK, LORIE_VK_FRAME_SKIP, LORIE_VK_FRAME_RECREATE, LORIE_VK_FRAME_FATAL };")
         + span(VC, "static const char *const lorieVkInstanceExtensions[] = {", "#define LORIE_VK_MAX_DEVICES 8")
         + "".join(func(VC, f) for f in (
             "void lorieVkFallback(volatile struct lorie_shared_server_state *st, uint8_t cls, uint8_t reason, VkResult result) {",
@@ -91,9 +92,12 @@ recipes = {
             "struct lorie_vk_barrier lorieVkReleaseBarrier(const struct lorie_vk *vk, VkImage image, enum lorie_vk_use use) {",
             "struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from, enum lorie_vk_use to) {"))
         + macro(VH, "LORIE_VK_SELFTEST_ITERATIONS") + macro(VH, "LORIE_VK_SELFTEST_QUICK_ITERATIONS")
-        + span(VC, "#define LORIE_VK_SELFTEST_WIDTH 67", "    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);\n    return false;\n}"),
+        + span(VC, "#define LORIE_VK_SELFTEST_WIDTH 67", "    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);\n    return false;\n}")
+        + span(VC, "/* ---- presenting ---- */", "LORIE_FALLBACK_VK_PRESENT, res);\n            return LORIE_VK_FRAME_FATAL;\n    }\n}"),
+    # the shaders as committed (vk.c includes them)
+    "vk_shaders": lambda: open(os.path.join(L, "vk_shaders.h"), encoding="utf-8").read(),
 }
 
 for name, make in recipes.items():
-    with open(os.path.join(OUT, name + "_src.inc"), "w") as f:
+    with open(os.path.join(OUT, name + (".h" if name == "vk_shaders" else "_src.inc")), "w") as f:
         f.write(make())

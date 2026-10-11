@@ -24,7 +24,9 @@ struct lorie_shared_server_state;
 #define LORIE_VK_INSTANCE_FNS(X) \
     X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
     X(GetPhysicalDeviceQueueFamilyProperties) X(EnumerateDeviceExtensionProperties) \
-    X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceImageFormatProperties2)
+    X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceImageFormatProperties2) \
+    X(CreateAndroidSurfaceKHR) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
+    X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR)
 #define LORIE_VK_DEVICE_FNS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) \
     X(GetAndroidHardwareBufferPropertiesANDROID) X(CreateImage) X(DestroyImage) X(AllocateMemory) X(FreeMemory) \
     X(BindImageMemory) X(CreateImageView) X(DestroyImageView) \
@@ -32,7 +34,14 @@ struct lorie_shared_server_state;
     X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdCopyBufferToImage) \
     X(CmdCopyImageToBuffer) X(QueueSubmit) X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) \
     X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory) X(MapMemory) \
-    X(UnmapMemory) X(FlushMappedMemoryRanges) X(InvalidateMappedMemoryRanges)
+    X(UnmapMemory) X(FlushMappedMemoryRanges) X(InvalidateMappedMemoryRanges) X(GetImageMemoryRequirements) \
+    X(CreateSwapchainKHR) X(DestroySwapchainKHR) X(GetSwapchainImagesKHR) X(AcquireNextImageKHR) X(QueuePresentKHR) \
+    X(CreateRenderPass) X(DestroyRenderPass) X(CreateFramebuffer) X(DestroyFramebuffer) X(CreateShaderModule) \
+    X(DestroyShaderModule) X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
+    X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) X(CreateDescriptorPool) X(DestroyDescriptorPool) \
+    X(ResetDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CreateSampler) X(DestroySampler) \
+    X(CreateSemaphore) X(DestroySemaphore) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) \
+    X(CmdBindDescriptorSets) X(CmdPushConstants) X(CmdSetViewport) X(CmdSetScissor) X(CmdDraw)
 
 struct lorie_vk {
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
@@ -75,6 +84,7 @@ struct lorie_vk_image {
     uint32_t ahbFormat;
     uint64_t ahbUsage;
     bool rgbaOrder, rgbx;
+    VkFramebuffer framebuffer;  /* for rendering into it (GPU copies): made when first needed */
 };
 
 struct lorie_vk_images {
@@ -139,6 +149,98 @@ struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from,
 // way (TERMUX_X11_RENDERER_VK_SELFTEST=full asks for LORIE_VK_SELFTEST_ITERATIONS).
 #define LORIE_VK_SELFTEST_QUICK_ITERATIONS 5
 bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations);
+
+/*
+ * Presenting: what the renderer draws a frame with (lorieVkRendererCreate, once per device) and the window's
+ * swapchain (lorieVkSwapchainCreate, per window). A frame is done as GLES does it, one at a time:
+ *
+ *   lorieVkAcquire         swapchain image, outside the X server's lock; its fence waited for (bounded) and reset
+ *   - X server's lock taken by the caller -
+ *   lorieVkFrameBegin      command buffer and descriptor sets reset
+ *   lorieVkFrameCopy       each pending GPU copy: source sampled, destination rendered into
+ *   lorieVkFrameCursor     the cursor image refilled, if it changed
+ *   lorieVkFrameScreen     the root (and cursor) drawn into the swapchain image
+ *   lorieVkFrameSubmit     every X server buffer the frame used released, submitted, its fence waited for (bounded)
+ *   - completed serial published, X server's lock let go by the caller -
+ *   lorieVkPresent
+ *
+ * Every X server buffer a frame uses is acquired from the foreign owner once, at its first use, moved between
+ * uses within the frame, and released at the end (lorieVkFrameUse); the X server may lock it again only after
+ * the frame's fence was waited for, which happens before its lock is let go. Draws counted as using an imported
+ * image (source or destination) are added to the diagnostics only after the fence signalled.
+ */
+#define LORIE_VK_MAX_SWAPCHAIN_IMAGES 8
+#define LORIE_VK_MAX_FRAME_IMAGES 32
+
+struct lorie_vk_quad {          /* the shaders' push constants: see shaders/quad.vert */
+    float rect[4], uv[4];
+    uint32_t flags;
+};
+#define LORIE_VK_QUAD_SWIZZLE 1u    /* red and blue swapped: GLES's .bgra program */
+#define LORIE_VK_QUAD_OPAQUE 2u     /* alpha written as one */
+
+struct lorie_vk_renderer {
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkFence frameFence, acquireFence;
+    VkDescriptorSetLayout setLayout;
+    VkPipelineLayout layout;
+    VkDescriptorPool descriptors;
+    VkSampler samplers[2];          /* nearest, linear */
+    VkShaderModule vert, frag;
+    VkRenderPass copyPass[2];       /* rendering into an imported buffer: [0] R8G8B8A8, [1] B8G8R8A8 */
+    VkPipeline copyPipeline[2];
+    /* the cursor: the renderer's own image, filled from the X server's bits through a staging buffer */
+    VkImage cursor;
+    VkDeviceMemory cursorMemory;
+    VkImageView cursorView;
+    uint32_t cursorWidth, cursorHeight;
+    VkBuffer staging;
+    VkDeviceMemory stagingMemory;
+    uint8_t *stagingMapped;
+    bool stagingCoherent;
+    /* the window's swapchain */
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkFormat format;
+    VkExtent2D extent;
+    uint32_t windowWidth, windowHeight;     /* the window's size the swapchain was made for */
+    uint32_t imageCount;
+    VkImage images[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
+    VkImageView views[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
+    VkFramebuffer framebuffers[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
+    VkSemaphore rendered[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
+    VkRenderPass screenPass;
+    VkPipeline screenPipeline, cursorPipeline;
+    bool recreate;                  /* suboptimal or out of date: made again before the next frame */
+    /* this frame: the imported images it used and the use each is in; its draws */
+    struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
+    uint32_t usedCount, sourceDraws, destinationDraws, draws;
+    uint64_t submitCpuUs, fenceWaitUs;
+};
+
+enum { LORIE_VK_FRAME_OK, LORIE_VK_FRAME_SKIP, LORIE_VK_FRAME_RECREATE, LORIE_VK_FRAME_FATAL };
+
+bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
+void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r);
+// The window's surface and swapchain (made again, keeping the surface, when it is already there).
+bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct ANativeWindow *window,
+                            volatile struct lorie_shared_server_state *st);
+void lorieVkSwapchainDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r);
+int lorieVkAcquire(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t *index, volatile struct lorie_shared_server_state *st);
+VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r);
+bool lorieVkFrameUse(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *img, enum lorie_vk_use use);
+bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                      const struct lorie_vk_quad *quads, uint32_t count, int filter);
+bool lorieVkFrameCursor(struct lorie_vk *vk, struct lorie_vk_renderer *r, const uint32_t *bits, uint32_t width, uint32_t height);
+void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, struct lorie_vk_image *root,
+                        const VkRect2D *viewport, const struct lorie_vk_quad *rootQuad, const struct lorie_vk_quad *cursorQuad,
+                        int filter);
+// Releases the frame's images, ends and submits it (signalling the swapchain image's semaphore when `present`),
+// and waits for its fence; VK_SUCCESS only once the fence signalled.
+VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
+                            volatile struct lorie_shared_server_state *st);
+int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, volatile struct lorie_shared_server_state *st);
 
 // libvulkan.so's vkGetInstanceProcAddr, or NULL with the fallback recorded (VK_LOADER).
 PFN_vkGetInstanceProcAddr lorieVkLoader(volatile struct lorie_shared_server_state *st);

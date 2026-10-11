@@ -48,6 +48,9 @@ typedef struct AHardwareBuffer {
     VkImageLayout layout;
 } AHardwareBuffer;
 typedef struct ARect { int32_t left, top, right, bottom; } ARect;
+typedef struct ANativeWindow { int32_t width, height; } ANativeWindow;
+static int32_t ANativeWindow_getWidth(ANativeWindow *w) { return w->width; }
+static int32_t ANativeWindow_getHeight(ANativeWindow *w) { return w->height; }
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL " __VA_ARGS__); printf("\n"); } } while (0)
@@ -59,7 +62,19 @@ static struct {
     long lockFail, corruptCopy;     /* the n-th lock fails; the n-th copy writes one wrong byte (1-based, 0: none) */
     uint32_t corruptByte;
     VkResult submitResult, fenceResult;
+    VkResult acquireResult, presentResult;  /* what the next acquire / present returns */
+    bool surfaceUnsupported;
+    VkSurfaceFormatKHR surfaceFormats[4];
+    uint32_t surfaceFormatCount;
+    VkSurfaceCapabilitiesKHR caps;
+    long failObject;                /* the n-th render pass, pipeline, framebuffer, ... made fails (1-based, 0: none) */
     /* kept */
+    long objects;                   /* render passes, pipelines, ... made so far */
+    int live;                       /* of those, not destroyed */
+    int surfaces, swapchains, acquires2, presents, deviceWaits;
+    VkSwapchainCreateInfoKHR swapchainInfo;
+    uint32_t nextImage;
+    int passesIntoImported, drawsFromImported, drawsIntoImported, draws;
     long copies, locks;
     bool fencePending;
     int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
@@ -132,6 +147,7 @@ static int AHardwareBuffer_unlock(AHardwareBuffer *b, int32_t *fence) {
 struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie_backend_control backend; };
 #define log(...) ((void) 0)
 #define loge(...) ((void) 0)
+#include "vk_shaders.h"
 #include "vk_src.inc"
 
 /* ---- the fake Vulkan ---- */
@@ -255,6 +271,7 @@ static VKAPI_ATTR void VKAPI_CALL fGetDeviceQueue(VkDevice d, uint32_t family, u
 static VKAPI_ATTR VkResult VKAPI_CALL fDeviceWaitIdle(VkDevice d) {
     (void) d;
     calls.waitIdle++;
+    emu.deviceWaits++;
     emu.fencePending = false;
     return VK_SUCCESS;
 }
@@ -389,6 +406,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL fBindImageMemory(VkDevice d, VkImage i, Vk
                 }
     return VK_SUCCESS;
 }
+static struct { VkImageView view; VkImage image; } viewImages[128];
+static VkImage imageOfView(VkImageView v) {
+    for (int i = 0; i < 128; i++)
+        if (v && viewImages[i].view == v)
+            return viewImages[i].image;
+    return VK_NULL_HANDLE;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateImageView(VkDevice d, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *a, VkImageView *out) {
     (void) d; (void) a;
     if (imp.viewCount < 2)
@@ -397,15 +421,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateImageView(VkDevice d, const VkImage
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     imp.views++;
     *out = (VkImageView) nextHandle++;
+    for (int i = 0; i < 128; i++)
+        if (!viewImages[i].view) {
+            viewImages[i].view = *out;
+            viewImages[i].image = info->image;
+            break;
+        }
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fDestroyImageView(VkDevice d, VkImageView v, const VkAllocationCallbacks *a) {
     (void) d; (void) a;
     CHECK(v, "vkDestroyImageView of a null view");
     imp.views--;
+    for (int i = 0; i < 128; i++)
+        if (viewImages[i].view == v)
+            memset(&viewImages[i], 0, sizeof viewImages[i]);
 }
 /* ---- what the self-test records and submits, run by the small device ---- */
-enum { OP_IMAGE_BARRIER, OP_BUFFER_BARRIER, OP_COPY_IMAGE, OP_BUFFER_TO_IMAGE, OP_IMAGE_TO_BUFFER };
+enum { OP_IMAGE_BARRIER, OP_BUFFER_BARRIER, OP_COPY_IMAGE, OP_BUFFER_TO_IMAGE, OP_IMAGE_TO_BUFFER, OP_BEGIN_PASS,
+       OP_END_PASS, OP_BIND_SET, OP_DRAW };
 struct fake_op {
     int kind;
     VkImageMemoryBarrier image;
@@ -415,8 +449,27 @@ struct fake_op {
     VkBuffer buf;
     VkImageLayout la, lb;
     VkExtent3D extent;
+    VkFramebuffer framebuffer;
+    VkDescriptorSet set;
 };
-static struct { struct fake_op ops[16]; int n; bool recording; } cmdObj;
+static struct { struct fake_op ops[256]; int n; bool recording; } cmdObj;
+static struct { VkFramebuffer framebuffer; VkImageView view; } framebuffers[64];
+static struct { VkDescriptorSet set; VkImageView view; VkImageLayout layout; } descriptorSets[64];
+static VkImage imageOfFramebuffer(VkFramebuffer f) {
+    for (int i = 0; i < 64; i++)
+        if (f && framebuffers[i].framebuffer == f)
+            return imageOfView(framebuffers[i].view);
+    return VK_NULL_HANDLE;
+}
+static const VkImageLayout *layoutOfSet(VkDescriptorSet s, VkImage *image) {
+    for (int i = 0; i < 64; i++)
+        if (s && descriptorSets[i].set == s) {
+            *image = imageOfView(descriptorSets[i].view);
+            return &descriptorSets[i].layout;
+        }
+    *image = VK_NULL_HANDLE;
+    return NULL;
+}
 static uint8_t *bufferBytes(VkBuffer b) {
     for (int i = 0; i < 16; i++)
         if (buffers[i].buffer == b)
@@ -424,7 +477,7 @@ static uint8_t *bufferBytes(VkBuffer b) {
     return NULL;
 }
 static void record(struct fake_op op) {
-    if (!cmdObj.recording || cmdObj.n == 16)
+    if (!cmdObj.recording || cmdObj.n == 256)
         violation("command recorded outside a command buffer being recorded, or too many");
     else
         cmdObj.ops[cmdObj.n++] = op;
@@ -514,13 +567,16 @@ static bool usable(AHardwareBuffer *b, VkImageLayout l, VkImageLayout want, VkEx
     }
     return true;
 }
+static AHardwareBuffer *passTarget;
+static VkDescriptorSet boundSet;
 static void run(const struct fake_op *op) {
     AHardwareBuffer *a = op->a ? ahbOf(op->a) : NULL, *b = op->b ? ahbOf(op->b) : NULL, *x;
     const VkImageMemoryBarrier *m = &op->image;
     switch (op->kind) {
     case OP_IMAGE_BARRIER:
         if (!(x = ahbOf(m->image))) {
-            violation("barrier on an unknown image");
+            if (m->srcQueueFamilyIndex != m->dstQueueFamilyIndex)
+                violation("ownership transfer of an image that is no X server buffer");
             return;
         }
         if (m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT && m->dstQueueFamilyIndex == 1) {
@@ -561,6 +617,8 @@ static void run(const struct fake_op *op) {
         }
         return;
     case OP_BUFFER_TO_IMAGE:
+        if (!b && op->b)
+            return;     /* the renderer's own image (the cursor) */
         if (usable(b, op->lb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, op->extent)) {
             memcpy(b->gpu, bufferBytes(op->buf), (size_t) b->desc.width * b->desc.height * 4);
             copied(b->gpu);
@@ -573,12 +631,50 @@ static void run(const struct fake_op *op) {
         }
         emu.downloads++;
         return;
+    case OP_BEGIN_PASS:
+        passTarget = ahbOf(imageOfFramebuffer(op->framebuffer));
+        if (passTarget && (!passTarget->owned || passTarget->layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL))
+            violation("render pass into an X server buffer not owned, or not in COLOR_ATTACHMENT_OPTIMAL");
+        if (passTarget)
+            emu.passesIntoImported++;
+        return;
+    case OP_END_PASS:
+        passTarget = NULL;
+        return;
+    case OP_BIND_SET:
+        boundSet = op->set;
+        return;
+    case OP_DRAW: {
+        VkImage sampled;
+        const VkImageLayout *layout = layoutOfSet(boundSet, &sampled);
+        AHardwareBuffer *source = ahbOf(sampled);
+        if (!layout)
+            violation("draw without a descriptor set");
+        else if (source && (!source->owned || source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+                            *layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
+            violation("draw sampling an X server buffer not owned, or not in SHADER_READ_ONLY_OPTIMAL");
+        emu.draws++;
+        if (source)
+            emu.drawsFromImported++;
+        if (passTarget)
+            emu.drawsIntoImported++;
+        return;
     }
+    }
+}
+static struct { VkFence fence; bool signaled; } fences[16];
+static bool *signaled(VkFence f) {
+    for (int i = 0; i < 16; i++)
+        if (f && fences[i].fence == f)
+            return &fences[i].signaled;
+    return NULL;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) {
     (void) q;
     if (emu.submitResult != VK_SUCCESS)
         return emu.submitResult;
+    if (f && signaled(f) && *signaled(f))
+        violation("submission with a signalled fence");
     CHECK(n == 1 && s->commandBufferCount == 1 && s->pCommandBuffers[0] == (VkCommandBuffer) &cmdObj && !cmdObj.recording,
           "fake device: submission of a command buffer still being recorded");
     if (emu.fencePending)
@@ -601,28 +697,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const 
         }
     }
     emu.fencePending = f != VK_NULL_HANDLE;
+    if (f && signaled(f))
+        *signaled(f) = true;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateFence(VkDevice d, const VkFenceCreateInfo *i, const VkAllocationCallbacks *a, VkFence *f) {
-    (void) d; (void) i; (void) a;
+    (void) d; (void) a;
     emu.fences++;
     *f = (VkFence) nextHandle++;
+    for (int k = 0; k < 16; k++)
+        if (!fences[k].fence) {
+            fences[k].fence = *f;
+            fences[k].signaled = i->flags & VK_FENCE_CREATE_SIGNALED_BIT;
+            break;
+        }
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fDestroyFence(VkDevice d, VkFence f, const VkAllocationCallbacks *a) {
-    (void) d; (void) f; (void) a;
+    (void) d; (void) a;
     emu.fences--;
+    for (int k = 0; k < 16; k++)
+        if (fences[k].fence == f)
+            memset(&fences[k], 0, sizeof fences[k]);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fWaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
     (void) d; (void) n; (void) f; (void) all;
     CHECK(timeout != UINT64_MAX, "fake device: an unbounded fence wait");
     if (emu.fenceResult != VK_SUCCESS)
         return emu.fenceResult;
+    for (uint32_t i = 0; i < n; i++)
+        if (signaled(f[i]) && !*signaled(f[i]))
+            violation("waiting for a fence nothing signals");
     emu.fencePending = false;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fResetFences(VkDevice d, uint32_t n, const VkFence *f) {
-    (void) d; (void) n; (void) f;
+    (void) d;
+    for (uint32_t i = 0; i < n; i++)
+        if (signaled(f[i]))
+            *signaled(f[i]) = false;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateBuffer(VkDevice d, const VkBufferCreateInfo *i, const VkAllocationCallbacks *a, VkBuffer *b) {
@@ -684,6 +797,224 @@ static VKAPI_ATTR VkResult VKAPI_CALL fInvalidateMappedMemoryRanges(VkDevice d, 
     emu.invalidates++;
     return VK_SUCCESS;
 }
+/* ---- presenting: surface, swapchain, and what a frame is drawn with ---- */
+#define MADE(type, out) do { if (++emu.objects == emu.failObject) return VK_ERROR_OUT_OF_HOST_MEMORY; \
+                             emu.live++; *(out) = (type) nextHandle++; } while (0)
+#define GONE(h) do { if (h) emu.live--; } while (0)
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateAndroidSurfaceKHR(VkInstance i, const VkAndroidSurfaceCreateInfoKHR *info,
+                                                               const VkAllocationCallbacks *a, VkSurfaceKHR *out) {
+    (void) i; (void) a;
+    CHECK(info->window, "fake device: a surface without a window");
+    emu.surfaces++;
+    *out = (VkSurfaceKHR) nextHandle++;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroySurfaceKHR(VkInstance i, VkSurfaceKHR s, const VkAllocationCallbacks *a) {
+    (void) i; (void) a;
+    CHECK(s, "fake device: destroying a null surface");
+    CHECK(emu.swapchains == 0, "fake device: surface destroyed before its swapchain");
+    emu.surfaces--;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice pd, uint32_t family, VkSurfaceKHR s, VkBool32 *ok) {
+    (void) pd; (void) s;
+    *ok = family == 1 && !emu.surfaceUnsupported;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice pd, VkSurfaceKHR s, VkSurfaceCapabilitiesKHR *c) {
+    (void) pd; (void) s;
+    *c = emu.caps;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t *n, VkSurfaceFormatKHR *f) {
+    (void) pd; (void) s;
+    if (f)
+        for (uint32_t i = 0; i < emu.surfaceFormatCount && i < *n; i++)
+            f[i] = emu.surfaceFormats[i];
+    *n = emu.surfaceFormatCount;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *a,
+                                                          VkSwapchainKHR *out) {
+    (void) d; (void) a;
+    emu.swapchainInfo = *info;
+    if (++emu.objects == emu.failObject)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    emu.swapchains++;
+    *out = (VkSwapchainKHR) nextHandle++;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroySwapchainKHR(VkDevice d, VkSwapchainKHR s, const VkAllocationCallbacks *a) {
+    (void) d; (void) a;
+    CHECK(s, "fake device: destroying a null swapchain");
+    emu.swapchains--;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fGetSwapchainImagesKHR(VkDevice d, VkSwapchainKHR s, uint32_t *n, VkImage *images) {
+    (void) d; (void) s;
+    uint32_t count = emu.swapchainInfo.minImageCount;
+    if (images)
+        for (uint32_t i = 0; i < count && i < *n; i++)
+            images[i] = (VkImage) (uintptr_t) (0x900000 + i);    /* the presentation engine's: no X server buffer */
+    *n = count;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fAcquireNextImageKHR(VkDevice d, VkSwapchainKHR s, uint64_t timeout, VkSemaphore sem, VkFence f, uint32_t *index) {
+    (void) d; (void) s;
+    CHECK(timeout != UINT64_MAX && !sem && f, "fake device: acquire with an unbounded wait, a semaphore, or no fence");
+    emu.acquires2++;
+    if (signaled(f) && *signaled(f))
+        violation("acquire with a signalled fence (it was not reset)");
+    if (emu.acquireResult != VK_SUCCESS && emu.acquireResult != VK_SUBOPTIMAL_KHR)
+        return emu.acquireResult;
+    if (signaled(f))
+        *signaled(f) = true;
+    *index = emu.nextImage++ % emu.swapchainInfo.minImageCount;
+    return emu.acquireResult;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *info) {
+    (void) q;
+    CHECK(info->waitSemaphoreCount == 1 && info->swapchainCount == 1, "fake device: present without its semaphore");
+    CHECK(!emu.fencePending, "fake device: present before the frame's fence was waited for");
+    emu.presents++;
+    return emu.presentResult;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateRenderPass(VkDevice d, const VkRenderPassCreateInfo *i, const VkAllocationCallbacks *a, VkRenderPass *p) {
+    (void) d; (void) a;
+    CHECK(i->attachmentCount == 1, "fake device: one attachment");
+    if (i->pAttachments[0].format != VK_FORMAT_B8G8R8A8_UNORM && i->pAttachments[0].format != VK_FORMAT_R8G8B8A8_UNORM)
+        violation("render pass of an unexpected format");
+    if (i->pAttachments[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && i->pAttachments[0].initialLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        violation("contents loaded from UNDEFINED");
+    MADE(VkRenderPass, p);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyRenderPass(VkDevice d, VkRenderPass p, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(p); }
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateFramebuffer(VkDevice d, const VkFramebufferCreateInfo *i, const VkAllocationCallbacks *a, VkFramebuffer *f) {
+    (void) d; (void) a;
+    MADE(VkFramebuffer, f);
+    for (int k = 0; k < 64; k++)
+        if (!framebuffers[k].framebuffer) {
+            framebuffers[k].framebuffer = *f;
+            framebuffers[k].view = i->pAttachments[0];
+            break;
+        }
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyFramebuffer(VkDevice d, VkFramebuffer f, const VkAllocationCallbacks *a) {
+    (void) d; (void) a;
+    GONE(f);
+    for (int k = 0; k < 64; k++)
+        if (framebuffers[k].framebuffer == f)
+            memset(&framebuffers[k], 0, sizeof framebuffers[k]);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo *i, const VkAllocationCallbacks *a, VkShaderModule *m) {
+    (void) d; (void) a;
+    CHECK(i->codeSize % 4 == 0 && i->codeSize >= 20 && i->pCode[0] == 0x07230203, "fake device: not SPIR-V");
+    MADE(VkShaderModule, m);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyShaderModule(VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(m); }
+static VKAPI_ATTR VkResult VKAPI_CALL fCreatePipelineLayout(VkDevice d, const VkPipelineLayoutCreateInfo *i, const VkAllocationCallbacks *a, VkPipelineLayout *l) {
+    (void) d; (void) a;
+    CHECK(i->pushConstantRangeCount == 1 && i->pPushConstantRanges[0].size == sizeof(struct lorie_vk_quad), "fake device: push constants");
+    MADE(VkPipelineLayout, l);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyPipelineLayout(VkDevice d, VkPipelineLayout l, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(l); }
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateGraphicsPipelines(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *i,
+                                                               const VkAllocationCallbacks *a, VkPipeline *p) {
+    (void) d; (void) c; (void) a;
+    CHECK(n == 1 && i->renderPass && i->layout, "fake device: pipeline");
+    MADE(VkPipeline, p);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyPipeline(VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(p); }
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo *i, const VkAllocationCallbacks *a,
+                                                                 VkDescriptorSetLayout *l) {
+    (void) d; (void) i; (void) a;
+    MADE(VkDescriptorSetLayout, l);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(l); }
+static int setsInPool;
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreateInfo *i, const VkAllocationCallbacks *a, VkDescriptorPool *p) {
+    (void) d; (void) i; (void) a;
+    MADE(VkDescriptorPool, p);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroyDescriptorPool(VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(p); }
+static VKAPI_ATTR VkResult VKAPI_CALL fResetDescriptorPool(VkDevice d, VkDescriptorPool p, VkDescriptorPoolResetFlags f) {
+    (void) d; (void) p; (void) f;
+    setsInPool = 0;
+    memset(descriptorSets, 0, sizeof descriptorSets);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fAllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo *i, VkDescriptorSet *s) {
+    (void) d;
+    if (i->descriptorSetCount != 1 || setsInPool == 32)
+        return VK_ERROR_OUT_OF_POOL_MEMORY;
+    *s = (VkDescriptorSet) nextHandle++;
+    descriptorSets[setsInPool++].set = *s;
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fUpdateDescriptorSets(VkDevice d, uint32_t n, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
+    (void) d; (void) c;
+    CHECK(nc == 0, "fake device: descriptor copies");
+    for (uint32_t i = 0; i < n; i++)
+        for (int k = 0; k < 64; k++)
+            if (descriptorSets[k].set == w[i].dstSet) {
+                descriptorSets[k].view = w[i].pImageInfo->imageView;
+                descriptorSets[k].layout = w[i].pImageInfo->imageLayout;
+            }
+}
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateSampler(VkDevice d, const VkSamplerCreateInfo *i, const VkAllocationCallbacks *a, VkSampler *s) {
+    (void) d; (void) i; (void) a;
+    MADE(VkSampler, s);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroySampler(VkDevice d, VkSampler s, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(s); }
+static VKAPI_ATTR VkResult VKAPI_CALL fCreateSemaphore(VkDevice d, const VkSemaphoreCreateInfo *i, const VkAllocationCallbacks *a, VkSemaphore *s) {
+    (void) d; (void) i; (void) a;
+    MADE(VkSemaphore, s);
+    return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fDestroySemaphore(VkDevice d, VkSemaphore s, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(s); }
+static VKAPI_ATTR void VKAPI_CALL fGetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r) {
+    (void) d; (void) i;
+    *r = (VkMemoryRequirements) { 512 * 512 * 4, 256, 0x7 };
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdBeginRenderPass(VkCommandBuffer c, const VkRenderPassBeginInfo *i, VkSubpassContents k) {
+    (void) c; (void) k;
+    record((struct fake_op) { .kind = OP_BEGIN_PASS, .framebuffer = i->framebuffer });
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdEndRenderPass(VkCommandBuffer c) {
+    (void) c;
+    record((struct fake_op) { .kind = OP_END_PASS });
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint b, VkPipeline p) {
+    (void) c; (void) b;
+    CHECK(p, "fake device: binding no pipeline");
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBindPoint b, VkPipelineLayout l, uint32_t first, uint32_t n,
+                                                         const VkDescriptorSet *sets, uint32_t nd, const uint32_t *dyn) {
+    (void) c; (void) b; (void) l; (void) first; (void) nd; (void) dyn;
+    CHECK(n == 1, "fake device: one set");
+    record((struct fake_op) { .kind = OP_BIND_SET, .set = sets[0] });
+}
+static struct lorie_vk_quad pushed[64];
+static int pushes;
+static VKAPI_ATTR void VKAPI_CALL fCmdPushConstants(VkCommandBuffer c, VkPipelineLayout l, VkShaderStageFlags st, uint32_t off, uint32_t size, const void *v) {
+    (void) c; (void) l; (void) st;
+    CHECK(off == 0 && size == sizeof(struct lorie_vk_quad), "fake device: push constants");
+    if (pushes < 64)
+        memcpy(&pushed[pushes++], v, sizeof(struct lorie_vk_quad));
+}
+static VKAPI_ATTR void VKAPI_CALL fCmdSetViewport(VkCommandBuffer c, uint32_t f, uint32_t n, const VkViewport *v) { (void) c; (void) f; (void) n; (void) v; }
+static VKAPI_ATTR void VKAPI_CALL fCmdSetScissor(VkCommandBuffer c, uint32_t f, uint32_t n, const VkRect2D *r) { (void) c; (void) f; (void) n; (void) r; }
+static VKAPI_ATTR void VKAPI_CALL fCmdDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
+    (void) c; (void) fv; (void) fi;
+    CHECK(v == 4 && i == 1, "fake device: a quad");
+    record((struct fake_op) { .kind = OP_DRAW });
+}
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetDeviceProcAddr(VkDevice d, const char *name) {
     (void) d;
 #define F(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction) f ## n;
@@ -693,7 +1024,14 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetDeviceProcAddr(VkDevice d, c
     F(EndCommandBuffer) F(CmdPipelineBarrier) F(CmdCopyImage) F(CmdCopyBufferToImage) F(CmdCopyImageToBuffer)
     F(QueueSubmit) F(CreateFence) F(DestroyFence) F(WaitForFences) F(ResetFences) F(CreateBuffer) F(DestroyBuffer)
     F(GetBufferMemoryRequirements) F(BindBufferMemory) F(MapMemory) F(UnmapMemory) F(FlushMappedMemoryRanges)
-    F(InvalidateMappedMemoryRanges)
+    F(InvalidateMappedMemoryRanges) F(GetImageMemoryRequirements) F(CreateSwapchainKHR) F(DestroySwapchainKHR)
+    F(GetSwapchainImagesKHR) F(AcquireNextImageKHR) F(QueuePresentKHR) F(CreateRenderPass) F(DestroyRenderPass)
+    F(CreateFramebuffer) F(DestroyFramebuffer) F(CreateShaderModule) F(DestroyShaderModule) F(CreatePipelineLayout)
+    F(DestroyPipelineLayout) F(CreateGraphicsPipelines) F(DestroyPipeline) F(CreateDescriptorSetLayout)
+    F(DestroyDescriptorSetLayout) F(CreateDescriptorPool) F(DestroyDescriptorPool) F(ResetDescriptorPool)
+    F(AllocateDescriptorSets) F(UpdateDescriptorSets) F(CreateSampler) F(DestroySampler) F(CreateSemaphore)
+    F(DestroySemaphore) F(CmdBeginRenderPass) F(CmdEndRenderPass) F(CmdBindPipeline) F(CmdBindDescriptorSets)
+    F(CmdPushConstants) F(CmdSetViewport) F(CmdSetScissor) F(CmdDraw)
 #undef F
     return NULL;
 }
@@ -707,7 +1045,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetInstanceProcAddr(VkInstance 
     }
     F(DestroyInstance) F(EnumeratePhysicalDevices) F(GetPhysicalDeviceProperties) F(GetPhysicalDeviceQueueFamilyProperties)
     F(EnumerateDeviceExtensionProperties) F(GetPhysicalDeviceMemoryProperties) F(CreateDevice)
-    F(GetPhysicalDeviceImageFormatProperties2)
+    F(GetPhysicalDeviceImageFormatProperties2) F(CreateAndroidSurfaceKHR) F(DestroySurfaceKHR)
+    F(GetPhysicalDeviceSurfaceSupportKHR) F(GetPhysicalDeviceSurfaceCapabilitiesKHR) F(GetPhysicalDeviceSurfaceFormatsKHR)
     if (!cfg.noGetDeviceProcAddr)
         F(GetDeviceProcAddr)
 #undef F
@@ -736,4 +1075,14 @@ static void good(void) {
     cfg.memory.memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     cfg.externalFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
     cfg.maxExtent = (VkExtent3D) { 16384, 16384, 1 };
+    emu.surfaceFormats[0] = (VkSurfaceFormatKHR) { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+    emu.surfaceFormats[1] = (VkSurfaceFormatKHR) { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+    emu.surfaceFormatCount = 2;
+    emu.caps = (VkSurfaceCapabilitiesKHR) {
+            .minImageCount = 2, .maxImageCount = 4, .currentExtent = { 1080, 2400 }, .minImageExtent = { 1, 1 },
+            .maxImageExtent = { 4096, 4096 }, .maxImageArrayLayers = 1,
+            .supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR,
+            .currentTransform = VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR,
+            .supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR | VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+            .supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT };
 }

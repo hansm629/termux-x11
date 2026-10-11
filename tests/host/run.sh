@@ -30,7 +30,7 @@ rm -rf "$OUT/vkinc" && mkdir -p "$OUT/vkinc" && cp -r "$VKINC/vulkan" "$OUT/vkin
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest"
+C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest tvkframe"
 rm -f "$OUT/diag-vulkan.log" "$OUT/diag-gles.log"     # written by tdiaglog: never judge an earlier run's
 for t in $C_TESTS; do
     "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$OUT/vkinc" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }
@@ -40,8 +40,16 @@ done
 # the diagnostics scripts, on synthetic logs and on the ones tdiaglog wrote with the real formatter
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tdiag.py" "$HERE/../../tools/diag" "$OUT" || status=1
 
-# where the X server calls the AHB ownership code
+# where the X server calls the AHB ownership code, and the order of the renderer's Vulkan steps
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/twiring.py" "$LORIE" || status=1
+
+# the committed SPIR-V is what the shaders compile to now (fails without glslc/spirv-val rather than skips)
+if sh "$HERE/../../tools/vk/gen-spirv.sh" "$OUT/vk_shaders.regenerated.h" && cmp -s "$OUT/vk_shaders.regenerated.h" "$LORIE/vk_shaders.h"; then
+    echo "SPIR-V (vk_shaders.h from shaders/quad.*): PASS"
+else
+    echo "SPIR-V (vk_shaders.h from shaders/quad.*): FAIL - run tools/vk/gen-spirv.sh"
+    status=1
+fi
 
 # each rule broken in a copy of the sources: the test guarding it must fail
 CC="$CC" PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tcontrols.py" "$LORIE" "$OUT" "$BASE" || status=1

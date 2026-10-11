@@ -172,9 +172,11 @@ CONTROLS = [
      "",
      "tvkinit"),
     ("the device destroyed while it may still be busy", "vk.c",
-     """        vk->DeviceWaitIdle(vk->device);
+     """    if (vk->device) {
+        vk->DeviceWaitIdle(vk->device);
 """,
-     "",
+     """    if (vk->device) {
+""",
      "tvkinit"),
     ("the first device used whatever it lacks", "vk.c",
      """        if (!(reason = lorieVkDeviceUnsuitable(vk, devices[i], &family)))
@@ -319,6 +321,68 @@ CONTROLS = [
      """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, true, false },""",
      """        { AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 2, false, false },""",
      "tvkselftest"),
+    ("a frame acquiring a buffer at each use", "vk.c",
+     """        if (r->used[i].img == img) {""",
+     """        if (0) {""",
+     "tvkframe"),
+    ("a frame not giving its buffers back", "vk.c",
+     """    for (i = 0; i < r->usedCount; i++)
+        lorieVkCmdBarrier(vk, r->cmd, lorieVkReleaseBarrier(vk, r->used[i].img->image, r->used[i].use));""",
+     "",
+     "tvkframe"),
+    ("a frame counted before its submission", "vk.c",
+     """    start = lorieVkNowUs();
+    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS) {""",
+     """    LORIE_DIAG_ADD(st, vkQueueSubmits, 1);
+    start = lorieVkNowUs();
+    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS) {""",
+     "tvkframe"),
+    ("a late fence not waited out", "vk.c",
+     """        vk->DeviceWaitIdle(vk->device);
+        vk->ResetFences(vk->device, 1, &r->frameFence);
+        return res;""",
+     """        return res;""",
+     "tvkframe"),
+    ("the acquire fence not reset", "vk.c",
+     """                (wait = vk->ResetFences(vk->device, 1, &r->acquireFence)) != VK_SUCCESS) {""",
+     """                (wait = VK_SUCCESS) != VK_SUCCESS) {""",
+     "tvkframe"),
+    ("a swapchain in MAILBOX", "vk.c",
+     """                .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE, .oldSwapchain = old };""",
+     """                .presentMode = VK_PRESENT_MODE_MAILBOX_KHR, .clipped = VK_TRUE, .oldSwapchain = old };""",
+     "tvkframe"),
+    ("the surface's first format taken", "vk.c",
+     """    for (i = 0; i < count && format != VK_FORMAT_R8G8B8A8_UNORM; i++)""",
+     """    for (i = 0; i < count && format == VK_FORMAT_UNDEFINED; i++)""",
+     "tvkframe"),
+    ("a pre-rotated swapchain", "vk.c",
+     """                .preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ?""",
+     """                .preTransform = 0 ?""",
+     "tvkframe"),
+    ("a copy pass loading from UNDEFINED", "vk.c",
+     """            .initialLayout = screen ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,""",
+     """            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,""",
+     "tvkframe"),
+    ("a copy rendering into a buffer left in its sampling layout", "vk.c",
+     """!lorieVkFrameUse(vk, r, dst, LORIE_VK_USE_RENDER)""",
+     """!lorieVkFrameUse(vk, r, dst, LORIE_VK_USE_SAMPLE)""",
+     "tvkframe"),
+    ("the root sampled in the layout a copy left it in", "vk.c",
+     """    if (root && lorieVkFrameUse(vk, r, root, LORIE_VK_USE_SAMPLE))""",
+     """    if (root)""",
+     "tvkframe"),
+    ("the surface destroyed before its swapchain", "vk.c",
+     """    if (r->swapchain)
+        vk->DestroySwapchainKHR(vk->device, r->swapchain, NULL);
+    lorieVkScreenPassDestroy(vk, r);
+    if (r->surface)
+        vk->DestroySurfaceKHR(vk->instance, r->surface, NULL);""",
+     """    if (r->surface)
+        vk->DestroySurfaceKHR(vk->instance, r->surface, NULL);
+    if (r->swapchain)
+        vk->DestroySwapchainKHR(vk->device, r->swapchain, NULL);
+    lorieVkScreenPassDestroy(vk, r);""",
+     "tvkframe"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

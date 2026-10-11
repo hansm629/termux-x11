@@ -4,6 +4,7 @@
 #include <string.h>
 #include "lorie.h"
 #include "vk.h"
+#include "vk_shaders.h"
 
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "lorie-vulkan", __VA_ARGS__)
 #define loge(...) __android_log_print(ANDROID_LOG_ERROR, "lorie-vulkan", __VA_ARGS__)
@@ -247,6 +248,8 @@ struct lorie_vk_image *lorieVkImageFind(struct lorie_vk_images *images, uint64_t
 }
 
 static void lorieVkImageDestroy(struct lorie_vk *vk, struct lorie_vk_image *img) {
+    if (img->framebuffer)
+        vk->DestroyFramebuffer(vk->device, img->framebuffer, NULL);
     if (img->attachView)
         vk->DestroyImageView(vk->device, img->attachView, NULL);
     if (img->sampleView)
@@ -924,4 +927,715 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     }
     lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);
     return false;
+}
+
+/* ---- presenting ---- */
+
+#define LORIE_VK_ACQUIRE_TIMEOUT_NS 50000000ULL     // 50 ms: the X server's lock is not held meanwhile
+#define LORIE_VK_FENCE_TIMEOUT_NS 1000000000ULL     // 1 s, then the frame is a failure (and waited out)
+#define LORIE_VK_CURSOR_BYTES (512 * 512 * 4)       // the shared state's cursor bits
+
+static uint64_t lorieVkNowUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000;
+}
+
+/*
+ * A render pass with one colour attachment. Into an imported buffer: its contents loaded and stored, in
+ * COLOR_ATTACHMENT_OPTIMAL from start to end (the frame's barriers put it there and take it back). Into a
+ * swapchain image: cleared, so its previous contents are not needed - it is the renderer's own image, never an
+ * X server buffer - and left for presenting.
+ */
+static VkRenderPass lorieVkRenderPass(struct lorie_vk *vk, VkFormat format, bool screen) {
+    VkAttachmentDescription a = {
+            .format = format, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = screen ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = screen ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .finalLayout = screen ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1,
+                                 .pColorAttachments = &ref };
+    // The swapchain image's transition and writes after the earlier frame's (the acquire's fence was waited for).
+    VkSubpassDependency dep = { VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0 };
+    VkRenderPassCreateInfo info = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1,
+                                    .pAttachments = &a, .subpassCount = 1, .pSubpasses = &sub,
+                                    .dependencyCount = screen ? 1 : 0, .pDependencies = &dep };
+    VkRenderPass pass = VK_NULL_HANDLE;
+    return vk->CreateRenderPass(vk->device, &info, NULL, &pass) == VK_SUCCESS ? pass : VK_NULL_HANDLE;
+}
+
+/*
+ * The quad pipeline (shaders/quad.*) for `pass`. Blending, for the cursor, is GLES's SRC_ALPHA,
+ * ONE_MINUS_SRC_ALPHA on colour; alpha keeps the destination's (one: the screen stays opaque).
+ */
+static VkPipeline lorieVkPipeline(struct lorie_vk *vk, struct lorie_vk_renderer *r, VkRenderPass pass, bool blend) {
+    VkPipelineShaderStageCreateInfo stages[2] = {
+            { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = r->vert, .pName = "main" },
+            { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = r->frag, .pName = "main" } };
+    VkPipelineVertexInputStateCreateInfo vertexInput = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo assembly = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+    VkPipelineViewportStateCreateInfo viewport = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                                   .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo raster = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                      .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+                                                      .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.f };
+    VkPipelineMultisampleStateCreateInfo multisample = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState attachment = {
+            .blendEnable = blend, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            .colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+            .alphaBlendOp = VK_BLEND_OP_ADD,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT };
+    VkPipelineColorBlendStateCreateInfo colorBlend = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                                       .attachmentCount = 1, .pAttachments = &attachment };
+    VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamicState = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                                      .dynamicStateCount = 2, .pDynamicStates = dynamic };
+    VkGraphicsPipelineCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
+            .pVertexInputState = &vertexInput, .pInputAssemblyState = &assembly, .pViewportState = &viewport,
+            .pRasterizationState = &raster, .pMultisampleState = &multisample, .pColorBlendState = &colorBlend,
+            .pDynamicState = &dynamicState, .layout = r->layout, .renderPass = pass, .subpass = 0 };
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    return vk->CreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &info, NULL, &pipeline) == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
+}
+
+// A memory type `bits` allows with `want`, preferring `prefer` too; UINT32_MAX if none.
+static uint32_t lorieVkMemoryType(struct lorie_vk *vk, uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer) {
+    uint32_t i, type = UINT32_MAX;
+    for (i = 0; i < vk->memoryProperties.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = vk->memoryProperties.memoryTypes[i].propertyFlags;
+        if (!(bits & (1u << i)) || (f & want) != want)
+            continue;
+        if (type == UINT32_MAX || ((vk->memoryProperties.memoryTypes[type].propertyFlags & prefer) != prefer && (f & prefer) == prefer))
+            type = i;
+    }
+    return type;
+}
+
+static void lorieVkCursorDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    if (r->cursorView)
+        vk->DestroyImageView(vk->device, r->cursorView, NULL);
+    if (r->cursor)
+        vk->DestroyImage(vk->device, r->cursor, NULL);
+    if (r->cursorMemory)
+        vk->FreeMemory(vk->device, r->cursorMemory, NULL);
+    r->cursorView = VK_NULL_HANDLE;
+    r->cursor = VK_NULL_HANDLE;
+    r->cursorMemory = VK_NULL_HANDLE;
+    r->cursorWidth = r->cursorHeight = 0;
+}
+
+// The swapchain's images and what is made per image; the swapchain itself stays.
+static void lorieVkSwapchainImagesDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    uint32_t i;
+    for (i = 0; i < r->imageCount; i++) {
+        if (r->framebuffers[i])
+            vk->DestroyFramebuffer(vk->device, r->framebuffers[i], NULL);
+        if (r->views[i])
+            vk->DestroyImageView(vk->device, r->views[i], NULL);
+        if (r->rendered[i])
+            vk->DestroySemaphore(vk->device, r->rendered[i], NULL);
+        r->framebuffers[i] = VK_NULL_HANDLE;
+        r->views[i] = VK_NULL_HANDLE;
+        r->rendered[i] = VK_NULL_HANDLE;
+        r->images[i] = VK_NULL_HANDLE;
+    }
+    r->imageCount = 0;
+}
+
+static void lorieVkScreenPassDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    if (r->screenPipeline)
+        vk->DestroyPipeline(vk->device, r->screenPipeline, NULL);
+    if (r->cursorPipeline)
+        vk->DestroyPipeline(vk->device, r->cursorPipeline, NULL);
+    if (r->screenPass)
+        vk->DestroyRenderPass(vk->device, r->screenPass, NULL);
+    r->screenPipeline = r->cursorPipeline = VK_NULL_HANDLE;
+    r->screenPass = VK_NULL_HANDLE;
+    r->format = VK_FORMAT_UNDEFINED;
+}
+
+void lorieVkSwapchainDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    if (!vk->device)
+        return;
+    vk->DeviceWaitIdle(vk->device);     // nothing may still use what goes, the window included
+    lorieVkSwapchainImagesDestroy(vk, r);
+    if (r->swapchain)
+        vk->DestroySwapchainKHR(vk->device, r->swapchain, NULL);
+    lorieVkScreenPassDestroy(vk, r);
+    if (r->surface)
+        vk->DestroySurfaceKHR(vk->instance, r->surface, NULL);
+    r->swapchain = VK_NULL_HANDLE;
+    r->surface = VK_NULL_HANDLE;
+    r->recreate = false;
+}
+
+void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    int i;
+    if (!vk->device) {
+        memset(r, 0, sizeof(*r));
+        return;
+    }
+    lorieVkSwapchainDestroy(vk, r);
+    lorieVkCursorDestroy(vk, r);
+    if (r->stagingMapped)
+        vk->UnmapMemory(vk->device, r->stagingMemory);
+    if (r->staging)
+        vk->DestroyBuffer(vk->device, r->staging, NULL);
+    if (r->stagingMemory)
+        vk->FreeMemory(vk->device, r->stagingMemory, NULL);
+    for (i = 0; i < 2; i++) {
+        if (r->copyPipeline[i])
+            vk->DestroyPipeline(vk->device, r->copyPipeline[i], NULL);
+        if (r->copyPass[i])
+            vk->DestroyRenderPass(vk->device, r->copyPass[i], NULL);
+        if (r->samplers[i])
+            vk->DestroySampler(vk->device, r->samplers[i], NULL);
+    }
+    if (r->vert)
+        vk->DestroyShaderModule(vk->device, r->vert, NULL);
+    if (r->frag)
+        vk->DestroyShaderModule(vk->device, r->frag, NULL);
+    if (r->descriptors)
+        vk->DestroyDescriptorPool(vk->device, r->descriptors, NULL);
+    if (r->layout)
+        vk->DestroyPipelineLayout(vk->device, r->layout, NULL);
+    if (r->setLayout)
+        vk->DestroyDescriptorSetLayout(vk->device, r->setLayout, NULL);
+    if (r->frameFence)
+        vk->DestroyFence(vk->device, r->frameFence, NULL);
+    if (r->acquireFence)
+        vk->DestroyFence(vk->device, r->acquireFence, NULL);
+    if (r->pool)
+        vk->DestroyCommandPool(vk->device, r->pool, NULL);
+    memset(r, 0, sizeof(*r));
+}
+
+#define LORIE_VK_TRY(call) do { if ((res = (call)) != VK_SUCCESS) goto fail; } while (0)
+#define LORIE_VK_MADE(handle) do { if (!(handle)) { res = VK_ERROR_INITIALIZATION_FAILED; goto fail; } } while (0)
+
+bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st) {
+    VkResult res;
+    int i;
+
+    memset(r, 0, sizeof(*r));
+    {
+        VkCommandPoolCreateInfo info = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk->queueFamily };
+        VkCommandBufferAllocateInfo cmd = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VkFenceCreateInfo fence = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        LORIE_VK_TRY(vk->CreateCommandPool(vk->device, &info, NULL, &r->pool));
+        cmd.commandPool = r->pool;
+        LORIE_VK_TRY(vk->AllocateCommandBuffers(vk->device, &cmd, &r->cmd));
+        LORIE_VK_TRY(vk->CreateFence(vk->device, &fence, NULL, &r->frameFence));
+        LORIE_VK_TRY(vk->CreateFence(vk->device, &fence, NULL, &r->acquireFence));
+    }
+    {
+        VkDescriptorSetLayoutBinding binding = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+        VkDescriptorSetLayoutCreateInfo set = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                .bindingCount = 1, .pBindings = &binding };
+        VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct lorie_vk_quad) };
+        VkPipelineLayoutCreateInfo layout = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                              .pushConstantRangeCount = 1, .pPushConstantRanges = &push };
+        VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LORIE_VK_MAX_FRAME_IMAGES };
+        VkDescriptorPoolCreateInfo pool = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                            .maxSets = LORIE_VK_MAX_FRAME_IMAGES, .poolSizeCount = 1, .pPoolSizes = &size };
+        LORIE_VK_TRY(vk->CreateDescriptorSetLayout(vk->device, &set, NULL, &r->setLayout));
+        layout.pSetLayouts = &r->setLayout;
+        LORIE_VK_TRY(vk->CreatePipelineLayout(vk->device, &layout, NULL, &r->layout));
+        LORIE_VK_TRY(vk->CreateDescriptorPool(vk->device, &pool, NULL, &r->descriptors));
+    }
+    for (i = 0; i < 2; i++) {
+        VkFilter filter = i ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        VkSamplerCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = filter, .minFilter = filter,
+                                     .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                                     .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                     .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                     .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.f };
+        LORIE_VK_TRY(vk->CreateSampler(vk->device, &info, NULL, &r->samplers[i]));
+    }
+    {
+        VkShaderModuleCreateInfo vert = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                          .codeSize = sizeof(lorieVkQuad_vert), .pCode = lorieVkQuad_vert };
+        VkShaderModuleCreateInfo frag = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                          .codeSize = sizeof(lorieVkQuad_frag), .pCode = lorieVkQuad_frag };
+        LORIE_VK_TRY(vk->CreateShaderModule(vk->device, &vert, NULL, &r->vert));
+        LORIE_VK_TRY(vk->CreateShaderModule(vk->device, &frag, NULL, &r->frag));
+    }
+    for (i = 0; i < 2; i++) {
+        LORIE_VK_MADE(r->copyPass[i] = lorieVkRenderPass(vk, i ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, false));
+        LORIE_VK_MADE(r->copyPipeline[i] = lorieVkPipeline(vk, r, r->copyPass[i], false));
+    }
+    {
+        VkBufferCreateInfo info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = LORIE_VK_CURSOR_BYTES,
+                                    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        VkMemoryRequirements req;
+        VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        LORIE_VK_TRY(vk->CreateBuffer(vk->device, &info, NULL, &r->staging));
+        vk->GetBufferMemoryRequirements(vk->device, r->staging, &req);
+        alloc.allocationSize = req.size;
+        if ((alloc.memoryTypeIndex = lorieVkMemoryType(vk, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == UINT32_MAX) {
+            res = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto fail;
+        }
+        r->stagingCoherent = vk->memoryProperties.memoryTypes[alloc.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        LORIE_VK_TRY(vk->AllocateMemory(vk->device, &alloc, NULL, &r->stagingMemory));
+        LORIE_VK_TRY(vk->BindBufferMemory(vk->device, r->staging, r->stagingMemory, 0));
+        LORIE_VK_TRY(vk->MapMemory(vk->device, r->stagingMemory, 0, VK_WHOLE_SIZE, 0, (void **) &r->stagingMapped));
+    }
+    return true;
+
+    fail:
+    loge("renderer objects: VkResult %d", res);
+    lorieVkRendererDestroy(vk, r);
+    // Part of making the device ready to draw with: recorded as the device's.
+    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_DEVICE, res);
+    return false;
+}
+
+bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct ANativeWindow *window,
+                            volatile struct lorie_shared_server_state *st) {
+    VkSurfaceCapabilitiesKHR caps;
+    VkSurfaceFormatKHR formats[64];
+    uint32_t count = 64, i, imageCount;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkSwapchainKHR old = r->swapchain;
+    VkBool32 supported = VK_FALSE;
+    uint8_t reason = LORIE_FALLBACK_VK_SWAPCHAIN;
+    VkResult res;
+
+    if (!r->surface) {
+        VkAndroidSurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = window };
+        if (lorieVkInjected(st, LORIE_VK_FAIL_AT_SURFACE, LORIE_FALLBACK_VK_SURFACE))
+            return false;
+        if ((res = vk->CreateAndroidSurfaceKHR(vk->instance, &info, NULL, &r->surface)) != VK_SUCCESS) {
+            r->surface = VK_NULL_HANDLE;
+            lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SURFACE, res);
+            return false;
+        }
+        LORIE_DIAG_ADD(st, vkSurfaceCreated, 1);
+    }
+    reason = LORIE_FALLBACK_VK_SURFACE;
+    LORIE_VK_TRY(vk->GetPhysicalDeviceSurfaceSupportKHR(vk->physicalDevice, vk->queueFamily, r->surface, &supported));
+    if (!supported) {
+        res = VK_ERROR_FEATURE_NOT_PRESENT;
+        goto fail;
+    }
+    LORIE_VK_TRY(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physicalDevice, r->surface, &caps));
+    if (vk->GetPhysicalDeviceSurfaceFormatsKHR(vk->physicalDevice, r->surface, &count, formats) < 0)
+        count = 0;
+    // Formats GLES draws the same values into: UNORM, R8G8B8A8 first.
+    reason = LORIE_FALLBACK_VK_SURFACE_FORMAT;
+    for (i = 0; i < count && format != VK_FORMAT_R8G8B8A8_UNORM; i++)
+        if (formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR &&
+            (formats[i].format == VK_FORMAT_R8G8B8A8_UNORM || formats[i].format == VK_FORMAT_B8G8R8A8_UNORM))
+            format = formats[i].format;
+    if (format == VK_FORMAT_UNDEFINED || !(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        res = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        goto fail;
+    }
+
+    reason = LORIE_FALLBACK_VK_SWAPCHAIN;
+    if (format != r->format)
+        lorieVkScreenPassDestroy(vk, r);
+    if (!r->screenPass) {
+        LORIE_VK_MADE(r->screenPass = lorieVkRenderPass(vk, format, true));
+        LORIE_VK_MADE(r->screenPipeline = lorieVkPipeline(vk, r, r->screenPass, false));
+        LORIE_VK_MADE(r->cursorPipeline = lorieVkPipeline(vk, r, r->screenPass, true));
+        r->format = format;
+    }
+
+    // The window's size, as GLES's surface has it, within what the surface allows; not pre-rotated (as GLES).
+    r->extent.width = r->windowWidth = (uint32_t) ANativeWindow_getWidth(window);
+    r->extent.height = r->windowHeight = (uint32_t) ANativeWindow_getHeight(window);
+    r->extent.width = r->extent.width < caps.minImageExtent.width ? caps.minImageExtent.width :
+                      r->extent.width > caps.maxImageExtent.width ? caps.maxImageExtent.width : r->extent.width;
+    r->extent.height = r->extent.height < caps.minImageExtent.height ? caps.minImageExtent.height :
+                       r->extent.height > caps.maxImageExtent.height ? caps.maxImageExtent.height : r->extent.height;
+    if (!r->extent.width || !r->extent.height) {
+        res = VK_ERROR_OUT_OF_DATE_KHR;
+        goto fail;
+    }
+    imageCount = caps.minImageCount + 1;
+    if (caps.maxImageCount && imageCount > caps.maxImageCount)
+        imageCount = caps.maxImageCount;
+    if (imageCount > LORIE_VK_MAX_SWAPCHAIN_IMAGES)
+        imageCount = LORIE_VK_MAX_SWAPCHAIN_IMAGES;
+
+    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_SWAPCHAIN, LORIE_FALLBACK_VK_SWAPCHAIN))
+        return false;
+    {
+        VkSwapchainCreateInfoKHR info = {
+                .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = r->surface, .minImageCount = imageCount,
+                .imageFormat = format, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, .imageExtent = r->extent,
+                .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ?
+                                VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform,
+                // Opaque where the surface allows it; the frame writes alpha one everywhere anyway.
+                .compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR :
+                                  (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR :
+                                  (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) ?
+                                  VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR : VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+                .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE, .oldSwapchain = old };
+        vk->DeviceWaitIdle(vk->device);     // the old swapchain's images may still be in use
+        lorieVkSwapchainImagesDestroy(vk, r);
+        res = vk->CreateSwapchainKHR(vk->device, &info, NULL, &r->swapchain);
+        if (old)
+            vk->DestroySwapchainKHR(vk->device, old, NULL);
+        if (res != VK_SUCCESS) {
+            r->swapchain = VK_NULL_HANDLE;
+            goto fail;
+        }
+    }
+    count = LORIE_VK_MAX_SWAPCHAIN_IMAGES;
+    LORIE_VK_TRY(vk->GetSwapchainImagesKHR(vk->device, r->swapchain, &count, r->images));
+    r->imageCount = count;
+    for (i = 0; i < count; i++) {
+        VkImageViewCreateInfo view = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = r->images[i],
+                                       .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
+                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        VkFramebufferCreateInfo fb = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = r->screenPass,
+                                       .attachmentCount = 1, .width = r->extent.width, .height = r->extent.height, .layers = 1 };
+        VkSemaphoreCreateInfo sem = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        LORIE_VK_TRY(vk->CreateImageView(vk->device, &view, NULL, &r->views[i]));
+        fb.pAttachments = &r->views[i];
+        LORIE_VK_TRY(vk->CreateFramebuffer(vk->device, &fb, NULL, &r->framebuffers[i]));
+        LORIE_VK_TRY(vk->CreateSemaphore(vk->device, &sem, NULL, &r->rendered[i]));
+    }
+    r->recreate = false;
+    LORIE_DIAG_ADD(st, vkSwapchainCreated, 1);
+    if (st)
+        memcpy((char *) st->diag.vkPresentMode, "FIFO", 5);
+    log("swapchain %ux%u format %d, %u images", r->extent.width, r->extent.height, format, count);
+    return true;
+
+    fail:
+    loge("swapchain: reason %u VkResult %d", reason, res);
+    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, reason, res);
+    return false;
+}
+
+int lorieVkAcquire(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t *index, volatile struct lorie_shared_server_state *st) {
+    uint64_t start = lorieVkNowUs();
+    VkResult res = vk->AcquireNextImageKHR(vk->device, r->swapchain, LORIE_VK_ACQUIRE_TIMEOUT_NS, VK_NULL_HANDLE, r->acquireFence, index);
+    VkResult wait;
+
+    switch (res) {
+        case VK_SUCCESS:
+        case VK_SUBOPTIMAL_KHR:
+            // The presentation engine may read the image until the fence signals: waited for here, outside the X
+            // server's lock, then reset, so that the next acquire is given an unsignalled fence.
+            if ((wait = vk->WaitForFences(vk->device, 1, &r->acquireFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS ||
+                (wait = vk->ResetFences(vk->device, 1, &r->acquireFence)) != VK_SUCCESS) {
+                lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                                wait == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SWAPCHAIN, wait);
+                return LORIE_VK_FRAME_FATAL;
+            }
+            LORIE_DIAG_ADD(st, vkAcquireWaitUs, lorieVkNowUs() - start);
+            if (res == VK_SUBOPTIMAL_KHR) {
+                LORIE_DIAG_ADD(st, vkAcquireSuboptimal, 1);
+                r->recreate = true;     // drawn and presented now, made again before the next frame
+            } else
+                LORIE_DIAG_ADD(st, vkAcquireSuccess, 1);
+            return LORIE_VK_FRAME_OK;
+        case VK_TIMEOUT:
+            LORIE_DIAG_ADD(st, vkAcquireTimeout, 1);
+            return LORIE_VK_FRAME_SKIP;
+        case VK_NOT_READY:
+            LORIE_DIAG_ADD(st, vkAcquireNotReady, 1);
+            return LORIE_VK_FRAME_SKIP;
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            LORIE_DIAG_ADD(st, vkAcquireOutOfDate, 1);
+            r->recreate = true;
+            return LORIE_VK_FRAME_RECREATE;
+        default:
+            lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                            res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SWAPCHAIN, res);
+            return LORIE_VK_FRAME_FATAL;
+    }
+}
+
+VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkResult res;
+    r->usedCount = r->sourceDraws = r->destinationDraws = r->draws = 0;
+    r->submitCpuUs = r->fenceWaitUs = 0;
+    if ((res = vk->ResetCommandBuffer(r->cmd, 0)) != VK_SUCCESS || (res = vk->ResetDescriptorPool(vk->device, r->descriptors, 0)) != VK_SUCCESS)
+        return res;
+    return vk->BeginCommandBuffer(r->cmd, &begin);
+}
+
+bool lorieVkFrameUse(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *img, enum lorie_vk_use use) {
+    uint32_t i;
+    for (i = 0; i < r->usedCount; i++)
+        if (r->used[i].img == img) {
+            if (r->used[i].use != use) {
+                lorieVkCmdBarrier(vk, r->cmd, lorieVkUseBarrier(img->image, r->used[i].use, use));
+                r->used[i].use = use;
+            }
+            return true;
+        }
+    if (r->usedCount == LORIE_VK_MAX_FRAME_IMAGES)
+        return false;
+    lorieVkCmdBarrier(vk, r->cmd, lorieVkAcquireBarrier(vk, img->image, use));
+    r->used[r->usedCount].img = img;
+    r->used[r->usedCount++].use = use;
+    return true;
+}
+
+static VkDescriptorSet lorieVkDescriptor(struct lorie_vk *vk, struct lorie_vk_renderer *r, VkImageView view, int filter) {
+    VkDescriptorSetAllocateInfo info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = r->descriptors,
+                                         .descriptorSetCount = 1, .pSetLayouts = &r->setLayout };
+    VkDescriptorImageInfo image = { r->samplers[filter ? 1 : 0], view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image };
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vk->AllocateDescriptorSets(vk->device, &info, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    write.dstSet = set;
+    vk->UpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+    return set;
+}
+
+bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                      const struct lorie_vk_quad *quads, uint32_t count, int filter) {
+    int pass = dst->format == VK_FORMAT_B8G8R8A8_UNORM ? 1 : 0;
+    VkDescriptorSet set;
+    uint32_t i;
+
+    if (src == dst || !dst->attachView)
+        return false;
+    if (!dst->framebuffer) {
+        VkFramebufferCreateInfo fb = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = r->copyPass[pass],
+                                       .attachmentCount = 1, .pAttachments = &dst->attachView, .width = dst->width,
+                                       .height = dst->height, .layers = 1 };
+        if (vk->CreateFramebuffer(vk->device, &fb, NULL, &dst->framebuffer) != VK_SUCCESS) {
+            dst->framebuffer = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    if (!lorieVkFrameUse(vk, r, src, LORIE_VK_USE_SAMPLE) || !lorieVkFrameUse(vk, r, dst, LORIE_VK_USE_RENDER) ||
+        !(set = lorieVkDescriptor(vk, r, src->sampleView, filter)))
+        return false;
+    {
+        VkRenderPassBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = r->copyPass[pass],
+                                        .framebuffer = dst->framebuffer, .renderArea = { { 0, 0 }, { dst->width, dst->height } } };
+        VkViewport viewport = { 0.f, 0.f, (float) dst->width, (float) dst->height, 0.f, 1.f };
+        vk->CmdBeginRenderPass(r->cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        vk->CmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->copyPipeline[pass]);
+        vk->CmdSetViewport(r->cmd, 0, 1, &viewport);
+        vk->CmdSetScissor(r->cmd, 0, 1, &begin.renderArea);
+        vk->CmdBindDescriptorSets(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, 1, &set, 0, NULL);
+        for (i = 0; i < count; i++) {
+            vk->CmdPushConstants(r->cmd, r->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                 sizeof(*quads), &quads[i]);
+            vk->CmdDraw(r->cmd, 4, 1, 0, 0);
+            r->draws++;
+            r->sourceDraws++;
+            r->destinationDraws++;
+        }
+        vk->CmdEndRenderPass(r->cmd);
+    }
+    return true;
+}
+
+bool lorieVkFrameCursor(struct lorie_vk *vk, struct lorie_vk_renderer *r, const uint32_t *bits, uint32_t width, uint32_t height) {
+    VkImageMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                     .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    if (!width || !height || (size_t) width * height * 4 > LORIE_VK_CURSOR_BYTES)
+        return false;
+    if (width != r->cursorWidth || height != r->cursorHeight || !r->cursor) {
+        VkImageCreateInfo info = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                   .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { width, height, 1 }, .mipLevels = 1, .arrayLayers = 1,
+                                   .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                   .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        VkMemoryRequirements req;
+        VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        VkImageViewCreateInfo view = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                       .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        lorieVkCursorDestroy(vk, r);
+        if (vk->CreateImage(vk->device, &info, NULL, &r->cursor) != VK_SUCCESS) {
+            r->cursor = VK_NULL_HANDLE;
+            return false;
+        }
+        vk->GetImageMemoryRequirements(vk->device, r->cursor, &req);
+        alloc.allocationSize = req.size;
+        if ((alloc.memoryTypeIndex = lorieVkMemoryType(vk, req.memoryTypeBits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) == UINT32_MAX ||
+            vk->AllocateMemory(vk->device, &alloc, NULL, &r->cursorMemory) != VK_SUCCESS) {
+            r->cursorMemory = VK_NULL_HANDLE;
+            lorieVkCursorDestroy(vk, r);
+            return false;
+        }
+        view.image = r->cursor;
+        if (vk->BindImageMemory(vk->device, r->cursor, r->cursorMemory, 0) != VK_SUCCESS ||
+            vk->CreateImageView(vk->device, &view, NULL, &r->cursorView) != VK_SUCCESS) {
+            r->cursorView = VK_NULL_HANDLE;
+            lorieVkCursorDestroy(vk, r);
+            return false;
+        }
+        r->cursorWidth = width;
+        r->cursorHeight = height;
+    }
+    memcpy(r->stagingMapped, bits, (size_t) width * height * 4);
+    if (!r->stagingCoherent) {
+        VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = r->stagingMemory, .size = VK_WHOLE_SIZE };
+        vk->FlushMappedMemoryRanges(vk->device, 1, &range);
+    }
+    // The renderer's own image, all of it written: its earlier contents are not needed.
+    barrier.image = r->cursor;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vk->CmdPipelineBarrier(r->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+    vk->CmdCopyBufferToImage(r->cmd, r->staging, r->cursor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                             &(VkBufferImageCopy) { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { width, height, 1 } });
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vk->CmdPipelineBarrier(r->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+    return true;
+}
+
+void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, struct lorie_vk_image *root,
+                        const VkRect2D *viewport, const struct lorie_vk_quad *rootQuad, const struct lorie_vk_quad *cursorQuad,
+                        int filter) {
+    VkClearValue black = { .color = { .float32 = { 0.f, 0.f, 0.f, 1.f } } };
+    VkRenderPassBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = r->screenPass,
+                                    .framebuffer = r->framebuffers[index], .renderArea = { { 0, 0 }, r->extent },
+                                    .clearValueCount = 1, .pClearValues = &black };
+    VkViewport vp = { (float) viewport->offset.x, (float) viewport->offset.y, (float) viewport->extent.width,
+                      (float) viewport->extent.height, 0.f, 1.f };
+    VkRect2D scissor = *viewport;
+    VkDescriptorSet rootSet = VK_NULL_HANDLE, cursorSet = VK_NULL_HANDLE;
+
+    if (root && lorieVkFrameUse(vk, r, root, LORIE_VK_USE_SAMPLE))
+        rootSet = lorieVkDescriptor(vk, r, root->sampleView, filter);
+    if (cursorQuad && r->cursorView)
+        cursorSet = lorieVkDescriptor(vk, r, r->cursorView, filter);
+    // The scissor within the image (the viewport may reach out of it).
+    if (scissor.offset.x < 0) {
+        scissor.extent.width = (uint32_t) ((int32_t) scissor.extent.width + scissor.offset.x > 0 ? (int32_t) scissor.extent.width + scissor.offset.x : 0);
+        scissor.offset.x = 0;
+    }
+    if (scissor.offset.y < 0) {
+        scissor.extent.height = (uint32_t) ((int32_t) scissor.extent.height + scissor.offset.y > 0 ? (int32_t) scissor.extent.height + scissor.offset.y : 0);
+        scissor.offset.y = 0;
+    }
+    if ((uint32_t) scissor.offset.x + scissor.extent.width > r->extent.width)
+        scissor.extent.width = (uint32_t) scissor.offset.x < r->extent.width ? r->extent.width - (uint32_t) scissor.offset.x : 0;
+    if ((uint32_t) scissor.offset.y + scissor.extent.height > r->extent.height)
+        scissor.extent.height = (uint32_t) scissor.offset.y < r->extent.height ? r->extent.height - (uint32_t) scissor.offset.y : 0;
+
+    vk->CmdBeginRenderPass(r->cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    if (vp.width > 0 && vp.height > 0) {
+        vk->CmdSetViewport(r->cmd, 0, 1, &vp);
+        vk->CmdSetScissor(r->cmd, 0, 1, &scissor);
+        if (rootSet) {
+            vk->CmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->screenPipeline);
+            vk->CmdBindDescriptorSets(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, 1, &rootSet, 0, NULL);
+            vk->CmdPushConstants(r->cmd, r->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*rootQuad), rootQuad);
+            vk->CmdDraw(r->cmd, 4, 1, 0, 0);
+            r->draws++;
+            r->sourceDraws++;
+        }
+        if (cursorSet) {
+            vk->CmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->cursorPipeline);
+            vk->CmdBindDescriptorSets(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, 1, &cursorSet, 0, NULL);
+            vk->CmdPushConstants(r->cmd, r->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*cursorQuad), cursorQuad);
+            vk->CmdDraw(r->cmd, 4, 1, 0, 0);
+            r->draws++;
+        }
+    }
+    vk->CmdEndRenderPass(r->cmd);
+}
+
+VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
+                            volatile struct lorie_shared_server_state *st) {
+    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &r->cmd,
+                            .signalSemaphoreCount = present ? 1 : 0, .pSignalSemaphores = present ? &r->rendered[index] : NULL };
+    uint64_t start;
+    VkResult res;
+    uint32_t i;
+
+    // Every X server buffer the frame used goes back to the foreign owner, from the use it ended in.
+    for (i = 0; i < r->usedCount; i++)
+        lorieVkCmdBarrier(vk, r->cmd, lorieVkReleaseBarrier(vk, r->used[i].img->image, r->used[i].use));
+    if ((res = vk->EndCommandBuffer(r->cmd)) != VK_SUCCESS) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, res);
+        return res;
+    }
+    // Not submitted: nothing changed hands (the recorded acquires never ran), nothing to wait for.
+    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_SUBMIT, LORIE_FALLBACK_VK_SUBMIT))
+        return VK_ERROR_UNKNOWN;
+    start = lorieVkNowUs();
+    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                        res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SUBMIT, res);
+        return res;
+    }
+    r->submitCpuUs = lorieVkNowUs() - start;
+    start = lorieVkNowUs();
+    if ((res = vk->WaitForFences(vk->device, 1, &r->frameFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                        res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SUBMIT, res);
+        // The X server must not touch the frame's buffers before the device is done with them, or lost.
+        vk->DeviceWaitIdle(vk->device);
+        vk->ResetFences(vk->device, 1, &r->frameFence);
+        return res;
+    }
+    r->fenceWaitUs = lorieVkNowUs() - start;
+    if ((res = vk->ResetFences(vk->device, 1, &r->frameFence)) != VK_SUCCESS) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, res);
+        return res;
+    }
+    LORIE_DIAG_ADD(st, vkQueueSubmits, 1);
+    LORIE_DIAG_ADD(st, vkImportedSourceDraws, r->sourceDraws);
+    LORIE_DIAG_ADD(st, vkImportedDestinationDraws, r->destinationDraws);
+    LORIE_DIAG_ADD(st, vkRenderCommands, r->draws);
+    LORIE_DIAG_ADD(st, vkSubmitCpuUs, r->submitCpuUs);
+    LORIE_DIAG_ADD(st, vkFenceWaitUs, r->fenceWaitUs);
+    return VK_SUCCESS;
+}
+
+int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, volatile struct lorie_shared_server_state *st) {
+    VkPresentInfoKHR info = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+                              .pWaitSemaphores = &r->rendered[index], .swapchainCount = 1, .pSwapchains = &r->swapchain,
+                              .pImageIndices = &index };
+    uint64_t start;
+    VkResult res;
+
+    if (lorieVkInjected(st, LORIE_VK_FAIL_AT_PRESENT, LORIE_FALLBACK_VK_PRESENT))
+        return LORIE_VK_FRAME_FATAL;
+    start = lorieVkNowUs();
+    res = vk->QueuePresentKHR(vk->queue, &info);
+    LORIE_DIAG_ADD(st, vkPresentCallUs, lorieVkNowUs() - start);
+    switch (res) {
+        case VK_SUBOPTIMAL_KHR:
+            r->recreate = true;
+            /* fallthrough: presented */
+        case VK_SUCCESS:
+            LORIE_DIAG_ADD(st, vkQueuePresentSuccess, 1);
+            LORIE_DIAG_ADD(st, vkFramesPresented, 1);
+            return LORIE_VK_FRAME_OK;
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            r->recreate = true;
+            return LORIE_VK_FRAME_RECREATE;
+        default:
+            lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                            res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_PRESENT, res);
+            return LORIE_VK_FRAME_FATAL;
+    }
 }
