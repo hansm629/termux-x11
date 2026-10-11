@@ -8,6 +8,7 @@ in its own log, which Termux can read with `logcat -d`:
 ```
 XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
+                x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d)
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
@@ -28,8 +29,10 @@ submit, present; `none` when unset, and `(invalid-value)` when set to anything e
 nothing): such a failure is counted in the `injected` fallback class. `ownership` is how the X server holds the AHardwareBuffers
 at that moment (`struct lorie_backend_control`): `persistent` is 3c98ffa's lifetime CPU locks, `per_access`
 the CPU lock only for each access, under the lock shared with the renderer - which the X server moves to only
-when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu_acquires` and
-`x_state_lock_wait_us` count those per-access locks and their wait for the shared lock.
+when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu_acquires` counts those
+per-access locks, `x_state_lock_wait_us` their whole wait before they could take the AHB (for the shared lock,
+and for a Vulkan frame still using it), `x_gpu_wait_us` the part of it spent waiting for that frame, and
+`x_ahb_cpu_lock_us` the time in the AHB's own CPU lock and unlock calls.
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,

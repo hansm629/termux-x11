@@ -442,14 +442,18 @@ Bool drawSquares() {
     // PER_ACCESS: drawn into where 3c98ffa would have it CPU-locked, under the shared lock for the drawing only.
     Bool perAccess = !pixels && lorieAhbPerAccess() && priv && priv->persistentWanted;
     if (perAccess) {
-        uint64_t waitStartUs = GetTimeInMicros();
+        uint64_t waitStartUs = GetTimeInMicros(), gpuStartUs, lockStartUs;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        gpuStartUs = GetTimeInMicros();
         lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
-        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
+        lockStartUs = GetTimeInMicros();
+        __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, lockStartUs - gpuStartUs, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, lockStartUs - waitStartUs, __ATOMIC_RELAXED);
         if (LorieBuffer_lock(priv->buffer, (void **) &pixels))
             pixels = NULL;
         else
             __atomic_fetch_add(&pvfb->state->diag.xAhbCpuAcquires, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - lockStartUs, __ATOMIC_RELAXED);
     }
     if (pixels) {
         const LorieBuffer_Desc *d = LorieBuffer_description(priv->buffer);
@@ -460,8 +464,11 @@ Bool drawSquares() {
         drawSquare(x + l/3, y + l/3, l, 0x000000FF, d->stride, pixels);
     }
     if (perAccess) {
-        if (pixels)
+        if (pixels) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
+        }
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
     }
 
@@ -733,7 +740,8 @@ static void lorieLogRendererDiag(void) {
     memcpy(&d, (const void *) &pvfb->state->diag, sizeof(d));
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
-              "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu)",
+              "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
+              "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu)",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -742,7 +750,8 @@ static void lorieLogRendererDiag(void) {
         pvfb->state->backend.vkSelftestFull ? "full" : "quick", pvfb->state->backend.vkSelftestInvalid ? "(invalid-value)" : "",
         lorieActiveName(d.active),
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
-        d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs));
+        d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
+        TD(xAhbCpuLockUs));
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -1462,14 +1471,20 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         uint64_t waitStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
         // PER_ACCESS: the renderer lets the lock go while the device runs a frame; not while it uses this one.
-        if (perAccessAhb && !priv->locked && !priv->mem)
+        if (perAccessAhb && !priv->locked && !priv->mem) {
+            uint64_t gpuStartUs = GetTimeInMicros();
             lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
+            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);
+        }
         if (perAccessAhb)
             __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
     }
 
     if (!priv->locked && !priv->mem) {
+        uint64_t lockStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         int err = LorieBuffer_lock(priv->buffer, &priv->locked);
+        if (perAccessAhb)
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - lockStartUs, __ATOMIC_RELAXED);
         if (err) {
             dprintf(2, "Failed to lock buffer, err %d\n", err);
             // PER_ACCESS: no FinishAccess follows a failed PrepareAccess, and the renderer would wait on
@@ -1495,7 +1510,9 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
     // and use the AHB while the X server still has it CPU-locked. 3c98ffa's order is kept otherwise.
     if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
         if (!priv->wasLocked) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }

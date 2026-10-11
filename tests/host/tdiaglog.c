@@ -45,6 +45,7 @@ int main(void) {
         fakeState.diag.vkQueuePresentSuccess += 300; fakeState.diag.vkFramesPresented += 300;
         fakeState.diag.vkAcquireSuccess += 300; fakeState.diag.vkFenceWaitUs += 900000;
         fakeState.diag.xAhbCpuAcquires += 120; fakeState.diag.xStateLockWaitUs += 4000;
+        fakeState.diag.xGpuWaitUs += 3000; fakeState.diag.xAhbCpuLockUs += 500;
         lorieLogRendererDiag();
     }
     fclose(logf);
@@ -58,7 +59,8 @@ int main(void) {
         if (strstr(line, "XlorieBackend:") && strstr(line, "x_ahb_cpu_acquires=480(+120)")) {
             CHECK(strstr(line, "XlorieBackend: requested=vulkan vk_fail_at=none vk_selftest=quick active=VULKAN ownership=per_access "
                                "ownership_transitions=1 ")
-                  && strstr(line, "x_state_lock_wait_us=16000(+4000)"), "vulkan backend line: %s", line);
+                  && strstr(line, "x_state_lock_wait_us=16000(+4000) x_gpu_wait_us=12000(+3000) x_ahb_cpu_lock_us=2000(+500)"),
+                  "vulkan backend line: %s", line);
             backendOk++;
         }
     }

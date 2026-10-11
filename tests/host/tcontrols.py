@@ -31,7 +31,9 @@ CONTROLS = [
     ("PER_ACCESS FinishAccess lets the shared lock go before the CPU lock", "InitOutput.c",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
         if (!priv->wasLocked) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
@@ -41,7 +43,9 @@ CONTROLS = [
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
         if (!priv->wasLocked) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
@@ -108,14 +112,20 @@ CONTROLS = [
      "townership"),
     ("drawSquares lets the shared lock go before the CPU lock", "InitOutput.c",
      """    if (perAccess) {
-        if (pixels)
+        if (pixels) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
+        }
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
     }""",
      """    if (perAccess) {
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
-        if (pixels)
+        if (pixels) {
+            uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
+            __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
+        }
     }""",
      "townership"),
     ("a lost connection does not reset the ownership", "InitOutput.c",
@@ -607,15 +617,14 @@ CONTROLS = [
      """state->gpuInFlight.pid == getpid() && 0 && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
      "tpresentcopy"),
     ("an access CPU-locking an AHB a submitted Vulkan frame uses", "InitOutput.c",
-     """        if (perAccessAhb && !priv->locked && !priv->mem)
-            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
-""",
-     "",
+     """            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
+            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);""",
+     """            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);""",
      "townership"),
     ("drawSquares into a root a submitted Vulkan frame uses", "InitOutput.c",
      """        lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
-        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
-     """        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
+        lockStartUs = GetTimeInMicros();""",
+     """        lockStartUs = GetTimeInMicros();""",
      "townership"),
     ("PERSISTENT taken again while a Vulkan frame may still run", "InitOutput.c",
      """        if (mode == LORIE_OWNERSHIP_PERSISTENT)
