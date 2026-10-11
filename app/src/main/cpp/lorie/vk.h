@@ -235,6 +235,8 @@ struct lorie_vk_renderer {
     VkPipeline screenPipeline, cursorPipeline;
     bool recreate;                  /* out of date, or another present mode wanted: made again before the next frame */
     bool smooth;                    /* the present mode wanted: FIFO, else the lowest latency the surface has */
+    bool held;                      /* image heldIndex acquired by a frame that drew nothing: the next frame's */
+    uint32_t heldIndex;
     VkPresentModeKHR presentMode;   /* the one the swapchain was made with */
     /* this frame: the imported images it used and the use each is in; its draws */
     struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];

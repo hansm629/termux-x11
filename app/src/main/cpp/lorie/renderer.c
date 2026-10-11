@@ -2023,7 +2023,12 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         if (!vkActive)
             return;     // failed (rendererVkFail)
     }
-    status = lorieVkAcquire(&vk, &vkr, &index, state);
+    if (vkr.held) {
+        index = vkr.heldIndex;      // acquired by a frame that drew nothing, and still ours
+        vkr.held = false;
+        status = LORIE_VK_FRAME_OK;
+    } else
+        status = lorieVkAcquire(&vk, &vkr, &index, state);
     if (status == LORIE_VK_FRAME_SKIP)
         return;     // drawRequested stays: tried again
     if (status == LORIE_VK_FRAME_RECREATE) {
@@ -2041,7 +2046,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         lorieGpuWaitIdle(state, true, 0);   // a frame another renderer process listed is over first (ours always are)
     // The root the X server publishes now, under this lock: root double buffering swaps it under the same lock
     // (InitOutput.c lorieRootSwap), and the one looked up before may have become the buffer it draws into.
-    if (state->rootWindowTextureID != desc->id) {
+    if (owned && state->rootWindowTextureID != desc->id) {
         LorieBuffer *now;
         pthread_spin_lock(&bufferLock);
         now = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
@@ -2050,6 +2055,16 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
             LorieBuffer_description(now)->width == desc->width && LorieBuffer_description(now)->height == desc->height) {
             buffer = now;
             desc = LorieBuffer_description(now);
+        } else {
+            // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.
+            // The image acquired is kept for the next frame (vkr.held), the copies run alone, the frame is tried
+            // again once the root is there - as when it was not found before acquiring.
+            lorie_mutex_unlock(&state->lock, &state->lockingPid);
+            vkr.held = true;
+            vkr.heldIndex = index;
+            *waitingForBuffers = true;
+            rendererVkApplyPendingGpuCopies();
+            return;
         }
     }
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {

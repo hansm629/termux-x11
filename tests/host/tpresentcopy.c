@@ -155,7 +155,8 @@ static LorieBuffer *LorieBufferList_findById(volatile void *list, uint64_t id) {
     return NULL;
 }
 static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) { return LorieBufferList_findById(&buffers, id); }
-static void lorie_mutex_lock(volatile int *m, volatile int *pid) { (*m)++; *pid = 1; }
+static uint64_t rootAtLock;     /* non-zero: the root id the X server publishes as the renderer takes the lock */
+static void lorie_mutex_lock(volatile int *m, volatile int *pid);
 static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pid = 0; }
 static void rendererVkFail(void) { vkFailures++; }
 /* the X server woken for a finished batch: how things stood at that moment */
@@ -169,6 +170,12 @@ static void notifyGpuCopyDone(void) {
         if (bufs[i].desc.buffer && bufs[i].desc.buffer->owned)
             notified.released = false;
     notified.completed = state->gpuCopyQueue.completedSerial;
+}
+static void lorie_mutex_lock(volatile int *m, volatile int *pid) {
+    (*m)++;
+    *pid = 1;
+    if (rootAtLock && m == &state->lock)
+        state->rootWindowTextureID = rootAtLock;
 }
 #include "presentcopy_src.inc"
 
@@ -712,6 +719,28 @@ int main(void) {
         lorieGpuCopyAck(&srcPix, dstBuffer);
         vkr.smooth = false;
         vkr.recreate = true;
+    }
+
+    /* the root published under the lock not one the renderer has: the old one not sampled, the image kept for the
+     * next frame, which uses it once the root is there */
+    {
+        int acquires = emu.acquires2, presented = (int) st.diag.vkFramesPresented, d1 = emu.draws;
+        own(40);
+        st.rootWindowTextureID = root->desc.id;
+        rootAtLock = 999999;
+        waiting = false;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        rootAtLock = 0;
+        CHECK(vkr.held && waiting && emu.acquires2 == acquires + 1 && (int) st.diag.vkFramesPresented == presented &&
+              emu.draws == d1, "root gone under the lock: held %d, waiting %d, %d frames presented, %d draws", vkr.held, waiting,
+              (int) st.diag.vkFramesPresented - presented, emu.draws - d1);
+        st.rootWindowTextureID = root->desc.id;
+        rendererVkRedraw(&waiting);
+        CHECK(!vkr.held && emu.acquires2 == acquires + 1 && (int) st.diag.vkFramesPresented == presented + 1 &&
+              emu.drawnFrom[d1 % 64] == root->desc.buffer, "the frame after: held %d, %d acquires, %d presented", vkr.held,
+              emu.acquires2 - acquires, (int) st.diag.vkFramesPresented - presented);
+        st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
     }
 
     /* a list another renderer process (alive) left: not cleared by this one; a frame of this one waits until it is over */

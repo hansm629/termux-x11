@@ -711,6 +711,12 @@ CONTROLS = [
      """           pthread_cond_timedwait(stateCond, &stateLock, &deadline) != ETIMEDOUT);""",
      """           (pthread_cond_timedwait(stateCond, &stateLock, &deadline), 1));""",
      "tvkrenderer"),
+    ("a root gone under the lock, the old one drawn", "renderer.c",
+     """        } else {
+            // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",
+     """        } else if (0) {
+            // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",
+     "tpresentcopy"),
 ]
 
 def copy_sources(dst):

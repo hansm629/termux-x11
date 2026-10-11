@@ -1089,6 +1089,7 @@ void lorieVkSwapchainDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
     r->swapchain = VK_NULL_HANDLE;
     r->surface = VK_NULL_HANDLE;
     r->recreate = false;
+    r->held = false;
 }
 
 void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
@@ -1245,6 +1246,8 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
     VkPresentModeKHR presentMode;
     uint8_t reason = LORIE_FALLBACK_VK_SWAPCHAIN;
     VkResult res;
+
+    r->held = false;    // an image held is the old swapchain's
 
     if (!r->surface) {
         VkAndroidSurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = window };
