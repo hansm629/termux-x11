@@ -394,14 +394,6 @@ struct lorie_shared_server_state {
      */
     volatile uint8_t waitForNextFrame;
 
-    /*
-     * Root double buffering: the X server is in a tick (lorieRedraw) that swaps the root and then lets the frame go
-     * - waitForNextFrame cleared, then this, both with release ordering, so a renderer that sees this cleared sees
-     * the frame let go and the new root published. Present copies the tick's vblanks queue meanwhile are held for
-     * that frame (renderer.c rendererVkTickCopies, a bounded time) instead of going in a submission of their own.
-     */
-    volatile uint8_t tickOpen;
-
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 

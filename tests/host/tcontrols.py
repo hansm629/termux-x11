@@ -679,10 +679,8 @@ CONTROLS = [
     ("Vulkan's tick frame allowed only after the vblanks queued their copies", "InitOutput.c",
      """    if (lorieAhbPerAccess() && !twinned)
         pvfb->state->waitForNextFrame = false;
-    else if (twinned)""",
-     """    if (0)
-        pvfb->state->waitForNextFrame = false;
-    else if (twinned)""",
+    loriePerformVblanks();""",
+     """    loriePerformVblanks();""",
      "twiring"),
     ("FIFO copies held up by the frame's swapchain image", "renderer.c",
      """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
@@ -701,16 +699,6 @@ CONTROLS = [
 """,
      "",
      "townership"),
-    ("a root double buffering tick letting its copies go before its frame", "InitOutput.c",
-     """        __atomic_store_n(&pvfb->state->waitForNextFrame, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&pvfb->state->tickOpen, 0, __ATOMIC_RELEASE);""",
-     """        __atomic_store_n(&pvfb->state->tickOpen, 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&pvfb->state->waitForNextFrame, 0, __ATOMIC_RELEASE);""",
-     "twiring"),
-    ("a tick's copies waited for without bound", "renderer.c",
-     """           pthread_cond_timedwait(stateCond, &stateLock, &deadline) != ETIMEDOUT);""",
-     """           (pthread_cond_timedwait(stateCond, &stateLock, &deadline), 1));""",
-     "tvkrenderer"),
     ("a root gone under the lock, the old one drawn", "renderer.c",
      """        } else {
             // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",

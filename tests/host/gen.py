@@ -102,8 +102,7 @@ recipes = {
         + func(R, "static bool rendererGlesEager(void) {")
         + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
-        + func(R, "static bool rendererVkOwnedLocked(void) {")
-        + func(R, "static bool rendererVkTickCopies(void) {"),
+        + func(R, "static bool rendererVkOwnedLocked(void) {"),
     # the GPU copy queue's types (fakevk.h)
     "gpucopytypes": lambda: span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyEntry;")
         + macro(H, "LORIE_GPU_IN_FLIGHT_MAX"),

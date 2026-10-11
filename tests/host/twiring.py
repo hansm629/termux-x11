@@ -71,10 +71,7 @@ def in_order(what, body, *steps):
 
 # root double buffering: swapped after the vblanks, before the frame is allowed and the front published
 in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {"),
-         "__atomic_store_n(&pvfb->state->tickOpen, 1", "loriePerformVblanks();", "lorieRootSwap(priv)",
-         "rootDouble ? priv->twin : priv->buffer", "lorieTickEnd(twinned);")
-# its tick lets the frame go before it lets the held copies go (a renderer seeing tickOpen cleared sees the frame let go)
-in_order("tick end", func(I, "static Bool lorieTickEnd(Bool held) {"), "waitForNextFrame, 0", "tickOpen, 0", "pthread_cond_signal(rendererCond)")
+         "loriePerformVblanks();", "lorieRootSwap(priv)", "rootDouble ? priv->twin : priv->buffer")
 
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
 # the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
@@ -94,7 +91,6 @@ in_order("Vulkan failure", fail, "vkFailed = true;", "rendererVkTeardown();", "v
 refresh = func(R, "void rendererRefreshContext(void) {")
 in_order("window change", refresh, "lorieVkSwapchainDestroy(&vk, &vkr);", "releaseWinAndSurface(&win, &sfc);")
 loop = func(R, "__noreturn static void* rendererThread(void) {")
-in_order("tick copies", loop, "else if (gpuCopyPending && !rendererVkTickCopies())", "rendererVkApplyPendingGpuCopies();")
 in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "rendererSelectBackend();", "pthread_mutex_unlock(&stateLock);",
          "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
 # another session: the last one's imported images and ownership answer are dropped before anything else runs

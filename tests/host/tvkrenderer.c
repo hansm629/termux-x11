@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 #include "diagtypes_src.inc"
-struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint8_t tickOpen; };
+struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie_backend_control backend; };
 static volatile struct lorie_shared_server_state *state;
 static pthread_mutex_t stateLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER, *stateCond = &cond;
@@ -55,20 +55,6 @@ static void *xServer(void *unused) {
     return NULL;
 }
 
-static long msSince(const struct timespec *t0) {
-    struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
-}
-/* the X server ends its tick after 1 ms: tickOpen cleared, the renderer woken */
-static void *tickEnds(void *unused) {
-    (void) unused;
-    usleep(1000);
-    __atomic_store_n(&state->tickOpen, 0, __ATOMIC_RELEASE);
-    pthread_cond_signal(stateCond);
-    return NULL;
-}
-
 static bool ask(uint8_t mode, int delayMs, int answer, bool silent, long *tookMs) {
     pthread_t t;
     struct timespec t0, t1;
@@ -91,9 +77,6 @@ int main(void) {
     static struct lorie_shared_server_state s;
     long ms;
     uint32_t seq;
-
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    alarm(30);          /* a wait that never ends fails the test instead of hanging it */
 
     /* who draws */
     CHECK(rendererBackendFor(LORIE_BACKEND_GLES, false) == RENDERER_USE_GLES && rendererBackendFor(LORIE_BACKEND_GLES, true) == RENDERER_USE_GLES,
@@ -145,30 +128,6 @@ int main(void) {
     s.backend.ownershipAck = s.backend.ownershipRequest;    /* let the next one be answered */
     CHECK(ask(LORIE_OWNERSHIP_PERSISTENT, 0, -1, false, &ms) && !vkOwned &&
           LORIE_OWNERSHIP_MODE(s.backend.ownershipRequest) == LORIE_OWNERSHIP_PERSISTENT, "PERSISTENT asked and answered: owned");
-
-    /* copies queued in an X server tick: held until it ends (bounded) */
-    {
-        pthread_t t;
-        struct timespec t0;
-        long took;
-        bool ended;
-        s.tickOpen = 0;
-        CHECK(!rendererVkTickCopies(), "no tick: copies held");
-        s.tickOpen = 1;
-        pthread_create(&t, NULL, tickEnds, NULL);
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        ended = rendererVkTickCopies();
-        took = msSince(&t0);
-        pthread_join(t, NULL);
-        CHECK(ended && took < 4, "tick ending after 1 ms: %s after %ld ms", ended ? "ended" : "not ended", took);
-        s.tickOpen = 1;     /* never ends */
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        ended = rendererVkTickCopies();
-        took = msSince(&t0);
-        CHECK(!ended && took >= 3 && took < 50, "tick never ending: %s after %ld ms (want given up after about 4)",
-              ended ? "ended" : "not ended", took);
-        s.tickOpen = 0;
-    }
 
     printf("TVKRENDERER backend choice and ownership handshake: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
