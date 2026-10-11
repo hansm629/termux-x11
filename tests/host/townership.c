@@ -11,9 +11,11 @@
  *   has no AHB CPU-locked; every CPU lock of an AHB is taken, and dropped, inside the shared lock.
  *   The answer describes the locks every time the shared lock is let go: PER_ACCESS - no AHB CPU-locked;
  *   PERSISTENT - every pixmap 3c98ffa keeps CPU-locked is.
- *   A submitted Vulkan frame (lorie.h gpuInFlight): no AHB it uses is CPU-locked until the renderer saw it finish
- *   - an access, drawSquares, PERSISTENT taken again all wait for it, holding the shared lock; an AHB the frame
- *   does not use is not waited for. With the renderer's connection gone the wait gives up, and clears the list. */
+ *   A submitted Vulkan frame (lorie.h gpuInFlight): no AHB it uses is CPU-locked until it is over - an access,
+ *   drawSquares, PERSISTENT taken again all wait for it, holding the shared lock; an AHB the frame does not use is
+ *   not waited for, the root's (id 0, as buffer.c's first) included. The wait ends when the submitter says the
+ *   frame is over, however long that takes, connection or not; or when the submitter no longer exists, and the
+ *   list is cleared then. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -24,7 +26,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <linux/futex.h>
+#include <signal.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include "xorglist_src.inc"
 #include "diagtypes_src.inc"
@@ -77,11 +82,8 @@ struct fake_state {
     int lock, lockingPid;
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
-    struct { volatile uint32_t busy; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
+    struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
 };
-#define lorie_shared_server_state fake_state
-#include "inflight_src.inc"
-#undef lorie_shared_server_state
 struct fake_pvfb {
     struct fake_state *state;
     struct { Bool legacyDrawing; } root;
@@ -128,6 +130,32 @@ static uint8_t answered(void) {
     return LORIE_OWNERSHIP_MODE(checked->state->backend.ownershipAck);
 }
 static void rendererView(const char *where);
+
+/* the submitter of a listed frame: the X server's futex wait on gpuInFlight.busy is where the frame becomes over
+ * (the submitter clears the list) once `gpuSlices` 33 ms slices timed out before it */
+static int gpuWaits, gpuSlices;
+static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
+    gpuWaits++;
+    CHECK(op == FUTEX_WAIT && *word == value, "%s op %d: not a futex wait on the list's word", runName, opIndex);
+    if (checked)
+        CHECK(checked->state->lock > 0, "%s op %d: waited for a Vulkan frame without the shared lock", runName, opIndex);
+    if (gpuWaits > 2000) {
+        CHECK(0, "%s op %d: a wait for a Vulkan frame that does not end", runName, opIndex);
+        *word = 0;
+        return 0;
+    }
+    if (gpuSlices > 0) {
+        gpuSlices--;
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    *word = 0;
+    return 0;
+}
+#define syscall(nr, word, op, value, timeout, a, b) ((void) (nr), (void) (timeout), fakeFutexWait(word, op, value))
+#define lorie_shared_server_state fake_state
+#include "inflight_src.inc"
+#undef lorie_shared_server_state
 
 static const LorieBuffer_Desc *LorieBuffer_description(LorieBuffer *b) {
     static const LorieBuffer_Desc none = {0};
@@ -204,24 +232,6 @@ static void lorie_mutex_unlock(int *m, __unused int *pid) {
     if (*m > 0 && --*m == 0 && checked && m == &checked->state->lock)
         rendererView("shared lock let go");
 }
-/* the renderer's side of a submitted frame: the X server's futex wait on gpuInFlight.busy is where the frame
- * finishes (the renderer clears the list), or, with `gpuGone`, where the wait times out */
-static int gpuWaits;
-static bool gpuGone, connected = true;
-static bool lorieConnectionAlive(void) { return connected; }
-static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
-    gpuWaits++;
-    CHECK(op == FUTEX_WAIT && *word == value, "%s op %d: not a futex wait on the list's word", runName, opIndex);
-    if (checked)
-        CHECK(checked->state->lock > 0, "%s op %d: waited for a Vulkan frame without the shared lock", runName, opIndex);
-    if (gpuGone) {
-        errno = ETIMEDOUT;
-        return -1;
-    }
-    *word = 0;
-    return 0;
-}
-#define syscall(nr, word, op, value, timeout, a, b) ((void) (nr), (void) (timeout), fakeFutexWait(word, op, value))
 static uint64_t fakeNow;
 static uint64_t GetTimeInMicros(void) { return fakeNow += 3; }
 static Bool (*queuedProc)(ClientPtr, void *);
@@ -345,6 +355,7 @@ struct op { int what, pix; };
 #define MAXOPS 160
 static PixmapRec pix[NPIX];
 static char slices[2][MAXOPS][256], lockSets[2][MAXOPS][65];
+static int opWaits[MAXOPS];         /* waits for a Vulkan frame each operation made */
 static int perAccessAcquires;
 
 static void ask(struct fake_pvfb *w, uint8_t mode) {
@@ -484,6 +495,7 @@ static void exec(const struct impl *im, struct op o) {
     case IN_FLIGHT:
         w->state->gpuInFlight.ids[0] = b->desc.id;
         w->state->gpuInFlight.count = 1;
+        w->state->gpuInFlight.pid = getpid();
         w->state->gpuInFlight.busy = 1;
         break;
     case CONNECT: {
@@ -518,7 +530,9 @@ static void run(int slot, const struct impl *im, const struct op *ops, int n, ui
     for (i = 0; i < n; i++) {
         size_t start = traceLen;
         opIndex = i;
+        opWaits[i] = gpuWaits;
         exec(im, ops[i]);
+        opWaits[i] = gpuWaits - opWaits[i];
         snprintf(slices[slot][i], sizeof slices[slot][i], "%s", trace + start);
         for (j = 0; j < nbuffers; j++)
             lockSets[slot][i][j] = buffers[j]->released ? 'x' : buffers[j]->cpuHeld ? 'L' : '-';
@@ -689,33 +703,46 @@ int main(void) {
     {
         static const struct op F[] = {
             {ASK_PER_ACCESS},
-            {IN_FLIGHT, 0}, {DEST, 2}, {SRC, 4},     /* not the frame's: not waited for */
-            {DEST, 0},                               /* the root, in the frame: waited for */
-            {IN_FLIGHT, 0}, {DRAW},                  /* drawSquares into it: waited for */
-            {IN_FLIGHT, 2}, {SRC, 0}, {DEST, 2},     /* the root no longer, pixmap 2 now: only that waited for */
-            {IN_FLIGHT, 4}, {CONNECT},               /* PERSISTENT again locks every AHB: waited for */
+            {IN_FLIGHT, 2}, {SRC, 0}, {DEST, 4},    /* the root (id 0) and pixmap 4 not in the frame */
+            {DEST, 2},                              /* pixmap 2 in it */
+            {IN_FLIGHT, 0}, {DEST, 2},              /* the root in the frame, pixmap 2 not */
+            {SRC, 0},                               /* the root, id 0, in it */
+            {IN_FLIGHT, 0}, {DRAW},                 /* drawSquares into it */
+            {IN_FLIGHT, 4}, {CONNECT},              /* PERSISTENT again locks every AHB */
         };
+        static const int waits[] = { 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1 };
         int nA = sizeof A / sizeof *A;
         memcpy(ops, A, sizeof A);
         memcpy(ops + nA, F, sizeof F);
         n = nA + (int) (sizeof F / sizeof *F);
-        gpuWaits = 0;
+        gpuWaits = gpuSlices = 0;
         run(1, &cur, ops, n, LORIE_BACKEND_AUTO);
-        CHECK(gpuWaits == 4, "frames in flight: %d waits (want 4: the root twice, pixmap 2, PERSISTENT)", gpuWaits);
+        for (int i = 0; i < (int) (sizeof F / sizeof *F); i++)
+            CHECK(opWaits[nA + i] == waits[i], "frames in flight, op %d: %d waits for a Vulkan frame, want %d", nA + i,
+                  opWaits[nA + i], waits[i]);
         CHECK(!newWorld.state->gpuInFlight.busy, "frames in flight: the list still set at the end");
 
-        /* the renderer gone in the middle of a frame: the wait gives up, and clears the list */
-        newWorld.state->gpuInFlight.ids[0] = 77;
-        newWorld.state->gpuInFlight.count = 1;
-        newWorld.state->gpuInFlight.busy = 1;
-        connected = false;
-        gpuGone = true;
+        /* the submitter there (the connection gone or not: nothing reads it): waited for until it says so */
+        newWorld.state->gpuInFlight = (__typeof__(newWorld.state->gpuInFlight)) { 1, getpid(), 1, { 77 } };
         gpuWaits = 0;
-        lorieWaitGpuIdle(77);
-        CHECK(gpuWaits == 1 && !newWorld.state->gpuInFlight.busy, "renderer gone: %d waits, the list %s", gpuWaits,
+        gpuSlices = 5;
+        lorieGpuWaitIdle(newWorld.state, false, 77);
+        CHECK(gpuWaits == 6 && !newWorld.state->gpuInFlight.busy, "submitter there: %d waits (want 6, through 5 slices)", gpuWaits);
+
+        /* the submitter gone: a slice, then the list cleared */
+        {
+            pid_t dead = fork();
+            if (!dead)
+                _exit(0);
+            waitpid(dead, NULL, 0);
+            newWorld.state->gpuInFlight = (__typeof__(newWorld.state->gpuInFlight)) { 1, dead, 1, { 77 } };
+        }
+        gpuWaits = 0;
+        gpuSlices = 1000;
+        lorieGpuWaitIdle(newWorld.state, true, 0);
+        CHECK(gpuWaits == 1 && !newWorld.state->gpuInFlight.busy, "submitter gone: %d waits, the list %s", gpuWaits,
               newWorld.state->gpuInFlight.busy ? "still set" : "cleared");
-        connected = true;
-        gpuGone = false;
+        gpuSlices = 0;
     }
 
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

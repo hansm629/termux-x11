@@ -23,10 +23,13 @@
  *   GLES textures: none made for Vulkan's copies and frames; GLES's first use of a buffer makes its texture,
  *   once.
  *   While the device runs a frame (the fence waited for) the renderer does not hold the X server's lock, and
- *   exactly the frame's buffers are listed in flight; the list is cleared once the fence signalled, or once the
- *   device is idle after a fence that did not. Meanwhile the X server (lorieWaitGpuIdle, another thread here)
- *   gets an AHB the frame does not use at once, and one it uses only after the frame finished; with the
- *   renderer's connection gone it gives up waiting after a slice, and clears the list.
+ *   exactly the frame's buffers are listed in flight. The list is cleared once the frame is over: fence
+ *   signalled, or the device idle or lost after a fence that did not; kept while vkDeviceWaitIdle answers out
+ *   of memory, until teardown asks again and it answers. Meanwhile the X server (lorieGpuWaitIdle, another
+ *   thread here) gets an AHB the frame does not use at once - id 0 too, an id like any other - and one it uses
+ *   only after the frame is over. A lost connection changes nothing while the submitter is there; a submitter
+ *   that no longer exists ends the wait, and the list is cleared then. A list another renderer process left is
+ *   not cleared by this one, and a frame of this one is recorded only once it is over.
  *   X server again: done only then; the CPU may lock the source; the acknowledgement drops what was held. */
 #define _GNU_SOURCE         /* pthread_timedjoin_np: an X server thread never let go must not hang the test */
 #include <errno.h>
@@ -36,6 +39,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "fakevk.h"
 
@@ -168,14 +172,16 @@ static void notifyGpuCopyDone(void) {
 #include "presentcopy_src.inc"
 
 /* the moment the renderer waits for a frame's fence: the device runs the frame */
-static struct { int waits; bool lockHeld; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } atFence;
+static struct { int waits; bool lockHeld, otherOver; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } atFence;
 static int gpuMs;                   /* how long the device takes, at the next fence */
 static volatile bool gpuFinished;
+static volatile bool otherOver;     /* the frame another submitter listed is over (otherSubmitter) */
 static void lookAtFence(VkFence fence) {
     if (fence != vkr.frameFence)
         return;             /* a swapchain image's */
     atFence.waits++;
     atFence.lockHeld |= state->lock != 0;
+    atFence.otherOver = otherOver;
     atFence.busy = state->gpuInFlight.busy;
     atFence.count = state->gpuInFlight.count;
     memcpy(atFence.ids, (const void *) state->gpuInFlight.ids, sizeof atFence.ids);
@@ -206,12 +212,44 @@ static void *xServer(void *unused) {
     for (int spins = 0; spins < 5000 && !__atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE); spins++)
         usleep(200);
     xThread.started = __atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE);
-    lorieWaitGpuIdle(xThread.otherId);
+    lorieGpuWaitIdle(state, false, xThread.otherId);
     xThread.otherWhileBusy = !gpuFinished;
-    lorieWaitGpuIdle(xThread.rootId);
+    lorieGpuWaitIdle(state, false, xThread.rootId);
     xThread.rootAfterGpu = gpuFinished;
     xThread.rootListCleared = !__atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE);
     return NULL;
+}
+
+/* another submitter: its listed frame over after 80 ms (it clears the list, as rendererVkFrameDone does) */
+static void *otherSubmitter(void *unused) {
+    (void) unused;
+    usleep(80000);
+    otherOver = true;
+    __atomic_store_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &state->gpuInFlight.busy, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    return NULL;
+}
+
+// a process id no process has any more
+static pid_t deadPid(void) {
+    pid_t pid = fork();
+    if (!pid)
+        _exit(0);
+    waitpid(pid, NULL, 0);
+    return pid;
+}
+
+static void list(uint64_t id, pid_t pid) {
+    state->gpuInFlight.ids[0] = id;
+    state->gpuInFlight.count = 1;
+    state->gpuInFlight.pid = pid;
+    __atomic_store_n(&state->gpuInFlight.busy, 1, __ATOMIC_RELEASE);
+}
+
+static long msSince(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
 #define X_USAGE (AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | \
@@ -283,6 +321,8 @@ int main(void) {
     int d0;
     Queue saved;
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    alarm(30);          /* a wait that never ends fails the test (in a few seconds otherwise) instead of hanging it */
     pthread_spin_init(&bufferLock, PTHREAD_PROCESS_PRIVATE);
     good();
     state = pvfb->state = &st;
@@ -343,6 +383,7 @@ int main(void) {
     CHECK(atFence.waits == 1 && !atFence.lockHeld && inFlightAtFence(2, src, root) && !st.gpuInFlight.busy,
           "copies alone: at the fence the X server's lock %s, %u buffers in flight; afterwards the list %s",
           atFence.lockHeld ? "held" : "free", atFence.busy ? atFence.count : 0, st.gpuInFlight.busy ? "still set" : "cleared");
+    st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
     CHECK(notified.cleared && notified.fenceWaited && notified.released,
           "copies alone: published %s", !notified.cleared ? "with its buffers still in flight" : !notified.fenceWaited ?
           "before the fence was waited for" : "with a buffer still the renderer's");
@@ -384,6 +425,7 @@ int main(void) {
     CHECK(!atFence.lockHeld && inFlightAtFence(3, bgra, redirected, root) && !st.gpuInFlight.busy,
           "frame: at the fence the X server's lock %s, %u buffers in flight (want the copy's two and the root)",
           atFence.lockHeld ? "held" : "free", atFence.busy ? atFence.count : 0);
+    st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
     CHECK(st.gpuCopyQueue.readIndex == 2 && st.gpuCopyQueue.completedSerial == 2 && notified.count == 2 && notified.cleared &&
           notified.fenceWaited && notified.released, "frame: readIndex %u, completed %llu", st.gpuCopyQueue.readIndex,
           (unsigned long long) st.gpuCopyQueue.completedSerial);
@@ -398,7 +440,8 @@ int main(void) {
     /* a plain desktop frame: nothing queued, no copy drawn; the X server, meanwhile, on its own thread */
     {
         pthread_t x;
-        xThread = (__typeof__(xThread)) { .rootId = root->desc.id, .otherId = src->desc.id };
+        /* the other: AHB id 0 (buffer.c's first id; this test's start at 1), not in the frame - not "every AHB" */
+        xThread = (__typeof__(xThread)) { .rootId = root->desc.id, .otherId = 0 };
         gpuMs = 60;
         gpuFinished = false;
         pthread_create(&x, NULL, xServer, NULL);
@@ -410,13 +453,13 @@ int main(void) {
             deadline.tv_sec += 3;
             if (pthread_timedjoin_np(x, NULL, &deadline)) {
                 CHECK(0, "the X server still waiting for the root 3 s after the frame finished");
-                connectionAlive = false;        /* lets it give up */
+                st.gpuInFlight.pid = deadPid();     /* lets it give up */
                 pthread_join(x, NULL);
-                connectionAlive = true;
             }
         }
         gpuMs = 0;
         CHECK(!atFence.lockHeld && inFlightAtFence(1, root) && !st.gpuInFlight.busy, "plain frame: not the root alone in flight");
+        st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
         CHECK(xThread.started && xThread.otherWhileBusy && xThread.rootAfterGpu && xThread.rootListCleared,
               "the X server meanwhile: %s", !xThread.started ? "never saw the frame in flight" :
               !xThread.otherWhileBusy ? "waited for a buffer the frame does not use" :
@@ -526,8 +569,40 @@ int main(void) {
             CHECK(vkFailures == 1 && emu.deviceWaits == idle + 1 && !st.gpuInFlight.busy && st.gpuCopyQueue.readIndex == readIndex &&
                   !lorieGpuCopyIsDone(serial) && emu.violations == 0, "late fence: device waits %d, list %s, readIndex %u (was %u)",
                   emu.deviceWaits - idle, st.gpuInFlight.busy ? "set" : "cleared", st.gpuCopyQueue.readIndex, readIndex);
+            st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
             vkFailures = 0;
             emu.fencePending = false;
+        }
+
+        /* the fence lost (and the device): over - the device's external memory is other APIs' again, content undefined */
+        own(13);
+        emu.fenceResult = emu.idleResult = VK_ERROR_DEVICE_LOST;
+        rendererVkApplyPendingGpuCopies();
+        emu.fenceResult = emu.idleResult = VK_SUCCESS;
+        CHECK(vkFailures == 1 && !st.gpuInFlight.busy && st.gpuCopyQueue.readIndex == readIndex && !lorieGpuCopyIsDone(serial),
+              "lost device: list %s, readIndex %u (was %u)", st.gpuInFlight.busy ? "kept" : "cleared", st.gpuCopyQueue.readIndex, readIndex);
+        st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
+        vkFailures = 0;
+        emu.fencePending = false;
+
+        /* the fence late, vkDeviceWaitIdle out of memory: not known to be over, the list kept; teardown asks again */
+        own(14);
+        {
+            int idle;
+            emu.fenceResult = VK_TIMEOUT;
+            emu.idleFailures = 3;
+            rendererVkApplyPendingGpuCopies();
+            emu.fenceResult = VK_SUCCESS;
+            CHECK(vkFailures == 1 && st.gpuInFlight.busy && st.gpuInFlight.pid == getpid() && !lorieGpuCopyIsDone(serial),
+                  "device not known idle: list %s", st.gpuInFlight.busy ? "kept" : "cleared");
+            idle = emu.deviceWaits;
+            rendererVkIdle();           /* rendererVkFail's teardown, before anything else */
+            rendererVkFrameDone();
+            CHECK(emu.deviceWaits == idle + 3 && !st.gpuInFlight.busy, "teardown: vkDeviceWaitIdle asked %d times (want 3), list %s",
+                  emu.deviceWaits - idle, st.gpuInFlight.busy ? "kept" : "cleared");
+            st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
+            emu.idleFailures = 0;
+            vkFailures = 0;
         }
 
         /* owned again, the submission fails: nothing published */
@@ -611,19 +686,47 @@ int main(void) {
             CHECK(lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k], "many: source %d moved by a removal", k);
     }
 
-    /* the renderer gone in the middle of a frame: the X server waits a slice, then gives up and clears the list */
+    /* a list another renderer process (alive) left: not cleared by this one; a frame of this one waits until it is over */
     {
-        struct timespec t0, t1;
-        st.gpuInFlight.ids[0] = root->desc.id;
-        st.gpuInFlight.count = 1;
-        st.gpuInFlight.busy = 1;
+        pthread_t other;
+        own(20);
+        list(root->desc.id, getppid());
+        rendererVkFrameDone();
+        CHECK(st.gpuInFlight.busy, "another process's list cleared by this one");
+        otherOver = false;
+        pthread_create(&other, NULL, otherSubmitter, NULL);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        pthread_join(other, NULL);
+        CHECK(atFence.otherOver && !st.gpuInFlight.busy, "a frame recorded while another process's listed frame was not over");
+        st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
+    }
+
+    /* the X server's wait: a lost connection, the submitter there - until it says the frame is over; a submitter that
+     * no longer exists - a slice, then the list cleared */
+    {
+        pthread_t other;
+        struct timespec t0;
+        long ms;
+        bool afterSubmitter;
+        list(root->desc.id, getpid());
         connectionAlive = false;
+        otherOver = false;
+        pthread_create(&other, NULL, otherSubmitter, NULL);
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        lorieWaitGpuIdle(root->desc.id);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
+        lorieGpuWaitIdle(state, false, root->desc.id);
+        afterSubmitter = otherOver;
+        ms = msSince(&t0);
+        pthread_join(other, NULL);
         connectionAlive = true;
-        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
-        CHECK(!st.gpuInFlight.busy && ms >= 25 && ms < 1000, "renderer gone: waited %ld ms, list %s", ms,
+        CHECK(afterSubmitter && ms >= 70, "lost connection, submitter there: the wait ended after %ld ms, %s", ms,
+              afterSubmitter ? "once it said so" : "before it said so");
+
+        list(root->desc.id, deadPid());
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        lorieGpuWaitIdle(state, false, root->desc.id);
+        ms = msSince(&t0);
+        CHECK(!st.gpuInFlight.busy && ms >= 25 && ms < 1000, "submitter gone: waited %ld ms, list %s", ms,
               st.gpuInFlight.busy ? "still set" : "cleared");
     }
 

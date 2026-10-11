@@ -28,8 +28,6 @@
 #include "lorie.h"
 #include "vk.h"
 #include <limits.h>
-#include <linux/futex.h>
-#include <sys/syscall.h>
 
 #include <unistd.h>
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
@@ -1651,10 +1649,50 @@ static bool rendererVkOwnedLocked(void) {
            __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE) == LORIE_OWNERSHIP_WORD(vkOwnershipSeq, LORIE_OWNERSHIP_PER_ACCESS);
 }
 
-// Everything Vulkan made, gone once the device is idle.
+_Static_assert(LORIE_VK_MAX_FRAME_IMAGES <= LORIE_GPU_IN_FLIGHT_MAX, "a frame's buffers must all fit in gpuInFlight");
+
+/*
+ * The X server's AHBs the frame just submitted uses (lorieVkFrameUse's list): listed in flight, as this process's,
+ * under the X server's lock, before it is let go. From then until rendererVkFrameDone the X server may take the
+ * lock, but CPU-locks none of them (lorie.h gpuInFlight).
+ */
+static void rendererVkInFlight(void) {
+    uint32_t i;
+    if (!vkr.usedCount)
+        return;
+    for (i = 0; i < vkr.usedCount; i++)
+        state->gpuInFlight.ids[i] = vkr.used[i].img->id;
+    state->gpuInFlight.count = vkr.usedCount;
+    state->gpuInFlight.pid = getpid();
+    __atomic_store_n(&state->gpuInFlight.busy, 1, __ATOMIC_RELEASE);
+}
+
+// This process's submitted frame is over (lorieVkFrameWait's *over, or the device idle or lost since): its buffers
+// are the X server's again. Without the X server's lock, which it may be holding while it waits for exactly this.
+// A list another renderer process left is not ours to clear (lorieGpuWaitIdle clears it once that one is gone).
+static void rendererVkFrameDone(void) {
+    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))
+        syscall(SYS_futex, &state->gpuInFlight.busy, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+/*
+ * Until the device is idle, or lost (Lost Device: for whether resources are in use, VK_ERROR_DEVICE_LOST is
+ * equivalent to VK_SUCCESS). An out-of-memory answer establishes neither, and is asked again: the X server keeps
+ * off the buffers of a frame not known to be over meanwhile.
+ */
+static void rendererVkIdle(void) {
+    VkResult r;
+    while ((r = vk.DeviceWaitIdle(vk.device)) != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST) {
+        loge("Xlorie: vkDeviceWaitIdle: %d, asked again", r);
+        usleep(10000);
+    }
+}
+
+// Everything Vulkan made, gone once the device is idle (or lost); a frame left not over is over then.
 static void rendererVkTeardown(void) {
     if (vk.device) {
-        vk.DeviceWaitIdle(vk.device);
+        rendererVkIdle();
+        rendererVkFrameDone();
         lorieVkImagesClear(&vk, &vkImages);
         lorieVkRendererDestroy(&vk, &vkr);
         lorieVkDestroyDevice(&vk);
@@ -1771,30 +1809,6 @@ static void rendererSelectBackend(void) {
     loge("Xlorie: Vulkan was asked for and failed: nothing draws the window");
 }
 
-_Static_assert(LORIE_VK_MAX_FRAME_IMAGES <= LORIE_GPU_IN_FLIGHT_MAX, "a frame's buffers must all fit in gpuInFlight");
-
-/*
- * The X server's AHBs the frame just submitted uses (lorieVkFrameUse's list): listed in flight, under the X
- * server's lock, before it is let go. From then until rendererVkFrameDone the X server may take the lock, but
- * CPU-locks none of them (lorie.h gpuInFlight).
- */
-static void rendererVkInFlight(void) {
-    uint32_t i;
-    if (!vkr.usedCount)
-        return;
-    for (i = 0; i < vkr.usedCount; i++)
-        state->gpuInFlight.ids[i] = vkr.used[i].img->id;
-    state->gpuInFlight.count = vkr.usedCount;
-    __atomic_store_n(&state->gpuInFlight.busy, 1, __ATOMIC_RELEASE);
-}
-
-// The submitted frame finished (lorieVkFrameWait returned: fence signalled, or device idle): its buffers are the X
-// server's again. Without the X server's lock, which it may be holding while it waits for exactly this.
-static void rendererVkFrameDone(void) {
-    if (__atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))
-        syscall(SYS_futex, &state->gpuInFlight.busy, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
-}
-
 /*
  * One rectangle of a GPU copy, as GLES's rendererApplyPendingGpuCopiesLocked draws it: destination pixels
  * (r.x1 + xOff .. r.x2 + xOff, r.y1 + yOff .. r.y2 + yOff) from source pixels (r.x1 .. r.x2, r.y1 .. r.y2), red and
@@ -1872,6 +1886,7 @@ static void rendererVkApplyPendingGpuCopies(void) {
         backendSelect = true;   // asked for again first
         return;
     }
+    lorieGpuWaitIdle(state, true, 0);       // a frame another renderer process listed is over first (ours always are)
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
@@ -1888,8 +1903,10 @@ static void rendererVkApplyPendingGpuCopies(void) {
 
     if (res == VK_SUCCESS) {
         // The device runs the copies; the X server goes on, without their buffers (rendererVkInFlight).
-        res = lorieVkFrameWait(&vk, &vkr, state);
-        rendererVkFrameDone();
+        bool over;
+        res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        if (over)
+            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -1984,6 +2001,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     // We should signal X server to not use root window while we actively copy it
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     owned = rendererVkOwnedLocked();
+    if (owned)
+        lorieGpuWaitIdle(state, true, 0);   // a frame another renderer process listed is over first (ours always are)
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
@@ -2029,8 +2048,10 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
 
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
-        res = lorieVkFrameWait(&vk, &vkr, state);
-        rendererVkFrameDone();
+        bool over;
+        res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        if (over)
+            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -2171,9 +2192,6 @@ __noreturn static void* rendererThread(void) {
 
             if (state) {
                 // A new X server session: Vulkan may be tried again, the X server's ownership asked for again.
-                // Nothing of ours is in flight on it (frames finish before this runs); a renderer that died in the
-                // middle of a frame may have left its list set, which the X server would wait on.
-                rendererVkFrameDone();
                 vkFailed = false;
                 state->surfaceAvailable = win != defaultWin && (vkActive || sfc != defaultSfc);
                 rendererPublishActive();

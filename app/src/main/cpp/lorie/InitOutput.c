@@ -14,8 +14,6 @@
 
 #include <sys/eventfd.h>
 #include <sys/errno.h>
-#include <sys/syscall.h>
-#include <linux/futex.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
 #include <X11/Xmd.h>
@@ -168,25 +166,6 @@ static void lorieDropPersistent(LoriePixmapPriv *priv) {
 }
 
 /*
- * PER_ACCESS, holding the shared lock, before CPU-locking AHB `id` (0: before CPU-locking every one): waits until no
- * submitted Vulkan frame uses it (lorie.h gpuInFlight). The renderer lets the shared lock go once a frame is
- * submitted and ends this wait without it, so this waits holding the lock. Gives up only where lorie_mutex_lock
- * gives up the lock, when the renderer's connection is gone - and then clears the list, which a renderer that died
- * in the middle of a frame left set (a new renderer clears it too, when it takes up the session).
- */
-static void lorieWaitGpuIdle(uint64_t id) {
-    while (lorieGpuInFlight(pvfb->state, id)) {
-        struct timespec timeout = { 0, 33 * 1000000 };      // as lorie_mutex_lock: a slice, then the renderer checked
-        uint32_t busy = __atomic_load_n(&pvfb->state->gpuInFlight.busy, __ATOMIC_ACQUIRE);
-        if (busy && syscall(SYS_futex, &pvfb->state->gpuInFlight.busy, FUTEX_WAIT, busy, &timeout, NULL, 0) &&
-            errno == ETIMEDOUT && !lorieConnectionAlive()) {
-            __atomic_store_n(&pvfb->state->gpuInFlight.busy, 0, __ATOMIC_RELEASE);
-            return;
-        }
-    }
-}
-
-/*
  * Puts `mode` in effect for every remembered AHB pixmap - under PER_ACCESS none stays CPU-locked, under
  * PERSISTENT each is locked again as 3c98ffa keeps it - and answers request `seq` with it. Main thread,
  * between requests, so no EXA access is open on any of them. The locks and the answer change together under
@@ -200,8 +179,9 @@ static void lorieApplyOwnership(uint8_t mode, uint32_t seq) {
 
     lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
     if (mode != pvfb->ownership) {
+        // Every AHB locked: not before a Vulkan frame that may still run (a new or lost connection) is over.
         if (mode == LORIE_OWNERSHIP_PERSISTENT)
-            lorieWaitGpuIdle(0);    // a Vulkan frame may still be running (a new or lost connection)
+            lorieGpuWaitIdle(pvfb->state, true, 0);
         xorg_list_for_each_entry(priv, &pvfb->ahbPersistent, persistentLink) {
             if (mode == LORIE_OWNERSHIP_PER_ACCESS && priv->locked) {
                 LorieBuffer_unlock(priv->buffer);
@@ -464,7 +444,7 @@ Bool drawSquares() {
     if (perAccess) {
         uint64_t waitStartUs = GetTimeInMicros();
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
-        lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+        lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
         __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
         if (LorieBuffer_lock(priv->buffer, (void **) &pixels))
             pixels = NULL;
@@ -1479,7 +1459,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
         // PER_ACCESS: the renderer lets the lock go while the device runs a frame; not while it uses this one.
         if (perAccessAhb && !priv->locked && !priv->mem)
-            lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
         if (perAccessAhb)
             __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
     }

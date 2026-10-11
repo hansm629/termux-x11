@@ -1620,18 +1620,24 @@ VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uin
     return VK_SUCCESS;
 }
 
-VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st) {
+VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st,
+                          bool *over) {
     uint64_t start = lorieVkNowUs();
-    VkResult res;
+    VkResult res, idle;
 
     if ((res = vk->WaitForFences(vk->device, 1, &r->frameFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS) {
         lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
                         res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SUBMIT, res);
-        // The X server must not touch the frame's buffers before the device is done with them, or lost.
-        vk->DeviceWaitIdle(vk->device);
+        // The X server must not touch the frame's buffers before the device is done with them: the device waited
+        // for. Lost counts as done (Lost Device: for whether resources are in use, VK_ERROR_DEVICE_LOST is equivalent
+        // to VK_SUCCESS; other APIs keep the external memory, its content undefined). Out of memory establishes
+        // neither: the frame stays not over.
+        idle = vk->DeviceWaitIdle(vk->device);
+        *over = idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST || res == VK_ERROR_DEVICE_LOST;
         vk->ResetFences(vk->device, 1, &r->frameFence);
         return res;
     }
+    *over = true;
     r->fenceWaitUs = lorieVkNowUs() - start;
     if ((res = vk->ResetFences(vk->device, 1, &r->frameFence)) != VK_SUCCESS) {
         lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, res);
@@ -1649,7 +1655,8 @@ VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, vola
 VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
                             volatile struct lorie_shared_server_state *st) {
     VkResult res = lorieVkFrameQueue(vk, r, index, present, st);
-    return res != VK_SUCCESS ? res : lorieVkFrameWait(vk, r, st);
+    bool over;
+    return res != VK_SUCCESS ? res : lorieVkFrameWait(vk, r, st, &over);
 }
 
 int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, volatile struct lorie_shared_server_state *st) {

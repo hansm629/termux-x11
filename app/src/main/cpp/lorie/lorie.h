@@ -11,7 +11,10 @@
 #include <jni.h>
 #include <screenint.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include "linux/input-event-codes.h"
 #include "buffer.h"
 
@@ -347,15 +350,18 @@ struct lorie_shared_server_state {
     } gpuCopyQueue;
 
     /*
-     * The X server's AHBs that a submitted Vulkan frame uses, until the renderer saw it finish. The renderer
-     * fills `ids` and sets `busy` under `lock`, right after submitting the frame, and then lets `lock` go while
-     * the device runs it; once the frame's fence signalled (or the device is idle) it clears `busy` - without
-     * `lock`, which the X server may be holding while it waits - and wakes the X server (a futex on `busy`).
-     * Under PER_ACCESS the X server, holding `lock`, CPU-locks no AHB listed here while `busy` (lorieGpuInFlight,
-     * InitOutput.c lorieWaitGpuIdle): the device owns those (FOREIGN ownership, vk.h) until the frame finished.
+     * The X server's AHBs that a submitted Vulkan frame uses, until it is known to be over. The renderer fills
+     * `ids` and `pid` (its process) and sets `busy` under `lock`, right after submitting the frame, and then lets
+     * `lock` go while the device runs it. The frame is over when the renderer saw its fence signal, the device
+     * idle, or the device lost (renderer.c rendererVkFrameDone clears `busy` then - without `lock`, which the X
+     * server may be holding while it waits - and wakes the waiters, a futex on `busy`), or when the process
+     * `pid` no longer exists (lorieGpuWaitIdle clears it then). Nothing else clears it: a lost connection or
+     * elapsed time says nothing of the device. Under PER_ACCESS the X server, holding `lock`, CPU-locks no AHB
+     * listed here while `busy`: the device owns those (FOREIGN ownership, vk.h) until the frame is over.
      */
     struct {
         volatile uint32_t busy;
+        volatile pid_t pid;
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
@@ -430,15 +436,47 @@ struct lorie_shared_server_state {
     } cursor;
 };
 
-// Whether AHB `id` - or, for 0, any AHB - is used by a submitted Vulkan frame the renderer has not seen finish.
+// Whether AHB `id` (any id, 0 as well - LorieBuffer ids start at 0) is used by a submitted Vulkan frame not over.
 static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared_server_state *st, uint64_t id) {
     uint32_t i;
     if (!__atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE))
         return false;
-    for (i = 0; id && i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
+    for (i = 0; i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
         if (st->gpuInFlight.ids[i] == id)
             return true;
-    return !id;
+    return false;
+}
+
+// Whether any AHB is.
+static inline __always_inline bool lorieGpuAnyInFlight(volatile struct lorie_shared_server_state *st) {
+    return __atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE) != 0;
+}
+
+/*
+ * Whether the process that submitted the listed frame no longer exists. Its files went with it, the device's
+ * among them, and the kernel's GPU driver ended its work when they were released - what the drivers do with a
+ * process's GPU contexts; Vulkan itself says nothing of a process that is gone. Only ESRCH: a process that
+ * exists but may not be signalled (another app's: EPERM, EACCES) is there, and so is one not yet reaped.
+ */
+static inline __always_inline bool lorieGpuSubmitterGone(volatile struct lorie_shared_server_state *st) {
+    pid_t pid = st->gpuInFlight.pid;
+    return pid > 0 && kill(pid, 0) == -1 && errno == ESRCH;
+}
+
+/*
+ * Holding `lock`: returns once AHB `id` - or, with `every`, any AHB - is in no submitted Vulkan frame that is not
+ * over. The submitter ends the wait without `lock` (futex wake on `busy`); every 33 ms the submitter is looked
+ * for, and a list whose submitter no longer exists is cleared here. Waits for as long as the submitter exists
+ * and has not said so: it does, in bounded time, unless its device hangs.
+ */
+static inline __always_inline void lorieGpuWaitIdle(volatile struct lorie_shared_server_state *st, bool every, uint64_t id) {
+    while (every ? lorieGpuAnyInFlight(st) : lorieGpuInFlight(st, id)) {
+        struct timespec slice = { 0, 33 * 1000000 };
+        uint32_t busy = __atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE);
+        if (busy && syscall(SYS_futex, &st->gpuInFlight.busy, FUTEX_WAIT, busy, &slice, NULL, 0) && errno == ETIMEDOUT &&
+            lorieGpuSubmitterGone(st))
+            __atomic_store_n(&st->gpuInFlight.busy, 0, __ATOMIC_RELEASE);
+    }
 }
 
 static int android_to_linux_keycode[304] = {

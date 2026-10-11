@@ -16,6 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <linux/futex.h>
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
@@ -63,6 +69,8 @@ static struct {
     uint32_t corruptByte;
     VkResult submitResult, fenceResult;
     VkResult acquireResult, presentResult;  /* what the next acquire / present returns */
+    int idleFailures;               /* vkDeviceWaitIdle answers out of memory this many times (the device not idle), */
+    VkResult idleResult;            /* then this: VK_SUCCESS, or VK_ERROR_DEVICE_LOST */
     bool surfaceUnsupported;
     VkSurfaceFormatKHR surfaceFormats[4];
     uint32_t surfaceFormatCount;
@@ -158,6 +166,7 @@ struct lorie_shared_server_state {
     } gpuCopyQueue;
     struct {
         volatile uint32_t busy;
+        volatile pid_t pid;
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
@@ -304,8 +313,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL fDeviceWaitIdle(VkDevice d) {
     (void) d;
     calls.waitIdle++;
     emu.deviceWaits++;
+    if (emu.idleFailures > 0) {
+        emu.idleFailures--;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     emu.fencePending = false;
-    return VK_SUCCESS;
+    return emu.idleResult;
 }
 /* ---- what an import calls: every object counted while alive, every argument kept ---- */
 static struct {

@@ -258,9 +258,11 @@ void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32
 // submitted and nothing is to be waited for.
 VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
                            volatile struct lorie_shared_server_state *st);
-// Waits for the frame lorieVkFrameQueue submitted: VK_SUCCESS once its fence signalled. Whatever it returns, the
-// device no longer uses the frame's buffers (a fence that does not signal in time is waited out with the device).
-VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
+// Waits for the frame lorieVkFrameQueue submitted: VK_SUCCESS once its fence signalled. *over says whether the frame
+// is known to be over - fence signalled, or else the device idle or lost - and false only when that was not
+// established (vkDeviceWaitIdle out of memory): its buffers may still be in use then.
+VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st,
+                          bool *over);
 // lorieVkFrameQueue, then lorieVkFrameWait.
 VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
                             volatile struct lorie_shared_server_state *st);

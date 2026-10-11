@@ -8,8 +8,8 @@ And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c, tvkrendere
 steps): a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
 server's PER_ACCESS answer is still its own before touching a buffer, submits and lists the frame's buffers in
 flight before letting the lock go, then waits for its fence, gives the buffers back, publishes the completed
-copies, and presents; the copies alone likewise; a new session clears what a dead renderer may have left in
-flight; a failure is torn down before the X server is asked for its ownership back, and that before
+copies, and presents; the copies alone likewise; teardown finds the device idle (or lost) before it clears a
+frame of ours left not over; a failure is torn down before the X server is asked for its ownership back, and that before
 GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
 change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer; another
 X server session (or none) drops every imported image and the ownership answer of the last one first. The
@@ -84,7 +84,9 @@ in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "ren
          "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
 # another session: the last one's imported images and ownership answer are dropped before anything else runs
 in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
-         "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (state) {", "rendererVkFrameDone();", "if (windowChanged)")
+         "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")
+in_order("Vulkan teardown", func(R, "static void rendererVkTeardown(void) {"), "rendererVkIdle();", "rendererVkFrameDone();",
+         "lorieVkImagesClear(&vk, &vkImages);", "lorieVkDestroyDevice(&vk);")
 
 check("            if (rendererGlesEager())\n                rendererAttachToGL(buf);" in loop,
       "a buffer that comes gets a GLES texture whoever draws")

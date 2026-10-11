@@ -338,10 +338,8 @@ CONTROLS = [
     if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS) {""",
      "tvkframe"),
     ("a late fence not waited out", "vk.c",
-     """        vk->DeviceWaitIdle(vk->device);
-        vk->ResetFences(vk->device, 1, &r->frameFence);
-        return res;""",
-     """        return res;""",
+     """        idle = vk->DeviceWaitIdle(vk->device);""",
+     """        idle = VK_SUCCESS;""",
      "tvkframe"),
     ("the acquire fence not reset", "vk.c",
      """                (wait = vk->ResetFences(vk->device, 1, &r->acquireFence)) != VK_SUCCESS) {""",
@@ -499,12 +497,12 @@ CONTROLS = [
      """uint32_t n = 1, k;""",
      "tpresentcopy"),
     ("the copies alone published though their submission failed", "renderer.c",
-     """        rendererVkFrameDone();
+     """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
         state->gpuCopyQueue.readIndex = readIndex;""",
-     """        rendererVkFrameDone();
+     """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (1) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -582,15 +580,19 @@ CONTROLS = [
 
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
-        res = lorieVkFrameWait(&vk, &vkr, state);
-        rendererVkFrameDone();
+        bool over;
+        res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        if (over)
+            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }""",
      """    state->waitForNextFrame = true;
 
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
-        res = lorieVkFrameWait(&vk, &vkr, state);
-        rendererVkFrameDone();
+        bool over;
+        res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        if (over)
+            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);""",
      "tpresentcopy"),
@@ -601,36 +603,70 @@ CONTROLS = [
      """    state->waitForNextFrame = true;""",
      "tpresentcopy"),
     ("a frame's buffers never given back to the X server", "renderer.c",
-     """    if (__atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
-     """    if (0 && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     """state->gpuInFlight.pid == getpid() && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     """state->gpuInFlight.pid == getpid() && 0 && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
      "tpresentcopy"),
-    ("a new session keeping what a dead renderer left in flight", "renderer.c",
-     """                rendererVkFrameDone();
-                vkFailed = false;""",
-     """                vkFailed = false;""",
-     "twiring"),
     ("an access CPU-locking an AHB a submitted Vulkan frame uses", "InitOutput.c",
      """        if (perAccessAhb && !priv->locked && !priv->mem)
-            lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
 """,
      "",
      "townership"),
     ("drawSquares into a root a submitted Vulkan frame uses", "InitOutput.c",
-     """        lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+     """        lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
         __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
      """        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
      "townership"),
     ("PERSISTENT taken again while a Vulkan frame may still run", "InitOutput.c",
      """        if (mode == LORIE_OWNERSHIP_PERSISTENT)
-            lorieWaitGpuIdle(0);    // a Vulkan frame may still be running (a new or lost connection)
+            lorieGpuWaitIdle(pvfb->state, true, 0);
 """,
      "",
      "townership"),
-    ("the wait for a gone renderer leaving its list set", "InitOutput.c",
-     """            __atomic_store_n(&pvfb->state->gpuInFlight.busy, 0, __ATOMIC_RELEASE);
-            return;""",
-     """            return;""",
+    ("the wait for a gone submitter leaving its list set", "lorie.h",
+     """            lorieGpuSubmitterGone(st))
+            __atomic_store_n(&st->gpuInFlight.busy, 0, __ATOMIC_RELEASE);""",
+     """            lorieGpuSubmitterGone(st))
+            (void) 0;""",
      "townership"),
+    ("AHB id 0 taken as every AHB", "lorie.h",
+     """            return true;
+    return false;
+}
+
+// Whether any AHB is.""",
+     """            return true;
+    return !id;
+}
+
+// Whether any AHB is.""",
+     "townership"),
+    ("a slice without an answer taken as the frame over", "lorie.h",
+     """            lorieGpuSubmitterGone(st))""",
+     """            (lorieGpuSubmitterGone(st) || 1))""",
+     "townership"),
+    ("vkDeviceWaitIdle out of memory taken as the frame over", "vk.c",
+     """        *over = idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST || res == VK_ERROR_DEVICE_LOST;""",
+     """        *over = true;""",
+     "tpresentcopy"),
+    ("a lost device's frame kept as not over", "vk.c",
+     """        *over = idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST || res == VK_ERROR_DEVICE_LOST;""",
+     """        *over = idle == VK_SUCCESS;""",
+     "tpresentcopy"),
+    ("teardown not asking vkDeviceWaitIdle again", "renderer.c",
+     """    while ((r = vk.DeviceWaitIdle(vk.device)) != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST) {""",
+     """    if ((r = vk.DeviceWaitIdle(vk.device)) != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST) {""",
+     "tpresentcopy"),
+    ("a frame recorded over another process's listed frame", "renderer.c",
+     """    if (owned)
+        lorieGpuWaitIdle(state, true, 0);""",
+     """    if (0)
+        lorieGpuWaitIdle(state, true, 0);""",
+     "tpresentcopy"),
+    ("this process clearing another's list", "renderer.c",
+     """    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n""",
+     """    if (state && __atomic_exchange_n""",
+     "tpresentcopy"),
 ]
 
 def copy_sources(dst):
