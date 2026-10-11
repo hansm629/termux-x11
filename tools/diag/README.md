@@ -8,7 +8,7 @@ in its own log, which Termux can read with `logcat -d`:
 ```
 XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
-                x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d)
+                x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d)
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
@@ -32,7 +32,10 @@ the CPU lock only for each access, under the lock shared with the renderer - whi
 when the renderer asks for it, and never in a session asked for gles. `x_ahb_cpu_acquires` counts those
 per-access locks, `x_state_lock_wait_us` their whole wait before they could take the AHB (for the shared lock,
 and for a Vulkan frame still using it), `x_gpu_wait_us` the part of it spent waiting for that frame, and
-`x_ahb_cpu_lock_us` the time in the AHB's own CPU lock and unlock calls.
+`x_ahb_cpu_lock_us` the time in the AHB's own CPU lock and unlock calls. `root_buffers` is 2 while root double
+buffering is in effect (`TERMUX_X11_RENDERER_ROOT_DOUBLE=1`, experimental, Vulkan only): the X server draws into
+one buffer of the screen pixmap while the renderer samples the other, and at each tick with damage the damage is
+copied into the one sampled and they swap (`x_root_copy_us` is the time those copies took).
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,

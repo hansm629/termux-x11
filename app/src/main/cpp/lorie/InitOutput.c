@@ -14,6 +14,7 @@
 
 #include <sys/eventfd.h>
 #include <sys/errno.h>
+#include <pixman.h>
 #include <libxcvt/libxcvt.h>
 #include <X11/X.h>
 #include <X11/Xmd.h>
@@ -92,6 +93,10 @@ typedef struct {
      * keeps CPU-locked for its lifetime - locked while PERSISTENT is in effect, not under PER_ACCESS */
     uint8_t ownership;
     struct xorg_list ahbPersistent;
+
+    /* Root double buffering (TERMUX_X11_RENDERER_ROOT_DOUBLE=1, lorieRootSwap): asked for; the twin out of date
+     * (filled whole at the next swap) */
+    Bool rootDouble, rootTwinStale;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -114,6 +119,9 @@ static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
 
 typedef struct {
     LorieBuffer *buffer;
+    /* The screen pixmap's second buffer under root double buffering (lorieRootSwap): the one the renderer samples,
+     * while the X server draws into `buffer`. NULL otherwise. */
+    LorieBuffer *twin;
     bool flipped, wasLocked, imported;
     void *locked;
     void *mem;
@@ -334,6 +342,8 @@ void OsVendorInit(void) {
                                                                  &lorieScreen.state->backend.vkFailAtInvalid);
     lorieScreen.state->backend.vkSelftestFull = lorieRequestedVkSelftest(getenv("TERMUX_X11_RENDERER_VK_SELFTEST"),
                                                                          &lorieScreen.state->backend.vkSelftestInvalid);
+    // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
+    lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
 }
 
 // Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
@@ -363,11 +373,22 @@ void lorieSetRendererWakeupCond(int fd) {
     lorieWakeServer();
 }
 
+// The screen pixmap's buffers, to the renderer: the one the X server draws into and, under root double buffering,
+// its twin.
+static void lorieRegisterRoot(void) {
+    LoriePixmapPriv *priv = pScreenPtr && pScreenPtr->devPrivate ? exaGetPixmapDriverPrivate(pScreenPtr->devPrivate) : NULL;
+    if (!priv)
+        return;
+    lorieRegisterBuffer(priv->buffer);
+    if (priv->twin)
+        lorieRegisterBuffer(priv->twin);
+}
+
 void lorieActivityConnected(void) {
     lorieResetOwnership();      // a new renderer starts on GLES, with 3c98ffa's ownership
     pvfb->state->drawRequested = pvfb->state->cursor.updated = true;
     lorieSendSharedServerState(pvfb->stateFd);
-    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+    lorieRegisterRoot();
 }
 
 static LoriePixmapPriv* lorieRootWindowPixmapPriv(void) {
@@ -462,6 +483,7 @@ Bool drawSquares() {
         drawSquare(x - l/3, y - l/3, l, 0x00FF0000, d->stride, pixels);
         drawSquare(x, y, l, 0x0000FF00, d->stride, pixels);
         drawSquare(x + l/3, y + l/3, l, 0x000000FF, d->stride, pixels);
+        pvfb->rootTwinStale = TRUE;     // drawn past Damage: the twin is brought up to date whole
     }
     if (perAccess) {
         if (pixels) {
@@ -656,17 +678,88 @@ static miPointerScreenFuncRec loriePointerCursorFuncs = {
 
 static void loriePerformVblanks(void);
 
+/*
+ * Root double buffering (TERMUX_X11_RENDERER_ROOT_DOUBLE=1). The screen pixmap has two buffers: `buffer`, which the X
+ * server draws into (back), and `twin`, which the renderer samples (front). The X server never draws into the
+ * front, the renderer never samples the back, so while the device runs a frame sampling the front the X server's
+ * accesses to the root (in the back) wait for nothing. At a tick (lorieRedraw) the back's damage since the last
+ * swap is copied into the front - once the frame sampling it is over - and the two swap: the renderer then has
+ * what the X server finished, the X server goes on in the other buffer, which now holds the same.
+ *
+ * In effect only while Vulkan draws (PER_ACCESS: under PERSISTENT GLES samples `buffer`, as 3c98ffa) and the
+ * screen pixmap is the root window's (not while a client's pixmap is flipped in); Present copies into the root are
+ * then the X server's own (lorieTryScheduleGpuCopy refuses them), so nothing but the X server writes the back.
+ */
+static Bool lorieRootTwinned(void) {
+    PixmapPtr screen = pScreenPtr ? pScreenPtr->devPrivate : NULL;
+    LoriePixmapPriv *priv = screen ? exaGetPixmapDriverPrivate(screen) : NULL;
+    return priv && priv->twin && lorieAhbPerAccess() && pScreenPtr->root && pScreenPtr->GetWindowPixmap(pScreenPtr->root) == screen;
+}
+
+/*
+ * The swap, between requests, under the shared lock (the renderer reads which buffer is the front under it). The
+ * front is written only once no frame uses it (lorieGpuWaitIdle); what is copied is the damage since the last swap
+ * (Damage on the screen pixmap sees every drawing into it), or all of it when the twin is out of date. False, and
+ * nothing swapped, if a buffer cannot be CPU-locked.
+ */
+static Bool lorieRootSwap(LoriePixmapPriv *priv) {
+    LorieBuffer *back = priv->buffer, *front = priv->twin;
+    const LorieBuffer_Desc *d = LorieBuffer_description(back);
+    RegionPtr damage = DamageRegion(pvfb->damage);
+    BoxRec full = { 0, 0, (short) d->width, (short) d->height };
+    BoxPtr box = pvfb->rootTwinStale ? &full : RegionRects(damage);
+    int n = pvfb->rootTwinStale ? 1 : RegionNumRects(damage), i, failed;
+    uint32_t *src = NULL, *dst = NULL;
+    uint64_t waitStartUs = GetTimeInMicros(), gpuStartUs, lockStartUs, copyStartUs, copyEndUs;
+
+    if (priv->locked)
+        return FALSE;   // never between requests under PER_ACCESS
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    gpuStartUs = GetTimeInMicros();
+    lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(front)->id);     // the last frame sampling it
+    lorieGpuWaitIdle(pvfb->state, false, d->id);
+    lockStartUs = GetTimeInMicros();
+    failed = LorieBuffer_lock(back, (void **) &src);
+    failed |= LorieBuffer_lock(front, (void **) &dst);
+    failed |= !src || !dst;
+    copyStartUs = GetTimeInMicros();
+    for (i = 0; !failed && i < n; i++) {
+        int x1 = max(box[i].x1, 0), y1 = max(box[i].y1, 0), x2 = min(box[i].x2, d->width), y2 = min(box[i].y2, d->height);
+        if (x2 > x1 && y2 > y1)
+            pixman_blt(src, dst, d->stride, d->stride, 32, 32, x1, y1, x1, y1, x2 - x1, y2 - y1);
+    }
+    copyEndUs = GetTimeInMicros();
+    LorieBuffer_unlock(back);           // LorieBuffer_lock marks a buffer locked even when it failed
+    LorieBuffer_unlock(front);
+    __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, lockStartUs - waitStartUs, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, lockStartUs - gpuStartUs, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pvfb->state->diag.xAhbCpuAcquires, 2, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, (copyStartUs - lockStartUs) + (GetTimeInMicros() - copyEndUs), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pvfb->state->diag.xRootCopyUs, copyEndUs - copyStartUs, __ATOMIC_RELAXED);
+    if (!failed) {
+        priv->buffer = front;
+        priv->twin = back;
+        pvfb->rootTwinStale = FALSE;
+        pvfb->state->rootWindowTextureID = LorieBuffer_description(back)->id;
+    }
+    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    return !failed;
+}
+
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
+    Bool twinned, rootDouble;
 
     lorieProcessOwnershipRequest();
+    twinned = lorieRootTwinned();
 
     pvfb->current_msc++;
     // Vulkan (PER_ACCESS): the frame this tick allows is allowed before the vblanks run, so that the Present copies
-    // they queue go into that frame's submission instead of one of their own ahead of it. GLES keeps 3c98ffa's order.
-    if (lorieAhbPerAccess())
+    // they queue go into that frame's submission instead of one of their own ahead of it. GLES keeps 3c98ffa's order,
+    // and so does root double buffering: its swap, after the vblanks, comes before the frame.
+    if (lorieAhbPerAccess() && !twinned)
         pvfb->state->waitForNextFrame = false;
     loriePerformVblanks();
 
@@ -681,6 +774,19 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (!priv)
         // Impossible situation, but let's skip this step
         return TRUE;
+
+    // Root double buffering, once no GPU copy into the root (from before it was in effect) is still to be
+    // acknowledged: those went into the buffer the X server draws into. Not in effect, the twin falls out of date.
+    rootDouble = twinned && lorieRootTwinned() && pvfb->rootGpuCopyPending == 0;
+    if (rootDouble && (nonEmpty || pvfb->rootTwinStale)) {
+        if (lorieRootSwap(priv))
+            pvfb->state->drawRequested = TRUE;
+        else
+            rootDouble = FALSE;     // the back drawn this tick, as with one buffer; the twin filled whole next time
+    }
+    if (!rootDouble)
+        pvfb->rootTwinStale = TRUE;
+    pvfb->state->diag.xRootBuffers = rootDouble ? 2 : 1;
 
     if (nonEmpty && priv->buffer) {
         // We should unlock and lock buffer in order to update texture content on some devices
@@ -700,7 +806,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     }
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
-        pvfb->state->rootWindowTextureID = LorieBuffer_description(priv->buffer)->id;
+        pvfb->state->rootWindowTextureID = LorieBuffer_description(rootDouble ? priv->twin : priv->buffer)->id;
 
         // Sending signal about pending root window changes to renderer thread.
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
@@ -741,7 +847,7 @@ static void lorieLogRendererDiag(void) {
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
-              "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu)",
+              "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu)",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -751,7 +857,7 @@ static void lorieLogRendererDiag(void) {
         lorieActiveName(d.active),
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
-        TD(xAhbCpuLockUs));
+        TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs));
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -857,7 +963,7 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
     DamageRegister(&(*pScreen->GetScreenPixmap)(pScreen)->drawable, pvfb->damage);
     pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
 
-    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+    lorieRegisterRoot();
 
     return TRUE;
 }
@@ -943,7 +1049,7 @@ static Bool lorieRRScreenSetSize(ScreenPtr pScreen, CARD16 width, CARD16 height,
         pScreen->DestroyPixmap(oldPixmap);
     }
 
-    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+    lorieRegisterRoot();
 
     pScreen->ResizeWindow(pScreen->root, 0, 0, width, height, NULL);
     RegionReset(&pScreen->root->winSize, &box);
@@ -1245,6 +1351,13 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         return FALSE;
     }
 
+    // Root double buffering: the X server's own copy into the buffer it draws into. A GPU copy there would have
+    // the X server wait for the device again, which is what the twin is for.
+    if (dst == pScreenPtr->devPrivate && lorieRootTwinned()) {
+        gpuCopyAttempts++;
+        return FALSE;
+    }
+
     if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
         // No renderer to drain the queue, so fall back to CPU copy.
         gpuCopyAttempts++;
@@ -1419,6 +1532,15 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
     priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
     *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
+    // Root double buffering: the screen pixmap's twin, the same in every way (the pixmap's stride serves both).
+    if (pvfb->rootDouble && type == LORIEBUFFER_AHARDWAREBUFFER && priv->buffer) {
+        priv->twin = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
+        if (priv->twin && LorieBuffer_description(priv->twin)->stride != LorieBuffer_description(priv->buffer)->stride) {
+            LorieBuffer_release(priv->twin);
+            priv->twin = NULL;
+        }
+        pvfb->rootTwinStale = TRUE;
+    }
 
     lorieHoldPersistent(priv);
     if (!priv->buffer) {
@@ -1440,6 +1562,10 @@ void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
             LorieBuffer_unlock(priv->buffer);
         lorieUnregisterBuffer(priv->buffer);
         LorieBuffer_release(priv->buffer);
+    }
+    if (priv->twin) {
+        lorieUnregisterBuffer(priv->twin);
+        LorieBuffer_release(priv->twin);
     }
     free(priv);
 }

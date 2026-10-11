@@ -3,7 +3,8 @@
 the code itself): every frame's lorieRedraw takes up the renderer's request before anything can return
 early; a new renderer connection and a lost one both go back to 3c98ffa's ownership; the requested backend
 is read from TERMUX_X11_RENDERER_BACKEND when the server state is made; under PER_ACCESS lorieRedraw allows the
-tick's frame before its vblanks queue the Present copies.
+tick's frame before its vblanks queue the Present copies (root double buffering: swaps after them instead),
+and a Vulkan frame takes the root the X server publishes under the lock.
 
 And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c, tvkrenderer.c and tpresentcopy.c test the
 steps): a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
@@ -42,8 +43,8 @@ check(before_first_return(redraw, "lorieProcessOwnershipRequest();"),
       "lorieRedraw does not take up the ownership request before its first return")
 
 # Vulkan: the tick's frame allowed before the vblanks queue their Present copies, so they go in that frame
-check(redraw.find("if (lorieAhbPerAccess())\n        pvfb->state->waitForNextFrame = false;") >= 0 and
-      redraw.find("if (lorieAhbPerAccess())\n        pvfb->state->waitForNextFrame = false;") < redraw.find("loriePerformVblanks();"),
+early = "if (lorieAhbPerAccess() && !twinned)\n        pvfb->state->waitForNextFrame = false;"
+check(redraw.find(early) >= 0 and redraw.find(early) < redraw.find("loriePerformVblanks();"),
       "lorieRedraw does not allow a Vulkan frame before its vblanks queue the Present copies")
 
 connected = func(I, "void lorieActivityConnected(void) {")
@@ -68,11 +69,15 @@ def in_order(what, body, *steps):
             return
         at = i + len(s_)
 
+# root double buffering: swapped after the vblanks, before the frame is allowed and the front published
+in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {"),
+         "loriePerformVblanks();", "lorieRootSwap(priv)", "rootDouble ? priv->twin : priv->buffer")
+
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
 # the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
 check("ANativeWindow_get" not in redraw, "a Vulkan frame compares the window's size with the swapchain's")
 in_order("Vulkan frame", redraw, "lorieVkAcquire(", "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()",
-         "rendererVkCopiesLocked(", "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock",
+         "state->rootWindowTextureID != desc->id", "rendererVkCopiesLocked(", "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock",
          "lorieVkFrameWait(", "rendererVkFrameDone();", "completedSerial", "lorieVkPresent(")
 alone = func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
 in_order("Vulkan copies alone", alone, "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()", "rendererVkCopiesLocked(",

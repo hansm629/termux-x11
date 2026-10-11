@@ -71,6 +71,7 @@ static struct {
 static struct { void *devPrivate; } screen, *pScreenPtr = &screen;
 static uint64_t gpuCopyAttempts, gpuCopyOffloads;
 static bool connectionAlive = true;
+static Bool lorieRootTwinned(void) { return FALSE; }     /* root double buffering off: the copies into the root are GPU copies */
 static bool lorieConnectionAlive(void) { return connectionAlive; }
 /* InitOutput.c's, but a pixmap not yet a buffer is not converted to one: every pixmap here has its buffer */
 static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {

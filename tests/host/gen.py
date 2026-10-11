@@ -66,6 +66,8 @@ recipes = {
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {")
         + func(I, "static uint8_t lorieRequestedVkSelftest(const char *value, volatile uint8_t *invalid) {"),
+    # root double buffering's swap - townership.c
+    "rootswap": lambda: func(I, "static Bool lorieRootSwap(LoriePixmapPriv *priv) {"),
     # the Vulkan backend: instance and device, AHardwareBuffer import - tvkinit.c, tvkimport.c (fakevk.h)
     "vk": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */\n};")
         + span(VH, "struct lorie_vk_image {", "    VkResult lastResult;\n};")

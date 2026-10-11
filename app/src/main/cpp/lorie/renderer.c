@@ -2019,6 +2019,19 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     owned = rendererVkOwnedLocked();
     if (owned)
         lorieGpuWaitIdle(state, true, 0);   // a frame another renderer process listed is over first (ours always are)
+    // The root the X server publishes now, under this lock: root double buffering swaps it under the same lock
+    // (InitOutput.c lorieRootSwap), and the one looked up before may have become the buffer it draws into.
+    if (state->rootWindowTextureID != desc->id) {
+        LorieBuffer *now;
+        pthread_spin_lock(&bufferLock);
+        now = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
+        pthread_spin_unlock(&bufferLock);
+        if (now && LorieBuffer_description(now)->type == LORIEBUFFER_AHARDWAREBUFFER && LorieBuffer_description(now)->buffer &&
+            LorieBuffer_description(now)->width == desc->width && LorieBuffer_description(now)->height == desc->height) {
+            buffer = now;
+            desc = LorieBuffer_description(now);
+        }
+    }
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);

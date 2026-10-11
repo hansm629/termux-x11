@@ -320,10 +320,11 @@ struct lorie_renderer_diag {
     /* X: the AHB ownership mode in effect, its transitions, PER_ACCESS requests refused, CPU accesses that
      * locked an AHB per access, the time those spent waiting before they could (for the shared lock and for a
      * Vulkan frame using the AHB), of that the wait for the frame alone (lorieGpuWaitIdle), and the time spent
-     * in the AHB's CPU lock and unlock themselves */
-    volatile uint8_t xOwnership;
+     * in the AHB's CPU lock and unlock themselves; the root buffers in use (2: root double buffering, InitOutput.c
+     * lorieRootSwap) and the time spent copying damage between them */
+    volatile uint8_t xOwnership, xRootBuffers;
     volatile uint32_t xOwnershipTransitions, xOwnershipRefused;
-    volatile uint64_t xAhbCpuAcquires, xStateLockWaitUs, xGpuWaitUs, xAhbCpuLockUs;
+    volatile uint64_t xAhbCpuAcquires, xStateLockWaitUs, xGpuWaitUs, xAhbCpuLockUs, xRootCopyUs;
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \

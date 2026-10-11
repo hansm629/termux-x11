@@ -677,7 +677,7 @@ CONTROLS = [
      """    if (state && __atomic_exchange_n""",
      "tpresentcopy"),
     ("Vulkan's tick frame allowed only after the vblanks queued their copies", "InitOutput.c",
-     """    if (lorieAhbPerAccess())
+     """    if (lorieAhbPerAccess() && !twinned)
         pvfb->state->waitForNextFrame = false;
     loriePerformVblanks();""",
      """    loriePerformVblanks();""",
@@ -694,6 +694,11 @@ CONTROLS = [
      """    if (1) {
         rendererVkApplyPendingGpuCopies();""",
      "tpresentcopy"),
+    ("the root swap writing the front while a frame samples it", "InitOutput.c",
+     """    lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(front)->id);     // the last frame sampling it
+""",
+     "",
+     "townership"),
 ]
 
 def copy_sources(dst):

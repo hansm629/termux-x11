@@ -15,7 +15,10 @@
  *   drawSquares, PERSISTENT taken again all wait for it, holding the shared lock; an AHB the frame does not use is
  *   not waited for, the root's (id 0, as buffer.c's first) included. The wait ends when the submitter says the
  *   frame is over, however long that takes, connection or not; or when the submitter no longer exists, and the
- *   list is cleared then. */
+ *   list is cleared then.
+ *   Root double buffering's swap (lorieRootSwap): the front written only once the frame sampling it is over, only
+ *   the damage copied (all of it when out of date), the two buffers swapped and the new front published, both
+ *   unlocked again; afterwards an access to the back waits for no frame while the front is being sampled. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -51,6 +54,12 @@ typedef int Bool;
 #define FALSE 0
 #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+typedef struct { short x1, y1, x2, y2; } BoxRec, *BoxPtr;
+typedef struct { int n; BoxRec *rects; } RegionRec, *RegionPtr;
+#define RegionRects(r) ((r)->rects)
+#define RegionNumRects(r) ((r)->n)
+#define DamageRegion(d) ((RegionPtr) (d))
 enum { LORIEBUFFER_REGULAR, LORIEBUFFER_FD, LORIEBUFFER_AHARDWAREBUFFER };
 
 typedef struct { int type; unsigned long long id; int width, height, stride; } LorieBuffer_Desc;
@@ -83,11 +92,14 @@ struct fake_state {
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
     struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
+    uint64_t rootWindowTextureID;
 };
 struct fake_pvfb {
     struct fake_state *state;
     struct { Bool legacyDrawing; } root;
     uint64_t rootGpuCopyPending;
+    Bool rootDouble, rootTwinStale;
+    void *damage;               /* a RegionRec here: DamageRegion */
     void (*SetWindowPixmap)(WindowPtr, PixmapPtr);
     uint8_t ownership;
     struct xorg_list ahbPersistent;
@@ -291,6 +303,14 @@ static LorieBuffer **base_bufferOf(void *priv) { return &((LoriePixmapPriv *) pr
 /* ---- this branch ---- */
 static struct fake_pvfb newWorld, *pvfb = &newWorld;
 #include "own_new_src.inc"
+static int pixman_blt(uint32_t *src, uint32_t *dst, int srcStride, int dstStride, int srcBpp, int dstBpp, int sx, int sy,
+                      int dx, int dy, int w, int h) {
+    (void) srcBpp; (void) dstBpp;
+    for (int y = 0; y < h; y++)
+        memcpy(dst + (size_t) (dy + y) * dstStride + dx, src + (size_t) (sy + y) * srcStride + sx, (size_t) w * 4);
+    return 1;
+}
+#include "rootswap_src.inc"
 static LorieBuffer **new_bufferOf(void *priv) { return &((LoriePixmapPriv *) priv)->buffer; }
 
 /* What a renderer frame would find, taking the shared lock now. */
@@ -743,6 +763,69 @@ int main(void) {
         CHECK(gpuWaits == 1 && !newWorld.state->gpuInFlight.busy, "submitter gone: %d waits, the list %s", gpuWaits,
               newWorld.state->gpuInFlight.busy ? "still set" : "cleared");
         gpuSlices = 0;
+    }
+
+    /* root double buffering: the swap */
+    {
+        static struct fake_state swapState;
+        BoxRec box = { 2, 3, 10, 7 };
+        RegionRec damage = { 1, &box };
+        LoriePixmapPriv sp = {0};
+        PixmapRec screenPix = { { NULL }, &sp };
+        LorieBuffer *back, *front;
+        int outside = 0, inside = 0;
+        Bool ok;
+
+        nbuffers = 0;           /* only these two are the world's now */
+        back = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 16, 16);
+        front = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 16, 16);
+        for (int i = 0; i < 16 * 16; i++)
+            back->mem[i] = 0x10000u + (uint32_t) i, front->mem[i] = 0;
+        newWorld = (struct fake_pvfb) { .state = &swapState, .ownership = LORIE_OWNERSHIP_PER_ACCESS, .damage = &damage };
+        xorg_list_init(&newWorld.ahbPersistent);
+        swapState.backend.ownershipAck = LORIE_OWNERSHIP_WORD(1, LORIE_OWNERSHIP_PER_ACCESS);
+        sp.buffer = back;
+        sp.twin = front;
+        checked = &newWorld;
+        runName = "root swap";
+        /* the front still sampled by a frame: that frame is over first */
+        swapState.gpuInFlight.ids[0] = front->desc.id;
+        swapState.gpuInFlight.count = 1;
+        swapState.gpuInFlight.pid = getpid();
+        swapState.gpuInFlight.busy = 1;
+        gpuWaits = gpuSlices = 0;
+        ok = lorieRootSwap(&sp);
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++) {
+                bool in = x >= 2 && x < 10 && y >= 3 && y < 7;
+                if (in)
+                    inside += front->mem[y * 16 + x] == back->mem[y * 16 + x];
+                else
+                    outside += front->mem[y * 16 + x] == 0;
+            }
+        CHECK(ok && gpuWaits == 1, "root swap: swapped %d, %d waits for the frame sampling the front (want 1)", ok, gpuWaits);
+        CHECK(inside == 8 * 4 && outside == 16 * 16 - 8 * 4, "root swap: %d of the damage copied, %d outside it left alone", inside, outside);
+        CHECK(sp.buffer == front && sp.twin == back && swapState.rootWindowTextureID == back->desc.id && !newWorld.rootTwinStale,
+              "root swap: not swapped, or not published");
+        CHECK(!back->locked && !front->locked && swapState.lock == 0, "root swap: a buffer, or the shared lock, still held");
+
+        /* the X server draws into the new back while the new front is sampled: no wait */
+        swapState.gpuInFlight.ids[0] = back->desc.id;
+        swapState.gpuInFlight.busy = 1;
+        gpuWaits = 0;
+        ok = loriePrepareAccess(&screenPix, EXA_PREPARE_DEST);
+        CHECK(ok && gpuWaits == 0 && screenPix.devPrivate.ptr == front->mem, "root swap: the back's access waited for the front's frame");
+        if (ok)
+            lorieFinishAccess(&screenPix, EXA_PREPARE_DEST);
+        swapState.gpuInFlight.busy = 0;
+
+        /* out of date: all of it */
+        for (int i = 0; i < 16 * 16; i++)
+            front->mem[i] = 0x20000u + (uint32_t) i, back->mem[i] = 0;
+        newWorld.rootTwinStale = TRUE;
+        ok = lorieRootSwap(&sp);
+        CHECK(ok && !memcmp(back->mem, front->mem, 16 * 16 * 4) && sp.buffer == back, "root swap, out of date: not all copied");
+        checked = NULL;
     }
 
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
