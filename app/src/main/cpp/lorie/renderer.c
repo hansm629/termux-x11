@@ -1880,6 +1880,26 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
     return true;
 }
 
+/*
+ * Copies an X server tick queued while it is still in it (root double buffering, lorie.h tickOpen): the tick is
+ * about to swap the root and let the frame go, and the copies go in that frame rather than in a submission of their
+ * own just before it. Waits for the tick to end at most 4 ms (the X server's wake-up can be missed: the timed wait
+ * covers it); true when it ended - the main loop then draws the frame - false otherwise, and the copies run alone.
+ * A copy queued outside a tick (a Present not synced to a vblank) never waits here.
+ */
+static bool rendererVkTickCopies(void) {
+    struct timespec deadline;
+    if (!state || !__atomic_load_n(&state->tickOpen, __ATOMIC_ACQUIRE))
+        return false;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    rendererTimespecAddUs(&deadline, 4000);
+    pthread_mutex_lock(&stateLock);
+    while (__atomic_load_n(&state->tickOpen, __ATOMIC_ACQUIRE) &&
+           pthread_cond_timedwait(stateCond, &stateLock, &deadline) != ETIMEDOUT);
+    pthread_mutex_unlock(&stateLock);
+    return !__atomic_load_n(&state->tickOpen, __ATOMIC_ACQUIRE);
+}
+
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
 static void rendererVkApplyPendingGpuCopies(void) {
     uint64_t serial = 0;
@@ -2259,11 +2279,11 @@ __noreturn static void* rendererThread(void) {
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
         bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
         if (vkActive) {
-            if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+            if (state && state->surfaceAvailable && !__atomic_load_n(&state->waitForNextFrame, __ATOMIC_ACQUIRE) &&
                 (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending))
                 rendererVkRedraw(&waitingForBuffers);
-            else if (gpuCopyPending)
-                rendererVkApplyPendingGpuCopies();
+            else if (gpuCopyPending && !rendererVkTickCopies())
+                rendererVkApplyPendingGpuCopies();     // (held for the tick's frame: drawn next time round)
         } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
             (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
             rendererRedrawLocked(&waitingForBuffers);

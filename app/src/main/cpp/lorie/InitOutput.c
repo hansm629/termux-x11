@@ -746,6 +746,18 @@ static Bool lorieRootSwap(LoriePixmapPriv *priv) {
     return !failed;
 }
 
+// A root double buffering tick lets the frame go, after its swap: waitForNextFrame, then tickOpen (lorie.h), and the
+// renderer woken if copies were held for the frame. Any other tick let the frame go before (3c98ffa's order).
+static Bool lorieTickEnd(Bool held) {
+    if (held) {
+        __atomic_store_n(&pvfb->state->waitForNextFrame, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&pvfb->state->tickOpen, 0, __ATOMIC_RELEASE);
+        if (pvfb->state->gpuCopyQueue.readIndex != __atomic_load_n(&pvfb->state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE))
+            pthread_cond_signal(rendererCond);
+    }
+    return TRUE;
+}
+
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
@@ -761,19 +773,22 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     // and so does root double buffering: its swap, after the vblanks, comes before the frame.
     if (lorieAhbPerAccess() && !twinned)
         pvfb->state->waitForNextFrame = false;
+    else if (twinned)
+        __atomic_store_n(&pvfb->state->tickOpen, 1, __ATOMIC_RELEASE);     // the vblanks' copies wait for this tick's frame
     loriePerformVblanks();
 
-    pvfb->state->waitForNextFrame = false;
+    if (!twinned)
+        pvfb->state->waitForNextFrame = false;
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
-        return TRUE;
+        return lorieTickEnd(twinned);
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
     priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
 
     if (!priv)
         // Impossible situation, but let's skip this step
-        return TRUE;
+        return lorieTickEnd(twinned);
 
     // Root double buffering, once no GPU copy into the root (from before it was in effect) is still to be
     // acknowledged: those went into the buffer the X server draws into. Not in effect, the twin falls out of date.
@@ -807,15 +822,17 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
         pvfb->state->rootWindowTextureID = LorieBuffer_description(rootDouble ? priv->twin : priv->buffer)->id;
+        lorieTickEnd(twinned);
 
         // Sending signal about pending root window changes to renderer thread.
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
         // for all drawing operations to be finished.
         // Renderer thread will check the `drawRequested` flag right before going to sleep.
         pthread_cond_signal(rendererCond);
+        return TRUE;
     }
 
-    return TRUE;
+    return lorieTickEnd(twinned);
 }
 
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
