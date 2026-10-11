@@ -4,6 +4,14 @@ the code itself): every frame's lorieRedraw takes up the renderer's request befo
 early; a new renderer connection and a lost one both go back to 3c98ffa's ownership; the requested backend
 is read from TERMUX_X11_RENDERER_BACKEND when the server state is made.
 
+And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c and tvkrenderer.c test the steps):
+a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
+server's PER_ACCESS answer is still its own before touching a buffer, submits and waits for its fence before
+publishing the completed copies, publishes them before letting the lock go, and presents after; the copies
+alone likewise; a failure is torn down before the X server is asked for its ownership back, and that before
+GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
+change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer.
+
 usage: twiring.py <lorie source dir>
 """
 import os, sys
@@ -39,6 +47,33 @@ init = func(I, "void OsVendorInit(void) {")
 check('lorieScreen.state->backend.requested = lorieRequestedBackend(getenv("TERMUX_X11_RENDERER_BACKEND"),' in init,
       "OsVendorInit does not read TERMUX_X11_RENDERER_BACKEND into the server state")
 
-print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit): %s (%d failures)" % (
+R = os.path.join(L, "renderer.c")
+def in_order(what, body, *steps):
+    at = 0
+    for s_ in steps:
+        i = body.find(s_, at)
+        if i < 0:
+            check(False, "%s: %r missing, or not after %r" % (what, s_, steps[steps.index(s_) - 1] if steps.index(s_) else "the start"))
+            return
+        at = i + len(s_)
+
+redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
+in_order("Vulkan frame", redraw, "lorieVkAcquire(", "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()",
+         "rendererVkCopiesLocked(", "lorieVkFrameSubmit(", "completedSerial", "lorie_mutex_unlock(&state->lock", "lorieVkPresent(")
+alone = func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
+in_order("Vulkan copies alone", alone, "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()", "rendererVkCopiesLocked(",
+         "lorieVkFrameSubmit(", "completedSerial", "lorie_mutex_unlock(&state->lock")
+select = func(R, "static void rendererSelectBackend(void) {")
+in_order("backend choice", select, "rendererDropEgl();", "rendererVkStart()", "vkFailed = true;", "rendererVkTeardown();",
+         "rendererVkOwnership(LORIE_OWNERSHIP_PERSISTENT)", "rendererUseEgl();")
+fail = func(R, "static void rendererVkFail(void) {")
+in_order("Vulkan failure", fail, "vkFailed = true;", "rendererVkTeardown();", "vkGiveBack = backendSelect = true;")
+refresh = func(R, "void rendererRefreshContext(void) {")
+in_order("window change", refresh, "lorieVkSwapchainDestroy(&vk, &vkr);", "releaseWinAndSurface(&win, &sfc);")
+loop = func(R, "__noreturn static void* rendererThread(void) {")
+in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "rendererSelectBackend();", "pthread_mutex_unlock(&stateLock);",
+         "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
+
+print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit) and the renderer's Vulkan order: %s (%d failures)" % (
     "FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

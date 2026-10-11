@@ -383,6 +383,34 @@ CONTROLS = [
         vk->DestroySwapchainKHR(vk->device, r->swapchain, NULL);
     lorieVkScreenPassDestroy(vk, r);""",
      "tvkframe"),
+    ("a frame not checking the X server's answer under its lock", "renderer.c",
+     """    owned = rendererVkOwnedLocked();""",
+     """    owned = true;""",
+     "twiring"),
+    ("a session that asked for Vulkan only falling back to GLES", "renderer.c",
+     """    return requested == LORIE_BACKEND_VULKAN ? RENDERER_USE_NONE : RENDERER_USE_GLES;""",
+     """    return RENDERER_USE_GLES;""",
+     "tvkrenderer"),
+    ("an unanswered ownership request taken as granted", "renderer.c",
+     """    if (LORIE_OWNERSHIP_SEQ(ack) != seq || LORIE_OWNERSHIP_MODE(ack) != mode) {""",
+     """    if (0) {""",
+     "tvkrenderer"),
+    ("a window let go of before its swapchain", "renderer.c",
+     """    if (vkActive) {
+        lorieVkSwapchainDestroy(&vk, &vkr);
+        vkActive = false;
+    }
+    releaseWinAndSurface(&win, &sfc);""",
+     """    vkActive = false;
+    releaseWinAndSurface(&win, &sfc);""",
+     "twiring"),
+    ("a Vulkan failure not torn down", "renderer.c",
+     """    vkFailed = true;
+    rendererVkTeardown();
+    if (state) {""",
+     """    vkFailed = true;
+    if (state) {""",
+     "twiring"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

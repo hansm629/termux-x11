@@ -94,6 +94,12 @@ recipes = {
         + macro(VH, "LORIE_VK_SELFTEST_ITERATIONS") + macro(VH, "LORIE_VK_SELFTEST_QUICK_ITERATIONS")
         + span(VC, "#define LORIE_VK_SELFTEST_WIDTH 67", "    lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SELFTEST, r);\n    return false;\n}")
         + span(VC, "/* ---- presenting ---- */", "LORIE_FALLBACK_VK_PRESENT, res);\n            return LORIE_VK_FRAME_FATAL;\n    }\n}"),
+    # the renderer's choice of backend and its side of the ownership handshake - tvkrenderer.c
+    "vkrenderer": lambda: span(R, "enum { RENDERER_USE_GLES, RENDERER_USE_VULKAN, RENDERER_USE_NONE };", "RENDERER_USE_NONE };")
+        + func(R, "static int rendererBackendFor(uint8_t requested, bool vulkanFailed) {")
+        + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
+        + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
+        + func(R, "static bool rendererVkOwnedLocked(void) {"),
     # the shaders as committed (vk.c includes them)
     "vk_shaders": lambda: open(os.path.join(L, "vk_shaders.h"), encoding="utf-8").read(),
 }

@@ -26,6 +26,7 @@
 #include <time.h>
 #include "list.h"
 #include "lorie.h"
+#include "vk.h"
 
 #include <unistd.h>
 #define log(...) __android_log_print(ANDROID_LOG_DEBUG, "gles-renderer", __VA_ARGS__)
@@ -342,6 +343,26 @@ static void rendererApplyPresentMode(void) {
 
 static volatile struct lorie_shared_server_state* state = NULL;
 
+/*
+ * The Vulkan backend (vk.h). A window is drawn either by GLES, through its EGL window surface, or by Vulkan,
+ * through a swapchain - never both: an ANativeWindow takes one producer at a time, so a window Vulkan is to
+ * draw gets no EGL surface, and EGL stays current on the default (ImageReader) surface, where GLES still runs
+ * the GPU copies when Vulkan does not.
+ *
+ * vkReady    device, ownership self-test and renderer objects made (kept while windows come and go)
+ * vkActive   the window has a swapchain and Vulkan draws it
+ * vkFailed   a failure ended Vulkan for this X server session: everything Vulkan made is gone, and the window
+ *            is GLES's in auto, nobody's in a session that asked for Vulkan only (an explicit failure)
+ * vkOwned    the X server answered our PER_ACCESS request vkOwnershipSeq; re-checked under its lock every frame
+ * vkGiveBack ask the X server for PERSISTENT (its own CPU ownership) at the next backend selection
+ * backendSelect  the window, the session or the backend's state changed: rendererSelectBackend runs
+ */
+static struct lorie_vk vk;
+static struct lorie_vk_images vkImages;
+static struct lorie_vk_renderer vkr;
+static bool vkReady, vkActive, vkFailed, vkOwned, vkGiveBack, backendSelect;
+static uint32_t vkOwnershipSeq;
+
 // Counted after the real call (see rendererMaybeSkipEglSwapBuffers, which can skip a swap and still
 // return EGL_TRUE), and only for a window surface: the default one is the ImageReader's, never shown.
 static void rendererNoteEglSwap(EGLSurface surface, EGLBoolean ok) {
@@ -355,10 +376,12 @@ static void rendererAttachToGL(LorieBuffer *buf) {
         LORIE_DIAG_ADD(state, eglImageImports, 1);
 }
 
-// What draws the root now: GLES once a window surface of ours is current, nothing on the default one.
+// What draws the root now: Vulkan once a swapchain of ours is on the window, GLES once a window surface of ours
+// is current, nothing otherwise.
 static void rendererPublishActive(void) {
     if (state)
-        state->diag.active = win != defaultWin && sfc != defaultSfc ? LORIE_ACTIVE_GLES : LORIE_ACTIVE_NONE;
+        state->diag.active = vkActive ? LORIE_ACTIVE_VULKAN :
+                             win != defaultWin && sfc != defaultSfc ? LORIE_ACTIVE_GLES : LORIE_ACTIVE_NONE;
 }
 static struct {
     GLuint id;
@@ -826,32 +849,20 @@ void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int
     pthread_mutex_unlock(&stateLock);
 }
 
-void rendererRefreshContext(void) {
-    int width = pendingWin ? ANativeWindow_getWidth(pendingWin) : 0;
-    int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
-    log("rendererSetWindow %p %d %d", pendingWin, width, height);
+enum { RENDERER_USE_GLES, RENDERER_USE_VULKAN, RENDERER_USE_NONE };
 
-    releaseWinAndSurface(&win, &sfc);
+// Who draws a window in a session asked for `requested`: GLES when asked for; Vulkan (auto or vulkan) until it
+// failed in this session; after that GLES in auto, nobody in a session that asked for Vulkan only.
+static int rendererBackendFor(uint8_t requested, bool vulkanFailed) {
+    if (requested == LORIE_BACKEND_GLES)
+        return RENDERER_USE_GLES;
+    if (!vulkanFailed)
+        return RENDERER_USE_VULKAN;
+    return requested == LORIE_BACKEND_VULKAN ? RENDERER_USE_NONE : RENDERER_USE_GLES;
+}
 
-    if (pendingWin && (width <= 0 || height <= 0)) {
-        log("Xlorie: We've got invalid surface. Probably it became invalid before we started working with it.\n");
-        releaseWinAndSurface(&pendingWin, NULL);
-    }
-
-    win = pendingWin;
-    pendingWin = NULL;
-    windowChanged = FALSE;
-
-    if (!win) {
-        win = defaultWin;
-        eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx);
-        rendererPublishActive();
-        if (state)
-            state->surfaceAvailable = false;
-        notifyGpuCopyDone(); // Wake up any GPU copy stuck waiting on a surface we no longer have.
-        return;
-    }
-
+// GLES on the window: its EGL window surface made and current (what rendererRefreshContext always did).
+static void rendererUseEgl(void) {
     sfc = eglCreateWindowSurface(egl_display, cfg, win, NULL);
     if (sfc == EGL_NO_SURFACE)
         return vprintEglError("eglCreateWindowSurface failed", __LINE__);
@@ -874,6 +885,59 @@ void rendererRefreshContext(void) {
 
     glViewport(0, 0, ANativeWindow_getWidth(win), ANativeWindow_getHeight(win));
     log("Xlorie: new surface applied: %p\n", sfc);
+}
+
+// The window's EGL surface let go of (the window kept), so that a Vulkan swapchain can be made on it.
+static void rendererDropEgl(void) {
+    if (sfc == EGL_NO_SURFACE || sfc == defaultSfc)
+        return;
+    eglSwapBuffers(egl_display, sfc);   // as releaseWinAndSurface: the dequeued buffer goes back
+    if (eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx) != EGL_TRUE)
+        vprintEglError("eglMakeCurrent failed (default surface)", __LINE__);
+    if (eglDestroySurface(egl_display, sfc) != EGL_TRUE)
+        vprintEglError("eglDestroySurface failed", __LINE__);
+    sfc = defaultSfc;
+}
+
+void rendererRefreshContext(void) {
+    int width = pendingWin ? ANativeWindow_getWidth(pendingWin) : 0;
+    int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
+    log("rendererSetWindow %p %d %d", pendingWin, width, height);
+
+    // A swapchain goes before its window does (the device stays for the next window).
+    if (vkActive) {
+        lorieVkSwapchainDestroy(&vk, &vkr);
+        vkActive = false;
+    }
+    releaseWinAndSurface(&win, &sfc);
+
+    if (pendingWin && (width <= 0 || height <= 0)) {
+        log("Xlorie: We've got invalid surface. Probably it became invalid before we started working with it.\n");
+        releaseWinAndSurface(&pendingWin, NULL);
+    }
+
+    win = pendingWin;
+    pendingWin = NULL;
+    windowChanged = FALSE;
+
+    if (!win) {
+        win = defaultWin;
+        eglMakeCurrent(egl_display, defaultSfc, defaultSfc, ctx);
+        rendererPublishActive();
+        if (state)
+            state->surfaceAvailable = false;
+        notifyGpuCopyDone(); // Wake up any GPU copy stuck waiting on a surface we no longer have.
+        return;
+    }
+
+    // A window Vulkan may draw gets no EGL surface: rendererSelectBackend decides, once this change is done.
+    if (state && rendererBackendFor(state->backend.requested, vkFailed) != RENDERER_USE_GLES) {
+        state->surfaceAvailable = false;
+        rendererPublishActive();
+        backendSelect = true;
+        return;
+    }
+    rendererUseEgl();
 }
 
 static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
@@ -1532,6 +1596,395 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 }
 
+/* ---- the Vulkan backend: choosing it, starting it, its frames ---- */
+
+/*
+ * Asks the X server for CPU ownership `mode` (struct lorie_backend_control) and waits, at most a second, for its
+ * answer; stateLock held (the wait lets it go). The X server moves its CPU locks and answers under its own lock,
+ * so once PER_ACCESS is answered no buffer of it is CPU-locked outside that lock; every frame checks again, under
+ * the lock, that the answer is still ours (rendererVkOwnedLocked).
+ */
+static bool rendererVkOwnership(uint8_t mode) {
+    uint32_t ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE), seq = LORIE_OWNERSHIP_SEQ(ack) + 1;
+    struct timespec deadline;
+
+    vkOwned = false;
+    __atomic_store_n(&state->backend.ownershipRequest, LORIE_OWNERSHIP_WORD(seq, mode), __ATOMIC_RELEASE);
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    rendererTimespecAddUs(&deadline, 1000000);
+    while (LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) != seq)
+        if (pthread_cond_timedwait(stateCond, &stateLock, &deadline) == ETIMEDOUT &&
+            LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) != seq)
+            break;
+    if (LORIE_OWNERSHIP_SEQ(ack) != seq || LORIE_OWNERSHIP_MODE(ack) != mode) {
+        loge("Xlorie: X server CPU ownership %u: %s", mode, LORIE_OWNERSHIP_SEQ(ack) != seq ? "not answered" : "refused");
+        return false;
+    }
+    vkOwnershipSeq = seq;
+    vkOwned = mode == LORIE_OWNERSHIP_PER_ACCESS;
+    return true;
+}
+
+// Under the X server's lock: whether it still answers our PER_ACCESS request (it returns to PERSISTENT by
+// itself when a connection is made or lost).
+static bool rendererVkOwnedLocked(void) {
+    return vkOwned && state &&
+           __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE) == LORIE_OWNERSHIP_WORD(vkOwnershipSeq, LORIE_OWNERSHIP_PER_ACCESS);
+}
+
+// Everything Vulkan made, gone once the device is idle.
+static void rendererVkTeardown(void) {
+    if (vk.device) {
+        vk.DeviceWaitIdle(vk.device);
+        lorieVkImagesClear(&vk, &vkImages);
+        lorieVkRendererDestroy(&vk, &vkr);
+        lorieVkDestroyDevice(&vk);
+    }
+    vkReady = vkActive = vkOwned = false;
+}
+
+/*
+ * A failure that ends Vulkan for this session - the fallback was recorded where it happened, with its class and
+ * reason. In Stage 1 a resource-local failure ends it too. The device is idle when this returns; the X server
+ * is asked for its own ownership back and the window is given to GLES (auto) or to nobody (vulkan) by the next
+ * rendererSelectBackend, which the main loop runs right away.
+ */
+static void rendererVkFail(void) {
+    vkFailed = true;
+    rendererVkTeardown();
+    if (state) {
+        state->surfaceAvailable = false;
+        rendererPublishActive();
+    }
+    vkGiveBack = backendSelect = true;
+}
+
+/*
+ * Device, self-test and renderer objects (once), the X server's PER_ACCESS ownership, the window's swapchain;
+ * stateLock held. It is let go while the device and self-test are made (the full self-test takes seconds), so
+ * that the activity's surface callbacks are not held up: they only set pendingWin, windowChanged and the like,
+ * which the main loop takes up afterwards, and win - which this uses - stays valid until it does.
+ */
+static bool rendererVkStart(void) {
+    if (!vkReady) {
+        PFN_vkGetInstanceProcAddr gipa;
+        bool made;
+        pthread_mutex_unlock(&stateLock);
+        made = (gipa = lorieVkLoader(state)) && lorieVkCreateDevice(&vk, gipa, state);
+        if (made && (!lorieVkSelftest(&vk, state, state->backend.vkSelftestFull ? LORIE_VK_SELFTEST_ITERATIONS
+                                                                                : LORIE_VK_SELFTEST_QUICK_ITERATIONS) ||
+                     !lorieVkRendererCreate(&vk, &vkr, state))) {
+            lorieVkDestroyDevice(&vk);
+            made = false;
+        }
+        pthread_mutex_lock(&stateLock);
+        if (!made)
+            return false;
+        vkReady = true;
+    }
+    if (!vkOwned && !rendererVkOwnership(LORIE_OWNERSHIP_PER_ACCESS)) {
+        lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_OWNERSHIP, VK_SUCCESS);
+        return false;
+    }
+    if (!lorieVkSwapchainCreate(&vk, &vkr, win, state)) {
+        lorieVkSwapchainDestroy(&vk, &vkr);
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Gives the window to whoever rendererBackendFor says draws it now, and the X server the ownership that goes
+ * with it; stateLock held. Runs after a window or session change and after a Vulkan failure.
+ */
+static void rendererSelectBackend(void) {
+    int want;
+
+    backendSelect = false;
+    if (vkGiveBack && state && !rendererVkOwnership(LORIE_OWNERSHIP_PERSISTENT))
+        loge("Xlorie: X server did not take its CPU ownership back; GLES works with either");
+    vkGiveBack = false;
+    if (!state || win == defaultWin)
+        return;
+
+    want = rendererBackendFor(state->backend.requested, vkFailed);
+    if (want != RENDERER_USE_VULKAN && (vkReady || vkActive)) {
+        // The session no longer asks for Vulkan (a new X server): ours goes, the X server's ownership comes back.
+        rendererVkTeardown();
+        if (!rendererVkOwnership(LORIE_OWNERSHIP_PERSISTENT))
+            loge("Xlorie: X server did not take its CPU ownership back; GLES works with either");
+    }
+    if (want == RENDERER_USE_VULKAN) {
+        if (vkActive && vkOwned)
+            return;
+        if (vkActive) {
+            if (rendererVkOwnership(LORIE_OWNERSHIP_PER_ACCESS)) {
+                state->drawRequested = state->cursor.updated = true;
+                return;
+            }
+            lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_OWNERSHIP, VK_SUCCESS);
+        } else {
+            rendererDropEgl();
+            if (rendererVkStart()) {
+                vkActive = true;
+                state->surfaceAvailable = state->drawRequested = state->cursor.updated = true;
+                rendererPublishActive();
+                log("Xlorie: Vulkan draws the window");
+                return;
+            }
+        }
+        vkFailed = true;
+        rendererVkTeardown();
+        if (!rendererVkOwnership(LORIE_OWNERSHIP_PERSISTENT))
+            loge("Xlorie: X server did not take its CPU ownership back; GLES works with either");
+        want = rendererBackendFor(state->backend.requested, true);
+    }
+    if (want == RENDERER_USE_GLES) {
+        if (sfc == EGL_NO_SURFACE || sfc == defaultSfc)
+            rendererUseEgl();
+        return;
+    }
+    // A session that asked for Vulkan only, and Vulkan failed: nothing draws the window (explicit failure).
+    rendererDropEgl();
+    state->surfaceAvailable = false;
+    rendererPublishActive();
+    notifyGpuCopyDone();
+    loge("Xlorie: Vulkan was asked for and failed: nothing draws the window");
+}
+
+/*
+ * The pending GPU copies recorded into the frame (lorieVkFrameCopy), as GLES's rendererApplyPendingGpuCopiesLocked
+ * does them: the same rectangles, offsets and swizzle rule. The queue is not advanced here: *readIndex and
+ * *serial are what the caller publishes once the frame's fence signalled. False on a buffer Vulkan cannot use
+ * (recorded as RESOURCE_LOCAL).
+ */
+static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
+    uint32_t i = state->gpuCopyQueue.readIndex, end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+    int filter = filtering == GL_LINEAR;
+
+    for (; i != end; i++) {
+        LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        LorieBuffer *src = rendererFindBufferWithRetry(entry.srcBufferId);
+        LorieBuffer *dst = rendererFindBufferWithRetry(entry.dstBufferId);
+
+        if (!src || !dst)
+            log("rendererVkCopies: buffer %llu not found after waiting, skipping\n",
+                (unsigned long long) (!src ? entry.srcBufferId : entry.dstBufferId));
+        if (src && dst) {
+            const LorieBuffer_Desc *sd = LorieBuffer_description(src), *dd = LorieBuffer_description(dst);
+            struct lorie_vk_image *s = lorieVkImport(&vk, &vkImages, sd->id, sd->buffer, 0, state);
+            struct lorie_vk_image *d = s ? lorieVkImport(&vk, &vkImages, dd->id, dd->buffer, 0, state) : NULL;
+            struct lorie_vk_quad quads[LORIE_GPU_COPY_MAX_RECTS];
+            uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k;
+
+            if (!s || !d)
+                return false;
+            if (!d->attachView) {
+                lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED, VK_SUCCESS);
+                return false;
+            }
+            for (k = 0; k < n; k++) {
+                LorieGpuCopyRect r = entry.rects[k];
+                // Vulkan's clip space has y pointing down from the first row, as the buffer's rows go: GLES's
+                // values, without its FBO flip.
+                quads[k] = (struct lorie_vk_quad) {
+                        .rect = { 2.f * (float) (r.x1 + entry.xOff) / (float) dd->width - 1.f,
+                                  2.f * (float) (r.y1 + entry.yOff) / (float) dd->height - 1.f,
+                                  2.f * (float) (r.x2 + entry.xOff) / (float) dd->width - 1.f,
+                                  2.f * (float) (r.y2 + entry.yOff) / (float) dd->height - 1.f },
+                        .uv = { (float) r.x1 / (float) sd->width, (float) r.y1 / (float) sd->height,
+                                (float) r.x2 / (float) sd->width, (float) r.y2 / (float) sd->height },
+                        .flags = s->rgbaOrder != d->rgbaOrder ? LORIE_VK_QUAD_SWIZZLE : 0 };
+            }
+            if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {
+                lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
+                return false;
+            }
+        }
+        *serial = entry.serial;
+    }
+    *readIndex = i;
+    return true;
+}
+
+// The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
+static void rendererVkApplyPendingGpuCopies(void) {
+    uint64_t serial = 0;
+    uint32_t readIndex = 0;
+    VkResult res;
+
+    if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
+        return;
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    if (!rendererVkOwnedLocked()) {
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        vkOwned = false;
+        backendSelect = true;   // asked for again first
+        return;
+    }
+    if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
+        return rendererVkFail();
+    }
+    if (!rendererVkCopiesLocked(&serial, &readIndex)) {
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return rendererVkFail();
+    }
+    res = lorieVkFrameSubmit(&vk, &vkr, 0, false, state);
+    if (res == VK_SUCCESS) {
+        // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        state->gpuCopyQueue.readIndex = readIndex;
+        if (serial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
+            notifyGpuCopyDone();
+        }
+    }
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    if (res != VK_SUCCESS)
+        rendererVkFail();
+}
+
+// A black frame (no X server buffer used), as GLES clears the window when the X server goes away.
+static void rendererVkClear(void) {
+    uint32_t index;
+    if (lorieVkAcquire(&vk, &vkr, &index, NULL) != LORIE_VK_FRAME_OK)
+        return;
+    if (lorieVkFrameBegin(&vk, &vkr) == VK_SUCCESS) {
+        lorieVkFrameScreen(&vk, &vkr, index, NULL, &(VkRect2D) { { 0, 0 }, vkr.extent }, NULL, NULL, 0);
+        if (lorieVkFrameSubmit(&vk, &vkr, index, true, NULL) == VK_SUCCESS)
+            lorieVkPresent(&vk, &vkr, index, NULL);
+    }
+}
+
+/*
+ * A frame, as rendererRedrawLocked draws it with GLES: the same root buffer and size checks, the pending copies
+ * and the root in one submission under the X server's lock, the fence waited for before the lock is let go and
+ * before the completed serial is published; the swapchain image acquired before taking the lock, presented after
+ * letting it go. None of GLES's swap heuristics (backpressure guard, high-refresh limiter, DeX present skip,
+ * coalescing) are fed from here: Vulkan has its own timings (vk_* in the diagnostics).
+ */
+static void rendererVkRedraw(bool *waitingForBuffers) {
+    LorieBuffer *buffer;
+    LorieBuffer_Desc *desc;
+    struct lorie_vk_image *root = NULL;
+    struct lorie_vk_quad rootQuad, cursorQuad;
+    bool cursor = false, owned;
+    uint64_t serial = 0;
+    uint32_t readIndex = 0, index;
+    int status, filter = filtering == GL_LINEAR;
+    VkResult res = VK_SUCCESS;
+
+    pthread_spin_lock(&bufferLock);
+    buffer = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
+    if (!buffer)
+        buffer = LorieBufferList_findById(&removedBuffers, state->rootWindowTextureID);
+    if (!buffer)
+        *waitingForBuffers = true;
+    pthread_spin_unlock(&bufferLock);
+    if (!buffer) {
+        log("Buffer %llu not found", (unsigned long long) state->rootWindowTextureID);
+        rendererVkApplyPendingGpuCopies();
+        return;
+    }
+
+    desc = LorieBuffer_description(buffer);
+    {
+        int alignedExpectedW = expectedW - (expectedW % CVT_H_GRANULARITY);
+        if (!expectedW || !expectedH || desc->height != expectedH ||
+            (desc->width != alignedExpectedW && desc->width != expectedW)) {
+            log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
+                (unsigned long long) state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH, desc->width, desc->height);
+            state->drawRequested = FALSE;
+            *waitingForBuffers = true;
+            rendererVkApplyPendingGpuCopies();
+            return;
+        }
+    }
+    if (desc->type != LORIEBUFFER_AHARDWAREBUFFER || !desc->buffer) {
+        lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_ROOT_NOT_AHB, VK_SUCCESS);
+        return rendererVkFail();
+    }
+
+    // A swapchain no longer of the window's size, or reported suboptimal or out of date, is made again first.
+    if ((vkr.recreate || vkr.windowWidth != (uint32_t) ANativeWindow_getWidth(win) ||
+         vkr.windowHeight != (uint32_t) ANativeWindow_getHeight(win)) && !lorieVkSwapchainCreate(&vk, &vkr, win, state))
+        return rendererVkFail();
+    status = lorieVkAcquire(&vk, &vkr, &index, state);
+    if (status == LORIE_VK_FRAME_SKIP)
+        return;     // drawRequested stays: tried again
+    if (status == LORIE_VK_FRAME_RECREATE) {
+        if (!lorieVkSwapchainCreate(&vk, &vkr, win, state))
+            rendererVkFail();
+        return;
+    }
+    if (status == LORIE_VK_FRAME_FATAL)
+        return rendererVkFail();
+
+    // We should signal X server to not use root window while we actively copy it
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    owned = rendererVkOwnedLocked();
+    if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
+        return rendererVkFail();
+    }
+    // Without the X server's PER_ACCESS answer no buffer of it is touched: the acquired image is cleared and
+    // presented, the root drawn after ownership was asked for again.
+    if (owned) {
+        if (!rendererVkCopiesLocked(&serial, &readIndex) ||
+            !(root = lorieVkImport(&vk, &vkImages, desc->id, desc->buffer, 0, state))) {
+            lorie_mutex_unlock(&state->lock, &state->lockingPid);
+            return rendererVkFail();
+        }
+        state->drawRequested = FALSE;
+    }
+
+    if (state->cursor.updated) {
+        lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
+        state->cursor.updated = false;
+        lorieVkFrameCursor(&vk, &vkr, (const uint32_t *) state->cursor.bits, state->cursor.width, state->cursor.height);
+        lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
+    }
+    state->cursor.moved = FALSE;
+
+    rootQuad = (struct lorie_vk_quad) { .rect = { -1.f, -1.f, 1.f, 1.f }, .uv = { 0.f, 0.f, 1.f, 1.f },
+                                        .flags = LORIE_VK_QUAD_OPAQUE | (root && root->rgbaOrder ? LORIE_VK_QUAD_SWIZZLE : 0) };
+    if (state->cursor.width && state->cursor.height && vkr.cursorWidth == state->cursor.width &&
+        vkr.cursorHeight == state->cursor.height) {
+        float x = 2.f * ((float) state->cursor.x - (float) state->cursor.xhot) / (float) desc->width - 1.f;
+        float y = 2.f * ((float) state->cursor.y - (float) state->cursor.yhot) / (float) desc->height - 1.f;
+        float w = 2.f * (float) state->cursor.width / (float) desc->width;
+        float h = 2.f * (float) state->cursor.height / (float) desc->height;
+        cursorQuad = (struct lorie_vk_quad) { .rect = { x, y, x + w, y + h }, .uv = { 0.f, 0.f, 1.f, 1.f }, .flags = 0 };
+        cursor = true;
+    }
+    lorieVkFrameScreen(&vk, &vkr, index, root, &(VkRect2D) { { viewportX, viewportY }, { (uint32_t) viewportW, (uint32_t) viewportH } },
+                       &rootQuad, cursor ? &cursorQuad : NULL, filter);
+    res = lorieVkFrameSubmit(&vk, &vkr, index, true, state);
+    if (res == VK_SUCCESS) {
+        // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        if (owned)
+            state->gpuCopyQueue.readIndex = readIndex;
+        if (serial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
+            notifyGpuCopyDone();
+        }
+    }
+    state->waitForNextFrame = true;
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+
+    if (!owned) {
+        vkOwned = false;
+        backendSelect = true;   // asked for again before the next frame
+    }
+    if (res != VK_SUCCESS)
+        return rendererVkFail();
+    if (lorieVkPresent(&vk, &vkr, index, state) == LORIE_VK_FRAME_FATAL)
+        return rendererVkFail();
+    state->renderedFrames++;
+}
+
 static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     static uint64_t lastRequestedBufferId = 0;
     bool buffersChanged, gpuCopyPending;
@@ -1539,7 +1992,7 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending)
+    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect)
         // If there are pending changes we should process them immediately.
         return false;
 
@@ -1640,8 +2093,14 @@ __noreturn static void* rendererThread(void) {
             waitingForBuffers = false;
 
             if (state) {
-                state->surfaceAvailable = win != defaultWin;
+                // A new X server session: Vulkan may be tried again, the X server's ownership asked for again.
+                vkFailed = vkOwned = false;
+                state->surfaceAvailable = win != defaultWin && (vkActive || sfc != defaultSfc);
                 rendererPublishActive();
+                backendSelect = true;
+            } else if (vkActive) {
+                vkOwned = false;
+                rendererVkClear();
             } else if (win != defaultWin) {
                 glClearColor(0, 0, 0, 0);
                 glClear(GL_COLOR_BUFFER_BIT);
@@ -1662,22 +2121,38 @@ __noreturn static void* rendererThread(void) {
         pthread_spin_unlock(&bufferLock);
 
         pthread_cond_signal(&stateChangeFinishCond);
+        // After the window or session change was acknowledged: starting Vulkan (or falling back) may take a while.
+        if (backendSelect) {
+            rendererSelectBackend();
+            waitingForBuffers = false;
+        }
         pthread_mutex_unlock(&stateLock);
 
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
         bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-        if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        if (vkActive) {
+            if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+                (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending))
+                rendererVkRedraw(&waitingForBuffers);
+            else if (gpuCopyPending)
+                rendererVkApplyPendingGpuCopies();
+        } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
             (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
             rendererRedrawLocked(&waitingForBuffers);
         } else if (gpuCopyPending) {
+            // Also when no window is drawn (or Vulkan failed, even in a session that asked for Vulkan only): the X
+            // server waits for the copies it queued, and GLES runs them on the default surface's context.
             rendererApplyPendingGpuCopies();
         }
 
         pthread_spin_lock(&bufferLock);
-        // Remove all buffers which were attached to GL.
-        while((buf = LorieBufferList_first(&removedBuffers)))
+        // Remove all buffers which were attached to GL (and their Vulkan images, if any: no frame is in flight).
+        while((buf = LorieBufferList_first(&removedBuffers))) {
+            if (vkReady)
+                lorieVkImageRemove(&vk, &vkImages, LorieBuffer_description(buf)->id);
             LorieBuffer_release(buf);
+        }
         pthread_spin_unlock(&bufferLock);
         pthread_mutex_lock(&stateLock);
     }
