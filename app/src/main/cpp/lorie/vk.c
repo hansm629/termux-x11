@@ -90,19 +90,6 @@ static uint8_t lorieVkDeviceUnsuitable(struct lorie_vk *vk, VkPhysicalDevice pd,
     return reason;
 }
 
-// The global priority extension the device has, to be enabled: VK_KHR_global_priority, or before it the EXT one.
-static const char *lorieVkGlobalPriority(struct lorie_vk *vk, VkPhysicalDevice pd) {
-    VkExtensionProperties *ext = NULL;
-    uint32_t count = 0;
-    const char *name = NULL;
-    if (vk->EnumerateDeviceExtensionProperties(pd, NULL, &count, NULL) == VK_SUCCESS && (ext = calloc(count ?: 1, sizeof(*ext))) &&
-        vk->EnumerateDeviceExtensionProperties(pd, NULL, &count, ext) == VK_SUCCESS)
-        name = lorieVkHasExtension(ext, count, "VK_KHR_global_priority") ? "VK_KHR_global_priority" :
-               lorieVkHasExtension(ext, count, "VK_EXT_global_priority") ? "VK_EXT_global_priority" : NULL;
-    free(ext);
-    return name;
-}
-
 void lorieVkDestroyDevice(struct lorie_vk *vk) {
     if (vk->device) {
         vk->DeviceWaitIdle(vk->device);
@@ -201,37 +188,17 @@ bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, vo
     if (lorieVkInjected(st, LORIE_VK_FAIL_AT_DEVICE, LORIE_FALLBACK_VK_DEVICE))
         goto fail;
     {
-        // The queue at HIGH global priority where the device has the extension: a frame keeps the X server's buffers -
-        // the root among them - off its CPU until the device finished it (lorie.h gpuInFlight), and what makes that
-        // take long is waiting behind other processes' work on the device, a 3D client's. Refused (not permitted to
-        // this process, VK_ERROR_NOT_PERMITTED_KHR, or otherwise): made again at the default priority, as before.
-        const uint32_t n = sizeof(lorieVkDeviceExtensions) / sizeof(*lorieVkDeviceExtensions);
-        const char *names[sizeof(lorieVkDeviceExtensions) / sizeof(*lorieVkDeviceExtensions) + 1];
-        const char *globalPriority = lorieVkGlobalPriority(vk, vk->physicalDevice);
-        VkDeviceQueueGlobalPriorityCreateInfoEXT high = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
-                                                          .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT };
         VkDeviceQueueCreateInfo queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = family,
                                           .queueCount = 1, .pQueuePriorities = &priority };
         VkDeviceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
-                                    .pQueueCreateInfos = &queue, .enabledExtensionCount = n, .ppEnabledExtensionNames = names };
-        memcpy(names, lorieVkDeviceExtensions, sizeof(lorieVkDeviceExtensions));
-        if (globalPriority) {
-            names[info.enabledExtensionCount++] = globalPriority;
-            queue.pNext = &high;
-            if ((r = vk->CreateDevice(vk->physicalDevice, &info, NULL, &vk->device)) != VK_SUCCESS) {
-                loge("Vulkan: HIGH queue priority refused (%d), the default one taken", r);
-                vk->device = VK_NULL_HANDLE;
-                globalPriority = NULL;
-                info.enabledExtensionCount = n;
-                queue.pNext = NULL;
-            }
-        }
-        if (!globalPriority && (r = vk->CreateDevice(vk->physicalDevice, &info, NULL, &vk->device)) != VK_SUCCESS) {
+                                    .pQueueCreateInfos = &queue,
+                                    .enabledExtensionCount = sizeof(lorieVkDeviceExtensions) / sizeof(*lorieVkDeviceExtensions),
+                                    .ppEnabledExtensionNames = lorieVkDeviceExtensions };
+        if ((r = vk->CreateDevice(vk->physicalDevice, &info, NULL, &vk->device)) != VK_SUCCESS) {
             vk->device = VK_NULL_HANDLE;
             lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_DEVICE, r);
             goto fail;
         }
-        vk->highPriority = globalPriority != NULL;
     }
     LORIE_DIAG_ADD(st, vkDeviceCreated, 1);
 
@@ -252,7 +219,6 @@ bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, vo
         st->diag.vkDevice[i] = 0;
         st->diag.vkDriverVersion = vk->properties.driverVersion;
         st->diag.vkApiVersion = vk->properties.apiVersion;
-        st->diag.vkHighPriority = vk->highPriority;
     }
     log("Vulkan device %s, API %u.%u, driver %#x, queue family %u", vk->properties.deviceName,
         VK_API_VERSION_MAJOR(vk->properties.apiVersion), VK_API_VERSION_MINOR(vk->properties.apiVersion),

@@ -208,7 +208,6 @@ static struct {
     const char *instanceExt[3];
     int ninstanceExt;
     VkResult createInstance, createDevice;
-    bool refusePriority;            /* vkCreateDevice refuses a queue with a global priority (VK_ERROR_NOT_PERMITTED_KHR) */
     struct fake_device dev[2];
     int ndev;
     VkPhysicalDeviceMemoryProperties memory;
@@ -221,7 +220,6 @@ static struct {
 static struct {
     int createInstance, destroyInstance, createDevice, destroyDevice, waitIdle, getQueue;
     uint32_t apiVersion, family;
-    VkQueueGlobalPriorityEXT priority;  /* the last vkCreateDevice's queue global priority (0: none asked) */
     char instanceExt[256], deviceExt[512];
     VkPhysicalDevice deviceUsed;
 } calls;
@@ -291,20 +289,12 @@ static VKAPI_ATTR void VKAPI_CALL fGetPhysicalDeviceMemoryProperties(VkPhysicalD
     (void) pd;
     *p = cfg.memory;
 }
-static const void *findNext(const void *chain, VkStructureType type);
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *a, VkDevice *out) {
     (void) a;
     calls.createDevice++;
     calls.deviceUsed = pd;
     calls.family = info->queueCreateInfoCount ? info->pQueueCreateInfos[0].queueFamilyIndex : 99;
     joinNames(calls.deviceExt, sizeof calls.deviceExt, info->ppEnabledExtensionNames, info->enabledExtensionCount);
-    {
-        const VkDeviceQueueGlobalPriorityCreateInfoEXT *p = info->queueCreateInfoCount ?
-                findNext(info->pQueueCreateInfos[0].pNext, VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT) : NULL;
-        calls.priority = p ? p->globalPriority : 0;
-        if (p && cfg.refusePriority)
-            return VK_ERROR_NOT_PERMITTED_KHR;
-    }
     if (cfg.createDevice != VK_SUCCESS)
         return cfg.createDevice;
     *out = (VkDevice) &deviceObj;

@@ -12,7 +12,7 @@ XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=G
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
-XlorieVkTiming: acquire results, acquire/submit/fence/present times, self-test, device, present mode, queue priority
+XlorieVkTiming: acquire results, acquire/submit/fence/present times, self-test, device, present mode
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource

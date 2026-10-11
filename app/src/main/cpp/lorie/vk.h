@@ -57,7 +57,6 @@ struct lorie_vk {
     uint32_t queueFamily;
     VkDevice device;
     VkQueue queue;
-    bool highPriority;          /* the queue made with VK_QUEUE_GLOBAL_PRIORITY_HIGH (see lorieVkCreateDevice) */
     uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */
 };
 
