@@ -4,7 +4,8 @@
  * renderer's condition variable).
  *
  *   Backend: gles asked - GLES; auto or vulkan - Vulkan until it failed in the session; after a failure GLES in
- *   auto, nobody in vulkan (an explicit failure, no GLES fallback).
+ *   auto, nobody in vulkan (an explicit failure, no GLES fallback). A buffer gets its GLES texture when it comes
+ *   only in a session GLES draws: gles asked, or auto after a failure (otherwise when GLES first uses it).
  *   Ownership: the request is one past the last answer, with the mode asked for; answered PER_ACCESS - owned,
  *   under that sequence number, and no longer once the X server answers otherwise (a new connection); refused,
  *   or not answered within a second - not owned; answered late but in time - owned; PERSISTENT asked and
@@ -24,7 +25,7 @@ struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie
 static volatile struct lorie_shared_server_state *state;
 static pthread_mutex_t stateLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER, *stateCond = &cond;
-static bool vkOwned;
+static bool vkOwned, vkActive, vkFailed;
 static uint32_t vkOwnershipSeq;
 #define loge(...) ((void) 0)
 #include "vkrenderer_src.inc"
@@ -84,6 +85,23 @@ int main(void) {
           "auto or vulkan, nothing failed: not Vulkan");
     CHECK(rendererBackendFor(LORIE_BACKEND_AUTO, true) == RENDERER_USE_GLES, "auto after a failure: not GLES");
     CHECK(rendererBackendFor(LORIE_BACKEND_VULKAN, true) == RENDERER_USE_NONE, "vulkan after a failure: not an explicit failure");
+
+    /* GLES textures when a buffer comes */
+    CHECK(rendererGlesEager(), "no session: no GLES texture when a buffer comes");
+    state = &s;
+    s.backend.requested = LORIE_BACKEND_GLES;
+    CHECK(rendererGlesEager(), "gles: no GLES texture when a buffer comes");
+    s.backend.requested = LORIE_BACKEND_AUTO;
+    CHECK(!rendererGlesEager(), "auto, Vulkan not failed: a GLES texture made though Vulkan may draw");
+    vkActive = true;
+    CHECK(!rendererGlesEager(), "Vulkan drawing: a GLES texture made");
+    vkActive = false;
+    vkFailed = true;
+    CHECK(rendererGlesEager(), "auto after a failure: no GLES texture when a buffer comes");
+    s.backend.requested = LORIE_BACKEND_VULKAN;
+    CHECK(!rendererGlesEager(), "vulkan after a failure (nothing draws): a GLES texture made");
+    vkFailed = false;
+    s.backend.requested = LORIE_BACKEND_AUTO;
 
     /* the handshake */
     state = &s;

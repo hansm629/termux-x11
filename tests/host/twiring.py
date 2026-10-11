@@ -12,7 +12,9 @@ alone likewise; a failure is torn down before the X server is asked for its owne
 GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
 change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer; another
 X server session (or none) drops every imported image and the ownership answer of the last one first. The
-self-test's duration is lorieVkElapsedUs's (tvkselftest.c tests it) on both ways out.
+self-test's duration is lorieVkElapsedUs's (tvkselftest.c tests it) on both ways out. A buffer that comes gets
+its GLES texture only when rendererGlesEager says GLES draws, a buffer found for a copy none, and GLES's frame
+makes the root's (rendererGlBuffer) before binding it.
 
 usage: twiring.py <lorie source dir>
 """
@@ -80,6 +82,13 @@ in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "ren
 # another session: the last one's imported images and ownership answer are dropped before anything else runs
 in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
          "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")
+
+check("            if (rendererGlesEager())\n                rendererAttachToGL(buf);" in loop,
+      "a buffer that comes gets a GLES texture whoever draws")
+check("rendererAttachToGL" not in func(R, "static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {"),
+      "a buffer found for a copy gets a GLES texture whoever copies")
+in_order("GLES frame", func(R, "void rendererRedrawLocked(bool* waitingForBuffers) {"), "rendererGlBuffer(buffer);",
+         "LorieBuffer_bindTexture(buffer);")
 
 selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {")
 check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,

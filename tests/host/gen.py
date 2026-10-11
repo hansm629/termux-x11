@@ -97,6 +97,7 @@ recipes = {
     # the renderer's choice of backend and its side of the ownership handshake - tvkrenderer.c
     "vkrenderer": lambda: span(R, "enum { RENDERER_USE_GLES, RENDERER_USE_VULKAN, RENDERER_USE_NONE };", "RENDERER_USE_NONE };")
         + func(R, "static int rendererBackendFor(uint8_t requested, bool vulkanFailed) {")
+        + func(R, "static bool rendererGlesEager(void) {")
         + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
@@ -111,6 +112,7 @@ recipes = {
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
         + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
         + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
+        + func(R, "static void rendererGlBuffer(LorieBuffer *buf) {")
         + func(R, "static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {")
         + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {")

@@ -20,6 +20,8 @@
  *   renderer never got is skipped and completed, as GLES does. Frames of eight copies from new sources, the
  *   cache passing 16 and 32 images in the middle of a frame: every image a frame already used stays valid (its
  *   acquire released, its draw from the right buffer), every image keeps its address until removed.
+ *   GLES textures: none made for Vulkan's copies and frames; GLES's first use of a buffer makes its texture,
+ *   once.
  *   X server again: done only then; the CPU may lock the source; the acknowledgement drops what was held. */
 #include <math.h>
 #include <pthread.h>
@@ -30,7 +32,7 @@
 #define _Nullable
 #define __LIBC_HIDDEN__ static
 #include "buffertypes_src.inc"
-typedef struct LorieBuffer { LorieBuffer_Desc desc; int refs, gpuCopyPending; bool registered; } LorieBuffer;
+typedef struct LorieBuffer { LorieBuffer_Desc desc; int refs, gpuCopyPending; bool registered; unsigned glTexture; } LorieBuffer;
 static LorieBuffer_Desc *LorieBuffer_description(LorieBuffer *b) { return &b->desc; }
 
 /* ---- the X server's side ---- */
@@ -106,8 +108,10 @@ static void glDrawArrays(GLenum mode, GLint first, GLsizei n) {
     glDraws[glDrawCount++].target = glTarget;
 }
 #define checkGlError() ((void) 0)
-static GLuint LorieBuffer_getGLTextureId(LorieBuffer *b) { return (GLuint) b->desc.id; }
-static void LorieBuffer_bindTexture(LorieBuffer *b) { glTexture = (GLuint) b->desc.id; }
+static int glTextures;     /* GLES textures made for buffers (renderer.c rendererAttachToGL) */
+static void rendererAttachToGL(LorieBuffer *b) { b->glTexture = (GLuint) b->desc.id; glTextures++; }
+static GLuint LorieBuffer_getGLTextureId(LorieBuffer *b) { return b->glTexture; }
+static void LorieBuffer_bindTexture(LorieBuffer *b) { glTexture = b->glTexture; }
 static bool lorieDebugEnabled;
 static int filtering = GL_NEAREST;
 
@@ -279,7 +283,10 @@ int main(void) {
     CHECK(notified.locked && notified.fenceWaited && notified.released,
           "copies alone: published %s", !notified.locked ? "without the X server's lock" : !notified.fenceWaited ?
           "before the fence was waited for" : "with a buffer still the renderer's");
+    CHECK(glTextures == 0, "copies alone: a GLES texture made for Vulkan");
     CHECK(gles(&saved) == 1 && glesState.gpuCopyQueue.readIndex == 1 && glDrawCount == 2 && pushes == 2, "GLES: %d draws", glDrawCount);
+    CHECK(glTextures == 2 && src->glTexture && root->glTexture, "GLES's first copies: %d textures made (want the source's and the root's)",
+          glTextures);
     CHECK(sameAsGles(0, &pushed[0]) && sameAsGles(1, &pushed[1]) && glDraws[0].texture == src->desc.id && glDraws[0].target == root->desc.id,
           "copies alone: not what GLES draws");
     if (!sameAsGles(0, &pushed[0]) || !sameAsGles(1, &pushed[1]))
@@ -346,7 +353,8 @@ int main(void) {
               st.gpuCopyQueue.completedSerial == serials[7] && emu.violations == 0 && lorieGpuCopyIsDone(serials[0]) &&
               lorieGpuCopyIsDone(serials[7]), "eight: submits %u, destination draws %u, completed %llu",
               st.diag.vkQueueSubmits - submits, st.diag.vkImportedDestinationDraws, (unsigned long long) st.gpuCopyQueue.completedSerial);
-        CHECK(gles(&saved) == serials[7] && glDrawCount == 8, "eight: GLES drew %d", glDrawCount);
+        CHECK(gles(&saved) == serials[7] && glDrawCount == 8 && glTextures == 4, "eight: GLES drew %d, %d textures made in all (want 4)",
+              glDrawCount, glTextures);
         for (int k = 0; k < 8; k++)
             CHECK(sameAsGles(k, &pushed[k]), "eight: copy %d not what GLES draws", k);
         for (int k = 0; k < 8; k++)
@@ -438,7 +446,7 @@ int main(void) {
         memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
         rendererVkApplyPendingGpuCopies();
         CHECK(lorieGpuCopyIsDone(serial) && st.diag.vkImportedDestinationDraws == dests && vkFailures == 0 &&
-              gles(&saved) == serial && glDrawCount == 0, "never got: not skipped as GLES skips it");
+              gles(&saved) == serial && glDrawCount == 0 && !fresh->glTexture, "never got: not skipped as GLES skips it");
         lorieGpuCopyAck(&freshPix, dstBuffer);
     }
 
@@ -483,6 +491,8 @@ int main(void) {
             }
         }
         CHECK(crossed16 && crossed32, "many: the cache did not pass 16 and 32 images in a frame");
+        for (int k = 0; k < SOURCES; k++)
+            CHECK(!many[k]->glTexture, "many: a GLES texture made for source %d, which only Vulkan used", k);
         CHECK(lorieVkImageFind(&vkImages, root->desc.id) == rootImage, "many: the root's image moved");
         for (int k = 0; k < SOURCES; k++)
             CHECK(kept[k] && lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k] && kept[k]->image == keptImage[k] &&

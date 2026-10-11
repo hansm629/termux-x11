@@ -555,6 +555,21 @@ CONTROLS = [
      """        st->diag.vkSelftestUs = (uint64_t) (t1.tv_sec - t0.tv_sec) * 1000000 + (uint64_t) (t1.tv_nsec - t0.tv_nsec) / 1000;
         st->diag.vkSelftestFailStep = step;""",
      "twiring"),
+    ("a buffer given its GLES texture when it comes, though Vulkan draws", "renderer.c",
+     """            if (rendererGlesEager())
+                rendererAttachToGL(buf);""",
+     """            rendererAttachToGL(buf);""",
+     "twiring"),
+    ("a buffer's GLES texture made again at each use", "renderer.c",
+     """    if (buf && !LorieBuffer_getGLTextureId(buf))
+        rendererAttachToGL(buf);""",
+     """    if (buf)
+        rendererAttachToGL(buf);""",
+     "tpresentcopy"),
+    ("GLES textures made when buffers come, though Vulkan may still be started", "renderer.c",
+     """    return !vkActive && (!state || rendererBackendFor(state->backend.requested, vkFailed) == RENDERER_USE_GLES);""",
+     """    return !vkActive;""",
+     "tvkrenderer"),
 ]
 
 def copy_sources(dst):

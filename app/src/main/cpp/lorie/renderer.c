@@ -761,7 +761,8 @@ void rendererRemoveBuffer(uint64_t id) {
     else {
         buf = LorieBufferList_findById(&buffers, id);
         if (buf) {
-            // The buffer is attached to GL so we should release it from renderer thread.
+            // The renderer took the buffer up (its GLES texture, its Vulkan image, or both may exist), so we should
+            // release it from renderer thread.
             LorieBuffer_removeFromList(buf);
             LorieBuffer_addToList(buf, &removedBuffers);
         }
@@ -778,7 +779,7 @@ void rendererRemoveAllBuffers(void) {
         LorieBuffer_release(buf);
     }
     while ((buf = LorieBufferList_first(&buffers))) {
-        // These buffers are attached to GL, we must release them from renderer thread.
+        // These buffers were taken up by the renderer (GLES texture, Vulkan image), we must release them from renderer thread.
         LorieBuffer_removeFromList(buf);
         LorieBuffer_addToList(buf, &removedBuffers);
     }
@@ -859,6 +860,21 @@ static int rendererBackendFor(uint8_t requested, bool vulkanFailed) {
     if (!vulkanFailed)
         return RENDERER_USE_VULKAN;
     return requested == LORIE_BACKEND_VULKAN ? RENDERER_USE_NONE : RENDERER_USE_GLES;
+}
+
+/*
+ * A buffer's GLES texture (and EGLImage) is made when it arrives only in a session GLES draws, as 3c98ffa made
+ * it; while Vulkan draws (or may still be started) nothing GLES of it is made: Vulkan imports the AHB itself.
+ */
+static bool rendererGlesEager(void) {
+    return !vkActive && (!state || rendererBackendFor(state->backend.requested, vkFailed) == RENDERER_USE_GLES);
+}
+
+// Before GLES uses a buffer: its texture, made now if it was not when the buffer came (a fallback to GLES, or
+// GLES running the copies of a session Vulkan failed in). Made once: LorieBuffer_attachToGL makes a new one per call.
+static void rendererGlBuffer(LorieBuffer *buf) {
+    if (buf && !LorieBuffer_getGLTextureId(buf))
+        rendererAttachToGL(buf);
 }
 
 // GLES on the window: its EGL window surface made and current (what rendererRefreshContext always did).
@@ -1178,20 +1194,16 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
 
     pthread_spin_lock(&bufferLock);
     buf = LorieBufferList_findById(&buffers, id);
-    if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
-        rendererAttachToGL(buf);
-        LorieBuffer_addToList(buf, &buffers);
-    }
+    if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
+        LorieBuffer_addToList(buf, &buffers);     // its GLES texture, if GLES uses it: rendererGlBuffer
     pthread_spin_unlock(&bufferLock);
 
     for (attempt = 0; attempt < 20 && !buf; attempt++) {
         usleep(5000);
         pthread_spin_lock(&bufferLock);
         buf = LorieBufferList_findById(&buffers, id);
-        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id))) {
-            rendererAttachToGL(buf);
+        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
             LorieBuffer_addToList(buf, &buffers);
-        }
         pthread_spin_unlock(&bufferLock);
     }
     return buf;
@@ -1220,6 +1232,9 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             const LorieBuffer_Desc *srcDesc = LorieBuffer_description(src);
             const LorieBuffer_Desc *dstDesc = LorieBuffer_description(dst);
             int i;
+
+            rendererGlBuffer(src);
+            rendererGlBuffer(dst);
 
             if (!fboSetUp) {
                 glGetIntegerv(GL_VIEWPORT, prevViewport);
@@ -1452,6 +1467,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     uint64_t gpuCopySerial = rendererApplyPendingGpuCopiesLocked();
     state->drawRequested = FALSE;
 
+    rendererGlBuffer(buffer);
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
@@ -2129,7 +2145,8 @@ __noreturn static void* rendererThread(void) {
         if (windowChanged) { rendererRefreshContext(); waitingForBuffers = false; } if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); } // Attach all pending buffers to GL.
         pthread_spin_lock(&bufferLock);
         while((buf = LorieBufferList_first(&addedBuffers))) {
-            rendererAttachToGL(buf);
+            if (rendererGlesEager())
+                rendererAttachToGL(buf);
             LorieBuffer_addToList(buf, &buffers);
             waitingForBuffers = false;
         }
