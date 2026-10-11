@@ -8,7 +8,7 @@ in its own log, which Termux can read with `logcat -d`:
 ```
 XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
-                x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d)
+                x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
@@ -36,6 +36,13 @@ and for a Vulkan frame still using it), `x_gpu_wait_us` the part of it spent wai
 buffering is in effect (`TERMUX_X11_RENDERER_ROOT_DOUBLE=1`, experimental, Vulkan only): the X server draws into
 one buffer of the screen pixmap while the renderer samples the other, and at each tick with damage the damage is
 copied into the one sampled and they swap (`x_root_copy_us` is the time those copies took).
+`vk_transfer_copy` is `on` when the X server was started with `TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1`
+(experimental, Vulkan only): a Present copy is then made by `vkCmdCopyImage` (counted in `XlorieVk`
+`copy_commands`, one per queued copy) where that gives exactly the pixels the shader copy gives - one Vulkan format
+and byte order, an RGBX source only into an RGBX destination below depth 32, both AHBs imported with the transfer
+usage (asked for only where the device allows it for that AHB; refused, the AHB is imported without it), every
+rectangle inside its source, no two destinations overlapping; every other copy is drawn as before
+(`imported_destination_draws`).
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,

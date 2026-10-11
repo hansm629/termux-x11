@@ -1837,14 +1837,65 @@ static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff,
 }
 
 /*
+ * Experimental, TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1: an entry's rectangles as vkCmdCopyImage regions, where the
+ * copy gives exactly the pixels rendererVkCopyQuad's draws give - one VkFormat and one byte order (no swizzle); an
+ * RGBX source, whose 4th byte the draw reads as 1, only into an RGBX destination below depth 32 (that byte X
+ * padding there, read by no one: the copy leaves the source's byte as the X server's own CopyArea would, the draw
+ * 255); both images made with the transfer usage (lorieVkImport gives it only where the device allows it); each
+ * rectangle a real one inside the source (a draw past the source samples its edge); the destination clipped to the
+ * destination, as the draw's render area clips it; no two destinations overlapping (the regions of one copy are
+ * written in no order). One pixel per texel: no filter changes a draw's pixel. The number of regions, 0: the entry
+ * is drawn.
+ */
+static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,
+                                      const struct lorie_vk_image *d, VkImageCopy *regions) {
+    uint32_t k, j, count = 0;
+
+    if (!state->backend.vkTransferCopy || s == d || s->format != d->format || s->rgbaOrder != d->rgbaOrder ||
+        (s->rgbx && (!d->rgbx || entry->dstDepth >= 32)) || !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        !(d->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return 0;
+    for (k = 0; k < n; k++) {
+        LorieGpuCopyRect r = entry->rects[k];
+        int32_t sx = r.x1, sy = r.y1, w = r.x2 - r.x1, h = r.y2 - r.y1, dx = sx + entry->xOff, dy = sy + entry->yOff;
+
+        if (w <= 0 || h <= 0 || sx < 0 || sy < 0 || r.x2 > (int32_t) s->width || r.y2 > (int32_t) s->height)
+            return 0;
+        if (dx < 0)
+            sx -= dx, w += dx, dx = 0;
+        if (dy < 0)
+            sy -= dy, h += dy, dy = 0;
+        if (w > (int32_t) d->width - dx)
+            w = (int32_t) d->width - dx;
+        if (h > (int32_t) d->height - dy)
+            h = (int32_t) d->height - dy;
+        if (w <= 0 || h <= 0)
+            continue;       // all of it outside the destination: the draw draws no pixel of it either
+        for (j = 0; j < count; j++)
+            if (dx < regions[j].dstOffset.x + (int32_t) regions[j].extent.width && regions[j].dstOffset.x < dx + w &&
+                dy < regions[j].dstOffset.y + (int32_t) regions[j].extent.height && regions[j].dstOffset.y < dy + h)
+                return 0;
+        regions[count++] = (VkImageCopy) {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffset = { sx, sy, 0 },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffset = { dx, dy, 0 },
+                .extent = { (uint32_t) w, (uint32_t) h, 1 } };
+    }
+    return count;
+}
+
+/*
  * The pending GPU copies recorded into the frame (lorieVkFrameCopy), as GLES's rendererApplyPendingGpuCopiesLocked
- * does them: the same rectangles, offsets and swizzle rule. The queue is not advanced here: *readIndex and
- * *serial are what the caller publishes once the frame's fence signalled. False on a buffer Vulkan cannot use
- * (recorded as RESOURCE_LOCAL).
+ * does them: the same rectangles, offsets and swizzle rule - or, with TERMUX_X11_RENDERER_VK_TRANSFER_COPY, by
+ * vkCmdCopyImage where that gives the same pixels (rendererVkCopyRegions; lorieVkFrameCopyImage). The queue is
+ * not advanced here: *readIndex and *serial are what the caller publishes once the frame's fence signalled. False
+ * on a buffer Vulkan cannot use (recorded as RESOURCE_LOCAL).
  */
 static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
     uint32_t i = state->gpuCopyQueue.readIndex, end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
     int filter = filtering == GL_LINEAR;
+
+    // The transfer usage the experimental copies need, asked for every image this X server session imports.
+    vkImages.optionalUsage = state->backend.vkTransferCopy ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0;
 
     for (; i != end; i++) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
@@ -1859,7 +1910,8 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
             struct lorie_vk_image *s = lorieVkImport(&vk, &vkImages, sd->id, sd->buffer, 0, state);
             struct lorie_vk_image *d = s ? lorieVkImport(&vk, &vkImages, dd->id, dd->buffer, 0, state) : NULL;
             struct lorie_vk_quad quads[LORIE_GPU_COPY_MAX_RECTS];
-            uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k;
+            VkImageCopy regions[LORIE_GPU_COPY_MAX_RECTS];
+            uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k, count;
 
             if (!s || !d)
                 return false;
@@ -1867,11 +1919,14 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
                 lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED, VK_SUCCESS);
                 return false;
             }
-            for (k = 0; k < n; k++)
-                quads[k] = rendererVkCopyQuad(entry.rects[k], entry.xOff, entry.yOff, sd, dd, s->rgbaOrder != d->rgbaOrder);
-            if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {
-                lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
-                return false;
+            count = rendererVkCopyRegions(&entry, n, s, d, regions);
+            if (!count || !lorieVkFrameCopyImage(&vk, &vkr, s, d, regions, count)) {
+                for (k = 0; k < n; k++)
+                    quads[k] = rendererVkCopyQuad(entry.rects[k], entry.xOff, entry.yOff, sd, dd, s->rgbaOrder != d->rgbaOrder);
+                if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {
+                    lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
+                    return false;
+                }
             }
         }
         *serial = entry.serial;

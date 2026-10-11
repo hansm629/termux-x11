@@ -199,11 +199,11 @@ CONTROLS = [
      """    if (0) {""",
      "tvkimport"),
     ("the format query's importable bit not required", "vk.c",
-     """            !(externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||""",
+     """                (externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) &&""",
      "",
      "tvkimport"),
     ("the buffer's size not checked against the format query", "vk.c",
-     """            formatOut.imageFormatProperties.maxExtent.width < desc.width ||""",
+     """                formatOut.imageFormatProperties.maxExtent.width >= desc.width &&""",
      "",
      "tvkimport"),
     ("the first allowed memory type used, device-local or not", "vk.c",
@@ -223,10 +223,10 @@ CONTROLS = [
      """        if (1 &&""",
      "tvkimport"),
     ("a failed import leaving its objects behind", "vk.c",
-     """    fail:
+     """    }
     lorieVkImageDestroy(vk, &img);
     lorieVkImportFailed(images, st, reason, r, id, &desc);""",
-     """    fail:
+     """    }
     lorieVkImportFailed(images, st, reason, r, id, &desc);""",
      "tvkimport"),
     ("an import counted as a success before it is one", "vk.c",
@@ -503,8 +503,8 @@ CONTROLS = [
      """if (!lorieVkFrameCopy(&vk, &vkr, d, s, quads, n, filter)) {""",
      "tpresentcopy"),
     ("only a copy's first rectangle drawn", "renderer.c",
-     """uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k;""",
-     """uint32_t n = 1, k;""",
+     """uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k, count;""",
+     """uint32_t n = 1, k, count;""",
      "tpresentcopy"),
     ("the copies alone published though their submission failed", "renderer.c",
      """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
@@ -704,6 +704,32 @@ CONTROLS = [
             // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",
      """        } else if (0) {
             // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: an RGBX source copied as is into alpha", "renderer.c",
+     """        (s->rgbx && (!d->rgbx || entry->dstDepth >= 32)) || !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||""",
+     """        !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a copy into an image a copy wrote before not ordered after it", "vk.c",
+     """        if (r->used[i].img == dst && r->used[i].use == LORIE_VK_USE_TRANSFER_DST)""",
+     """        if (0)""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: an import the transfer usage was refused for fails", "vk.c",
+     """            if (info.usage == img.usage) {
+                reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;""",
+     """            if (1) {
+                reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: an import whose image failed with the transfer usage fails", "vk.c",
+     """    if (img.usage & optional) {
+        VkImageUsageFlags kept = images->optionalUsage;""",
+     """    if (0) {
+        VkImageUsageFlags kept = images->optionalUsage;""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
+     """        if (w > (int32_t) d->width - dx)
+            w = (int32_t) d->width - dx;""",
+     """        if (0)
+            w = (int32_t) d->width - dx;""",
      "tpresentcopy"),
 ]
 

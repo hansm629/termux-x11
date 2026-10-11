@@ -84,7 +84,7 @@ static struct {
     int surfaces, swapchains, swapchainsMade, acquires2, presents, deviceWaits;
     VkSwapchainCreateInfoKHR swapchainInfo;
     uint32_t nextImage;
-    int passesIntoImported, drawsFromImported, drawsIntoImported, draws;
+    int passesIntoImported, drawsFromImported, drawsIntoImported, draws, copyCommands, copyRegions;
     AHardwareBuffer *drawnFrom[64], *drawnInto[64];    /* draw n's X server buffers (NULL: none), at n % 64 */
     long copies, locks;
     bool fencePending;
@@ -216,6 +216,9 @@ static struct {
     int failViewNumber;             /* the n-th vkCreateImageView of a case fails (0: none) */
     VkExternalMemoryFeatureFlags externalFeatures;
     VkExtent3D maxExtent;
+    VkFormatFeatureFlags optimalFeatures;   /* every format's optimal-tiling features (good(): sampled, attachment, transfer) */
+    bool refuseTransferUsage;               /* the image-format query refuses the transfer usage (an AHB the device cannot copy) */
+    bool failTransferImage;                 /* vkCreateImage fails an image with the transfer usage the query allowed */
 } cfg;
 static struct {
     int createInstance, destroyInstance, createDevice, destroyDevice, waitIdle, getQueue;
@@ -324,7 +327,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL fDeviceWaitIdle(VkDevice d) {
 }
 /* ---- what an import calls: every object counted while alive, every argument kept ---- */
 static struct {
-    int properties, formatQueries, images, memories, views, binds;
+    int properties, formatQueries, featureQueries, images, memories, views, binds;
     VkPhysicalDeviceImageFormatInfo2 query;
     VkExternalMemoryHandleTypeFlagBits queryHandleType;
     VkImageCreateInfo image;
@@ -338,7 +341,7 @@ static struct {
 } imp;
 static uintptr_t nextHandle = 0x1000;
 static struct { VkDeviceMemory memory; AHardwareBuffer *ahb; uint8_t *host; } memories[64];
-static struct { VkImage image; AHardwareBuffer *ahb; } boundImages[64];
+static struct { VkImage image; AHardwareBuffer *ahb; VkImageUsageFlags usage; } boundImages[64];
 static struct { VkBuffer buffer; VkDeviceSize size; uint8_t *bytes; } buffers[16];
 static AHardwareBuffer *ahbOf(VkImage image) {
     for (int i = 0; i < 64; i++)
@@ -380,10 +383,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceImageFormatProperties2(V
     imp.queryHandleType = ext ? ext->handleType : 0;
     if (cfg.formatQuery != VK_SUCCESS)
         return cfg.formatQuery;
+    if (cfg.refuseTransferUsage && (info->usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     out->imageFormatProperties = (VkImageFormatProperties) { .maxExtent = cfg.maxExtent, .maxMipLevels = 1, .maxArrayLayers = 1 };
     if (eout)
         eout->externalMemoryProperties.externalMemoryFeatures = cfg.externalFeatures;
     return VK_SUCCESS;
+}
+static VKAPI_ATTR void VKAPI_CALL fGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat f, VkFormatProperties *out) {
+    (void) pd; (void) f;
+    imp.featureQueries++;
+    *out = (VkFormatProperties) { .optimalTilingFeatures = cfg.optimalFeatures };
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateImage(VkDevice d, const VkImageCreateInfo *info, const VkAllocationCallbacks *a, VkImage *out) {
     const VkExternalMemoryImageCreateInfo *ext = findNext(info->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
@@ -392,6 +402,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateImage(VkDevice d, const VkImageCrea
     imp.imageHandleTypes = ext ? ext->handleTypes : 0;
     if (cfg.createImage != VK_SUCCESS)
         return cfg.createImage;
+    if (cfg.failTransferImage && (info->usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     imp.images++;
     *out = imp.createdImage = (VkImage) nextHandle++;
     return VK_SUCCESS;
@@ -449,6 +461,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL fBindImageMemory(VkDevice d, VkImage i, Vk
                 if (!boundImages[j].image || boundImages[j].image == i) {
                     boundImages[j].image = i;
                     boundImages[j].ahb = memories[k].ahb;
+                    boundImages[j].usage = i == imp.createdImage ? imp.image.usage : 0;
                     break;
                 }
     return VK_SUCCESS;
@@ -498,6 +511,8 @@ struct fake_op {
     VkExtent3D extent;
     VkFramebuffer framebuffer;
     VkDescriptorSet set;
+    VkImageCopy regions[16];        /* vkCmdCopyImage's */
+    uint32_t nregions;
 };
 static struct { struct fake_op ops[256]; int n; bool recording; } cmdObj;
 static struct { VkFramebuffer framebuffer; VkImageView view; } framebuffers[64];
@@ -575,9 +590,13 @@ static VKAPI_ATTR void VKAPI_CALL fCmdPipelineBarrier(VkCommandBuffer c, VkPipel
 }
 static VKAPI_ATTR void VKAPI_CALL fCmdCopyImage(VkCommandBuffer c, VkImage s, VkImageLayout sl, VkImage t, VkImageLayout tl,
                                                 uint32_t n, const VkImageCopy *r) {
+    struct fake_op op = { .kind = OP_COPY_IMAGE, .a = s, .la = sl, .b = t, .lb = tl, .extent = r->extent, .nregions = n };
     (void) c;
-    CHECK(n == 1, "fake device: one region");
-    record((struct fake_op) { .kind = OP_COPY_IMAGE, .a = s, .la = sl, .b = t, .lb = tl, .extent = r->extent });
+    CHECK(n >= 1 && n <= 16, "fake device: %u regions", n);
+    memcpy(op.regions, r, (n <= 16 ? n : 16) * sizeof *r);
+    emu.copyCommands++;
+    emu.copyRegions += n;
+    record(op);
 }
 static VKAPI_ATTR void VKAPI_CALL fCmdCopyBufferToImage(VkCommandBuffer c, VkBuffer s, VkImage t, VkImageLayout tl, uint32_t n,
                                                         const VkBufferImageCopy *r) {
@@ -613,6 +632,18 @@ static bool usable(AHardwareBuffer *b, VkImageLayout l, VkImageLayout want, VkEx
         return false;
     }
     return true;
+}
+static VkImageUsageFlags usageOf(VkImage image) {
+    for (int i = 0; i < 64; i++)
+        if (boundImages[i].image == image)
+            return boundImages[i].usage;
+    return 0;
+}
+/* a region of a copy: the color aspect of mip 0, layer 0, a 2D extent of at least one pixel, all of it in the image */
+static bool inside(VkImageSubresourceLayers s, VkOffset3D o, VkExtent3D e, const AHardwareBuffer *b) {
+    return s.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && s.mipLevel == 0 && s.baseArrayLayer == 0 && s.layerCount == 1 &&
+           o.z == 0 && e.depth == 1 && e.width && e.height && o.x >= 0 && o.y >= 0 &&
+           (uint64_t) o.x + e.width <= b->desc.width && (uint64_t) o.y + e.height <= b->desc.height;
 }
 static AHardwareBuffer *passTarget;
 static VkDescriptorSet boundSet;
@@ -658,10 +689,39 @@ static void run(const struct fake_op *op) {
     case OP_BUFFER_BARRIER:
         return;
     case OP_COPY_IMAGE:
-        if (usable(a, op->la, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, op->extent) && usable(b, op->lb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, op->extent)) {
-            memcpy(b->gpu, a->gpu, (size_t) a->desc.width * a->desc.height * 4);
-            copied(b->gpu);
+        if (!(usageOf(op->a) & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(usageOf(op->b) & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+            violation("copy with an image made without the transfer usage");
+            return;
         }
+        if (!a || !b || a == b || a->vkFormat != b->vkFormat) {
+            violation("copy between images not two X server buffers of one format");
+            return;
+        }
+        if (!usable(a, op->la, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkExtent3D) { a->desc.width, a->desc.height, 1 }) ||
+            !usable(b, op->lb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (VkExtent3D) { b->desc.width, b->desc.height, 1 }))
+            return;
+        for (uint32_t i = 0; i < op->nregions; i++) {
+            const VkImageCopy *g = &op->regions[i];
+            if (!inside(g->srcSubresource, g->srcOffset, g->extent, a) || !inside(g->dstSubresource, g->dstOffset, g->extent, b)) {
+                violation("copy region not inside both images");
+                return;
+            }
+            for (uint32_t j = 0; j < i; j++)
+                if (g->dstOffset.x < op->regions[j].dstOffset.x + (int32_t) op->regions[j].extent.width &&
+                    op->regions[j].dstOffset.x < g->dstOffset.x + (int32_t) g->extent.width &&
+                    g->dstOffset.y < op->regions[j].dstOffset.y + (int32_t) op->regions[j].extent.height &&
+                    op->regions[j].dstOffset.y < g->dstOffset.y + (int32_t) g->extent.height) {
+                    violation("copy regions overlapping in the destination (written in no order)");
+                    return;
+                }
+        }
+        for (uint32_t i = 0; i < op->nregions; i++) {
+            const VkImageCopy *g = &op->regions[i];
+            for (uint32_t y = 0; y < g->extent.height; y++)
+                memcpy(b->gpu + ((size_t) (g->dstOffset.y + y) * b->desc.width + g->dstOffset.x) * 4,
+                       a->gpu + ((size_t) (g->srcOffset.y + y) * a->desc.width + g->srcOffset.x) * 4, (size_t) g->extent.width * 4);
+        }
+        copied(b->gpu);
         return;
     case OP_BUFFER_TO_IMAGE:
         if (!b && op->b)
@@ -1106,7 +1166,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetInstanceProcAddr(VkInstance 
     }
     F(DestroyInstance) F(EnumeratePhysicalDevices) F(GetPhysicalDeviceProperties) F(GetPhysicalDeviceQueueFamilyProperties)
     F(EnumerateDeviceExtensionProperties) F(GetPhysicalDeviceMemoryProperties) F(CreateDevice)
-    F(GetPhysicalDeviceImageFormatProperties2) F(CreateAndroidSurfaceKHR) F(DestroySurfaceKHR)
+    F(GetPhysicalDeviceImageFormatProperties2) F(GetPhysicalDeviceFormatProperties) F(CreateAndroidSurfaceKHR) F(DestroySurfaceKHR)
     F(GetPhysicalDeviceSurfaceSupportKHR) F(GetPhysicalDeviceSurfaceCapabilitiesKHR) F(GetPhysicalDeviceSurfaceFormatsKHR)
     F(GetPhysicalDeviceSurfacePresentModesKHR)
     if (!cfg.noGetDeviceProcAddr)
@@ -1137,6 +1197,8 @@ static void good(void) {
     cfg.memory.memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     cfg.externalFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
     cfg.maxExtent = (VkExtent3D) { 16384, 16384, 1 };
+    cfg.optimalFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     emu.surfaceFormats[0] = (VkSurfaceFormatKHR) { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     emu.surfaceFormats[1] = (VkSurfaceFormatKHR) { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     emu.surfaceFormatCount = 2;

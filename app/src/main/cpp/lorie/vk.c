@@ -293,6 +293,7 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID };
     VkExternalImageFormatProperties externalProps = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
     VkImageFormatProperties2 formatOut = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &externalProps };
+    VkImageUsageFlags optional = 0;
     uint32_t i, memoryType = UINT32_MAX;
     uint8_t reason = LORIE_FALLBACK_NONE;
     VkResult r = VK_SUCCESS;
@@ -348,20 +349,40 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
         goto fail;
     }
 
-    // The image exactly as it will be made, asked about as an import of an AHardwareBuffer.
+    // The optional transfer usage only where the format has the features vkCmdCopyImage asks of an image of optimal
+    // tiling (VUID-vkCmdCopyImage-srcImage-01995, VUID-vkCmdCopyImage-dstImage-01996).
+    if (images->optionalUsage & ~img.usage) {
+        VkFormatProperties features = {0};
+        vk->GetPhysicalDeviceFormatProperties(vk->physicalDevice, img.format, &features);
+        if (features.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)
+            optional |= images->optionalUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (features.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
+            optional |= images->optionalUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        optional &= ~img.usage;
+    }
+
+    // The image exactly as it will be made, asked about as an import of an AHardwareBuffer: with the optional usage
+    // first where there is one (refused, it is asked about again without, and made without).
     {
         VkPhysicalDeviceImageFormatInfo2 info = {
                 .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &externalInfo,
-                .format = img.format, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = img.usage };
-        r = vk->GetPhysicalDeviceImageFormatProperties2(vk->physicalDevice, &info, &formatOut);
-        if (r != VK_SUCCESS ||
-            !(externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
-            formatOut.imageFormatProperties.maxExtent.width < desc.width ||
-            formatOut.imageFormatProperties.maxExtent.height < desc.height) {
-            reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;
-            r = r != VK_SUCCESS ? r : VK_ERROR_FORMAT_NOT_SUPPORTED;
-            goto fail;
+                .format = img.format, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = img.usage | optional };
+        for (;;) {
+            r = vk->GetPhysicalDeviceImageFormatProperties2(vk->physicalDevice, &info, &formatOut);
+            if (r == VK_SUCCESS &&
+                (externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) &&
+                formatOut.imageFormatProperties.maxExtent.width >= desc.width &&
+                formatOut.imageFormatProperties.maxExtent.height >= desc.height)
+                break;
+            if (info.usage == img.usage) {
+                reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;
+                r = r != VK_SUCCESS ? r : VK_ERROR_FORMAT_NOT_SUPPORTED;
+                goto fail;
+            }
+            info.usage = img.usage;
         }
+        img.usage = info.usage;
     }
 
     // Any memory type the buffer allows, device-local first.
@@ -452,6 +473,18 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
     return found;
 
     fail:
+    // Made with the optional usage, and that failed: made again without it. The usage is only for copies that are
+    // drawn without it, never a reason for a buffer not to be imported (nothing recorded for it).
+    if (img.usage & optional) {
+        VkImageUsageFlags kept = images->optionalUsage;
+        loge("AHardwareBuffer %llu: not made with the optional usage %#x (reason %u, VkResult %d), made without it",
+             (unsigned long long) id, optional, reason, r);
+        lorieVkImageDestroy(vk, &img);
+        images->optionalUsage = 0;
+        found = lorieVkImport(vk, images, id, ahb, extraUsage, st);
+        images->optionalUsage = kept;
+        return found;
+    }
     lorieVkImageDestroy(vk, &img);
     lorieVkImportFailed(images, st, reason, r, id, &desc);
     return NULL;
@@ -1422,7 +1455,7 @@ VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
     VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     VkResult res;
-    r->usedCount = r->sourceDraws = r->destinationDraws = r->draws = 0;
+    r->usedCount = r->sourceDraws = r->destinationDraws = r->draws = r->copies = 0;
     r->submitCpuUs = r->fenceWaitUs = 0;
     if ((res = vk->ResetCommandBuffer(r->cmd, 0)) != VK_SUCCESS || (res = vk->ResetDescriptorPool(vk->device, r->descriptors, 0)) != VK_SUCCESS)
         return res;
@@ -1500,6 +1533,26 @@ bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct l
         }
         vk->CmdEndRenderPass(r->cmd);
     }
+    return true;
+}
+
+bool lorieVkFrameCopyImage(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                           const VkImageCopy *regions, uint32_t count) {
+    uint32_t i;
+
+    if (src == dst || !count || src->format != dst->format || !(src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        !(dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return false;
+    // A copy written into dst before in this frame: this one's writes after it (a draw's render pass or a change of
+    // use orders the others; two copies of one use are not ordered without a barrier).
+    for (i = 0; i < r->usedCount; i++)
+        if (r->used[i].img == dst && r->used[i].use == LORIE_VK_USE_TRANSFER_DST)
+            lorieVkCmdBarrier(vk, r->cmd, lorieVkUseBarrier(dst->image, LORIE_VK_USE_TRANSFER_DST, LORIE_VK_USE_TRANSFER_DST));
+    if (!lorieVkFrameUse(vk, r, src, LORIE_VK_USE_TRANSFER_SRC) || !lorieVkFrameUse(vk, r, dst, LORIE_VK_USE_TRANSFER_DST))
+        return false;
+    vk->CmdCopyImage(r->cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     count, regions);
+    r->copies++;
     return true;
 }
 
@@ -1672,6 +1725,7 @@ VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, vola
     LORIE_DIAG_ADD(st, vkImportedSourceDraws, r->sourceDraws);
     LORIE_DIAG_ADD(st, vkImportedDestinationDraws, r->destinationDraws);
     LORIE_DIAG_ADD(st, vkRenderCommands, r->draws);
+    LORIE_DIAG_ADD(st, vkCopyCommands, r->copies);
     LORIE_DIAG_ADD(st, vkSubmitCpuUs, r->submitCpuUs);
     LORIE_DIAG_ADD(st, vkFenceWaitUs, r->fenceWaitUs);
     return VK_SUCCESS;

@@ -25,6 +25,7 @@ struct lorie_shared_server_state;
     X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
     X(GetPhysicalDeviceQueueFamilyProperties) X(EnumerateDeviceExtensionProperties) \
     X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceImageFormatProperties2) \
+    X(GetPhysicalDeviceFormatProperties) \
     X(CreateAndroidSurfaceKHR) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
     X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR)
 #define LORIE_VK_DEVICE_FNS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) \
@@ -95,6 +96,10 @@ struct lorie_vk_image {
 struct lorie_vk_images {
     struct lorie_vk_image **items;
     uint32_t count, capacity;
+    /* Transfer usage (TRANSFER_SRC/DST only) an import is given where the device allows it - the format's features and
+     * the image-format query of an import of this AHB with it - and made without otherwise: nothing refused, nothing
+     * recorded (renderer.c: TERMUX_X11_RENDERER_VK_TRANSFER_COPY) */
+    VkImageUsageFlags optionalUsage;
     uint8_t lastReason;         /* why the last refused import was refused (LORIE_FALLBACK_*) */
     VkResult lastResult;
 };
@@ -240,7 +245,7 @@ struct lorie_vk_renderer {
     VkPresentModeKHR presentMode;   /* the one the swapchain was made with */
     /* this frame: the imported images it used and the use each is in; its draws */
     struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
-    uint32_t usedCount, sourceDraws, destinationDraws, draws;
+    uint32_t usedCount, sourceDraws, destinationDraws, draws, copies;
     uint64_t submitCpuUs, fenceWaitUs;
 };
 
@@ -259,6 +264,10 @@ VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r);
 bool lorieVkFrameUse(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *img, enum lorie_vk_use use);
 bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
                       const struct lorie_vk_quad *quads, uint32_t count, int filter);
+// The regions copied from src into dst by vkCmdCopyImage (both images with the transfer usage, of one format),
+// each buffer taken over for the transfer as lorieVkFrameCopy takes them for drawing. False: nothing recorded.
+bool lorieVkFrameCopyImage(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                           const VkImageCopy *regions, uint32_t count);
 bool lorieVkFrameCursor(struct lorie_vk *vk, struct lorie_vk_renderer *r, const uint32_t *bits, uint32_t width, uint32_t height);
 void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, struct lorie_vk_image *root,
                         const VkRect2D *viewport, const struct lorie_vk_quad *rootQuad, const struct lorie_vk_quad *cursorQuad,

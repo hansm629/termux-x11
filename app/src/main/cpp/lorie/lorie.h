@@ -190,6 +190,7 @@ typedef struct {
     uint64_t dstBufferId;
     int16_t xOff, yOff;
     uint16_t numRects;
+    uint8_t dstDepth;       /* the destination's depth: 32 keeps alpha in its RGBX 4th byte, below that it is padding */
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
 } LorieGpuCopyEntry;
 
@@ -253,6 +254,8 @@ struct lorie_backend_control {
     volatile uint8_t vkFailAtInvalid;           /* X: the variable was set, to none of the seven */
     volatile uint8_t vkSelftestFull;            /* X: TERMUX_X11_RENDERER_VK_SELFTEST=full - the full ownership self-test */
     volatile uint8_t vkSelftestInvalid;         /* X: the variable was set, to something else */
+    volatile uint8_t vkTransferCopy;            /* X: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1 - experimental: Present copies
+                                                 * by vkCmdCopyImage where that gives what the shader copy gives */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };

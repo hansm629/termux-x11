@@ -342,6 +342,9 @@ void OsVendorInit(void) {
                                                                  &lorieScreen.state->backend.vkFailAtInvalid);
     lorieScreen.state->backend.vkSelftestFull = lorieRequestedVkSelftest(getenv("TERMUX_X11_RENDERER_VK_SELFTEST"),
                                                                          &lorieScreen.state->backend.vkSelftestInvalid);
+    // Experimental: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1, Present copies by vkCmdCopyImage where equivalent (renderer.c).
+    lorieScreen.state->backend.vkTransferCopy = getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY") &&
+                                                !strcmp(getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
 }
@@ -847,7 +850,8 @@ static void lorieLogRendererDiag(void) {
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
-              "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu)",
+              "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
+              "vk_transfer_copy=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -857,7 +861,8 @@ static void lorieLogRendererDiag(void) {
         lorieActiveName(d.active),
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
-        TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs));
+        TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
+        pvfb->state->backend.vkTransferCopy ? "on" : "off");
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -1435,6 +1440,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->xOff = x_off;
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
+    entry->dstDepth = (uint8_t) dst->drawable.depth;
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
