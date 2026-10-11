@@ -54,6 +54,21 @@ int main(void) {
     CHECK(calls.waitIdle == 1 && calls.destroyDevice == 1 && calls.destroyInstance == 1 && !vk.instance && !vk.device,
           "destroy: wait %d, device %d, instance %d", calls.waitIdle, calls.destroyDevice, calls.destroyInstance);
 
+    /* a device with global priority: its queue asked for at HIGH; refused, made again at the default one */
+    good(); cfg.dev[0].ext[3] = "VK_EXT_global_priority";
+    ok = attempt(LORIE_VK_FAIL_AT_NONE);
+    CHECK(ok && calls.priority == VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT && vk.highPriority && st.diag.vkHighPriority &&
+          !strcmp(calls.deviceExt, SWAPCHAIN " " EXT_AHB " " FOREIGN " VK_EXT_global_priority"),
+          "global priority: queue priority %d, extensions %s", calls.priority, calls.deviceExt);
+    lorieVkDestroyDevice(&vk);
+    good(); cfg.dev[0].ext[3] = "VK_EXT_global_priority"; cfg.refusePriority = true;
+    ok = attempt(LORIE_VK_FAIL_AT_NONE);
+    CHECK(ok && calls.createDevice == 2 && calls.priority == 0 && !vk.highPriority && !st.diag.vkHighPriority &&
+          st.diag.fallbackTotal == 0 && !strcmp(calls.deviceExt, SWAPCHAIN " " EXT_AHB " " FOREIGN),
+          "global priority refused: %d device creations, priority %d, %u fallbacks, extensions %s", calls.createDevice,
+          calls.priority, st.diag.fallbackTotal, calls.deviceExt);
+    lorieVkDestroyDevice(&vk);
+
     good(); cfg.noEnumerateInstanceVersion = true;
     failed("1.0 loader", attempt(LORIE_VK_FAIL_AT_NONE), LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_VERSION);
     CHECK(!calls.createInstance, "1.0 loader: instance created");

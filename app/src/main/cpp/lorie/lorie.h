@@ -307,6 +307,7 @@ struct lorie_renderer_diag {
     volatile char vkDevice[96];                 /* VkPhysicalDeviceProperties.deviceName of the device used */
     volatile uint32_t vkDriverVersion, vkApiVersion;
     volatile char vkPresentMode[16];            /* the present mode the swapchain was created with */
+    volatile uint8_t vkHighPriority;            /* the device's queue made at HIGH global priority */
 
     /* fallbacks: every one counted, with its class and reason; the last one in detail */
     volatile uint32_t fallbackTotal;

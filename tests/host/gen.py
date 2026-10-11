@@ -77,6 +77,7 @@ recipes = {
             "bool lorieVkInjected(volatile struct lorie_shared_server_state *st, uint8_t point, uint8_t reason) {",
             "static bool lorieVkHasExtension(const VkExtensionProperties *ext, uint32_t count, const char *name) {",
             "static uint8_t lorieVkDeviceUnsuitable(struct lorie_vk *vk, VkPhysicalDevice pd, uint32_t *queueFamily) {",
+            "static const char *lorieVkGlobalPriority(struct lorie_vk *vk, VkPhysicalDevice pd) {",
             "void lorieVkDestroyDevice(struct lorie_vk *vk) {",
             "bool lorieVkCreateDevice(struct lorie_vk *vk, PFN_vkGetInstanceProcAddr gipa, volatile struct lorie_shared_server_state *st) {",
             "VkImageUsageFlags lorieVkAhbImageUsage(uint64_t ahbUsage) {",

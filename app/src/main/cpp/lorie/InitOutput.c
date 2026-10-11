@@ -766,11 +766,12 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieVkTiming: acquire_success=%llu(+%llu) acquire_suboptimal=%llu(+%llu) acquire_timeout=%llu(+%llu) "
               "acquire_not_ready=%llu(+%llu) acquire_out_of_date=%llu(+%llu) acquire_wait_us=%llu(+%llu) "
               "submit_cpu_us=%llu(+%llu) fence_wait_us=%llu(+%llu) present_call_us=%llu(+%llu) selftest=%s "
-              "device=\"%s\" driver_version=0x%x api_version=0x%x present_mode=\"%s\"",
+              "device=\"%s\" driver_version=0x%x api_version=0x%x present_mode=\"%s\" queue_priority=%s",
         TD(vkAcquireSuccess), TD(vkAcquireSuboptimal), TD(vkAcquireTimeout), TD(vkAcquireNotReady),
         TD(vkAcquireOutOfDate), TD(vkAcquireWaitUs), TD(vkSubmitCpuUs), TD(vkFenceWaitUs), TD(vkPresentCallUs),
         d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none",
-        (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode);
+        (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode,
+        d.vkHighPriority ? "high" : "default");
     log(INFO, "XlorieVkSelftest: result=%s compares=%llu(+%llu) iterations=%u formats_passed=0x%x formats_unavailable=0x%x "
               "us=%llu fail_step=%s fail_format=%u fail_direction=%u fail_iteration=%u fail_offset=%u fail_expected=0x%02x "
               "fail_actual=0x%02x fail_vkresult=%d",
