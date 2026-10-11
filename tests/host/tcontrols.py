@@ -346,7 +346,7 @@ CONTROLS = [
      """                (wait = VK_SUCCESS) != VK_SUCCESS) {""",
      "tvkframe"),
     ("a swapchain in MAILBOX", "vk.c",
-     """                .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE, .oldSwapchain = old };""",
+     """                .presentMode = presentMode, .clipped = VK_TRUE, .oldSwapchain = old };""",
      """                .presentMode = VK_PRESENT_MODE_MAILBOX_KHR, .clipped = VK_TRUE, .oldSwapchain = old };""",
      "tvkframe"),
     ("the surface's first format taken", "vk.c",

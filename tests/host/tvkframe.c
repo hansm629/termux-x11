@@ -5,7 +5,8 @@
  *   Renderer objects: made, or - when any one of them fails - none left behind and one fallback (FATAL_BACKEND,
  *   VK_DEVICE). Swapchain: R8G8B8A8 preferred, else B8G8R8A8, else VK_SURFACE_FORMAT; the window's size within
  *   the surface's limits; one image more than the minimum within the maximum; IDENTITY transform when allowed;
- *   opaque composite alpha when allowed; FIFO; the surface's currentExtent when it gives one, else the window's
+ *   opaque composite alpha when allowed; FIFO for smooth, else IMMEDIATE, MAILBOX or FIFO, the first the surface
+ *   lists; the surface's currentExtent when it gives one, else the window's
  *   size; made again without leaking, destroyed completely (swapchain before surface); injection at surface or
  *   swapchain makes no call. Acquire: each result handled - the fence waited for and reset on success, nothing
  *   waited for on a timeout. Made again only when out of date: SUBOPTIMAL on every acquire and present keeps
@@ -201,6 +202,28 @@ int main(void) {
         emu.fenceResult = VK_TIMEOUT;
         CHECK(lorieVkAcquire(&vk, &r, &index, &st) == LORIE_VK_FRAME_FATAL && fallbackOnce(LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SWAPCHAIN),
               "acquire whose fence never signals: not a failure");
+    }
+
+    /* the present mode: smooth - FIFO; immediate - the lowest latency the surface lists */
+    {
+        static const struct { bool smooth; VkPresentModeKHR modes[3]; uint32_t n; VkPresentModeKHR want; const char *name; } t[] = {
+            { false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_IMMEDIATE_KHR, "IMMEDIATE" },
+            { false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR }, 2, VK_PRESENT_MODE_MAILBOX_KHR, "MAILBOX" },
+            { false, { VK_PRESENT_MODE_FIFO_KHR }, 1, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
+            { true, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
+        };
+        for (unsigned k = 0; k < sizeof t / sizeof *t; k++) {
+            device();
+            CHECK(lorieVkRendererCreate(&vk, &r, &st), "renderer objects not made");
+            memcpy(emu.presentModes, t[k].modes, sizeof t[k].modes);
+            emu.presentModeCount = t[k].n;
+            r.smooth = t[k].smooth;
+            CHECK(lorieVkSwapchainCreate(&vk, &r, &window, &st) && emu.swapchainInfo.presentMode == t[k].want && r.presentMode == t[k].want &&
+                  !strcmp((const char *) st.diag.vkPresentMode, t[k].name) && lorieVkPresentModeFor(&vk, &r, t[k].smooth) == t[k].want,
+                  "present mode %u (%s, %u listed): made with %d, logged %s", k, t[k].smooth ? "smooth" : "immediate", t[k].n,
+                  emu.swapchainInfo.presentMode, (const char *) st.diag.vkPresentMode);
+        }
+        r.smooth = false;
     }
 
     /* fifty frames with every acquire and present SUBOPTIMAL (a swapchain not pre-rotated): one swapchain */

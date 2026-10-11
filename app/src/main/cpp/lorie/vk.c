@@ -1216,6 +1216,24 @@ bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, vol
     return false;
 }
 
+VkPresentModeKHR lorieVkPresentModeFor(struct lorie_vk *vk, struct lorie_vk_renderer *r, bool smooth) {
+    VkPresentModeKHR modes[16];
+    uint32_t count = 16, i;
+    bool immediate = false, mailbox = false;
+
+    if (smooth || !r->surface || vk->GetPhysicalDeviceSurfacePresentModesKHR(vk->physicalDevice, r->surface, &count, modes) < 0)
+        return VK_PRESENT_MODE_FIFO_KHR;
+    for (i = 0; i < count; i++) {
+        immediate |= modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR;
+        mailbox |= modes[i] == VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    return immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+}
+
+static const char *lorieVkPresentModeName(VkPresentModeKHR mode) {
+    return mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX" : "FIFO";
+}
+
 bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct ANativeWindow *window,
                             volatile struct lorie_shared_server_state *st) {
     VkSurfaceCapabilitiesKHR caps;
@@ -1224,6 +1242,7 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkSwapchainKHR old = r->swapchain;
     VkBool32 supported = VK_FALSE;
+    VkPresentModeKHR presentMode;
     uint8_t reason = LORIE_FALLBACK_VK_SWAPCHAIN;
     VkResult res;
 
@@ -1284,6 +1303,7 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
         res = VK_ERROR_OUT_OF_DATE_KHR;
         goto fail;
     }
+    presentMode = lorieVkPresentModeFor(vk, r, r->smooth);
     imageCount = caps.minImageCount + 1;
     if (caps.maxImageCount && imageCount > caps.maxImageCount)
         imageCount = caps.maxImageCount;
@@ -1305,7 +1325,7 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
                                   (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR :
                                   (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) ?
                                   VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR : VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
-                .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE, .oldSwapchain = old };
+                .presentMode = presentMode, .clipped = VK_TRUE, .oldSwapchain = old };
         vk->DeviceWaitIdle(vk->device);     // the old swapchain's images may still be in use
         lorieVkSwapchainImagesDestroy(vk, r);
         res = vk->CreateSwapchainKHR(vk->device, &info, NULL, &r->swapchain);
@@ -1332,10 +1352,12 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
         LORIE_VK_TRY(vk->CreateSemaphore(vk->device, &sem, NULL, &r->rendered[i]));
     }
     r->recreate = false;
+    r->presentMode = presentMode;
     LORIE_DIAG_ADD(st, vkSwapchainCreated, 1);
     if (st)
-        memcpy((char *) st->diag.vkPresentMode, "FIFO", 5);
-    log("swapchain %ux%u format %d, %u images", r->extent.width, r->extent.height, format, count);
+        strncpy((char *) st->diag.vkPresentMode, lorieVkPresentModeName(presentMode), sizeof(st->diag.vkPresentMode) - 1);
+    log("swapchain %ux%u format %d, %u images, %s", r->extent.width, r->extent.height, format, count,
+        lorieVkPresentModeName(presentMode));
     return true;
 
     fail:

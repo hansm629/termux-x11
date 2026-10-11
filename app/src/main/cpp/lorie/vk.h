@@ -26,7 +26,7 @@ struct lorie_shared_server_state;
     X(GetPhysicalDeviceQueueFamilyProperties) X(EnumerateDeviceExtensionProperties) \
     X(GetPhysicalDeviceMemoryProperties) X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceImageFormatProperties2) \
     X(CreateAndroidSurfaceKHR) X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR) \
-    X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR)
+    X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR)
 #define LORIE_VK_DEVICE_FNS(X) X(DestroyDevice) X(GetDeviceQueue) X(DeviceWaitIdle) \
     X(GetAndroidHardwareBufferPropertiesANDROID) X(CreateImage) X(DestroyImage) X(AllocateMemory) X(FreeMemory) \
     X(BindImageMemory) X(CreateImageView) X(DestroyImageView) \
@@ -185,6 +185,10 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
  * swapchain is not pre-rotated to the display's current transform - ours never is, as GLES's surface is not -
  * and making it again would give the same swapchain and the same result. More than this many OUT_OF_DATE in a
  * row without a frame presented in between is a failure, not a reason to make it once more.
+ *
+ * Its present mode follows GLES's swap interval (renderer.c smoothPresentationEnabled): smooth - FIFO, interval 1;
+ * immediate - IMMEDIATE, interval 0, where the surface supports it, else MAILBOX (no tearing, but no waiting for
+ * the display either), else FIFO, which every surface supports. Only modes the surface lists are asked for.
  */
 #define LORIE_VK_MAX_OUT_OF_DATE 3
 #define LORIE_VK_MAX_FRAME_IMAGES 32
@@ -229,7 +233,9 @@ struct lorie_vk_renderer {
     VkSemaphore rendered[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
     VkRenderPass screenPass;
     VkPipeline screenPipeline, cursorPipeline;
-    bool recreate;                  /* out of date: made again before the next frame */
+    bool recreate;                  /* out of date, or another present mode wanted: made again before the next frame */
+    bool smooth;                    /* the present mode wanted: FIFO, else the lowest latency the surface has */
+    VkPresentModeKHR presentMode;   /* the one the swapchain was made with */
     /* this frame: the imported images it used and the use each is in; its draws */
     struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
     uint32_t usedCount, sourceDraws, destinationDraws, draws;
@@ -241,6 +247,8 @@ enum { LORIE_VK_FRAME_OK, LORIE_VK_FRAME_SKIP, LORIE_VK_FRAME_RECREATE, LORIE_VK
 bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
 void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r);
 // The window's surface and swapchain (made again, keeping the surface, when it is already there).
+// The present mode a swapchain on r's surface is made with for `smooth` (see LORIE_VK_MAX_OUT_OF_DATE).
+VkPresentModeKHR lorieVkPresentModeFor(struct lorie_vk *vk, struct lorie_vk_renderer *r, bool smooth);
 bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct ANativeWindow *window,
                             volatile struct lorie_shared_server_state *st);
 void lorieVkSwapchainDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r);

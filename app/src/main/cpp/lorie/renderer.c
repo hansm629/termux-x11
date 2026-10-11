@@ -1743,11 +1743,20 @@ static bool rendererVkStart(void) {
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_OWNERSHIP, VK_SUCCESS);
         return false;
     }
+    vkr.smooth = smoothPresentationEnabled;
     if (!lorieVkSwapchainCreate(&vk, &vkr, win, state)) {
         lorieVkSwapchainDestroy(&vk, &vkr);
         return false;
     }
     return true;
+}
+
+// The present mode setting changed (GLES: rendererApplyPresentMode): the swapchain is made again before the next
+// frame only if the mode it would be made with now is not the one it has.
+static void rendererVkApplyPresentMode(void) {
+    vkr.smooth = smoothPresentationEnabled;
+    if (vkActive && vkr.swapchain && lorieVkPresentModeFor(&vk, &vkr, vkr.smooth) != vkr.presentMode)
+        vkr.recreate = true;
 }
 
 /*
@@ -2208,7 +2217,7 @@ __noreturn static void* rendererThread(void) {
                 munmap(oldState, sizeof(*oldState));
         }
 
-        if (windowChanged) { rendererRefreshContext(); waitingForBuffers = false; } if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); } // Attach all pending buffers to GL.
+        if (windowChanged) { rendererRefreshContext(); waitingForBuffers = false; } if (presentModeChanged) { presentModeChanged = false; rendererApplyPresentMode(); rendererVkApplyPresentMode(); } // Attach all pending buffers to GL.
         pthread_spin_lock(&bufferLock);
         while((buf = LorieBufferList_first(&addedBuffers))) {
             if (rendererGlesEager())

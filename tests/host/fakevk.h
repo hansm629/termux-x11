@@ -74,6 +74,8 @@ static struct {
     bool surfaceUnsupported;
     VkSurfaceFormatKHR surfaceFormats[4];
     uint32_t surfaceFormatCount;
+    VkPresentModeKHR presentModes[4];   /* what the surface lists: good() lists FIFO only */
+    uint32_t presentModeCount;
     VkSurfaceCapabilitiesKHR caps;
     long failObject;                /* the n-th render pass, pipeline, framebuffer, ... made fails (1-based, 0: none) */
     /* kept */
@@ -883,6 +885,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceSurfaceFormatsKHR(VkPhys
     *n = emu.surfaceFormatCount;
     return VK_SUCCESS;
 }
+static VKAPI_ATTR VkResult VKAPI_CALL fGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t *n, VkPresentModeKHR *m) {
+    (void) pd; (void) s;
+    if (m)
+        for (uint32_t i = 0; i < emu.presentModeCount && i < *n; i++)
+            m[i] = emu.presentModes[i];
+    *n = emu.presentModeCount;
+    return VK_SUCCESS;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *a,
                                                           VkSwapchainKHR *out) {
     (void) d; (void) a;
@@ -1098,6 +1108,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetInstanceProcAddr(VkInstance 
     F(EnumerateDeviceExtensionProperties) F(GetPhysicalDeviceMemoryProperties) F(CreateDevice)
     F(GetPhysicalDeviceImageFormatProperties2) F(CreateAndroidSurfaceKHR) F(DestroySurfaceKHR)
     F(GetPhysicalDeviceSurfaceSupportKHR) F(GetPhysicalDeviceSurfaceCapabilitiesKHR) F(GetPhysicalDeviceSurfaceFormatsKHR)
+    F(GetPhysicalDeviceSurfacePresentModesKHR)
     if (!cfg.noGetDeviceProcAddr)
         F(GetDeviceProcAddr)
 #undef F
@@ -1129,6 +1140,8 @@ static void good(void) {
     emu.surfaceFormats[0] = (VkSurfaceFormatKHR) { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     emu.surfaceFormats[1] = (VkSurfaceFormatKHR) { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
     emu.surfaceFormatCount = 2;
+    emu.presentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
+    emu.presentModeCount = 1;
     emu.caps = (VkSurfaceCapabilitiesKHR) {
             .minImageCount = 2, .maxImageCount = 4, .currentExtent = { 1080, 2400 }, .minImageExtent = { 1, 1 },
             .maxImageExtent = { 4096, 4096 }, .maxImageArrayLayers = 1,
