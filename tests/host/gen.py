@@ -100,6 +100,24 @@ recipes = {
         + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
+    # the GPU copy queue's types (fakevk.h)
+    "gpucopytypes": lambda: span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyEntry;"),
+    # a Present copy from the X server's queue through the renderer's frame and back to the X server - tpresentcopy.c:
+    # LorieBuffer's description and GLES's swizzle rule, the X server's side (schedule, done, ack), the renderer's
+    # GLES copies (what Vulkan must match) and its Vulkan copies, alone and in a frame
+    "buffertypes": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "} LorieBuffer_Desc;"),
+    "presentcopy": lambda: func(B, "__LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {")
+        + func(I, "bool lorieRendererAvailable(void) {")
+        + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
+        + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
+        + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
+        + func(R, "static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {")
+        + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
+        + func(R, "static bool rendererVkOwnedLocked(void) {")
+        + func(R, "static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff, int16_t yOff, const LorieBuffer_Desc *src,")
+        + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
+        + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
+        + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {"),
     # the shaders as committed (vk.c includes them)
     "vk_shaders": lambda: open(os.path.join(L, "vk_shaders.h"), encoding="utf-8").read(),
 }

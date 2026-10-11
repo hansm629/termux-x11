@@ -1753,6 +1753,24 @@ static void rendererSelectBackend(void) {
 }
 
 /*
+ * One rectangle of a GPU copy, as GLES's rendererApplyPendingGpuCopiesLocked draws it: destination pixels
+ * (r.x1 + xOff .. r.x2 + xOff, r.y1 + yOff .. r.y2 + yOff) from source pixels (r.x1 .. r.x2, r.y1 .. r.y2), red and
+ * blue swapped when `swizzle` (the two formats' orders differ: GLES's LorieBuffer_isRgba rule, vk.h rgbaOrder).
+ * The clip-space values of GLES's vertices once drawRegion negated y: both put y = -1 on the buffer's first row
+ * (Vulkan's framebuffer origin is its top row; GL's is its bottom row, a texture's first). tpresentcopy.c checks
+ * this against GLES's own code.
+ */
+static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff, int16_t yOff, const LorieBuffer_Desc *src,
+                                               const LorieBuffer_Desc *dst, bool swizzle) {
+    return (struct lorie_vk_quad) {
+            .rect = { 2.f * (float) (r.x1 + xOff) / (float) dst->width - 1.f, 2.f * (float) (r.y1 + yOff) / (float) dst->height - 1.f,
+                      2.f * (float) (r.x2 + xOff) / (float) dst->width - 1.f, 2.f * (float) (r.y2 + yOff) / (float) dst->height - 1.f },
+            .uv = { (float) r.x1 / (float) src->width, (float) r.y1 / (float) src->height,
+                    (float) r.x2 / (float) src->width, (float) r.y2 / (float) src->height },
+            .flags = swizzle ? LORIE_VK_QUAD_SWIZZLE : 0 };
+}
+
+/*
  * The pending GPU copies recorded into the frame (lorieVkFrameCopy), as GLES's rendererApplyPendingGpuCopiesLocked
  * does them: the same rectangles, offsets and swizzle rule. The queue is not advanced here: *readIndex and
  * *serial are what the caller publishes once the frame's fence signalled. False on a buffer Vulkan cannot use
@@ -1783,19 +1801,8 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
                 lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED, VK_SUCCESS);
                 return false;
             }
-            for (k = 0; k < n; k++) {
-                LorieGpuCopyRect r = entry.rects[k];
-                // Vulkan's clip space has y pointing down from the first row, as the buffer's rows go: GLES's
-                // values, without its FBO flip.
-                quads[k] = (struct lorie_vk_quad) {
-                        .rect = { 2.f * (float) (r.x1 + entry.xOff) / (float) dd->width - 1.f,
-                                  2.f * (float) (r.y1 + entry.yOff) / (float) dd->height - 1.f,
-                                  2.f * (float) (r.x2 + entry.xOff) / (float) dd->width - 1.f,
-                                  2.f * (float) (r.y2 + entry.yOff) / (float) dd->height - 1.f },
-                        .uv = { (float) r.x1 / (float) sd->width, (float) r.y1 / (float) sd->height,
-                                (float) r.x2 / (float) sd->width, (float) r.y2 / (float) sd->height },
-                        .flags = s->rgbaOrder != d->rgbaOrder ? LORIE_VK_QUAD_SWIZZLE : 0 };
-            }
+            for (k = 0; k < n; k++)
+                quads[k] = rendererVkCopyQuad(entry.rects[k], entry.xOff, entry.yOff, sd, dd, s->rgbaOrder != d->rgbaOrder);
             if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {
                 lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
                 return false;

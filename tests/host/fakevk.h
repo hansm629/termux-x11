@@ -1,5 +1,5 @@
-/* The fake Vulkan the vk.c host tests run on (tvkinit.c, tvkimport.c, tvkbarrier.c, tvkselftest.c): reached
- * only through the vkGetInstanceProcAddr given to lorieVkCreateDevice, as libvulkan.so's would be, configured
+/* The fake Vulkan the vk.c host tests run on (tvkinit.c, tvkimport.c, tvkbarrier.c, tvkselftest.c, tvkframe.c,
+ * tpresentcopy.c): reached only through the vkGetInstanceProcAddr given to lorieVkCreateDevice, as libvulkan.so's would be, configured
  * per case through `cfg` (good() sets up a usable phone), and recording what it was called with in `calls` and
  * `imp`. Also the NDK's AHardwareBuffer as far as vk.c uses it, and the real vk.h/vk.c code (gen.py "vk").
  *
@@ -75,6 +75,7 @@ static struct {
     VkSwapchainCreateInfoKHR swapchainInfo;
     uint32_t nextImage;
     int passesIntoImported, drawsFromImported, drawsIntoImported, draws;
+    AHardwareBuffer *drawnFrom[64], *drawnInto[64];    /* draw n's X server buffers (NULL: none), at n % 64 */
     long copies, locks;
     bool fencePending;
     int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
@@ -144,7 +145,29 @@ static int AHardwareBuffer_unlock(AHardwareBuffer *b, int32_t *fence) {
 }
 
 #include "diagtypes_src.inc"
-struct lorie_shared_server_state { struct lorie_renderer_diag diag; struct lorie_backend_control backend; };
+#include "gpucopytypes_src.inc"
+/* the shared state, as far as the code under test uses it (lorie.h's fields, its types for the GPU copy queue;
+ * a smaller cursor) */
+struct lorie_shared_server_state {
+    int lock, lockingPid;
+    struct {
+        volatile uint32_t writeIndex;
+        volatile uint32_t readIndex;
+        volatile uint64_t completedSerial;
+        LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
+    } gpuCopyQueue;
+    uint64_t rootWindowTextureID;
+    volatile uint8_t drawRequested, surfaceAvailable, waitForNextFrame;
+    volatile int renderedFrames;
+    struct lorie_renderer_diag diag;
+    struct lorie_backend_control backend;
+    struct {
+        int lock, lockingPid;
+        uint32_t x, y, xhot, yhot, width, height;
+        uint32_t bits[64 * 64];
+        volatile uint8_t updated, moved;
+    } cursor;
+};
 #define log(...) ((void) 0)
 #define loge(...) ((void) 0)
 #include "vk_shaders.h"
@@ -653,6 +676,8 @@ static void run(const struct fake_op *op) {
         else if (source && (!source->owned || source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
                             *layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
             violation("draw sampling an X server buffer not owned, or not in SHADER_READ_ONLY_OPTIMAL");
+        emu.drawnFrom[emu.draws % 64] = source;
+        emu.drawnInto[emu.draws % 64] = passTarget;
         emu.draws++;
         if (source)
             emu.drawsFromImported++;
