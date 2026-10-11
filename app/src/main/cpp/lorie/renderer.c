@@ -1906,9 +1906,9 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         return rendererVkFail();
     }
 
-    // A swapchain no longer of the window's size, or reported suboptimal or out of date, is made again first.
-    if ((vkr.recreate || vkr.windowWidth != (uint32_t) ANativeWindow_getWidth(win) ||
-         vkr.windowHeight != (uint32_t) ANativeWindow_getHeight(win)) && !lorieVkSwapchainCreate(&vk, &vkr, win, state))
+    // A swapchain reported out of date is made again first. A new size or format comes as a new surface
+    // (rendererSetWindow, from surfaceChanged), which makes the swapchain again anyway.
+    if (vkr.recreate && !lorieVkSwapchainCreate(&vk, &vkr, win, state))
         return rendererVkFail();
     status = lorieVkAcquire(&vk, &vkr, &index, state);
     if (status == LORIE_VK_FRAME_SKIP)

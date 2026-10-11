@@ -1252,9 +1252,14 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
         r->format = format;
     }
 
-    // The window's size, as GLES's surface has it, within what the surface allows; not pre-rotated (as GLES).
-    r->extent.width = r->windowWidth = (uint32_t) ANativeWindow_getWidth(window);
-    r->extent.height = r->windowHeight = (uint32_t) ANativeWindow_getHeight(window);
+    // The surface's current size where it gives one (currentExtent), otherwise the window's, as GLES's surface
+    // has it; within what the surface allows; not pre-rotated (as GLES).
+    if (caps.currentExtent.width != UINT32_MAX && caps.currentExtent.height != UINT32_MAX)
+        r->extent = caps.currentExtent;
+    else {
+        r->extent.width = (uint32_t) ANativeWindow_getWidth(window);
+        r->extent.height = (uint32_t) ANativeWindow_getHeight(window);
+    }
     r->extent.width = r->extent.width < caps.minImageExtent.width ? caps.minImageExtent.width :
                       r->extent.width > caps.maxImageExtent.width ? caps.maxImageExtent.width : r->extent.width;
     r->extent.height = r->extent.height < caps.minImageExtent.height ? caps.minImageExtent.height :
@@ -1323,6 +1328,16 @@ bool lorieVkSwapchainCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, st
     return false;
 }
 
+// OUT_OF_DATE: the swapchain is made again, unless that already failed to help LORIE_VK_MAX_OUT_OF_DATE times.
+static int lorieVkOutOfDate(struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st) {
+    if (++r->outOfDateStreak > LORIE_VK_MAX_OUT_OF_DATE) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SWAPCHAIN, VK_ERROR_OUT_OF_DATE_KHR);
+        return LORIE_VK_FRAME_FATAL;
+    }
+    r->recreate = true;
+    return LORIE_VK_FRAME_RECREATE;
+}
+
 int lorieVkAcquire(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t *index, volatile struct lorie_shared_server_state *st) {
     uint64_t start = lorieVkNowUs();
     VkResult res = vk->AcquireNextImageKHR(vk->device, r->swapchain, LORIE_VK_ACQUIRE_TIMEOUT_NS, VK_NULL_HANDLE, r->acquireFence, index);
@@ -1340,10 +1355,10 @@ int lorieVkAcquire(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t *i
                 return LORIE_VK_FRAME_FATAL;
             }
             LORIE_DIAG_ADD(st, vkAcquireWaitUs, lorieVkNowUs() - start);
-            if (res == VK_SUBOPTIMAL_KHR) {
+            // Suboptimal still presents successfully: counted, not a reason to make the swapchain again.
+            if (res == VK_SUBOPTIMAL_KHR)
                 LORIE_DIAG_ADD(st, vkAcquireSuboptimal, 1);
-                r->recreate = true;     // drawn and presented now, made again before the next frame
-            } else
+            else
                 LORIE_DIAG_ADD(st, vkAcquireSuccess, 1);
             return LORIE_VK_FRAME_OK;
         case VK_TIMEOUT:
@@ -1354,8 +1369,7 @@ int lorieVkAcquire(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t *i
             return LORIE_VK_FRAME_SKIP;
         case VK_ERROR_OUT_OF_DATE_KHR:
             LORIE_DIAG_ADD(st, vkAcquireOutOfDate, 1);
-            r->recreate = true;
-            return LORIE_VK_FRAME_RECREATE;
+            return lorieVkOutOfDate(r, st);
         default:
             lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
                             res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SWAPCHAIN, res);
@@ -1623,16 +1637,14 @@ int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t in
     res = vk->QueuePresentKHR(vk->queue, &info);
     LORIE_DIAG_ADD(st, vkPresentCallUs, lorieVkNowUs() - start);
     switch (res) {
-        case VK_SUBOPTIMAL_KHR:
-            r->recreate = true;
-            /* fallthrough: presented */
+        case VK_SUBOPTIMAL_KHR:     // presented: nothing to make again (see LORIE_VK_MAX_OUT_OF_DATE)
         case VK_SUCCESS:
+            r->outOfDateStreak = 0;
             LORIE_DIAG_ADD(st, vkQueuePresentSuccess, 1);
             LORIE_DIAG_ADD(st, vkFramesPresented, 1);
             return LORIE_VK_FRAME_OK;
         case VK_ERROR_OUT_OF_DATE_KHR:
-            r->recreate = true;
-            return LORIE_VK_FRAME_RECREATE;
+            return lorieVkOutOfDate(r, st);
         default:
             lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
                             res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_PRESENT, res);

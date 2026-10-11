@@ -170,6 +170,15 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
  * image (source or destination) are added to the diagnostics only after the fence signalled.
  */
 #define LORIE_VK_MAX_SWAPCHAIN_IMAGES 8
+/*
+ * The swapchain is made again only when the presentation engine says it is out of date (and when the window
+ * itself changes: the activity hands the renderer the surface again on every size or format change). Not on
+ * VK_SUBOPTIMAL_KHR, which by definition still presents successfully: Android reports it for every frame whose
+ * swapchain is not pre-rotated to the display's current transform - ours never is, as GLES's surface is not -
+ * and making it again would give the same swapchain and the same result. More than this many OUT_OF_DATE in a
+ * row without a frame presented in between is a failure, not a reason to make it once more.
+ */
+#define LORIE_VK_MAX_OUT_OF_DATE 3
 #define LORIE_VK_MAX_FRAME_IMAGES 32
 
 struct lorie_vk_quad {          /* the shaders' push constants: see shaders/quad.vert */
@@ -204,7 +213,7 @@ struct lorie_vk_renderer {
     VkSwapchainKHR swapchain;
     VkFormat format;
     VkExtent2D extent;
-    uint32_t windowWidth, windowHeight;     /* the window's size the swapchain was made for */
+    uint32_t outOfDateStreak;   /* OUT_OF_DATE results since a frame was last presented */
     uint32_t imageCount;
     VkImage images[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
     VkImageView views[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
@@ -212,7 +221,7 @@ struct lorie_vk_renderer {
     VkSemaphore rendered[LORIE_VK_MAX_SWAPCHAIN_IMAGES];
     VkRenderPass screenPass;
     VkPipeline screenPipeline, cursorPipeline;
-    bool recreate;                  /* suboptimal or out of date: made again before the next frame */
+    bool recreate;                  /* out of date: made again before the next frame */
     /* this frame: the imported images it used and the use each is in; its draws */
     struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
     uint32_t usedCount, sourceDraws, destinationDraws, draws;

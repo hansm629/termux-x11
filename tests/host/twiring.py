@@ -59,6 +59,8 @@ def in_order(what, body, *steps):
         at = i + len(s_)
 
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
+# the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
+check("ANativeWindow_get" not in redraw, "a Vulkan frame compares the window's size with the swapchain's")
 in_order("Vulkan frame", redraw, "lorieVkAcquire(", "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()",
          "rendererVkCopiesLocked(", "lorieVkFrameSubmit(", "completedSerial", "lorie_mutex_unlock(&state->lock", "lorieVkPresent(")
 alone = func(R, "static void rendererVkApplyPendingGpuCopies(void) {")

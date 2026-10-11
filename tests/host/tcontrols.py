@@ -428,6 +428,36 @@ CONTROLS = [
 
             if (state) {""",
      "twiring"),
+    ("a suboptimal acquire making the swapchain again", "vk.c",
+     """            if (res == VK_SUBOPTIMAL_KHR)
+                LORIE_DIAG_ADD(st, vkAcquireSuboptimal, 1);
+            else""",
+     """            if (res == VK_SUBOPTIMAL_KHR) {
+                LORIE_DIAG_ADD(st, vkAcquireSuboptimal, 1);
+                r->recreate = true;
+            } else""",
+     "tvkframe"),
+    ("a suboptimal present making the swapchain again", "vk.c",
+     """        case VK_SUBOPTIMAL_KHR:     // presented: nothing to make again (see LORIE_VK_MAX_OUT_OF_DATE)""",
+     """        case VK_SUBOPTIMAL_KHR:     r->recreate = true; /* fallthrough */""",
+     "tvkframe"),
+    ("out of date made again for ever", "vk.c",
+     """    if (++r->outOfDateStreak > LORIE_VK_MAX_OUT_OF_DATE) {""",
+     """    if (0) {""",
+     "tvkframe"),
+    ("a presented frame not starting the out-of-date count over", "vk.c",
+     """            r->outOfDateStreak = 0;
+""",
+     "",
+     "tvkframe"),
+    ("the window's size taken over the surface's currentExtent", "vk.c",
+     """    if (caps.currentExtent.width != UINT32_MAX && caps.currentExtent.height != UINT32_MAX)""",
+     """    if (0)""",
+     "tvkframe"),
+    ("a frame comparing the window's size with the swapchain's", "renderer.c",
+     """    if (vkr.recreate && !lorieVkSwapchainCreate(&vk, &vkr, win, state))""",
+     """    if ((vkr.recreate || vkr.extent.width != (uint32_t) ANativeWindow_getWidth(win)) && !lorieVkSwapchainCreate(&vk, &vkr, win, state))""",
+     "twiring"),
     ("lorieRedraw without the ownership request", "InitOutput.c",
      """
     lorieProcessOwnershipRequest();

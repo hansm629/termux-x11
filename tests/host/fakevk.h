@@ -71,7 +71,7 @@ static struct {
     /* kept */
     long objects;                   /* render passes, pipelines, ... made so far */
     int live;                       /* of those, not destroyed */
-    int surfaces, swapchains, acquires2, presents, deviceWaits;
+    int surfaces, swapchains, swapchainsMade, acquires2, presents, deviceWaits;
     VkSwapchainCreateInfoKHR swapchainInfo;
     uint32_t nextImage;
     int passesIntoImported, drawsFromImported, drawsIntoImported, draws;
@@ -840,6 +840,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateSwapchainKHR(VkDevice d, const VkSw
     if (++emu.objects == emu.failObject)
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     emu.swapchains++;
+    emu.swapchainsMade++;
     *out = (VkSwapchainKHR) nextHandle++;
     return VK_SUCCESS;
 }

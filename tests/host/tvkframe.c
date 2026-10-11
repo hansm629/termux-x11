@@ -5,9 +5,12 @@
  *   Renderer objects: made, or - when any one of them fails - none left behind and one fallback (FATAL_BACKEND,
  *   VK_DEVICE). Swapchain: R8G8B8A8 preferred, else B8G8R8A8, else VK_SURFACE_FORMAT; the window's size within
  *   the surface's limits; one image more than the minimum within the maximum; IDENTITY transform when allowed;
- *   opaque composite alpha when allowed; FIFO; made again without leaking, destroyed completely (swapchain before
- *   surface); injection at surface or swapchain makes no call. Acquire: each result handled - the fence waited
- *   for and reset on success, nothing waited for on a timeout. A frame: each X server buffer acquired once from
+ *   opaque composite alpha when allowed; FIFO; the surface's currentExtent when it gives one, else the window's
+ *   size; made again without leaking, destroyed completely (swapchain before surface); injection at surface or
+ *   swapchain makes no call. Acquire: each result handled - the fence waited for and reset on success, nothing
+ *   waited for on a timeout. Made again only when out of date: SUBOPTIMAL on every acquire and present keeps
+ *   the one swapchain; out of date more than LORIE_VK_MAX_OUT_OF_DATE times without a frame presented in
+ *   between is a failure, and a presented frame starts the count over. A frame: each X server buffer acquired once from
  *   FOREIGN, moved between uses, released once; draws counted only after the fence; a failed or injected
  *   submission moves no counter and acquires nothing; a fence that does not signal is waited out (device idle)
  *   before returning. Present: each result handled; the frame's fence waited for before it. */
@@ -88,7 +91,7 @@ int main(void) {
           "swapchain made with format %d, %ux%u, %u images, transform %#x, alpha %#x, mode %d", emu.swapchainInfo.imageFormat,
           emu.swapchainInfo.imageExtent.width, emu.swapchainInfo.imageExtent.height, emu.swapchainInfo.minImageCount,
           emu.swapchainInfo.preTransform, emu.swapchainInfo.compositeAlpha, emu.swapchainInfo.presentMode);
-    CHECK(r.imageCount == 3 && r.windowWidth == 1080 && r.windowHeight == 2400, "swapchain: %u images", r.imageCount);
+    CHECK(r.imageCount == 3 && r.extent.width == 1080 && r.extent.height == 2400, "swapchain: %u images", r.imageCount);
     {
         VkSwapchainKHR first = r.swapchain;
         int afterFirst = emu.live;
@@ -127,10 +130,25 @@ int main(void) {
     emu.caps.supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     CHECK(lorieVkSwapchainCreate(&vk, &r, &window, &st) && emu.swapchainInfo.imageExtent.width == 1000 &&
           emu.swapchainInfo.imageExtent.height == 2000 && emu.swapchainInfo.minImageCount == 2 &&
-          emu.swapchainInfo.compositeAlpha == VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR && r.windowWidth == 1080,
+          emu.swapchainInfo.compositeAlpha == VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
           "within the surface's limits: %ux%u, %u images, alpha %#x", emu.swapchainInfo.imageExtent.width,
           emu.swapchainInfo.imageExtent.height, emu.swapchainInfo.minImageCount, emu.swapchainInfo.compositeAlpha);
     lorieVkSwapchainDestroy(&vk, &r);
+    /* the surface's size first; the window's only where the surface leaves it to the swapchain */
+    {
+        ANativeWindow other = { 1000, 2000 };
+        device();
+        CHECK(lorieVkRendererCreate(&vk, &r, &st), "renderer objects not made");
+        CHECK(lorieVkSwapchainCreate(&vk, &r, &other, &st) && emu.swapchainInfo.imageExtent.width == 1080 &&
+              emu.swapchainInfo.imageExtent.height == 2400, "window of another size: %ux%u, not currentExtent",
+              emu.swapchainInfo.imageExtent.width, emu.swapchainInfo.imageExtent.height);
+        lorieVkSwapchainDestroy(&vk, &r);
+        emu.caps.currentExtent = (VkExtent2D) { UINT32_MAX, UINT32_MAX };
+        CHECK(lorieVkSwapchainCreate(&vk, &r, &other, &st) && emu.swapchainInfo.imageExtent.width == 1000 &&
+              emu.swapchainInfo.imageExtent.height == 2000, "undefined currentExtent: %ux%u, not the window's size",
+              emu.swapchainInfo.imageExtent.width, emu.swapchainInfo.imageExtent.height);
+        lorieVkSwapchainDestroy(&vk, &r);
+    }
     device();
     CHECK(lorieVkRendererCreate(&vk, &r, &st), "renderer objects not made");
     emu.surfaceUnsupported = true;
@@ -167,8 +185,7 @@ int main(void) {
             int got = lorieVkAcquire(&vk, &r, &index, &st);
             CHECK(got == t[k].want, "acquire %d: %d, not %d", t[k].result, got, t[k].want);
             CHECK(!*signaled(r.acquireFence), "acquire %d: the fence left signalled", t[k].result);
-            CHECK(r.recreate == (t[k].result == VK_SUBOPTIMAL_KHR || t[k].result == VK_ERROR_OUT_OF_DATE_KHR),
-                  "acquire %d: recreate %d", t[k].result, r.recreate);
+            CHECK(r.recreate == (t[k].result == VK_ERROR_OUT_OF_DATE_KHR), "acquire %d: recreate %d", t[k].result, r.recreate);
             CHECK(t[k].reason ? fallbackOnce(LORIE_FALLBACK_CLASS_FATAL_BACKEND, t[k].reason) : st.diag.fallbackTotal == 0,
                   "acquire %d: fallback total %u reason %u", t[k].result, st.diag.fallbackTotal, st.diag.lastFallbackReason);
             CHECK(st.diag.vkAcquireSuccess == (t[k].result == VK_SUCCESS) && st.diag.vkAcquireSuboptimal == (t[k].result == VK_SUBOPTIMAL_KHR) &&
@@ -185,6 +202,48 @@ int main(void) {
         CHECK(lorieVkAcquire(&vk, &r, &index, &st) == LORIE_VK_FRAME_FATAL && fallbackOnce(LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SWAPCHAIN),
               "acquire whose fence never signals: not a failure");
     }
+
+    /* fifty frames with every acquire and present SUBOPTIMAL (a swapchain not pre-rotated): one swapchain */
+    device();
+    CHECK(lorieVkRendererCreate(&vk, &r, &st) && lorieVkSwapchainCreate(&vk, &r, &window, &st), "no swapchain");
+    emu.acquireResult = emu.presentResult = VK_SUBOPTIMAL_KHR;
+    for (int k = 0; k < 50; k++) {
+        if (r.recreate)
+            lorieVkSwapchainCreate(&vk, &r, &window, &st);
+        CHECK(lorieVkAcquire(&vk, &r, &index, &st) == LORIE_VK_FRAME_OK && lorieVkFrameBegin(&vk, &r) == VK_SUCCESS, "suboptimal frame %d", k);
+        lorieVkFrameScreen(&vk, &r, index, NULL, &viewport, NULL, NULL, 0);
+        CHECK(lorieVkFrameSubmit(&vk, &r, index, true, &st) == VK_SUCCESS && lorieVkPresent(&vk, &r, index, &st) == LORIE_VK_FRAME_OK,
+              "suboptimal frame %d not presented", k);
+    }
+    CHECK(emu.swapchainsMade == 1 && !r.recreate && st.diag.vkSwapchainCreated == 1 && st.diag.vkAcquireSuboptimal == 50 &&
+          st.diag.vkFramesPresented == 50 && st.diag.fallbackTotal == 0,
+          "suboptimal: %d swapchains made for 50 frames (want 1), %u presented", emu.swapchainsMade, st.diag.vkFramesPresented);
+
+    /* out of date: made again, until that stops helping */
+    device();
+    CHECK(lorieVkRendererCreate(&vk, &r, &st) && lorieVkSwapchainCreate(&vk, &r, &window, &st), "no swapchain");
+    emu.acquireResult = VK_ERROR_OUT_OF_DATE_KHR;
+    CHECK(lorieVkAcquire(&vk, &r, &index, &st) == LORIE_VK_FRAME_RECREATE && r.recreate, "out of date: not made again");
+    CHECK(lorieVkSwapchainCreate(&vk, &r, &window, &st) && !r.recreate && emu.swapchainsMade == 2, "out of date: not made again");
+    emu.acquireResult = VK_SUCCESS;
+    CHECK(lorieVkAcquire(&vk, &r, &index, &st) == LORIE_VK_FRAME_OK && lorieVkFrameBegin(&vk, &r) == VK_SUCCESS, "after remaking");
+    lorieVkFrameScreen(&vk, &r, index, NULL, &viewport, NULL, NULL, 0);
+    CHECK(lorieVkFrameSubmit(&vk, &r, index, true, &st) == VK_SUCCESS && lorieVkPresent(&vk, &r, index, &st) == LORIE_VK_FRAME_OK &&
+          r.outOfDateStreak == 0, "presented after remaking: count not started over");
+    emu.acquireResult = VK_ERROR_OUT_OF_DATE_KHR;
+    {
+        int got = LORIE_VK_FRAME_RECREATE, made = emu.swapchainsMade, tries = 0;
+        while (got == LORIE_VK_FRAME_RECREATE && tries++ < 10) {
+            got = lorieVkAcquire(&vk, &r, &index, &st);
+            if (got == LORIE_VK_FRAME_RECREATE)
+                CHECK(lorieVkSwapchainCreate(&vk, &r, &window, &st), "out of date: not made again");
+        }
+        CHECK(got == LORIE_VK_FRAME_FATAL && emu.swapchainsMade - made == LORIE_VK_MAX_OUT_OF_DATE &&
+              fallbackOnce(LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SWAPCHAIN) && st.diag.lastVkResult == VK_ERROR_OUT_OF_DATE_KHR,
+              "always out of date: %d more swapchains, result %d (want %d swapchains, then a VK_SWAPCHAIN failure)",
+              emu.swapchainsMade - made, got, LORIE_VK_MAX_OUT_OF_DATE);
+    }
+    emu.acquireResult = VK_SUCCESS;
 
     /* a frame: a copy from an RGBA buffer into the root (RGBX), the cursor, the root on screen */
     device();
@@ -291,7 +350,7 @@ int main(void) {
                 r.recreate = false;
                 emu.presentResult = t[k].result;
                 CHECK(lorieVkPresent(&vk, &r, 0, &st) == t[k].want && (st.diag.vkFramesPresented == presented + 1) == t[k].counted &&
-                      r.recreate == (t[k].result != VK_ERROR_SURFACE_LOST_KHR), "present %d: handled wrongly", t[k].result);
+                      r.recreate == (t[k].result == VK_ERROR_OUT_OF_DATE_KHR), "present %d: handled wrongly", t[k].result);
             }
             emu.presentResult = VK_SUCCESS;
             st.backend.vkFailAt = LORIE_VK_FAIL_AT_PRESENT;
