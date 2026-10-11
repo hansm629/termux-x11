@@ -499,10 +499,16 @@ CONTROLS = [
      """uint32_t n = 1, k;""",
      "tpresentcopy"),
     ("the copies alone published though their submission failed", "renderer.c",
-     """    res = lorieVkFrameSubmit(&vk, &vkr, 0, false, state);
-    if (res == VK_SUCCESS) {""",
-     """    res = lorieVkFrameSubmit(&vk, &vkr, 0, false, state);
-    if (1) {""",
+     """        rendererVkFrameDone();
+    }
+    if (res == VK_SUCCESS) {
+        // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        state->gpuCopyQueue.readIndex = readIndex;""",
+     """        rendererVkFrameDone();
+    }
+    if (1) {
+        // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        state->gpuCopyQueue.readIndex = readIndex;""",
      "tpresentcopy"),
     ("the queue not advanced after the copies alone", "renderer.c",
      """reuse the source.
@@ -570,6 +576,61 @@ CONTROLS = [
      """    return !vkActive && (!state || rendererBackendFor(state->backend.requested, vkFailed) == RENDERER_USE_GLES);""",
      """    return !vkActive;""",
      "tvkrenderer"),
+    ("a frame's fence waited for holding the X server's lock", "renderer.c",
+     """    state->waitForNextFrame = true;
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+
+    if (res == VK_SUCCESS) {
+        // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
+        res = lorieVkFrameWait(&vk, &vkr, state);
+        rendererVkFrameDone();
+    }""",
+     """    state->waitForNextFrame = true;
+
+    if (res == VK_SUCCESS) {
+        // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
+        res = lorieVkFrameWait(&vk, &vkr, state);
+        rendererVkFrameDone();
+    }
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);""",
+     "tpresentcopy"),
+    ("a frame's buffers not listed in flight", "renderer.c",
+     """    if (res == VK_SUCCESS)
+        rendererVkInFlight();
+    state->waitForNextFrame = true;""",
+     """    state->waitForNextFrame = true;""",
+     "tpresentcopy"),
+    ("a frame's buffers never given back to the X server", "renderer.c",
+     """    if (__atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     """    if (0 && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     "tpresentcopy"),
+    ("a new session keeping what a dead renderer left in flight", "renderer.c",
+     """                rendererVkFrameDone();
+                vkFailed = false;""",
+     """                vkFailed = false;""",
+     "twiring"),
+    ("an access CPU-locking an AHB a submitted Vulkan frame uses", "InitOutput.c",
+     """        if (perAccessAhb && !priv->locked && !priv->mem)
+            lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+""",
+     "",
+     "townership"),
+    ("drawSquares into a root a submitted Vulkan frame uses", "InitOutput.c",
+     """        lorieWaitGpuIdle(LorieBuffer_description(priv->buffer)->id);
+        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
+     """        __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs""",
+     "townership"),
+    ("PERSISTENT taken again while a Vulkan frame may still run", "InitOutput.c",
+     """        if (mode == LORIE_OWNERSHIP_PERSISTENT)
+            lorieWaitGpuIdle(0);    // a Vulkan frame may still be running (a new or lost connection)
+""",
+     "",
+     "townership"),
+    ("the wait for a gone renderer leaving its list set", "InitOutput.c",
+     """            __atomic_store_n(&pvfb->state->gpuInFlight.busy, 0, __ATOMIC_RELEASE);
+            return;""",
+     """            return;""",
+     "townership"),
 ]
 
 def copy_sources(dst):

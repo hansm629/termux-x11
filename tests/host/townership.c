@@ -10,7 +10,10 @@
  *   PER_ACCESS: whenever the renderer could take the shared lock and finds PER_ACCESS answered, the X server
  *   has no AHB CPU-locked; every CPU lock of an AHB is taken, and dropped, inside the shared lock.
  *   The answer describes the locks every time the shared lock is let go: PER_ACCESS - no AHB CPU-locked;
- *   PERSISTENT - every pixmap 3c98ffa keeps CPU-locked is. */
+ *   PERSISTENT - every pixmap 3c98ffa keeps CPU-locked is.
+ *   A submitted Vulkan frame (lorie.h gpuInFlight): no AHB it uses is CPU-locked until the renderer saw it finish
+ *   - an access, drawSquares, PERSISTENT taken again all wait for it, holding the shared lock; an AHB the frame
+ *   does not use is not waited for. With the renderer's connection gone the wait gives up, and clears the list. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -20,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 
 #include "xorglist_src.inc"
 #include "diagtypes_src.inc"
@@ -67,7 +72,16 @@ struct FakeScreen {
 typedef void *ClientPtr;
 #define exaGetPixmapDriverPrivate(p) (((PixmapPtr) (p))->driverPriv)
 
-struct fake_state { int lock, lockingPid; struct lorie_renderer_diag diag; struct lorie_backend_control backend; };
+#include "gpucopytypes_src.inc"
+struct fake_state {
+    int lock, lockingPid;
+    struct lorie_renderer_diag diag;
+    struct lorie_backend_control backend;
+    struct { volatile uint32_t busy; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
+};
+#define lorie_shared_server_state fake_state
+#include "inflight_src.inc"
+#undef lorie_shared_server_state
 struct fake_pvfb {
     struct fake_state *state;
     struct { Bool legacyDrawing; } root;
@@ -153,6 +167,9 @@ static int LorieBuffer_lock(LorieBuffer *b, void **out) {
     if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER && answered() == LORIE_OWNERSHIP_PER_ACCESS)
         CHECK(checked->state->lock > 0, "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
               runName, opIndex, b->desc.id);
+    if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
+        CHECK(!lorieGpuInFlight(checked->state, b->desc.id), "%s op %d: AHB %llu CPU-locked while a submitted Vulkan frame uses it",
+              runName, opIndex, b->desc.id);
     b->lockAttempts++;
     if (b->failLock)
         ret = EIO, b->lockedData = NULL;
@@ -187,6 +204,24 @@ static void lorie_mutex_unlock(int *m, __unused int *pid) {
     if (*m > 0 && --*m == 0 && checked && m == &checked->state->lock)
         rendererView("shared lock let go");
 }
+/* the renderer's side of a submitted frame: the X server's futex wait on gpuInFlight.busy is where the frame
+ * finishes (the renderer clears the list), or, with `gpuGone`, where the wait times out */
+static int gpuWaits;
+static bool gpuGone, connected = true;
+static bool lorieConnectionAlive(void) { return connected; }
+static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
+    gpuWaits++;
+    CHECK(op == FUTEX_WAIT && *word == value, "%s op %d: not a futex wait on the list's word", runName, opIndex);
+    if (checked)
+        CHECK(checked->state->lock > 0, "%s op %d: waited for a Vulkan frame without the shared lock", runName, opIndex);
+    if (gpuGone) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    *word = 0;
+    return 0;
+}
+#define syscall(nr, word, op, value, timeout, a, b) ((void) (nr), (void) (timeout), fakeFutexWait(word, op, value))
 static uint64_t fakeNow;
 static uint64_t GetTimeInMicros(void) { return fakeNow += 3; }
 static Bool (*queuedProc)(ClientPtr, void *);
@@ -301,6 +336,7 @@ enum {
     ROOT_PENDING, ROOT_DONE, FAIL_SRC,
     /* the renderer's side of the handshake, and its connection: nothing to 3c98ffa */
     ASK_PER_ACCESS, ASK_PERSISTENT, ASK_INVALID, ASK_NOTHING_NEW, DISCONNECT, CONNECT,
+    IN_FLIGHT,          /* the renderer submits a Vulkan frame using the pixmap's AHB */
 };
 #define OWNERSHIP_OP(what) ((what) >= ASK_PER_ACCESS)
 struct op { int what, pix; };
@@ -445,6 +481,11 @@ static void exec(const struct impl *im, struct op o) {
               "%s op %d: disconnect did not answer PERSISTENT to request %u", runName, opIndex, LORIE_OWNERSHIP_SEQ(req));
         break;
     }
+    case IN_FLIGHT:
+        w->state->gpuInFlight.ids[0] = b->desc.id;
+        w->state->gpuInFlight.count = 1;
+        w->state->gpuInFlight.busy = 1;
+        break;
     case CONNECT: {
         uint32_t req = w->state->backend.ownershipRequest;
         lorieResetOwnership();                              /* lorieActivityConnected */
@@ -642,6 +683,39 @@ int main(void) {
             CHECK(point == t[k].point && invalid == t[k].invalid, "TERMUX_X11_RENDERER_VK_FAIL_AT=%s: point %u, flagged %u",
                   t[k].value ? t[k].value : "(unset)", point, invalid);
         }
+    }
+
+    /* PER_ACCESS with Vulkan frames in flight: the AHB a frame uses waited for, no other */
+    {
+        static const struct op F[] = {
+            {ASK_PER_ACCESS},
+            {IN_FLIGHT, 0}, {DEST, 2}, {SRC, 4},     /* not the frame's: not waited for */
+            {DEST, 0},                               /* the root, in the frame: waited for */
+            {IN_FLIGHT, 0}, {DRAW},                  /* drawSquares into it: waited for */
+            {IN_FLIGHT, 2}, {SRC, 0}, {DEST, 2},     /* the root no longer, pixmap 2 now: only that waited for */
+            {IN_FLIGHT, 4}, {CONNECT},               /* PERSISTENT again locks every AHB: waited for */
+        };
+        int nA = sizeof A / sizeof *A;
+        memcpy(ops, A, sizeof A);
+        memcpy(ops + nA, F, sizeof F);
+        n = nA + (int) (sizeof F / sizeof *F);
+        gpuWaits = 0;
+        run(1, &cur, ops, n, LORIE_BACKEND_AUTO);
+        CHECK(gpuWaits == 4, "frames in flight: %d waits (want 4: the root twice, pixmap 2, PERSISTENT)", gpuWaits);
+        CHECK(!newWorld.state->gpuInFlight.busy, "frames in flight: the list still set at the end");
+
+        /* the renderer gone in the middle of a frame: the wait gives up, and clears the list */
+        newWorld.state->gpuInFlight.ids[0] = 77;
+        newWorld.state->gpuInFlight.count = 1;
+        newWorld.state->gpuInFlight.busy = 1;
+        connected = false;
+        gpuGone = true;
+        gpuWaits = 0;
+        lorieWaitGpuIdle(77);
+        CHECK(gpuWaits == 1 && !newWorld.state->gpuInFlight.busy, "renderer gone: %d waits, the list %s", gpuWaits,
+              newWorld.state->gpuInFlight.busy ? "still set" : "cleared");
+        connected = true;
+        gpuGone = false;
     }
 
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

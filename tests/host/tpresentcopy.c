@@ -15,16 +15,28 @@
  *   (both put clip-space y = -1 on the buffer's first row: GLES's framebuffer origin is its bottom row, which is
  *   the texture's first; Vulkan's is its top row) and texture coordinates, red and blue swapped exactly when GLES
  *   swaps them, the source's alpha kept; several entries in one submission; completedSerial and readIndex
- *   published only after the fence, under the X server's lock, with every buffer back with the foreign owner; a
+ *   published only after the fence, with every buffer back with the foreign owner and out of the in-flight list; a
  *   failed submission publishes nothing; a frame with no copy queued draws none; an entry whose buffer the
  *   renderer never got is skipped and completed, as GLES does. Frames of eight copies from new sources, the
  *   cache passing 16 and 32 images in the middle of a frame: every image a frame already used stays valid (its
  *   acquire released, its draw from the right buffer), every image keeps its address until removed.
  *   GLES textures: none made for Vulkan's copies and frames; GLES's first use of a buffer makes its texture,
  *   once.
+ *   While the device runs a frame (the fence waited for) the renderer does not hold the X server's lock, and
+ *   exactly the frame's buffers are listed in flight; the list is cleared once the fence signalled, or once the
+ *   device is idle after a fence that did not. Meanwhile the X server (lorieWaitGpuIdle, another thread here)
+ *   gets an AHB the frame does not use at once, and one it uses only after the frame finished; with the
+ *   renderer's connection gone it gives up waiting after a slice, and clears the list.
  *   X server again: done only then; the CPU may lock the source; the acknowledgement drops what was held. */
+#define _GNU_SOURCE         /* pthread_timedjoin_np: an X server thread never let go must not hang the test */
+#include <errno.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "fakevk.h"
 
 /* ---- LorieBuffer: buffer.h's description; registration and references as the test keeps them ---- */
@@ -142,10 +154,10 @@ static void lorie_mutex_lock(volatile int *m, volatile int *pid) { (*m)++; *pid 
 static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pid = 0; }
 static void rendererVkFail(void) { vkFailures++; }
 /* the X server woken for a finished batch: how things stood at that moment */
-static struct { int count; bool locked, fenceWaited, released; uint64_t completed; } notified;
+static struct { int count; bool cleared, fenceWaited, released; uint64_t completed; } notified;
 static void notifyGpuCopyDone(void) {
     notified.count++;
-    notified.locked = state->lock == 1;
+    notified.cleared = !state->gpuInFlight.busy;
     notified.fenceWaited = !emu.fencePending;
     notified.released = true;
     for (int i = 0; i < nbufs; i++)
@@ -154,6 +166,53 @@ static void notifyGpuCopyDone(void) {
     notified.completed = state->gpuCopyQueue.completedSerial;
 }
 #include "presentcopy_src.inc"
+
+/* the moment the renderer waits for a frame's fence: the device runs the frame */
+static struct { int waits; bool lockHeld; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } atFence;
+static int gpuMs;                   /* how long the device takes, at the next fence */
+static volatile bool gpuFinished;
+static void lookAtFence(VkFence fence) {
+    if (fence != vkr.frameFence)
+        return;             /* a swapchain image's */
+    atFence.waits++;
+    atFence.lockHeld |= state->lock != 0;
+    atFence.busy = state->gpuInFlight.busy;
+    atFence.count = state->gpuInFlight.count;
+    memcpy(atFence.ids, (const void *) state->gpuInFlight.ids, sizeof atFence.ids);
+    if (gpuMs)
+        usleep(gpuMs * 1000);
+    gpuFinished = true;
+}
+// whether the last fence found exactly these buffers in flight
+static bool inFlightAtFence(int n, ...) {
+    va_list ap;
+    bool all = atFence.busy && atFence.count == (uint32_t) n;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++) {
+        uint64_t id = va_arg(ap, LorieBuffer *)->desc.id;
+        bool found = false;
+        for (uint32_t k = 0; k < atFence.count; k++)
+            found |= atFence.ids[k] == id;
+        all &= found;
+    }
+    va_end(ap);
+    return all;
+}
+
+/* the X server, on its own thread while the renderer draws a frame using the root */
+static struct { uint64_t rootId, otherId; bool otherWhileBusy, rootAfterGpu, rootListCleared, started; } xThread;
+static void *xServer(void *unused) {
+    (void) unused;
+    for (int spins = 0; spins < 5000 && !__atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE); spins++)
+        usleep(200);
+    xThread.started = __atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE);
+    lorieWaitGpuIdle(xThread.otherId);
+    xThread.otherWhileBusy = !gpuFinished;
+    lorieWaitGpuIdle(xThread.rootId);
+    xThread.rootAfterGpu = gpuFinished;
+    xThread.rootListCleared = !__atomic_load_n(&state->gpuInFlight.busy, __ATOMIC_ACQUIRE);
+    return NULL;
+}
 
 #define X_USAGE (AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | \
                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER)
@@ -252,6 +311,7 @@ int main(void) {
     expectedH = 480;
     st.surfaceAvailable = 1;
     own(7);
+    emuFenceWait = lookAtFence;
 
     /* a client's window presented into the root: two rectangles at an offset, the copies alone */
     CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 37, 11, &serial, &dstBuffer), "into the root: not queued");
@@ -280,8 +340,11 @@ int main(void) {
     CHECK(st.gpuCopyQueue.readIndex == 1 && st.gpuCopyQueue.completedSerial == 1 && notified.count == 1 && notified.completed == 1,
           "copies alone: readIndex %u, completed %llu, notified %d", st.gpuCopyQueue.readIndex,
           (unsigned long long) st.gpuCopyQueue.completedSerial, notified.count);
-    CHECK(notified.locked && notified.fenceWaited && notified.released,
-          "copies alone: published %s", !notified.locked ? "without the X server's lock" : !notified.fenceWaited ?
+    CHECK(atFence.waits == 1 && !atFence.lockHeld && inFlightAtFence(2, src, root) && !st.gpuInFlight.busy,
+          "copies alone: at the fence the X server's lock %s, %u buffers in flight; afterwards the list %s",
+          atFence.lockHeld ? "held" : "free", atFence.busy ? atFence.count : 0, st.gpuInFlight.busy ? "still set" : "cleared");
+    CHECK(notified.cleared && notified.fenceWaited && notified.released,
+          "copies alone: published %s", !notified.cleared ? "with its buffers still in flight" : !notified.fenceWaited ?
           "before the fence was waited for" : "with a buffer still the renderer's");
     CHECK(glTextures == 0, "copies alone: a GLES texture made for Vulkan");
     CHECK(gles(&saved) == 1 && glesState.gpuCopyQueue.readIndex == 1 && glDrawCount == 2 && pushes == 2, "GLES: %d draws", glDrawCount);
@@ -318,7 +381,10 @@ int main(void) {
           emu.drawnInto[d0 % 64] == redirected->desc.buffer && emu.drawnFrom[(d0 + 1) % 64] == root->desc.buffer &&
           !emu.drawnInto[(d0 + 1) % 64], "frame: destination draws %u; the copy, then the root on screen, not drawn",
           st.diag.vkImportedDestinationDraws);
-    CHECK(st.gpuCopyQueue.readIndex == 2 && st.gpuCopyQueue.completedSerial == 2 && notified.count == 2 && notified.locked &&
+    CHECK(!atFence.lockHeld && inFlightAtFence(3, bgra, redirected, root) && !st.gpuInFlight.busy,
+          "frame: at the fence the X server's lock %s, %u buffers in flight (want the copy's two and the root)",
+          atFence.lockHeld ? "held" : "free", atFence.busy ? atFence.count : 0);
+    CHECK(st.gpuCopyQueue.readIndex == 2 && st.gpuCopyQueue.completedSerial == 2 && notified.count == 2 && notified.cleared &&
           notified.fenceWaited && notified.released, "frame: readIndex %u, completed %llu", st.gpuCopyQueue.readIndex,
           (unsigned long long) st.gpuCopyQueue.completedSerial);
     CHECK(gles(&saved) == 2 && glDrawCount == 1 && sameAsGles(0, &pushed[0]) && glDraws[0].program == g_texture_program_bgra,
@@ -329,9 +395,33 @@ int main(void) {
     lorieGpuCopyAck(&bgraPix, dstBuffer);
     CHECK(bgra->refs == 0 && redirected->refs == 0 && redirected->gpuCopyPending == 0, "frame acknowledged: something still held");
 
-    /* a plain desktop frame: nothing queued, no copy drawn */
-    st.drawRequested = 1;
-    rendererVkRedraw(&waiting);
+    /* a plain desktop frame: nothing queued, no copy drawn; the X server, meanwhile, on its own thread */
+    {
+        pthread_t x;
+        xThread = (__typeof__(xThread)) { .rootId = root->desc.id, .otherId = src->desc.id };
+        gpuMs = 60;
+        gpuFinished = false;
+        pthread_create(&x, NULL, xServer, NULL);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 3;
+            if (pthread_timedjoin_np(x, NULL, &deadline)) {
+                CHECK(0, "the X server still waiting for the root 3 s after the frame finished");
+                connectionAlive = false;        /* lets it give up */
+                pthread_join(x, NULL);
+                connectionAlive = true;
+            }
+        }
+        gpuMs = 0;
+        CHECK(!atFence.lockHeld && inFlightAtFence(1, root) && !st.gpuInFlight.busy, "plain frame: not the root alone in flight");
+        CHECK(xThread.started && xThread.otherWhileBusy && xThread.rootAfterGpu && xThread.rootListCleared,
+              "the X server meanwhile: %s", !xThread.started ? "never saw the frame in flight" :
+              !xThread.otherWhileBusy ? "waited for a buffer the frame does not use" :
+              !xThread.rootAfterGpu ? "got the root before the frame finished" : "got the root with the list still set");
+    }
     CHECK(st.diag.vkImportedDestinationDraws == 3 && st.gpuCopyQueue.completedSerial == 2 && notified.count == 2 &&
           st.diag.vkFramesPresented == 2 && vkFailures == 0, "plain frame: destination draws %u, completed %llu",
           st.diag.vkImportedDestinationDraws, (unsigned long long) st.gpuCopyQueue.completedSerial);
@@ -424,6 +514,22 @@ int main(void) {
               "frame, not owned: readIndex %u (was %u), copies drawn %u", st.gpuCopyQueue.readIndex, readIndex,
               st.diag.vkImportedDestinationDraws - dests);
 
+        CHECK(!atFence.busy, "frame, not owned: %u buffers in flight", atFence.count);
+
+        /* owned again, the fence does not signal: the device waited out, the list cleared, nothing published */
+        own(12);
+        {
+            int idle = emu.deviceWaits;
+            emu.fenceResult = VK_TIMEOUT;
+            rendererVkApplyPendingGpuCopies();
+            emu.fenceResult = VK_SUCCESS;
+            CHECK(vkFailures == 1 && emu.deviceWaits == idle + 1 && !st.gpuInFlight.busy && st.gpuCopyQueue.readIndex == readIndex &&
+                  !lorieGpuCopyIsDone(serial) && emu.violations == 0, "late fence: device waits %d, list %s, readIndex %u (was %u)",
+                  emu.deviceWaits - idle, st.gpuInFlight.busy ? "set" : "cleared", st.gpuCopyQueue.readIndex, readIndex);
+            vkFailures = 0;
+            emu.fencePending = false;
+        }
+
         /* owned again, the submission fails: nothing published */
         own(11);
         emu.submitResult = VK_ERROR_DEVICE_LOST;
@@ -505,6 +611,23 @@ int main(void) {
             CHECK(lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k], "many: source %d moved by a removal", k);
     }
 
+    /* the renderer gone in the middle of a frame: the X server waits a slice, then gives up and clears the list */
+    {
+        struct timespec t0, t1;
+        st.gpuInFlight.ids[0] = root->desc.id;
+        st.gpuInFlight.count = 1;
+        st.gpuInFlight.busy = 1;
+        connectionAlive = false;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        lorieWaitGpuIdle(root->desc.id);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        connectionAlive = true;
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        CHECK(!st.gpuInFlight.busy && ms >= 25 && ms < 1000, "renderer gone: waited %ld ms, list %s", ms,
+              st.gpuInFlight.busy ? "still set" : "cleared");
+    }
+
+    CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",
           emu.violations);
     printf("TPRESENTCOPY a Present copy from the X server through Vulkan and back, as GLES does it: %s (%d failures)\n",

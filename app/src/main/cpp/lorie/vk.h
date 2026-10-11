@@ -165,14 +165,17 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
  *   lorieVkFrameCopy       each pending GPU copy: source sampled, destination rendered into
  *   lorieVkFrameCursor     the cursor image refilled, if it changed
  *   lorieVkFrameScreen     the root (and cursor) drawn into the swapchain image
- *   lorieVkFrameSubmit     every X server buffer the frame used released, submitted, its fence waited for (bounded)
- *   - completed serial published, X server's lock let go by the caller -
+ *   lorieVkFrameQueue      every X server buffer the frame used released, the frame submitted
+ *   - the frame's buffers listed in flight (lorie.h gpuInFlight), X server's lock let go by the caller -
+ *   lorieVkFrameWait       its fence waited for (bounded; the device idle otherwise)
+ *   - the buffers no longer in flight, completed serial published by the caller -
  *   lorieVkPresent
  *
  * Every X server buffer a frame uses is acquired from the foreign owner once, at its first use, moved between
- * uses within the frame, and released at the end (lorieVkFrameUse); the X server may lock it again only after
- * the frame's fence was waited for, which happens before its lock is let go. Draws counted as using an imported
- * image (source or destination) are added to the diagnostics only after the fence signalled.
+ * uses within the frame, and released at the end (lorieVkFrameUse); the X server may CPU-lock it again only
+ * after the frame's fence was waited for: until then it is in flight, and the X server, which may take its lock
+ * meanwhile, leaves it alone. Draws counted as using an imported image (source or destination) are added to the
+ * diagnostics only after the fence signalled. lorieVkFrameSubmit is lorieVkFrameQueue and lorieVkFrameWait in one.
  */
 #define LORIE_VK_MAX_SWAPCHAIN_IMAGES 8
 /*
@@ -250,8 +253,15 @@ bool lorieVkFrameCursor(struct lorie_vk *vk, struct lorie_vk_renderer *r, const 
 void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, struct lorie_vk_image *root,
                         const VkRect2D *viewport, const struct lorie_vk_quad *rootQuad, const struct lorie_vk_quad *cursorQuad,
                         int filter);
-// Releases the frame's images, ends and submits it (signalling the swapchain image's semaphore when `present`),
-// and waits for its fence; VK_SUCCESS only once the fence signalled.
+// Releases the frame's images, ends and submits it (signalling the swapchain image's semaphore when `present`).
+// After VK_SUCCESS the device runs it: lorieVkFrameWait must follow before the next frame. Otherwise nothing was
+// submitted and nothing is to be waited for.
+VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
+                           volatile struct lorie_shared_server_state *st);
+// Waits for the frame lorieVkFrameQueue submitted: VK_SUCCESS once its fence signalled. Whatever it returns, the
+// device no longer uses the frame's buffers (a fence that does not signal in time is waited out with the device).
+VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
+// lorieVkFrameQueue, then lorieVkFrameWait.
 VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
                             volatile struct lorie_shared_server_state *st);
 int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, volatile struct lorie_shared_server_state *st);

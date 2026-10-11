@@ -1592,8 +1592,8 @@ void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32
     vk->CmdEndRenderPass(r->cmd);
 }
 
-VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
-                            volatile struct lorie_shared_server_state *st) {
+VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
+                           volatile struct lorie_shared_server_state *st) {
     VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &r->cmd,
                             .signalSemaphoreCount = present ? 1 : 0, .pSignalSemaphores = present ? &r->rendered[index] : NULL };
     uint64_t start;
@@ -1617,7 +1617,13 @@ VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, ui
         return res;
     }
     r->submitCpuUs = lorieVkNowUs() - start;
-    start = lorieVkNowUs();
+    return VK_SUCCESS;
+}
+
+VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st) {
+    uint64_t start = lorieVkNowUs();
+    VkResult res;
+
     if ((res = vk->WaitForFences(vk->device, 1, &r->frameFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS) {
         lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
                         res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SUBMIT, res);
@@ -1638,6 +1644,12 @@ VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, ui
     LORIE_DIAG_ADD(st, vkSubmitCpuUs, r->submitCpuUs);
     LORIE_DIAG_ADD(st, vkFenceWaitUs, r->fenceWaitUs);
     return VK_SUCCESS;
+}
+
+VkResult lorieVkFrameSubmit(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
+                            volatile struct lorie_shared_server_state *st) {
+    VkResult res = lorieVkFrameQueue(vk, r, index, present, st);
+    return res != VK_SUCCESS ? res : lorieVkFrameWait(vk, r, st);
 }
 
 int lorieVkPresent(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, volatile struct lorie_shared_server_state *st) {

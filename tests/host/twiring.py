@@ -4,11 +4,12 @@ the code itself): every frame's lorieRedraw takes up the renderer's request befo
 early; a new renderer connection and a lost one both go back to 3c98ffa's ownership; the requested backend
 is read from TERMUX_X11_RENDERER_BACKEND when the server state is made.
 
-And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c and tvkrenderer.c test the steps):
-a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
-server's PER_ACCESS answer is still its own before touching a buffer, submits and waits for its fence before
-publishing the completed copies, publishes them before letting the lock go, and presents after; the copies
-alone likewise; a failure is torn down before the X server is asked for its ownership back, and that before
+And the order of the renderer's Vulkan steps (renderer.c; tvkframe.c, tvkrenderer.c and tpresentcopy.c test the
+steps): a frame acquires its swapchain image before taking the X server's lock, checks under the lock that the X
+server's PER_ACCESS answer is still its own before touching a buffer, submits and lists the frame's buffers in
+flight before letting the lock go, then waits for its fence, gives the buffers back, publishes the completed
+copies, and presents; the copies alone likewise; a new session clears what a dead renderer may have left in
+flight; a failure is torn down before the X server is asked for its ownership back, and that before
 GLES takes the window; a window's swapchain goes before the window; the backend is chosen after the window
 change was acknowledged, before stateLock is let go; a buffer's Vulkan image goes before the buffer; another
 X server session (or none) drops every imported image and the ownership answer of the last one first. The
@@ -65,10 +66,12 @@ redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
 # the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
 check("ANativeWindow_get" not in redraw, "a Vulkan frame compares the window's size with the swapchain's")
 in_order("Vulkan frame", redraw, "lorieVkAcquire(", "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()",
-         "rendererVkCopiesLocked(", "lorieVkFrameSubmit(", "completedSerial", "lorie_mutex_unlock(&state->lock", "lorieVkPresent(")
+         "rendererVkCopiesLocked(", "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock",
+         "lorieVkFrameWait(", "rendererVkFrameDone();", "completedSerial", "lorieVkPresent(")
 alone = func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
 in_order("Vulkan copies alone", alone, "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()", "rendererVkCopiesLocked(",
-         "lorieVkFrameSubmit(", "completedSerial", "lorie_mutex_unlock(&state->lock")
+         "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock", "lorieVkFrameWait(",
+         "rendererVkFrameDone();", "completedSerial")
 select = func(R, "static void rendererSelectBackend(void) {")
 in_order("backend choice", select, "rendererDropEgl();", "rendererVkStart()", "vkFailed = true;", "rendererVkTeardown();",
          "rendererVkOwnership(LORIE_OWNERSHIP_PERSISTENT)", "rendererUseEgl();")
@@ -81,7 +84,7 @@ in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "ren
          "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
 # another session: the last one's imported images and ownership answer are dropped before anything else runs
 in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
-         "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")
+         "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (state) {", "rendererVkFrameDone();", "if (windowChanged)")
 
 check("            if (rendererGlesEager())\n                rendererAttachToGL(buf);" in loop,
       "a buffer that comes gets a GLES texture whoever draws")

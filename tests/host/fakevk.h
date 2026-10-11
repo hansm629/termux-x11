@@ -156,6 +156,11 @@ struct lorie_shared_server_state {
         volatile uint64_t completedSerial;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
+    struct {
+        volatile uint32_t busy;
+        uint32_t count;
+        uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
+    } gpuInFlight;
     uint64_t rootWindowTextureID;
     volatile uint8_t drawRequested, surfaceAvailable, waitForNextFrame;
     volatile int renderedFrames;
@@ -168,6 +173,10 @@ struct lorie_shared_server_state {
         volatile uint8_t updated, moved;
     } cursor;
 };
+#ifndef __always_inline
+#define __always_inline __attribute__((always_inline))
+#endif
+#include "inflight_src.inc"
 #define log(...) ((void) 0)
 #define loge(...) ((void) 0)
 #include "vk_shaders.h"
@@ -745,8 +754,11 @@ static VKAPI_ATTR void VKAPI_CALL fDestroyFence(VkDevice d, VkFence f, const VkA
         if (fences[k].fence == f)
             memset(&fences[k], 0, sizeof fences[k]);
 }
+static void (*emuFenceWait)(VkFence);  /* a test's look at the moment the renderer waits for a fence */
 static VKAPI_ATTR VkResult VKAPI_CALL fWaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
     (void) d; (void) n; (void) f; (void) all;
+    if (emuFenceWait && n)
+        emuFenceWait(f[0]);
     CHECK(timeout != UINT64_MAX, "fake device: an unbounded fence wait");
     if (emu.fenceResult != VK_SUCCESS)
         return emu.fenceResult;

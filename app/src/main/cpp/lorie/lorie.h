@@ -179,6 +179,7 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
+#define LORIE_GPU_IN_FLIGHT_MAX 32      /* AHBs one Vulkan frame may use (vk.h LORIE_VK_MAX_FRAME_IMAGES) */
 
 typedef struct {
     uint64_t serial;
@@ -345,6 +346,20 @@ struct lorie_shared_server_state {
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
 
+    /*
+     * The X server's AHBs that a submitted Vulkan frame uses, until the renderer saw it finish. The renderer
+     * fills `ids` and sets `busy` under `lock`, right after submitting the frame, and then lets `lock` go while
+     * the device runs it; once the frame's fence signalled (or the device is idle) it clears `busy` - without
+     * `lock`, which the X server may be holding while it waits - and wakes the X server (a futex on `busy`).
+     * Under PER_ACCESS the X server, holding `lock`, CPU-locks no AHB listed here while `busy` (lorieGpuInFlight,
+     * InitOutput.c lorieWaitGpuIdle): the device owns those (FOREIGN ownership, vk.h) until the frame finished.
+     */
+    struct {
+        volatile uint32_t busy;
+        uint32_t count;
+        uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
+    } gpuInFlight;
+
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;
 
@@ -414,6 +429,17 @@ struct lorie_shared_server_state {
         volatile uint8_t updated, moved;
     } cursor;
 };
+
+// Whether AHB `id` - or, for 0, any AHB - is used by a submitted Vulkan frame the renderer has not seen finish.
+static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared_server_state *st, uint64_t id) {
+    uint32_t i;
+    if (!__atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE))
+        return false;
+    for (i = 0; id && i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
+        if (st->gpuInFlight.ids[i] == id)
+            return true;
+    return !id;
+}
 
 static int android_to_linux_keycode[304] = {
         [ 4   /* ANDROID_KEYCODE_BACK */] = KEY_ESC,

@@ -58,6 +58,7 @@ recipes = {
         "static Bool lorieIsAhb(LoriePixmapPriv *priv) {",
         "static void lorieHoldPersistent(LoriePixmapPriv *priv) {",
         "static void lorieDropPersistent(LoriePixmapPriv *priv) {",
+        "static void lorieWaitGpuIdle(uint64_t id) {",
         "static void lorieApplyOwnership(uint8_t mode, uint32_t seq) {",
         "static void lorieProcessOwnershipRequest(void) {",
         "static void lorieResetOwnership(void) {",
@@ -102,7 +103,10 @@ recipes = {
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
     # the GPU copy queue's types (fakevk.h)
-    "gpucopytypes": lambda: span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyEntry;"),
+    "gpucopytypes": lambda: span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyEntry;")
+        + macro(H, "LORIE_GPU_IN_FLIGHT_MAX"),
+    # the AHBs a submitted Vulkan frame uses, as both sides look them up (fakevk.h, townership.c)
+    "inflight": lambda: func(H, "static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared_server_state *st, uint64_t id) {"),
     # a Present copy from the X server's queue through the renderer's frame and back to the X server - tpresentcopy.c:
     # LorieBuffer's description and GLES's swizzle rule, the X server's side (schedule, done, ack), the renderer's
     # GLES copies (what Vulkan must match) and its Vulkan copies, alone and in a frame
@@ -112,10 +116,13 @@ recipes = {
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
         + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
         + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
+        + func(I, "static void lorieWaitGpuIdle(uint64_t id) {")
         + func(R, "static void rendererGlBuffer(LorieBuffer *buf) {")
         + func(R, "static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {")
         + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {")
+        + func(R, "static void rendererVkInFlight(void) {")
+        + func(R, "static void rendererVkFrameDone(void) {")
         + func(R, "static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff, int16_t yOff, const LorieBuffer_Desc *src,")
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
