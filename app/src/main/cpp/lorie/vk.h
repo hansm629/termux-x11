@@ -87,8 +87,13 @@ struct lorie_vk_image {
     VkFramebuffer framebuffer;  /* for rendering into it (GPU copies): made when first needed */
 };
 
+/*
+ * The renderer's images, each allocated on its own: a pointer lorieVkImport returned stays valid until that image
+ * is removed, however many are imported after it - a frame keeps the images it uses (lorieVkFrameUse) while it
+ * imports more. Only the array of pointers grows.
+ */
 struct lorie_vk_images {
-    struct lorie_vk_image *items;
+    struct lorie_vk_image **items;
     uint32_t count, capacity;
     uint8_t lastReason;         /* why the last refused import was refused (LORIE_FALLBACK_*) */
     VkResult lastResult;

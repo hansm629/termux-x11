@@ -17,7 +17,9 @@
  *   swaps them, the source's alpha kept; several entries in one submission; completedSerial and readIndex
  *   published only after the fence, under the X server's lock, with every buffer back with the foreign owner; a
  *   failed submission publishes nothing; a frame with no copy queued draws none; an entry whose buffer the
- *   renderer never got is skipped and completed, as GLES does.
+ *   renderer never got is skipped and completed, as GLES does. Frames of eight copies from new sources, the
+ *   cache passing 16 and 32 images in the middle of a frame: every image a frame already used stays valid (its
+ *   acquire released, its draw from the right buffer), every image keeps its address until removed.
  *   X server again: done only then; the CPU may lock the source; the acknowledgement drops what was held. */
 #include <math.h>
 #include <pthread.h>
@@ -120,7 +122,7 @@ static volatile int viewportX, viewportY, viewportW = 1080, viewportH = 2400, ex
 #define CVT_H_GRANULARITY 8
 static ANativeWindow window = { 1080, 2400 }, *win = &window;
 static pthread_spinlock_t bufferLock;
-static LorieBuffer bufs[16];
+static LorieBuffer bufs[64];
 static int nbufs, vkFailures;
 #define buffers rendererBuffers     /* fakevk.h has its own `buffers` */
 static int buffers, removedBuffers;
@@ -438,6 +440,59 @@ int main(void) {
         CHECK(lorieGpuCopyIsDone(serial) && st.diag.vkImportedDestinationDraws == dests && vkFailures == 0 &&
               gles(&saved) == serial && glDrawCount == 0, "never got: not skipped as GLES skips it");
         lorieGpuCopyAck(&freshPix, dstBuffer);
+    }
+
+    /* frames of eight copies from new sources: the cache grows past 16 and 32 images in the middle of a frame */
+    {
+        enum { SOURCES = 40 };
+        LorieBuffer *many[SOURCES];
+        LoriePixmapPriv manyP[SOURCES];
+        PixmapRec manyPix[SOURCES];
+        struct lorie_vk_image *kept[SOURCES], *rootImage = lorieVkImageFind(&vkImages, root->desc.id);
+        VkImage keptImage[SOURCES];
+        RegionRec one = { 1, boxes };
+        bool crossed16 = false, crossed32 = false;
+        for (int k = 0; k < SOURCES; k++) {
+            many[k] = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 32, 16);
+            manyP[k] = (LoriePixmapPriv) { many[k] };
+            manyPix[k] = (PixmapRec) { { 32, 16 }, &manyP[k] };
+        }
+        CHECK(rootImage && vkImages.count < 16, "many: %u images before", vkImages.count);
+        for (int f = 0; f < SOURCES / 8; f++) {
+            uint32_t before = vkImages.count;
+            int acquires = emu.acquires, releases = emu.releases, violations = emu.violations;
+            for (int k = f * 8; k < f * 8 + 8; k++)
+                CHECK(lorieTryScheduleGpuCopy(&manyPix[k], &rootPix, &one, (int16_t) k, 0, &serial, &dstBuffer), "many: copy %d not queued", k);
+            d0 = emu.draws;
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            crossed16 |= before < 16 && vkImages.count > 16;
+            crossed32 |= before < 32 && vkImages.count > 32;
+            /* eight sources and the root, each acquired once and released once */
+            CHECK(vkFailures == 0 && emu.violations == violations && emu.acquires - acquires == 9 && emu.releases - releases == 9 &&
+                  lorieGpuCopyIsDone(serial), "many, frame %d (%u -> %u images): %d violations, %d acquires, %d releases", f, before,
+                  vkImages.count, emu.violations - violations, emu.acquires - acquires, emu.releases - releases);
+            for (int k = 0; k < 8; k++)
+                CHECK(emu.drawnFrom[(d0 + k) % 64] == many[f * 8 + k]->desc.buffer && emu.drawnInto[(d0 + k) % 64] == root->desc.buffer,
+                      "many, frame %d: copy %d not drawn from its source into the root", f, k);
+            CHECK(emu.drawnFrom[(d0 + 8) % 64] == root->desc.buffer, "many, frame %d: the root not drawn", f);
+            for (int k = f * 8; k < f * 8 + 8; k++) {
+                kept[k] = lorieVkImageFind(&vkImages, many[k]->desc.id);
+                keptImage[k] = kept[k] ? kept[k]->image : VK_NULL_HANDLE;
+                lorieGpuCopyAck(&manyPix[k], dstBuffer);
+            }
+        }
+        CHECK(crossed16 && crossed32, "many: the cache did not pass 16 and 32 images in a frame");
+        CHECK(lorieVkImageFind(&vkImages, root->desc.id) == rootImage, "many: the root's image moved");
+        for (int k = 0; k < SOURCES; k++)
+            CHECK(kept[k] && lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k] && kept[k]->image == keptImage[k] &&
+                  kept[k]->id == many[k]->desc.id, "many: source %d's image moved or changed", k);
+        /* removing one leaves every other where it was */
+        lorieVkImageRemove(&vk, &vkImages, many[0]->desc.id);
+        CHECK(!lorieVkImageFind(&vkImages, many[0]->desc.id) && lorieVkImageFind(&vkImages, root->desc.id) == rootImage,
+              "many: a removal moved another image");
+        for (int k = 1; k < SOURCES; k++)
+            CHECK(lorieVkImageFind(&vkImages, many[k]->desc.id) == kept[k], "many: source %d moved by a removal", k);
     }
 
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",

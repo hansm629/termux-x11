@@ -242,8 +242,8 @@ VkImageUsageFlags lorieVkAhbImageUsage(uint64_t ahbUsage) {
 struct lorie_vk_image *lorieVkImageFind(struct lorie_vk_images *images, uint64_t id) {
     uint32_t i;
     for (i = 0; i < images->count; i++)
-        if (images->items[i].id == id)
-            return &images->items[i];
+        if (images->items[i]->id == id)
+            return images->items[i];
     return NULL;
 }
 
@@ -432,7 +432,7 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
 
     if (images->count == images->capacity) {
         uint32_t capacity = images->capacity ? images->capacity * 2 : 16;
-        struct lorie_vk_image *items = realloc(images->items, capacity * sizeof(*items));
+        struct lorie_vk_image **items = realloc(images->items, capacity * sizeof(*items));
         if (!items) {
             reason = LORIE_FALLBACK_AHB_IMPORT;
             r = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -441,9 +441,15 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
         images->items = items;
         images->capacity = capacity;
     }
-    images->items[images->count] = img;
+    if (!(found = malloc(sizeof(*found)))) {
+        reason = LORIE_FALLBACK_AHB_IMPORT;
+        r = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto fail;
+    }
+    *found = img;
+    images->items[images->count++] = found;
     LORIE_DIAG_ADD(st, vkAhbImportSuccess, 1);
-    return &images->items[images->count++];
+    return found;
 
     fail:
     lorieVkImageDestroy(vk, &img);
@@ -452,16 +458,19 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
 }
 
 void lorieVkImageRemove(struct lorie_vk *vk, struct lorie_vk_images *images, uint64_t id) {
-    struct lorie_vk_image *img = lorieVkImageFind(images, id);
-    if (!img)
-        return;
-    lorieVkImageDestroy(vk, img);
-    *img = images->items[--images->count];
+    uint32_t i;
+    for (i = 0; i < images->count; i++)
+        if (images->items[i]->id == id) {
+            lorieVkImageDestroy(vk, images->items[i]);
+            free(images->items[i]);
+            images->items[i] = images->items[--images->count];
+            return;
+        }
 }
 
 void lorieVkImagesClear(struct lorie_vk *vk, struct lorie_vk_images *images) {
     while (images->count)
-        lorieVkImageRemove(vk, images, images->items[0].id);
+        lorieVkImageRemove(vk, images, images->items[0]->id);
     free(images->items);
     memset(images, 0, sizeof(*images));
 }
