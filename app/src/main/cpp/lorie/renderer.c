@@ -1739,6 +1739,16 @@ static bool rendererVkStart(void) {
             return false;
         vkReady = true;
     }
+    // TERMUX_X11_RENDERER_VK_TRANSFER_COPY: its BGRA into RGBX copy checked on this device once, before any is made
+    // (a device made again checks again); every session's diagnostics say how it went.
+    if (state->backend.vkTransferCopy) {
+        if (vk.transferCheck == LORIE_VK_XFER_CHECK_NONE) {
+            pthread_mutex_unlock(&stateLock);
+            lorieVkTransferCheck(&vk, state);
+            pthread_mutex_lock(&stateLock);
+        }
+        state->diag.vkXferCheck = vk.transferCheck;
+    }
     if (!vkOwned && !rendererVkOwnership(LORIE_OWNERSHIP_PER_ACCESS)) {
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_OWNERSHIP, VK_SUCCESS);
         return false;
@@ -1878,8 +1888,22 @@ static void rendererVkCountTransfer(const LorieGpuCopyEntry *entry, uint32_t n, 
 }
 
 /*
+ * The one copy between two formats made by vkCmdCopyImage: a BGRA AHB (B8G8R8A8_UNORM) into an RGBX AHB
+ * (R8G8B8A8_UNORM) of depth 24, once this device copied it byte-exact (lorieVkTransferCheck). The draw reads the BGRA
+ * texel, swaps its red and blue (rendererVkCopyQuad's swizzle: the two byte orders differ) and writes it as RGBA:
+ * every byte where the source has it, the alpha in the 4th, X padding at depth 24 - the raw copy's bytes
+ * (lorieVkCopyFormats), as the X server's own CopyArea copies them.
+ */
+static bool rendererVkCopyBgraIntoRgbx(const LorieGpuCopyEntry *entry, const struct lorie_vk_image *s, const struct lorie_vk_image *d) {
+    return vk.transferCheck == LORIE_VK_XFER_CHECK_PASS && entry->dstDepth == 24 &&
+           s->ahbFormat == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM && s->format == VK_FORMAT_B8G8R8A8_UNORM &&
+           d->ahbFormat == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM && d->format == VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+/*
  * Experimental, TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1: an entry's rectangles as vkCmdCopyImage regions, where the
- * copy gives exactly the pixels rendererVkCopyQuad's draws give - one VkFormat and one byte order (no swizzle); an
+ * copy gives exactly the pixels rendererVkCopyQuad's draws give - one VkFormat and one byte order (no swizzle), or
+ * BGRA into RGBX of depth 24 (rendererVkCopyBgraIntoRgbx: the swizzle gives the raw bytes there); an
  * RGBX source, whose 4th byte the draw reads as 1, only into an RGBX destination below depth 32 (that byte X
  * padding there, read by no one: the copy leaves the source's byte as the X server's own CopyArea would, the draw
  * 255); both images made with the transfer usage (lorieVkImport gives it only where the device allows it); each
@@ -1898,7 +1922,7 @@ static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n
     // when none does.
     if (s == d)
         why |= 1u << LORIE_VK_XFER_NOT_SAME;
-    if (s->format != d->format || s->rgbaOrder != d->rgbaOrder)
+    if ((s->format != d->format || s->rgbaOrder != d->rgbaOrder) && !rendererVkCopyBgraIntoRgbx(entry, s, d))
         why |= 1u << LORIE_VK_XFER_NOT_FORMAT;
     if (s->rgbx && !d->rgbx)
         why |= 1u << LORIE_VK_XFER_NOT_RGBX_ALPHA;

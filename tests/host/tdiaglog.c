@@ -140,6 +140,9 @@ int main(void) {
     fakeState.diag.vkXferLastRects = 1;
     fakeState.diag.vkXferLastRect[2] = 800, fakeState.diag.vkXferLastRect[3] = 600;
     fakeState.diag.vkXferLastOff[0] = 1, fakeState.diag.vkXferLastOff[1] = 29;
+    fakeState.diag.vkXferCheck = LORIE_VK_XFER_CHECK_FAIL;
+    fakeState.diag.vkXferCheckStep = LORIE_VK_SELFTEST_STEP_COMPARE;
+    fakeState.diag.vkXferCheckOffset = 286, fakeState.diag.vkXferCheckExpected = 0x12, fakeState.diag.vkXferCheckActual = 0x56;
     lorieLogRendererDiag();
     fclose(logf);
     {
@@ -153,7 +156,8 @@ int main(void) {
                           strstr(line, " imports_granted=3(+3) ") && strstr(line, " imports_refused=1(+1) ") &&
                           strstr(line, " last_not=FORMAT+RECT_SOURCE last_src=BGRA(5)/800x600/ahb_usage=0x300/vk_usage=0x17 "
                                        "last_dst=RGBX(2)/802x630/depth=24/") &&
-                          strstr(line, " last_rects=1 last_first=0,0-800,600 last_off=1,29") != NULL;
+                          strstr(line, " last_rects=1 last_first=0,0-800,600 last_off=1,29 bgra_rgbx_check=FAIL check_step=COMPARE "
+                                       "check_byte=286 check_expected=0x12 check_actual=0x56 check_vkresult=0") != NULL;
             }
         fclose(logf);
         CHECK(transferLines == 2 && lastOk == 1, "transfer log: %d lines (want 2), %d with the verdicts and last copy (want 1)",

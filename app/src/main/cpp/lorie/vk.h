@@ -58,6 +58,7 @@ struct lorie_vk {
     uint32_t queueFamily;
     VkDevice device;
     VkQueue queue;
+    uint8_t transferCheck;      /* LORIE_VK_XFER_CHECK_*: lorieVkTransferCheck on this device */
     uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */
 };
 
@@ -160,6 +161,9 @@ struct lorie_vk_barrier lorieVkUseBarrier(VkImage image, enum lorie_vk_use from,
 // way (TERMUX_X11_RENDERER_VK_SELFTEST=full asks for LORIE_VK_SELFTEST_ITERATIONS).
 #define LORIE_VK_SELFTEST_QUICK_ITERATIONS 5
 bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations);
+// TERMUX_X11_RENDERER_VK_TRANSFER_COPY: vkCmdCopyImage from a BGRA AHB into an RGBX AHB on this device, compared byte
+// by byte with what the X server's byte order wants (vk.c). LORIE_VK_XFER_CHECK_*, kept in vk->transferCheck.
+uint8_t lorieVkTransferCheck(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st);
 
 /*
  * Presenting: what the renderer draws a frame with (lorieVkRendererCreate, once per device) and the window's
@@ -265,7 +269,8 @@ VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r);
 bool lorieVkFrameUse(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *img, enum lorie_vk_use use);
 bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
                       const struct lorie_vk_quad *quads, uint32_t count, int filter);
-// The regions copied from src into dst by vkCmdCopyImage (both images with the transfer usage, of one format),
+// The regions copied from src into dst by vkCmdCopyImage (both images with the transfer usage, of one format or
+// lorieVkCopyFormats' one pair),
 // each buffer taken over for the transfer as lorieVkFrameCopy takes them for drawing. False: nothing recorded.
 bool lorieVkFrameCopyImage(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
                            const VkImageCopy *regions, uint32_t count);

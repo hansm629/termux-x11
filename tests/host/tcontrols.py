@@ -732,6 +732,22 @@ CONTROLS = [
      """            img.optionalVerdict = LORIE_VK_XFER_USAGE_REFUSED;""",
      "",
      "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: BGRA into RGBX copied whatever the device check said", "renderer.c",
+     """    return vk.transferCheck == LORIE_VK_XFER_CHECK_PASS && entry->dstDepth == 24 &&""",
+     """    return entry->dstDepth == 24 &&""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: BGRA into RGBX copied at depth 32", "renderer.c",
+     """    return vk.transferCheck == LORIE_VK_XFER_CHECK_PASS && entry->dstDepth == 24 &&""",
+     """    return vk.transferCheck == LORIE_VK_XFER_CHECK_PASS &&""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: the device check not comparing the copy", "vk.c",
+     """        if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, false, &diff, &got)))
+            goto done;
+    }
+    result = LORIE_VK_XFER_CHECK_PASS;""",
+     """    }
+    result = LORIE_VK_XFER_CHECK_PASS;""",
+     "tvkselftest"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

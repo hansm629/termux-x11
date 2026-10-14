@@ -38,7 +38,9 @@
  *   destination ordered by a barrier, the second over the first,
  *   RGBX into RGBX copying the 4th byte as it is; BGRA into RGBX, RGBX into RGBA, RGBX into depth 32 and a
  *   rectangle past its source drawn exactly as GLES draws them; a device refusing the usage, or failing the image
- *   made with it: imported without it, nothing recorded, drawn; the option off: drawn, even between images that have the usage, and no import asks
+ *   made with it: imported without it, nothing recorded, drawn; BGRA into RGBX of depth 24 once the device check
+ *   passed: copied as raw bits, every byte the source's and what the shader copy (quad.frag, modelled from the
+ *   quad's flags) gives, red and blue apart in every source pixel - not passed, or depth 32: drawn; the option off: drawn, even between images that have the usage, and no import asks
  *   for it. */
 #define _GNU_SOURCE         /* pthread_timedjoin_np: an X server thread never let go must not hang the test */
 #include <errno.h>
@@ -404,6 +406,42 @@ static const char *xferMoves(void) {
     return out;
 }
 #define XFER_MOVED(want, what) CHECK(!strcmp(xferMoves(), want), what ": verdicts %s (want %s)", xferMoves(), want)
+/* the shader copy (shaders/quad.frag) of one pixel, by what the formats and the quad's flags make of its bytes: the
+ * texel read in the source's format (an RGBX source's 4th byte read as 1), red and blue swapped by
+ * LORIE_VK_QUAD_SWIZZLE, alpha 1 by LORIE_VK_QUAD_OPAQUE, written in the destination's format */
+static void shaderPixel(const uint8_t *in, VkFormat sf, bool rgbx, uint32_t flags, VkFormat df, uint8_t *out) {
+    uint8_t c[4] = { in[0], in[1], in[2], in[3] }, t;   /* red, green, blue, alpha */
+    if (sf == VK_FORMAT_B8G8R8A8_UNORM)
+        c[0] = in[2], c[2] = in[0];
+    if (rgbx)
+        c[3] = 255;
+    if (flags & LORIE_VK_QUAD_SWIZZLE)
+        t = c[0], c[0] = c[2], c[2] = t;
+    if (flags & LORIE_VK_QUAD_OPAQUE)
+        c[3] = 255;
+    if (df == VK_FORMAT_B8G8R8A8_UNORM)
+        t = c[0], c[0] = c[2], c[2] = t;
+    memcpy(out, c, 4);
+}
+/* dst's pixels inside src's boxes copied at an offset that are not the shader copy's (all four bytes) */
+static int notAsShader(LorieBuffer *src, LorieBuffer *dst, const BoxRec *box, int n, int xOff, int yOff) {
+    const AHardwareBuffer *s = src->desc.buffer, *d = dst->desc.buffer;
+    struct lorie_vk_image *si = lorieVkImageFind(&vkImages, src->desc.id), *di = lorieVkImageFind(&vkImages, dst->desc.id);
+    int wrong = 0;
+    for (int k = 0; k < n; k++) {
+        LorieGpuCopyRect r = { box[k].x1, box[k].y1, box[k].x2, box[k].y2 };
+        uint32_t flags = rendererVkCopyQuad(r, (int16_t) xOff, (int16_t) yOff, &src->desc, &dst->desc, si->rgbaOrder != di->rgbaOrder).flags;
+        for (int y = r.y1; y < r.y2; y++)
+            for (int x = r.x1; x < r.x2; x++) {
+                uint8_t want[4];
+                if (x + xOff < 0 || y + yOff < 0 || x + xOff >= (int) d->desc.width || y + yOff >= (int) d->desc.height)
+                    continue;
+                shaderPixel(s->cpu + ((size_t) y * s->desc.stride + x) * 4, si->format, si->rgbx, flags, di->format, want);
+                wrong += memcmp(d->cpu + ((size_t) (y + yOff) * d->desc.stride + x + xOff) * 4, want, 4) != 0;
+            }
+    }
+    return wrong;
+}
 
 int main(void) {
     LorieBuffer *root, *src, *bgra, *redirected, *fresh, *fd;
@@ -1051,6 +1089,64 @@ int main(void) {
             XFER_MOVED("checked+1 SRC_USAGE+1 DST_USAGE+1 missing_FAILED+2 imports_FAILED+2", "failed image");
             st.gpuInFlight.busy = 0;
             lorieGpuCopyAck(&fsPix, held[0]);
+        }
+
+        /* BGRA into RGBX of depth 24, once the device check passed: copied as raw bits (B8G8R8A8_UNORM into
+         * R8G8B8A8_UNORM, size-compatible), every byte the source's and the shader copy's - red and blue apart in every
+         * source pixel, so a swap shows; the check not passed, or depth 32: drawn */
+        {
+            LorieBuffer *gs = buffer(AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, 50, 40), *gd = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48),
+                        *g32 = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48);
+            LoriePixmapPriv gsP = { gs }, gdP = { gd }, g32P = { g32 };
+            PixmapRec gsPix = { { 50, 40, 24 }, &gsP }, gdPix = { { 64, 48, 24 }, &gdP }, g32Pix = { { 64, 48, 32 }, &g32P };
+            const struct copied bgra[2] = { { gs, in[0], 2, 5 }, { gs, in[1], 2, 5 } };
+            const AHardwareBuffer *ga = gs->desc.buffer;
+            int apart = 1;
+            fill(gs, 0xc3, -1); fill(gd, 9, 0x11); fill(g32, 10, 0x11);
+            for (uint32_t y = 0; y < ga->desc.height; y++)
+                for (uint32_t x = 0; x < ga->desc.width; x++)
+                    apart &= ga->cpu[((size_t) y * ga->desc.stride + x) * 4] != ga->cpu[((size_t) y * ga->desc.stride + x) * 4 + 2];
+            CHECK(apart, "BGRA into RGBX: a source pixel with red and blue alike");
+
+            CHECK(lorieVkTransferCheck(&vk, &st) == LORIE_VK_XFER_CHECK_PASS, "BGRA into RGBX: the device check did not pass");
+            copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws, c0 = emu.copyCommands, v0 = emu.violations;
+            xferMark();
+            CHECK(lorieTryScheduleGpuCopy(&gsPix, &gdPix, &inR, 2, 5, &serial, &held[0]), "BGRA into RGBX: not queued");
+            rendererVkApplyPendingGpuCopies();
+            CHECK(vkFailures == 0 && emu.violations == v0 && lorieGpuCopyIsDone(serial) && st.diag.vkCopyCommands - copies0 == 1 &&
+                  emu.copyCommands - c0 == 1 && st.diag.vkImportedDestinationDraws == dests0 && st.diag.fallbackTotal == fallbacks0,
+                  "BGRA into RGBX: copy_commands +%u (want 1), destination draws +%u (want 0), %d violations",
+                  st.diag.vkCopyCommands - copies0, st.diag.vkImportedDestinationDraws - dests0, emu.violations - v0);
+            XFER_MOVED("checked+1 imports_GRANTED+2", "BGRA into RGBX");
+            CHECK(wrongPixels(gd, 9, bgra, 2) == 0, "BGRA into RGBX: %d pixels not the source's bytes", wrongPixels(gd, 9, bgra, 2));
+            CHECK(notAsShader(gs, gd, in, 2, 2, 5) == 0, "BGRA into RGBX: %d pixels not the shader copy's", notAsShader(gs, gd, in, 2, 2, 5));
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&gsPix, held[0]);
+
+            /* the shader copy itself, on the same bytes: what it gives is what the copy gave */
+            {
+                uint8_t px[4] = { 0x11, 0x22, 0x33, 0x44 }, out[4];
+                shaderPixel(px, VK_FORMAT_B8G8R8A8_UNORM, false, LORIE_VK_QUAD_SWIZZLE, VK_FORMAT_R8G8B8A8_UNORM, out);
+                CHECK(!memcmp(px, out, 4), "BGRA into RGBX: the shader copy gives %02x %02x %02x %02x of 11 22 33 44", out[0], out[1],
+                      out[2], out[3]);
+            }
+
+            xferMark();
+            CHECK(lorieTryScheduleGpuCopy(&gsPix, &g32Pix, &inR, 2, 5, &serial, &held[0]), "BGRA into RGBX of depth 32: not queued");
+            rendererVkApplyPendingGpuCopies();
+            XFER_MOVED("checked+1 FORMAT+1 imports_GRANTED+1", "BGRA into RGBX of depth 32");
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&gsPix, held[0]);
+
+            vk.transferCheck = LORIE_VK_XFER_CHECK_FAIL;
+            xferMark();
+            CHECK(lorieTryScheduleGpuCopy(&gsPix, &gdPix, &inR, 2, 5, &serial, &held[0]), "BGRA into RGBX, check failed: not queued");
+            rendererVkApplyPendingGpuCopies();
+            XFER_MOVED("checked+1 FORMAT+1", "BGRA into RGBX, check failed");
+            CHECK(vkFailures == 0 && lorieGpuCopyIsDone(serial), "BGRA into RGBX, check failed: %d failures", vkFailures);
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&gsPix, held[0]);
+            vk.transferCheck = LORIE_VK_XFER_CHECK_NONE;
         }
 
         /* without it: drawn, images with the usage too; new imports neither ask for the usage nor about the features */

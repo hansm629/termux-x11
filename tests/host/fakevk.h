@@ -219,6 +219,7 @@ static struct {
     VkFormatFeatureFlags optimalFeatures;   /* every format's optimal-tiling features (good(): sampled, attachment, transfer) */
     bool refuseTransferUsage;               /* the image-format query refuses the transfer usage (an AHB the device cannot copy) */
     bool failTransferImage;                 /* vkCreateImage fails an image with the transfer usage the query allowed */
+    bool copyConverts;                      /* a driver bug: a copy between two formats converts (red and blue swapped) */
 } cfg;
 static struct {
     int createInstance, destroyInstance, createDevice, destroyDevice, waitIdle, getQueue;
@@ -693,8 +694,11 @@ static void run(const struct fake_op *op) {
             violation("copy with an image made without the transfer usage");
             return;
         }
-        if (!a || !b || a == b || a->vkFormat != b->vkFormat) {
-            violation("copy between images not two X server buffers of one format");
+        /* one format, or B8G8R8A8_UNORM into R8G8B8A8_UNORM: size-compatible, both of the 32-bit class
+         * (VUID-vkCmdCopyImage-srcImage-01548), copied as raw bits - the one pair of two formats the renderer copies */
+        if (!a || !b || a == b || (a->vkFormat != b->vkFormat &&
+                                   !(a->vkFormat == VK_FORMAT_B8G8R8A8_UNORM && b->vkFormat == VK_FORMAT_R8G8B8A8_UNORM))) {
+            violation("copy between images not two X server buffers of one format or of B8G8R8A8 into R8G8B8A8");
             return;
         }
         if (!usable(a, op->la, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkExtent3D) { a->desc.width, a->desc.height, 1 }) ||
@@ -717,9 +721,15 @@ static void run(const struct fake_op *op) {
         }
         for (uint32_t i = 0; i < op->nregions; i++) {
             const VkImageCopy *g = &op->regions[i];
-            for (uint32_t y = 0; y < g->extent.height; y++)
-                memcpy(b->gpu + ((size_t) (g->dstOffset.y + y) * b->desc.width + g->dstOffset.x) * 4,
-                       a->gpu + ((size_t) (g->srcOffset.y + y) * a->desc.width + g->srcOffset.x) * 4, (size_t) g->extent.width * 4);
+            for (uint32_t y = 0; y < g->extent.height; y++) {
+                uint8_t *to = b->gpu + ((size_t) (g->dstOffset.y + y) * b->desc.width + g->dstOffset.x) * 4;
+                memcpy(to, a->gpu + ((size_t) (g->srcOffset.y + y) * a->desc.width + g->srcOffset.x) * 4, (size_t) g->extent.width * 4);
+                if (cfg.copyConverts && a->vkFormat != b->vkFormat)
+                    for (uint32_t x = 0; x < g->extent.width; x++) {
+                        uint8_t t = to[x * 4];
+                        to[x * 4] = to[x * 4 + 2], to[x * 4 + 2] = t;
+                    }
+            }
         }
         copied(b->gpu);
         return;

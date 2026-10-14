@@ -14,7 +14,11 @@
  *   lock, submission or fence wait fails it at its step. Every failure records one fallback (FATAL_BACKEND,
  *   VK_SELFTEST) and leaves nothing behind. Non-coherent memory is flushed and invalidated.
  *   Its duration (vkSelftestUs, lorieVkElapsedUs): microseconds across a second boundary, where tv_nsec is
- *   smaller at the end, as within one; never a wrapped value. */
+ *   smaller at the end, as within one; never a wrapped value.
+ *   The transfer-copy check (lorieVkTransferCheck): BGRA into RGBX at an offset, three patterns, through the same
+ *   acquires and releases - byte-exact on a device that copies raw bits; a device whose copy between the two formats
+ *   swaps red and blue fails it at the compare, with the byte, its expected and actual value; without BGRA it is
+ *   not possible. It records no fallback and leaves nothing behind. */
 #include "fakevk.h"
 
 #define N LORIE_VK_SELFTEST_ITERATIONS
@@ -194,6 +198,34 @@ int main(void) {
     ok = lorieVkSelftest(&vk, &st, N);
     failed("a fence wait times out", ok, LORIE_VK_SELFTEST_STEP_FENCE, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, 1, 0, 0);
     CHECK(st.diag.vkSelftestFailResult == VK_TIMEOUT, "a fence wait times out: VkResult %d", st.diag.vkSelftestFailResult);
+
+    /* the transfer-copy check: BGRA into RGBX */
+    device();
+    vk.verifiedFormats = 7;
+    {
+        int copies = emu.copyCommands;
+        CHECK(lorieVkTransferCheck(&vk, &st) == LORIE_VK_XFER_CHECK_PASS && vk.transferCheck == LORIE_VK_XFER_CHECK_PASS &&
+              st.diag.vkXferCheck == LORIE_VK_XFER_CHECK_PASS && emu.copyCommands - copies == 3 && emu.violations == 0 &&
+              emu.acquires == emu.releases && st.diag.fallbackTotal == 0, "transfer check: %u (step %u byte %d expected %#x got %#x), "
+              "%d copies, %d violations", st.diag.vkXferCheck, st.diag.vkXferCheckStep, st.diag.vkXferCheckOffset,
+              st.diag.vkXferCheckExpected, st.diag.vkXferCheckActual, emu.copyCommands - copies, emu.violations);
+        clean("transfer check");
+    }
+    device();
+    vk.verifiedFormats = 7;
+    cfg.copyConverts = true;
+    CHECK(lorieVkTransferCheck(&vk, &st) == LORIE_VK_XFER_CHECK_FAIL && vk.transferCheck == LORIE_VK_XFER_CHECK_FAIL &&
+          st.diag.vkXferCheckStep == LORIE_VK_SELFTEST_STEP_COMPARE && st.diag.vkXferCheckOffset >= 0 &&
+          (st.diag.vkXferCheckOffset % 4 == 0 || st.diag.vkXferCheckOffset % 4 == 2) &&
+          st.diag.vkXferCheckExpected != st.diag.vkXferCheckActual && st.diag.fallbackTotal == 0 && emu.violations == 0,
+          "transfer check, red and blue swapped: %u at step %u byte %d expected %#x got %#x", st.diag.vkXferCheck,
+          st.diag.vkXferCheckStep, st.diag.vkXferCheckOffset, st.diag.vkXferCheckExpected, st.diag.vkXferCheckActual);
+    clean("transfer check, red and blue swapped");
+    device();
+    vk.verifiedFormats = 3;     /* BGRA not verified by the self-test (unavailable) */
+    CHECK(lorieVkTransferCheck(&vk, &st) == LORIE_VK_XFER_CHECK_UNAVAILABLE && st.diag.vkXferCheckStep == LORIE_VK_SELFTEST_STEP_IMPORT &&
+          st.diag.fallbackTotal == 0, "transfer check without BGRA: %u at step %u", st.diag.vkXferCheck, st.diag.vkXferCheckStep);
+    clean("transfer check without BGRA");
 
     /* its duration */
     {

@@ -285,12 +285,18 @@ enum { LORIE_FALLBACK_REASONS(LORIE_ENUM_REASON) LORIE_FALLBACK_REASON_COUNT };
 #define LORIE_VK_XFER_NOTS(X) X(SAME) X(FORMAT) X(RGBX_ALPHA) X(DEPTH32) X(SRC_USAGE) X(DST_USAGE) X(RECT_SOURCE) \
     X(RECT_OVERLAP) X(RECT_NONE)
 #define LORIE_VK_XFER_USAGES(X) X(GRANTED) X(UNASKED) X(NO_FEATURE) X(REFUSED) X(FAILED)
+/* ... and the device check of its one copy between two formats, BGRA into RGBX (vk.c lorieVkTransferCheck): not run,
+ * byte-exact, not byte-exact (or failed on the way), not possible here (no BGRA import with the transfer usage) */
+#define LORIE_VK_XFER_CHECKS(X) X(NONE) X(PASS) X(FAIL) X(UNAVAILABLE)
 #define LORIE_ENUM_XFER_NOT(n) LORIE_VK_XFER_NOT_ ## n,
 #define LORIE_ENUM_XFER_USAGE(n) LORIE_VK_XFER_USAGE_ ## n,
+#define LORIE_ENUM_XFER_CHECK(n) LORIE_VK_XFER_CHECK_ ## n,
 enum { LORIE_VK_XFER_NOTS(LORIE_ENUM_XFER_NOT) LORIE_VK_XFER_NOT_COUNT };
 enum { LORIE_VK_XFER_USAGES(LORIE_ENUM_XFER_USAGE) LORIE_VK_XFER_USAGE_COUNT };
+enum { LORIE_VK_XFER_CHECKS(LORIE_ENUM_XFER_CHECK) LORIE_VK_XFER_CHECK_COUNT };
 #undef LORIE_ENUM_XFER_NOT
 #undef LORIE_ENUM_XFER_USAGE
+#undef LORIE_ENUM_XFER_CHECK
 
 struct lorie_renderer_diag {
     volatile uint8_t active;                    /* LORIE_ACTIVE_*: what draws the root right now */
@@ -357,6 +363,10 @@ struct lorie_renderer_diag {
     volatile uint64_t vkXferLastSrcAhbUsage, vkXferLastDstAhbUsage;
     volatile uint32_t vkXferLastRects;
     volatile int32_t vkXferLastRect[4], vkXferLastOff[2];
+    /* the BGRA into RGBX device check (LORIE_VK_XFER_CHECK_*); where it failed: the self-test step, the byte (of the
+     * destination, tightly packed), its expected and actual value, the VkResult */
+    volatile uint8_t vkXferCheck, vkXferCheckStep, vkXferCheckExpected, vkXferCheckActual;
+    volatile int32_t vkXferCheckOffset, vkXferCheckResult;
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \

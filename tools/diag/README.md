@@ -41,7 +41,10 @@ copied into the one sampled and they swap (`x_root_copy_us` is the time those co
 `vk_transfer_copy` is `on` when the X server was started with `TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1`
 (experimental, Vulkan only): a Present copy is then made by `vkCmdCopyImage` (counted in `XlorieVk`
 `copy_commands`, one per queued copy) where that gives exactly the pixels the shader copy gives - one Vulkan format
-and byte order, an RGBX source only into an RGBX destination below depth 32, both AHBs imported with the transfer
+and byte order, or a BGRA AHB into an RGBX one of depth 24 (B8G8R8A8_UNORM into R8G8B8A8_UNORM, size-compatible,
+copied as raw bits: the shader copy swaps red and blue between the two byte orders, which gives those same bytes)
+once this device copied that byte-exact (`bgra_rgbx_check`, below); an RGBX source only into an RGBX destination
+below depth 32, both AHBs imported with the transfer
 usage (asked for only where the device allows it for that AHB; refused, the AHB is imported without it), every
 rectangle inside its source, no two destinations overlapping; every other copy is drawn as before
 (`imported_destination_draws`).
@@ -57,7 +60,11 @@ overlapping), `rect_none` (nothing left inside the destination). For each image 
 `failed` (the image made with it failed, made again without it). `imports_*` counts the imports that asked for it
 by what they got (`granted` or the same reasons). `last_*` is the last copy drawn instead: its conditions, the
 source and destination (AHB format, size, the destination's depth, AHB usage, Vulkan usage), its rectangles, the
-first one and the offset.
+first one and the offset. `bgra_rgbx_check` is the device check made once when Vulkan starts with the option on:
+a BGRA AHB copied into an RGBX one at an offset, three patterns whose bytes all differ, compared byte by byte (each
+pixel's first three bytes, RGBX's 4th being X padding) - `PASS`, `FAIL` (red and blue swapped, or any other wrong
+byte: `check_step`, `check_byte` in the destination tightly packed, `check_expected`, `check_actual`,
+`check_vkresult`; such copies are then drawn), `UNAVAILABLE` (no BGRA import with the transfer usage) or `NONE`.
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,

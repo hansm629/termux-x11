@@ -843,6 +843,7 @@ static const char *const lorieFallbackClassNames[] = { LORIE_FALLBACK_CLASSES(LO
 static const char *const lorieFallbackReasonNames[] = { LORIE_FALLBACK_REASONS(LORIE_NAME) };
 static const char *const lorieSelftestStepNames[] = { LORIE_VK_SELFTEST_STEPS(LORIE_NAME) };
 static const char *const lorieXferNotNames[] = { LORIE_VK_XFER_NOTS(LORIE_NAME) };
+static const char *const lorieXferCheckNames[] = { LORIE_VK_XFER_CHECKS(LORIE_NAME) };
 #undef LORIE_NAME
 
 static void lorieLogRendererDiag(void) {
@@ -925,7 +926,8 @@ static void lorieLogRendererDiag(void) {
                   "imports_refused=%llu(+%llu) imports_failed=%llu(+%llu) last_not=%s "
                   "last_src=%s(%u)/%ux%u/ahb_usage=0x%llx/vk_usage=0x%x "
                   "last_dst=%s(%u)/%ux%u/depth=%u/ahb_usage=0x%llx/vk_usage=0x%x last_rects=%u last_first=%d,%d-%d,%d "
-                  "last_off=%d,%d",
+                  "last_off=%d,%d bgra_rgbx_check=%s check_step=%s check_byte=%d check_expected=0x%02x check_actual=0x%02x "
+                  "check_vkresult=%d",
             TD(vkXferChecked), TD(vkCopyCommands), TD(vkXferNot[LORIE_VK_XFER_NOT_SAME]),
             TD(vkXferNot[LORIE_VK_XFER_NOT_FORMAT]), TD(vkXferNot[LORIE_VK_XFER_NOT_RGBX_ALPHA]),
             TD(vkXferNot[LORIE_VK_XFER_NOT_DEPTH32]), TD(vkXferNot[LORIE_VK_XFER_NOT_SRC_USAGE]),
@@ -941,7 +943,9 @@ static void lorieLogRendererDiag(void) {
             lorieAhbFormatName(d.vkXferLastDstFormat), d.vkXferLastDstFormat, d.vkXferLastDstWidth, d.vkXferLastDstHeight,
             d.vkXferLastDstDepth, (unsigned long long) d.vkXferLastDstAhbUsage, d.vkXferLastDstUsage, d.vkXferLastRects,
             d.vkXferLastRect[0], d.vkXferLastRect[1], d.vkXferLastRect[2], d.vkXferLastRect[3], d.vkXferLastOff[0],
-            d.vkXferLastOff[1]);
+            d.vkXferLastOff[1], lorieXferCheckNames[d.vkXferCheck % LORIE_VK_XFER_CHECK_COUNT],
+            lorieSelftestStepNames[d.vkXferCheckStep % LORIE_VK_SELFTEST_STEP_COUNT], d.vkXferCheckOffset,
+            d.vkXferCheckExpected, d.vkXferCheckActual, d.vkXferCheckResult);
     }
 #undef TD
     prev = d;

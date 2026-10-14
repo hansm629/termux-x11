@@ -988,6 +988,106 @@ bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_st
     return false;
 }
 
+/*
+ * TERMUX_X11_RENDERER_VK_TRANSFER_COPY's one copy between two formats, a client's BGRA AHB into an X server's RGBX
+ * one (B8G8R8A8_UNORM into R8G8B8A8_UNORM, lorieVkCopyFormats), made on this device as frames make it - CPU writes,
+ * FOREIGN acquire from GENERAL, vkCmdCopyImage at an offset, release, the fence, CPU reads - and compared byte by
+ * byte with what the X server's byte order wants: each pixel's bytes as the source has them (what the shader copy
+ * gives: the BGRA texel read, its red and blue swapped, written as RGBA), red and blue never swapped, the rest of
+ * the destination as it was. Patterns whose four bytes differ; RGBX's 4th byte not compared (undefined to Vulkan,
+ * X padding at depth 24). Not possible without a BGRA import with the transfer usage. Recorded in
+ * vk->transferCheck and the diagnostics; nothing else depends on it but whether that copy is made.
+ */
+uint8_t lorieVkTransferCheck(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st) {
+    static const uint32_t formats[2] = { AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM };
+    const VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    const VkImageCopy region = { layers, { 1, 2, 0 }, layers, { 4, 1, 0 },
+                                 { LORIE_VK_SELFTEST_WIDTH - 7, LORIE_VK_SELFTEST_HEIGHT - 5, 1 } };
+    struct lorie_vk_selftest t = {0};
+    struct lorie_vk_image *img[2] = { NULL, NULL };
+    uint8_t result = LORIE_VK_XFER_CHECK_UNAVAILABLE, step = LORIE_VK_SELFTEST_STEP_NONE, expected = 0, got = 0;
+    uint8_t *source = NULL;
+    uint32_t i, it, y;
+    int64_t diff = -1;
+    VkResult r = VK_SUCCESS;
+
+    if ((r = lorieVkSelftestSetup(vk, &t)) != VK_SUCCESS || !(source = malloc(t.size))) {
+        step = LORIE_VK_SELFTEST_STEP_SETUP;
+        goto done;
+    }
+    for (i = 0; i < 2; i++) {
+        AHardwareBuffer_Desc desc = { .width = LORIE_VK_SELFTEST_WIDTH, .height = LORIE_VK_SELFTEST_HEIGHT, .layers = 1,
+                                      .format = formats[i],
+                                      .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                               AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER };
+        if (AHardwareBuffer_allocate(&desc, &t.ahb[i]) || !t.ahb[i]) {
+            t.ahb[i] = NULL;
+            step = LORIE_VK_SELFTEST_STEP_ALLOCATE;
+            goto done;
+        }
+        if (!(img[i] = lorieVkImport(vk, &t.images, UINT64_MAX - 2 - i, t.ahb[i],
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, NULL))) {
+            step = LORIE_VK_SELFTEST_STEP_IMPORT;
+            r = t.images.lastResult;
+            goto done;
+        }
+    }
+    if (img[0]->format != VK_FORMAT_B8G8R8A8_UNORM || img[1]->format != VK_FORMAT_R8G8B8A8_UNORM) {
+        step = LORIE_VK_SELFTEST_STEP_IMPORT;
+        goto done;
+    }
+
+    result = LORIE_VK_XFER_CHECK_FAIL;
+    for (it = 0; it < 3; it++) {
+        lorieVkSelftestPattern(source, 2 + it, it);             // checkerboard, row-dependent, pseudo-random
+        lorieVkSelftestPattern(t.write, 4, it ^ 0x3c3c3c3cu);   // the destination before the copy
+        memcpy(t.expect, t.write, t.size);
+        for (y = 0; y < region.extent.height; y++)
+            memcpy(t.expect + ((size_t) (y + region.dstOffset.y) * LORIE_VK_SELFTEST_WIDTH + region.dstOffset.x) * 4,
+                   source + ((size_t) (y + region.srcOffset.y) * LORIE_VK_SELFTEST_WIDTH + region.srcOffset.x) * 4,
+                   (size_t) region.extent.width * 4);
+        if ((step = lorieVkSelftestCpu(t.ahb[0], NULL, source, true, &diff, &got)) ||
+            (step = lorieVkSelftestCpu(t.ahb[1], NULL, t.write, true, &diff, &got)))
+            goto done;
+        if ((r = lorieVkSelftestBegin(vk, &t)) != VK_SUCCESS) {
+            step = LORIE_VK_SELFTEST_STEP_SUBMIT;
+            goto done;
+        }
+        lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+        lorieVkCmdBarrier(vk, t.cmd, lorieVkAcquireBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));
+        vk->CmdCopyImage(t.cmd, img[0]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img[1]->image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[0]->image, LORIE_VK_USE_TRANSFER_SRC));
+        lorieVkCmdBarrier(vk, t.cmd, lorieVkReleaseBarrier(vk, img[1]->image, LORIE_VK_USE_TRANSFER_DST));
+        if ((r = lorieVkSelftestSubmit(vk, &t, &step)) != VK_SUCCESS)
+            goto done;
+        if ((step = lorieVkSelftestCpu(t.ahb[1], t.expect, NULL, false, &diff, &got)))
+            goto done;
+    }
+    result = LORIE_VK_XFER_CHECK_PASS;
+
+    done:
+    if (step == LORIE_VK_SELFTEST_STEP_COMPARE && diff >= 0)
+        expected = t.expect[diff];
+    if (result == LORIE_VK_XFER_CHECK_PASS)
+        log("transfer copy check: BGRA into RGBX byte-exact");
+    else
+        loge("transfer copy check: %s, step %u, byte %lld expected %#x got %#x, VkResult %d: BGRA into RGBX copies are drawn",
+             result == LORIE_VK_XFER_CHECK_FAIL ? "FAILED" : "not possible", step, (long long) diff, expected, got, r);
+    lorieVkSelftestCleanup(vk, &t);
+    free(source);
+    vk->transferCheck = result;
+    if (st) {
+        st->diag.vkXferCheck = result;
+        st->diag.vkXferCheckStep = step;
+        st->diag.vkXferCheckOffset = (int32_t) diff;
+        st->diag.vkXferCheckExpected = expected;
+        st->diag.vkXferCheckActual = got;
+        st->diag.vkXferCheckResult = r;
+    }
+    return result;
+}
+
 /* ---- presenting ---- */
 
 #define LORIE_VK_ACQUIRE_TIMEOUT_NS 50000000ULL     // 50 ms: the X server's lock is not held meanwhile
@@ -1546,11 +1646,18 @@ bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct l
     return true;
 }
 
+// The formats vkCmdCopyImage copies between here: one format, or B8G8R8A8_UNORM into R8G8B8A8_UNORM (a client's BGRA
+// AHB into an X server's RGBX one) - size-compatible, both of the 32-bit class (VUID-vkCmdCopyImage-srcImage-01548),
+// copied as raw bits: no conversion, the bytes as they are.
+static bool lorieVkCopyFormats(VkFormat src, VkFormat dst) {
+    return src == dst || (src == VK_FORMAT_B8G8R8A8_UNORM && dst == VK_FORMAT_R8G8B8A8_UNORM);
+}
+
 bool lorieVkFrameCopyImage(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
                            const VkImageCopy *regions, uint32_t count) {
     uint32_t i;
 
-    if (src == dst || !count || src->format != dst->format || !(src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+    if (src == dst || !count || !lorieVkCopyFormats(src->format, dst->format) || !(src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
         !(dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
         return false;
     // A copy written into dst before in this frame: this one's writes after it (a draw's render pass or a change of
