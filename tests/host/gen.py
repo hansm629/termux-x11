@@ -119,6 +119,7 @@ recipes = {
     "presentcopy": lambda: func(B, "__LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {")
         + func(I, "bool lorieRendererAvailable(void) {")
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
+        + func(I, "void lorieCountCopyAck(void) {")
         + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
         + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
         + func(R, "static void rendererGlBuffer(LorieBuffer *buf) {")
@@ -133,6 +134,8 @@ recipes = {
         + func(R, "static bool rendererVkCopyBgraIntoRgbx(const LorieGpuCopyEntry *entry, const struct lorie_vk_image *s, const struct lorie_vk_image *d) {")
         + func(R, "static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
+        + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
+        + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {"),
     # the shaders as committed (vk.c includes them)

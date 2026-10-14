@@ -511,17 +511,19 @@ CONTROLS = [
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
-        state->gpuCopyQueue.readIndex = readIndex;""",
+        uint64_t queued[LORIE_GPU_COPY_QUEUE_CAPACITY], publishedUs;
+        uint32_t n = rendererVkQueuedTimes(readIndex, queued);""",
      """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (1) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
-        state->gpuCopyQueue.readIndex = readIndex;""",
+        uint64_t queued[LORIE_GPU_COPY_QUEUE_CAPACITY], publishedUs;
+        uint32_t n = rendererVkQueuedTimes(readIndex, queued);""",
      "tpresentcopy"),
     ("the queue not advanced after the copies alone", "renderer.c",
-     """reuse the source.
+     """        uint32_t n = rendererVkQueuedTimes(readIndex, queued);
         state->gpuCopyQueue.readIndex = readIndex;""",
-     """reuse the source.""",
+     """        uint32_t n = rendererVkQueuedTimes(readIndex, queued);""",
      "tpresentcopy"),
     ("a frame drawing the root without the copies queued", "renderer.c",
      """        if (!rendererVkCopiesLocked(&serial, &readIndex) ||
@@ -592,6 +594,7 @@ CONTROLS = [
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }""",
@@ -601,6 +604,7 @@ CONTROLS = [
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
@@ -748,6 +752,24 @@ CONTROLS = [
      """    }
     result = LORIE_VK_XFER_CHECK_PASS;""",
      "tvkselftest"),
+    ("P9-B0: a submission's entries timed as one", "renderer.c",
+     """    for (i = 0; i < n; i++) {
+        lorieLatencyAdd(&state->diag.copyQueue, startUs > queued[i] ? startUs - queued[i] : 0);""",
+     """    for (i = 0; i < 1; i++) {
+        lorieLatencyAdd(&state->diag.copyQueue, startUs > queued[i] ? startUs - queued[i] : 0);""",
+     "tpresentcopy"),
+    ("P9-B0: copies in a frame counted as on their own", "renderer.c",
+     """    if (frame) {
+        LORIE_DIAG_ADD(state, copyFrameEntries, n);""",
+     """    if (0) {
+        LORIE_DIAG_ADD(state, copyFrameEntries, n);""",
+     "tpresentcopy"),
+    ("P9-B0: the X server's re-execution counted at every event, not once per publish", "InitOutput.c",
+     """    if (!published || published == counted)
+        return;""",
+     """    if (!published)
+        return;""",
+     "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

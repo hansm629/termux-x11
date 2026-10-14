@@ -6,10 +6,12 @@
  * (active VULKAN, imports, draws, submits, presents) and $OUT/diag-gles.log (active GLES, EGLImages, GLES
  * frames, swaps). Here it checks only that every report came out with its keys and the deltas right; and the
  * TERMUX_X11_RENDERER_VK_TRANSFER_COPY line: none while it is off, its verdicts and last copy while it is on. */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static FILE *logf;
 #define log(prio, fmt, ...) fprintf(logf, "10-07 00:00:00.000  1  1 I LorieNative: " fmt "\n", ##__VA_ARGS__)
@@ -116,6 +118,40 @@ int main(void) {
     }
     fclose(logf);
     CHECK(reports == 4 && deltaOk == 1, "gles log: %d reports, %d with the expected total and delta", reports, deltaOk);
+
+    /* P9-B0: a latency's report - 100 samples, 90 of 400 us, 5 of 3 ms, 5 of 70 ms: mean 4010, p95 in the 3 ms bucket,
+     * the maximum 70 ms, taken back to 0; the next report, without samples, says so; all of 100 past the last bound */
+    {
+        int latencyLines = 0, firstOk = 0, emptyOk = 0, pastOk = 0;
+        snprintf(path, sizeof path, "%s/diag-latency.log", out ? out : ".");
+        logf = fopen(path, "w");
+        lorieLogRendererDiag();
+        for (i = 0; i < 100; i++)
+            lorieLatencyAdd(&fakeState.diag.copyQueue, i < 90 ? 400 : i < 95 ? 3000 : 70000);
+        fakeState.diag.copyStandaloneEntries += 100;
+        lorieLogRendererDiag();
+        lorieLogRendererDiag();
+        for (i = 0; i < 100; i++)
+            lorieLatencyAdd(&fakeState.diag.copyGpuWait, 70000);
+        lorieLogRendererDiag();
+        fclose(logf);
+        logf = fopen(path, "r");
+        while (fgets(line, sizeof line, logf))
+            if (strstr(line, "XlorieCopyLatency:")) {
+                latencyLines++;
+                if (latencyLines == 2)
+                    firstOk = strstr(line, "XlorieCopyLatency: copy_standalone_entries=100(+100) ") &&
+                              strstr(line, " copy_queue_us=n:100,avg:4010,p95:3000,max:70000 ") && strstr(line, " copy_lock_us=n:0 ");
+                if (latencyLines == 3)
+                    emptyOk = strstr(line, " copy_standalone_entries=100(+0) ") && strstr(line, " copy_queue_us=n:0 ");
+                if (latencyLines == 4)
+                    pastOk = strstr(line, " copy_gpu_wait_us=n:100,avg:70000,p95:>66000,max:70000 ") != NULL;
+            }
+        fclose(logf);
+        CHECK(latencyLines == 4 && firstOk && emptyOk && pastOk, "latency log: %d lines (want 4); with samples %s, without %s, past "
+              "the last bound %s", latencyLines, firstOk ? "right" : "wrong", emptyOk ? "right" : "wrong", pastOk ? "right" : "wrong");
+        CHECK(fakeState.diag.copyQueue.maxUs == 0 && fakeState.diag.copyGpuWait.maxUs == 0, "latency: a maximum not taken back by its report");
+    }
 
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY on: copies kept from vkCmdCopyImage by a BGRA source and an image whose
      * usage was refused; the last one BGRA into RGBX of depth 24 */

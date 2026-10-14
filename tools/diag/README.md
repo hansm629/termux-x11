@@ -18,6 +18,8 @@ XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
 XlorieVkTransfer: (only with TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1) checked copied not_* usage_missing_* imports_*
                 last_not last_src last_dst last_rects last_first last_off
+XlorieCopyLatency: copy_standalone_entries copy_frame_entries copy_standalone_submits copy_frame_submits
+                copy_queue_us copy_lock_us copy_record_us copy_gpu_wait_us copy_total_us copy_ack_us
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -48,6 +50,19 @@ below depth 32, both AHBs imported with the transfer
 usage (asked for only where the device allows it for that AHB; refused, the AHB is imported without it), every
 rectangle inside its source, no two destinations overlapping; every other copy is drawn as before
 (`imported_destination_draws`).
+
+`XlorieCopyLatency` times the Vulkan backend's Present copies (GLES's are not timed). Each `*_us` covers the 5
+seconds since the previous report as `n:<samples>,avg:<mean>,p95:<bound>,max:<largest>` (`n:0` without samples):
+p95 is the upper bound of the bucket the 95th percentile falls in (bounds 250, 500, 750, 1000, 1500, 2000, 3000,
+4000, 6000, 8000, 12000, 16000, 25000, 33000, 66000 us; `>66000` past the last). Per queued entry:
+`copy_queue_us`, from the X server queuing it to the renderer beginning the submission that records it (asking
+for the shared lock; in a frame that is after the swapchain image was acquired), and `copy_total_us`, to its
+completed serial published. Per submission that records copies (not per entry, so a submission of several is
+timed once): `copy_lock_us`, the shared lock's wait; `copy_record_us`, from the lock to the submission made
+(buffer lookups, imports, recording - in a frame the root and the cursor too); `copy_gpu_wait_us`, from the
+submission to its fence waited for. `copy_ack_us`: from the renderer publishing a completion to the X server
+having re-executed the Present work it completed, once per publish (measured against the latest publish).
+`copy_standalone_*` and `copy_frame_*` count entries and submissions made on their own and with a frame.
 
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under

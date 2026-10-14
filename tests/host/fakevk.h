@@ -164,6 +164,7 @@ struct lorie_shared_server_state {
         volatile uint32_t writeIndex;
         volatile uint32_t readIndex;
         volatile uint64_t completedSerial;
+        volatile uint64_t completedUs;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
     struct {

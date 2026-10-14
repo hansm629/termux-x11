@@ -33,6 +33,7 @@ void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
+void lorieCountCopyAck(void);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -188,6 +189,7 @@ typedef struct {
     uint64_t serial;
     uint64_t srcBufferId;
     uint64_t dstBufferId;
+    uint64_t queuedUs;      /* CLOCK_MONOTONIC microseconds when the X server queued it (lorieMonotonicUs) */
     int16_t xOff, yOff;
     uint16_t numRects;
     uint8_t dstDepth;       /* the destination's depth: 32 keeps alpha in its RGBX 4th byte, below that it is padding */
@@ -298,6 +300,38 @@ enum { LORIE_VK_XFER_CHECKS(LORIE_ENUM_XFER_CHECK) LORIE_VK_XFER_CHECK_COUNT };
 #undef LORIE_ENUM_XFER_USAGE
 #undef LORIE_ENUM_XFER_CHECK
 
+// CLOCK_MONOTONIC in microseconds: one clock for the X server and the renderer, whichever process reads it.
+static inline uint64_t lorieMonotonicUs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000;
+}
+
+/* A latency's samples (P9-B0): how many, their sum, how many fell at or under each bound in microseconds (the last
+ * bucket: over the last bound), all counted up; and the largest since the X server last logged it, which it takes
+ * back to 0. The X server logs every 5 seconds' samples: count, mean, p95 (the bound of the bucket the 95th
+ * percentile falls in) and maximum. */
+#define LORIE_LATENCY_BOUNDS 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 25000, 33000, 66000
+#define LORIE_LATENCY_BUCKETS 16
+struct lorie_latency {
+    volatile uint32_t count, maxUs;
+    volatile uint64_t sumUs;
+    volatile uint32_t buckets[LORIE_LATENCY_BUCKETS];
+};
+
+static inline void lorieLatencyAdd(volatile struct lorie_latency *l, uint64_t us) {
+    static const uint32_t bounds[LORIE_LATENCY_BUCKETS - 1] = { LORIE_LATENCY_BOUNDS };
+    uint32_t v = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us, b = 0, max;
+    while (b < LORIE_LATENCY_BUCKETS - 1 && v > bounds[b])
+        b++;
+    __atomic_fetch_add(&l->count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&l->sumUs, us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&l->buckets[b], 1, __ATOMIC_RELAXED);
+    max = __atomic_load_n(&l->maxUs, __ATOMIC_RELAXED);
+    while (v > max && !__atomic_compare_exchange_n(&l->maxUs, &max, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+}
+
 struct lorie_renderer_diag {
     volatile uint8_t active;                    /* LORIE_ACTIVE_*: what draws the root right now */
 
@@ -367,6 +401,16 @@ struct lorie_renderer_diag {
      * destination, tightly packed), its expected and actual value, the VkResult */
     volatile uint8_t vkXferCheck, vkXferCheckStep, vkXferCheckExpected, vkXferCheckActual;
     volatile int32_t vkXferCheckOffset, vkXferCheckResult;
+
+    /* P9-B0, the Vulkan backend's Present copies (renderer.c rendererVkCountCopies), counted once their
+     * completedSerial is published. Per queued entry: from the X server queuing it to the renderer starting the
+     * submission that records it (copyQueue), and to its completedSerial published (copyTotal). Per submission that
+     * records copies: the shared lock's wait (copyLock); lookups, imports, recording and the submission itself
+     * (copyRecord - in a frame the root and the cursor too); from the submission to its fence waited for
+     * (copyGpuWait). X: from the latest publish to the X server having re-executed what it completed (copyAck, once
+     * per publish). Entries and submissions on their own (standalone) or in a frame with the root. */
+    struct lorie_latency copyQueue, copyLock, copyRecord, copyGpuWait, copyTotal, copyAck;
+    volatile uint32_t copyStandaloneEntries, copyFrameEntries, copyStandaloneSubmits, copyFrameSubmits;
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \
@@ -391,6 +435,7 @@ struct lorie_shared_server_state {
         volatile uint32_t writeIndex;
         volatile uint32_t readIndex;
         volatile uint64_t completedSerial;
+        volatile uint64_t completedUs;      /* the Vulkan renderer: when it last published completedSerial (lorieMonotonicUs) */
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
 

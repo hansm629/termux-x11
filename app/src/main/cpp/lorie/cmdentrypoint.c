@@ -227,6 +227,7 @@ static Bool handleClipboardAnnounce(__unused ClientPtr pClient, __unused void *c
 static Bool handleGpuCopyDoneEvent(__unused ClientPtr pClient, __unused void *closure) {
     // This must be done only on X server thread (touches present's internal vblank queue).
     lorieRecheckGpuCopies();
+    lorieCountCopyAck();
     return TRUE;
 }
 

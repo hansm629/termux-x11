@@ -1184,6 +1184,83 @@ int main(void) {
         }
     }
 
+    /* P9-B0: each part of a Present copy timed - per entry its queue wait and its whole latency, per submission the
+     * lock, the recording and the fence; on its own or in a frame; the X server's re-execution once per publish */
+    {
+        struct lorie_renderer_diag b;
+        RegionRec one = { 1, &boxes[1] };
+        uint64_t serials[3], before;
+#define MOVED(f) (st.diag.f - b.f)
+        own(60);
+        st.gpuInFlight.busy = 0;
+
+        /* on its own: queued 5 ms before the renderer starts, the device 10 ms at the fence */
+        memcpy(&b, (const void *) &st.diag, sizeof b);
+        before = lorieMonotonicUs();
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "timed: not queued");
+        e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        CHECK(e->queuedUs >= before && e->queuedUs <= lorieMonotonicUs(), "timed: queued at %llu, not when queued",
+              (unsigned long long) e->queuedUs);
+        usleep(5000);
+        gpuMs = 10;
+        rendererVkApplyPendingGpuCopies();
+        gpuMs = 0;
+        CHECK(vkFailures == 0 && lorieGpuCopyIsDone(serial) && MOVED(copyStandaloneEntries) == 1 && MOVED(copyStandaloneSubmits) == 1 &&
+              MOVED(copyFrameEntries) == 0 && MOVED(copyFrameSubmits) == 0, "timed: %u/%u entries/submissions on their own, %u/%u in a frame",
+              MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits), MOVED(copyFrameEntries), MOVED(copyFrameSubmits));
+        CHECK(MOVED(copyQueue.count) == 1 && MOVED(copyTotal.count) == 1 && MOVED(copyLock.count) == 1 && MOVED(copyRecord.count) == 1 &&
+              MOVED(copyGpuWait.count) == 1, "timed: samples queue %u total %u lock %u record %u fence %u (want 1 each)",
+              MOVED(copyQueue.count), MOVED(copyTotal.count), MOVED(copyLock.count), MOVED(copyRecord.count), MOVED(copyGpuWait.count));
+        CHECK(MOVED(copyQueue.sumUs) >= 5000 && MOVED(copyGpuWait.sumUs) >= 10000 &&
+              MOVED(copyTotal.sumUs) >= MOVED(copyQueue.sumUs) + MOVED(copyLock.sumUs) + MOVED(copyRecord.sumUs) + MOVED(copyGpuWait.sumUs) &&
+              st.diag.copyQueue.maxUs >= 5000 && st.diag.copyGpuWait.maxUs >= 10000 && st.diag.copyTotal.maxUs >= 15000,
+              "timed: queue %llu us, fence %llu us, total %llu us (want >= 5000, >= 10000, >= their sum)",
+              (unsigned long long) MOVED(copyQueue.sumUs), (unsigned long long) MOVED(copyGpuWait.sumUs), (unsigned long long) MOVED(copyTotal.sumUs));
+        CHECK(MOVED(copyQueue.buckets[0]) == 0 && MOVED(copyGpuWait.buckets[0]) == 0, "timed: a 5 ms wait in the first bucket");
+        CHECK(st.gpuCopyQueue.completedUs >= e->queuedUs, "timed: published before queued");
+        lorieCountCopyAck();
+        lorieCountCopyAck();
+        CHECK(MOVED(copyAck.count) == 1, "timed: the X server's re-execution counted %u times for one publish", MOVED(copyAck.count));
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+
+        /* three entries in one submission: three entries' latencies, one submission's */
+        memcpy(&b, (const void *) &st.diag, sizeof b);
+        for (int k = 0; k < 3; k++)
+            CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, (int16_t) k, 0, &serials[k], &dstBuffer), "three: %d not queued", k);
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(serials[2]) && MOVED(copyStandaloneEntries) == 3 && MOVED(copyStandaloneSubmits) == 1 &&
+              MOVED(copyQueue.count) == 3 && MOVED(copyTotal.count) == 3 && MOVED(copyLock.count) == 1 && MOVED(copyRecord.count) == 1 &&
+              MOVED(copyGpuWait.count) == 1, "three: %u entries, %u submissions; samples queue %u total %u lock %u record %u fence %u",
+              MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits), MOVED(copyQueue.count), MOVED(copyTotal.count),
+              MOVED(copyLock.count), MOVED(copyRecord.count), MOVED(copyGpuWait.count));
+        st.gpuInFlight.busy = 0;
+        for (int k = 0; k < 3; k++)
+            lorieGpuCopyAck(&srcPix, NULL);
+
+        /* in a frame */
+        memcpy(&b, (const void *) &st.diag, sizeof b);
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "in a frame: not queued");
+        st.rootWindowTextureID = root->desc.id;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(lorieGpuCopyIsDone(serial) && MOVED(copyFrameEntries) == 1 && MOVED(copyFrameSubmits) == 1 &&
+              MOVED(copyStandaloneEntries) == 0 && MOVED(copyStandaloneSubmits) == 0 && MOVED(copyTotal.count) == 1 &&
+              MOVED(copyGpuWait.count) == 1, "in a frame: %u/%u entries/submissions in a frame, %u/%u on their own",
+              MOVED(copyFrameEntries), MOVED(copyFrameSubmits), MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits));
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+
+        /* a frame without copies: nothing */
+        memcpy(&b, (const void *) &st.diag, sizeof b);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(MOVED(copyFrameSubmits) == 0 && MOVED(copyLock.count) == 0 && MOVED(copyGpuWait.count) == 0,
+              "a frame without copies counted as one with them");
+        st.gpuInFlight.busy = 0;
+#undef MOVED
+    }
+
     CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",
           emu.violations);

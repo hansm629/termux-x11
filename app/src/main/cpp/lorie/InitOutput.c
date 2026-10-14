@@ -833,6 +833,26 @@ static const char *lorieActiveName(uint8_t a) {
     return a == LORIE_ACTIVE_GLES ? "GLES" : a == LORIE_ACTIVE_VULKAN ? "VULKAN" : "NONE";
 }
 
+// P9-B0: one latency's samples since the last report - count, mean, p95 (the bound of the bucket the 95th
+// percentile falls in, ">66000" past the last) and the maximum, which is taken back to 0 here.
+static void lorieLatencyText(char *out, size_t size, const struct lorie_latency *now, const struct lorie_latency *before,
+                             volatile uint32_t *max) {
+    static const uint32_t bounds[LORIE_LATENCY_BUCKETS - 1] = { LORIE_LATENCY_BOUNDS };
+    uint32_t n = now->count - before->count, want = (uint32_t) (((uint64_t) n * 95 + 99) / 100), seen = 0, b;
+    uint32_t top = __atomic_exchange_n(max, 0, __ATOMIC_RELAXED);
+    unsigned long long mean = n ? (unsigned long long) ((now->sumUs - before->sumUs) / n) : 0;
+
+    for (b = 0; b < LORIE_LATENCY_BUCKETS - 1; b++)
+        if ((seen += now->buckets[b] - before->buckets[b]) >= want)
+            break;
+    if (!n)
+        snprintf(out, size, "n:0");
+    else if (b < LORIE_LATENCY_BUCKETS - 1)
+        snprintf(out, size, "n:%u,avg:%llu,p95:%u,max:%u", n, mean, bounds[b], top);
+    else
+        snprintf(out, size, "n:%u,avg:%llu,p95:>%u,max:%u", n, mean, bounds[LORIE_LATENCY_BUCKETS - 2], top);
+}
+
 static const char *lorieAhbFormatName(uint32_t f) {
     return f == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? "RGBA" : f == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM ? "RGBX"
          : f == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? "BGRA" : "other";
@@ -911,6 +931,22 @@ static void lorieLogRendererDiag(void) {
         d.fallbackTotal ? lorieFallbackReasonNames[d.lastFallbackReason % LORIE_FALLBACK_REASON_COUNT] : "none",
         d.lastVkResult, (unsigned long long) d.lastResourceId, d.lastResourceFormat,
         (unsigned long long) d.lastResourceUsage, reasons[0] ? reasons : "none");
+    // P9-B0: the Vulkan backend's Present copies, how long each part took (lorie.h struct lorie_renderer_diag copy*).
+    {
+        char queue[96], lock[96], record[96], gpu[96], total[96], ack[96];
+        volatile struct lorie_renderer_diag *live = &pvfb->state->diag;
+        lorieLatencyText(queue, sizeof(queue), &d.copyQueue, &prev.copyQueue, &live->copyQueue.maxUs);
+        lorieLatencyText(lock, sizeof(lock), &d.copyLock, &prev.copyLock, &live->copyLock.maxUs);
+        lorieLatencyText(record, sizeof(record), &d.copyRecord, &prev.copyRecord, &live->copyRecord.maxUs);
+        lorieLatencyText(gpu, sizeof(gpu), &d.copyGpuWait, &prev.copyGpuWait, &live->copyGpuWait.maxUs);
+        lorieLatencyText(total, sizeof(total), &d.copyTotal, &prev.copyTotal, &live->copyTotal.maxUs);
+        lorieLatencyText(ack, sizeof(ack), &d.copyAck, &prev.copyAck, &live->copyAck.maxUs);
+        log(INFO, "XlorieCopyLatency: copy_standalone_entries=%llu(+%llu) copy_frame_entries=%llu(+%llu) "
+                  "copy_standalone_submits=%llu(+%llu) copy_frame_submits=%llu(+%llu) copy_queue_us=%s copy_lock_us=%s "
+                  "copy_record_us=%s copy_gpu_wait_us=%s copy_total_us=%s copy_ack_us=%s",
+            TD(copyStandaloneEntries), TD(copyFrameEntries), TD(copyStandaloneSubmits), TD(copyFrameSubmits),
+            queue, lock, record, gpu, total, ack);
+    }
     // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
     if (pvfb->state->backend.vkTransferCopy) {
         reasons[0] = 0;
@@ -1484,6 +1520,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
     entry->dstDepth = (uint8_t) dst->drawable.depth;
+    entry->queuedUs = lorieMonotonicUs();
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
@@ -1494,6 +1531,17 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     gpuCopyAttempts++;
     gpuCopyOffloads++;
     return TRUE;
+}
+
+// P9-B0: from the Vulkan renderer's latest completedSerial publish to here (cmdentrypoint.c, after the X server
+// re-executed what it completed: lorieRecheckGpuCopies), once per publish.
+void lorieCountCopyAck(void) {
+    static uint64_t counted;
+    uint64_t published = __atomic_load_n(&pvfb->state->gpuCopyQueue.completedUs, __ATOMIC_RELAXED), now = lorieMonotonicUs();
+    if (!published || published == counted)
+        return;
+    counted = published;
+    lorieLatencyAdd(&pvfb->state->diag.copyAck, now > published ? now - published : 0);
 }
 
 Bool lorieGpuCopyIsDone(uint64_t serial) {

@@ -2021,15 +2021,56 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
     return true;
 }
 
+/*
+ * P9-B0: when the entries a submission recorded (readIndex up to `readIndex`) were queued - taken from the queue
+ * before readIndex is published (the X server reuses their slots after). Their number.
+ */
+static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {
+    uint32_t i, n = 0;
+    for (i = state->gpuCopyQueue.readIndex; i != readIndex && n < LORIE_GPU_COPY_QUEUE_CAPACITY; i++)
+        queued[n++] = state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].queuedUs;
+    return n;
+}
+
+/*
+ * P9-B0: those `n` entries counted once their completedSerial was published at `publishedUs` (after it: nothing
+ * of the publish waits for this). Per entry: queued to `startUs` (the submission begun: the lock asked for) and
+ * queued to `publishedUs`; per submission: the lock's wait, the recording up to the submission, the submission to
+ * its fence waited for. Nothing without entries.
+ */
+static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,
+                                  uint64_t submittedUs, uint64_t fencedUs, uint64_t publishedUs) {
+    uint32_t i;
+
+    if (!n)
+        return;
+    for (i = 0; i < n; i++) {
+        lorieLatencyAdd(&state->diag.copyQueue, startUs > queued[i] ? startUs - queued[i] : 0);
+        lorieLatencyAdd(&state->diag.copyTotal, publishedUs > queued[i] ? publishedUs - queued[i] : 0);
+    }
+    lorieLatencyAdd(&state->diag.copyLock, lockedUs - startUs);
+    lorieLatencyAdd(&state->diag.copyRecord, submittedUs - lockedUs);
+    lorieLatencyAdd(&state->diag.copyGpuWait, fencedUs - submittedUs);
+    if (frame) {
+        LORIE_DIAG_ADD(state, copyFrameEntries, n);
+        LORIE_DIAG_ADD(state, copyFrameSubmits, 1);
+    } else {
+        LORIE_DIAG_ADD(state, copyStandaloneEntries, n);
+        LORIE_DIAG_ADD(state, copyStandaloneSubmits, 1);
+    }
+}
+
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
 static void rendererVkApplyPendingGpuCopies(void) {
-    uint64_t serial = 0;
+    uint64_t serial = 0, startUs, lockedUs, submittedUs = 0, fencedUs = 0;
     uint32_t readIndex = 0;
     VkResult res;
 
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return;
+    startUs = lorieMonotonicUs();
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    lockedUs = lorieMonotonicUs();
     if (!rendererVkOwnedLocked()) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         vkOwned = false;
@@ -2047,6 +2088,7 @@ static void rendererVkApplyPendingGpuCopies(void) {
         return rendererVkFail();
     }
     res = lorieVkFrameQueue(&vk, &vkr, 0, false, state);
+    submittedUs = lorieMonotonicUs();
     if (res == VK_SUCCESS)
         rendererVkInFlight();
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
@@ -2055,16 +2097,22 @@ static void rendererVkApplyPendingGpuCopies(void) {
         // The device runs the copies; the X server goes on, without their buffers (rendererVkInFlight).
         bool over;
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        uint64_t queued[LORIE_GPU_COPY_QUEUE_CAPACITY], publishedUs;
+        uint32_t n = rendererVkQueuedTimes(readIndex, queued);
         state->gpuCopyQueue.readIndex = readIndex;
+        publishedUs = lorieMonotonicUs();
         if (serial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedUs, publishedUs, __ATOMIC_RELAXED);
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
         }
+        rendererVkCountCopies(queued, n, false, startUs, lockedUs, submittedUs, fencedUs, publishedUs);
     }
     if (res != VK_SUCCESS)
         rendererVkFail();
@@ -2097,7 +2145,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     struct lorie_vk_image *root = NULL;
     struct lorie_vk_quad rootQuad, cursorQuad;
     bool cursor = false, owned;
-    uint64_t serial = 0;
+    uint64_t serial = 0, startUs, lockedUs, submittedUs = 0, fencedUs = 0;
     uint32_t readIndex = 0, index;
     int status, filter = filtering == GL_LINEAR;
     VkResult res = VK_SUCCESS;
@@ -2161,7 +2209,9 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         return rendererVkFail();
 
     // We should signal X server to not use root window while we actively copy it
+    startUs = lorieMonotonicUs();
     lorie_mutex_lock(&state->lock, &state->lockingPid);
+    lockedUs = lorieMonotonicUs();
     owned = rendererVkOwnedLocked();
     if (owned)
         lorieGpuWaitIdle(state, true, 0);   // a frame another renderer process listed is over first (ours always are)
@@ -2226,6 +2276,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     lorieVkFrameScreen(&vk, &vkr, index, root, &(VkRect2D) { { viewportX, viewportY }, { (uint32_t) viewportW, (uint32_t) viewportH } },
                        &rootQuad, cursor ? &cursorQuad : NULL, filter);
     res = lorieVkFrameQueue(&vk, &vkr, index, true, state);
+    submittedUs = lorieMonotonicUs();
     if (res == VK_SUCCESS)
         rendererVkInFlight();
     state->waitForNextFrame = true;
@@ -2235,17 +2286,23 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
+        uint64_t queued[LORIE_GPU_COPY_QUEUE_CAPACITY], publishedUs;
+        uint32_t n = owned ? rendererVkQueuedTimes(readIndex, queued) : 0;
         if (owned)
             state->gpuCopyQueue.readIndex = readIndex;
+        publishedUs = lorieMonotonicUs();
         if (serial) {
+            __atomic_store_n(&state->gpuCopyQueue.completedUs, publishedUs, __ATOMIC_RELAXED);
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
         }
+        rendererVkCountCopies(queued, n, true, startUs, lockedUs, submittedUs, fencedUs, publishedUs);
     }
 
     if (!owned) {
