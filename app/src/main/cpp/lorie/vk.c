@@ -319,6 +319,7 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
     img.rgbaOrder = desc.format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
     img.rgbx = desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
     img.usage = lorieVkAhbImageUsage(desc.usage) | extraUsage;
+    img.optionalVerdict = images->optionalUsage ? LORIE_VK_XFER_USAGE_GRANTED : LORIE_VK_XFER_USAGE_UNASKED;
     if (!(img.usage & VK_IMAGE_USAGE_SAMPLED_BIT) || desc.layers != 1) {
         reason = LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED;
         r = VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -359,6 +360,8 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
         if (features.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT)
             optional |= images->optionalUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         optional &= ~img.usage;
+        if (optional != (images->optionalUsage & ~img.usage))
+            img.optionalVerdict = LORIE_VK_XFER_USAGE_NO_FEATURE;
     }
 
     // The image exactly as it will be made, asked about as an import of an AHardwareBuffer: with the optional usage
@@ -381,6 +384,7 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
                 goto fail;
             }
             info.usage = img.usage;
+            img.optionalVerdict = LORIE_VK_XFER_USAGE_REFUSED;
         }
         img.usage = info.usage;
     }
@@ -470,6 +474,8 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
     *found = img;
     images->items[images->count++] = found;
     LORIE_DIAG_ADD(st, vkAhbImportSuccess, 1);
+    if (images->optionalUsage)
+        LORIE_DIAG_ADD(st, vkXferImports[img.optionalVerdict], 1);
     return found;
 
     fail:
@@ -483,6 +489,10 @@ struct lorie_vk_image *lorieVkImport(struct lorie_vk *vk, struct lorie_vk_images
         images->optionalUsage = 0;
         found = lorieVkImport(vk, images, id, ahb, extraUsage, st);
         images->optionalUsage = kept;
+        if (found) {
+            found->optionalVerdict = LORIE_VK_XFER_USAGE_FAILED;
+            LORIE_DIAG_ADD(st, vkXferImports[LORIE_VK_XFER_USAGE_FAILED], 1);
+        }
         return found;
     }
     lorieVkImageDestroy(vk, &img);

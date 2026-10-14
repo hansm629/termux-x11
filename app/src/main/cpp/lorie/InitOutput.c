@@ -833,10 +833,16 @@ static const char *lorieActiveName(uint8_t a) {
     return a == LORIE_ACTIVE_GLES ? "GLES" : a == LORIE_ACTIVE_VULKAN ? "VULKAN" : "NONE";
 }
 
+static const char *lorieAhbFormatName(uint32_t f) {
+    return f == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? "RGBA" : f == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM ? "RGBX"
+         : f == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? "BGRA" : "other";
+}
+
 #define LORIE_NAME(n) #n,
 static const char *const lorieFallbackClassNames[] = { LORIE_FALLBACK_CLASSES(LORIE_NAME) };
 static const char *const lorieFallbackReasonNames[] = { LORIE_FALLBACK_REASONS(LORIE_NAME) };
 static const char *const lorieSelftestStepNames[] = { LORIE_VK_SELFTEST_STEPS(LORIE_NAME) };
+static const char *const lorieXferNotNames[] = { LORIE_VK_XFER_NOTS(LORIE_NAME) };
 #undef LORIE_NAME
 
 static void lorieLogRendererDiag(void) {
@@ -904,6 +910,39 @@ static void lorieLogRendererDiag(void) {
         d.fallbackTotal ? lorieFallbackReasonNames[d.lastFallbackReason % LORIE_FALLBACK_REASON_COUNT] : "none",
         d.lastVkResult, (unsigned long long) d.lastResourceId, d.lastResourceFormat,
         (unsigned long long) d.lastResourceUsage, reasons[0] ? reasons : "none");
+    // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
+    if (pvfb->state->backend.vkTransferCopy) {
+        reasons[0] = 0;
+        used = 0;
+        for (i = 0; i < LORIE_VK_XFER_NOT_COUNT; i++)
+            if ((d.vkXferLastNot & 1u << i) && used < sizeof(reasons))
+                used += (size_t) snprintf(reasons + used, sizeof(reasons) - used, "%s%s", used ? "+" : "", lorieXferNotNames[i]);
+        log(INFO, "XlorieVkTransfer: checked=%llu(+%llu) copied=%llu(+%llu) not_same=%llu(+%llu) not_format=%llu(+%llu) "
+                  "not_rgbx_alpha=%llu(+%llu) not_depth32=%llu(+%llu) not_src_usage=%llu(+%llu) not_dst_usage=%llu(+%llu) "
+                  "not_rect_source=%llu(+%llu) not_rect_overlap=%llu(+%llu) not_rect_none=%llu(+%llu) "
+                  "usage_missing_unasked=%llu(+%llu) usage_missing_no_feature=%llu(+%llu) usage_missing_refused=%llu(+%llu) "
+                  "usage_missing_failed=%llu(+%llu) imports_granted=%llu(+%llu) imports_no_feature=%llu(+%llu) "
+                  "imports_refused=%llu(+%llu) imports_failed=%llu(+%llu) last_not=%s "
+                  "last_src=%s(%u)/%ux%u/ahb_usage=0x%llx/vk_usage=0x%x "
+                  "last_dst=%s(%u)/%ux%u/depth=%u/ahb_usage=0x%llx/vk_usage=0x%x last_rects=%u last_first=%d,%d-%d,%d "
+                  "last_off=%d,%d",
+            TD(vkXferChecked), TD(vkCopyCommands), TD(vkXferNot[LORIE_VK_XFER_NOT_SAME]),
+            TD(vkXferNot[LORIE_VK_XFER_NOT_FORMAT]), TD(vkXferNot[LORIE_VK_XFER_NOT_RGBX_ALPHA]),
+            TD(vkXferNot[LORIE_VK_XFER_NOT_DEPTH32]), TD(vkXferNot[LORIE_VK_XFER_NOT_SRC_USAGE]),
+            TD(vkXferNot[LORIE_VK_XFER_NOT_DST_USAGE]), TD(vkXferNot[LORIE_VK_XFER_NOT_RECT_SOURCE]),
+            TD(vkXferNot[LORIE_VK_XFER_NOT_RECT_OVERLAP]), TD(vkXferNot[LORIE_VK_XFER_NOT_RECT_NONE]),
+            TD(vkXferUsageMissing[LORIE_VK_XFER_USAGE_UNASKED]), TD(vkXferUsageMissing[LORIE_VK_XFER_USAGE_NO_FEATURE]),
+            TD(vkXferUsageMissing[LORIE_VK_XFER_USAGE_REFUSED]), TD(vkXferUsageMissing[LORIE_VK_XFER_USAGE_FAILED]),
+            TD(vkXferImports[LORIE_VK_XFER_USAGE_GRANTED]), TD(vkXferImports[LORIE_VK_XFER_USAGE_NO_FEATURE]),
+            TD(vkXferImports[LORIE_VK_XFER_USAGE_REFUSED]), TD(vkXferImports[LORIE_VK_XFER_USAGE_FAILED]),
+            reasons[0] ? reasons : "none",
+            lorieAhbFormatName(d.vkXferLastSrcFormat), d.vkXferLastSrcFormat, d.vkXferLastSrcWidth, d.vkXferLastSrcHeight,
+            (unsigned long long) d.vkXferLastSrcAhbUsage, d.vkXferLastSrcUsage,
+            lorieAhbFormatName(d.vkXferLastDstFormat), d.vkXferLastDstFormat, d.vkXferLastDstWidth, d.vkXferLastDstHeight,
+            d.vkXferLastDstDepth, (unsigned long long) d.vkXferLastDstAhbUsage, d.vkXferLastDstUsage, d.vkXferLastRects,
+            d.vkXferLastRect[0], d.vkXferLastRect[1], d.vkXferLastRect[2], d.vkXferLastRect[3], d.vkXferLastOff[0],
+            d.vkXferLastOff[1]);
+    }
 #undef TD
     prev = d;
 }

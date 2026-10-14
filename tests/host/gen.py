@@ -128,6 +128,7 @@ recipes = {
         + func(R, "static void rendererVkFrameDone(void) {")
         + func(R, "static void rendererVkIdle(void) {")
         + func(R, "static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff, int16_t yOff, const LorieBuffer_Desc *src,")
+        + func(R, "static void rendererVkCountTransfer(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
         + func(R, "static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")

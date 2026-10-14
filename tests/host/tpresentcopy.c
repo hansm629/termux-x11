@@ -381,6 +381,29 @@ static VkImageUsageFlags usageOfBuffer(LorieBuffer *b) {
     return img ? img->usage : 0;
 }
 #define TRANSFER_USAGE (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+/* its verdict counters (lorie.h vkXfer*): what a run moved them by, as "checked+N", then each condition, each reason
+ * an image lacked the usage (missing_*) and each import's (imports_*) that moved, in their order */
+#define XFER_NAME(n) #n,
+static const char *const xferNots[] = { LORIE_VK_XFER_NOTS(XFER_NAME) }, *const xferUsages[] = { LORIE_VK_XFER_USAGES(XFER_NAME) };
+#undef XFER_NAME
+static struct lorie_renderer_diag xferBefore;
+static void xferMark(void) { memcpy(&xferBefore, (const void *) &st.diag, sizeof xferBefore); }
+static const char *xferMoves(void) {
+    static char out[512];
+    int u = snprintf(out, sizeof out, "checked+%u", st.diag.vkXferChecked - xferBefore.vkXferChecked);
+    for (int i = 0; i < LORIE_VK_XFER_NOT_COUNT; i++)
+        if (st.diag.vkXferNot[i] != xferBefore.vkXferNot[i])
+            u += snprintf(out + u, sizeof out - u, " %s+%u", xferNots[i], st.diag.vkXferNot[i] - xferBefore.vkXferNot[i]);
+    for (int i = 0; i < LORIE_VK_XFER_USAGE_COUNT; i++)
+        if (st.diag.vkXferUsageMissing[i] != xferBefore.vkXferUsageMissing[i])
+            u += snprintf(out + u, sizeof out - u, " missing_%s+%u", xferUsages[i],
+                          st.diag.vkXferUsageMissing[i] - xferBefore.vkXferUsageMissing[i]);
+    for (int i = 0; i < LORIE_VK_XFER_USAGE_COUNT; i++)
+        if (st.diag.vkXferImports[i] != xferBefore.vkXferImports[i])
+            u += snprintf(out + u, sizeof out - u, " imports_%s+%u", xferUsages[i], st.diag.vkXferImports[i] - xferBefore.vkXferImports[i]);
+    return out;
+}
+#define XFER_MOVED(want, what) CHECK(!strcmp(xferMoves(), want), what ": verdicts %s (want %s)", xferMoves(), want)
 
 int main(void) {
     LorieBuffer *root, *src, *bgra, *redirected, *fresh, *fd;
@@ -882,6 +905,7 @@ int main(void) {
          * at a negative offset - copies, no draw, the pixels the draws give */
         copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws, c0 = emu.copyCommands, r0 = emu.copyRegions;
         d0 = emu.draws, v0 = emu.violations;
+        xferMark();
         CHECK(lorieTryScheduleGpuCopy(&tsPix, &tdPix, &inR, 30, 20, &serial, &held[0]) &&
               lorieTryScheduleGpuCopy(&tsPix, &tdPix, &cornerR, -5, -3, &serial, &held[1]), "transfer: not queued");
         rendererVkApplyPendingGpuCopies();
@@ -898,6 +922,7 @@ int main(void) {
               !notified.fenceWaited ? "before the fence" : !notified.released ? "with a buffer still the renderer's" : "after the fence");
         st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */
         CHECK(wrongPixels(td, 2, eligible, 3) == 0, "transfer: %d pixels not what the draws give", wrongPixels(td, 2, eligible, 3));
+        XFER_MOVED("checked+2 imports_GRANTED+2", "transfer");
         lorieGpuCopyAck(&tsPix, held[0]);
         lorieGpuCopyAck(&tsPix, held[1]);
 
@@ -906,6 +931,7 @@ int main(void) {
             const struct copied intoRoot[2] = { { ts, in[0], 100, 50 }, { ts, in[1], 100, 50 } };
             fill(root, 8, 0x11);
             copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws, v0 = emu.violations, d0 = emu.draws;
+            xferMark();
             CHECK(lorieTryScheduleGpuCopy(&tsPix, &rootPix, &inR, 100, 50, &serial, &held[0]), "transfer, frame: not queued");
             st.rootWindowTextureID = root->desc.id;
             st.drawRequested = 1;
@@ -915,6 +941,7 @@ int main(void) {
                   "transfer, frame: %d violations, copy_commands +%u (want 1), destination draws +%u, %d draws (want the root's)",
                   emu.violations - v0, st.diag.vkCopyCommands - copies0, st.diag.vkImportedDestinationDraws - dests0, emu.draws - d0);
             CHECK(wrongPixels(root, 8, intoRoot, 2) == 0, "transfer, frame: %d root pixels wrong", wrongPixels(root, 8, intoRoot, 2));
+            XFER_MOVED("checked+1 imports_GRANTED+1", "transfer, frame");
             st.gpuInFlight.busy = 0;
             lorieGpuCopyAck(&tsPix, held[0]);
         }
@@ -922,6 +949,7 @@ int main(void) {
         /* two copies into one destination, overlapping: the second ordered after the first, and over it; RGBX into RGBX
          * below depth 32 copies the 4th byte as it is */
         c0 = emu.copyCommands, v0 = emu.violations;
+        xferMark();
         CHECK(lorieTryScheduleGpuCopy(&tsPix, &t24Pix, &leftR, 0, 0, &serial, &held[0]) &&
               lorieTryScheduleGpuCopy(&txPix, &t24Pix, &rightR, 0, 0, &serial, &held[1]), "transfer, overlapping: not queued");
         rendererVkApplyPendingGpuCopies();
@@ -929,32 +957,55 @@ int main(void) {
               "transfer, overlapping: %d copies (want 2), %d violations", emu.copyCommands - c0, emu.violations - v0);
         CHECK(copiesOrdered(lorieVkImageFind(&vkImages, t24->desc.id)->image), "transfer, overlapping: the second copy not ordered after the first");
         CHECK(wrongPixels(t24, 7, overlapping, 2) == 0, "transfer, overlapping: %d pixels wrong", wrongPixels(t24, 7, overlapping, 2));
+        XFER_MOVED("checked+2 imports_GRANTED+2", "transfer, overlapping");
         st.gpuInFlight.busy = 0;
         lorieGpuCopyAck(&tsPix, held[0]);
         lorieGpuCopyAck(&txPix, held[1]);
 
         /* drawn, as GLES draws them: BGRA into RGBX (two formats), RGBX into RGBA (the draw's alpha 1), RGBX into RGBX
-         * of depth 32 (alpha there), a rectangle past its source (the draw samples the edge) */
-        copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws, c0 = emu.copyCommands, v0 = emu.violations;
-        CHECK(lorieTryScheduleGpuCopy(&tbPix, &tdPix, &inR, 3, 4, &serial, &held[0]) &&
-              lorieTryScheduleGpuCopy(&txPix, &taPix, &inR, 3, 4, &serial, &held[1]) &&
-              lorieTryScheduleGpuCopy(&txPix, &t32Pix, &inR, 3, 4, &serial, &held[2]) &&
-              lorieTryScheduleGpuCopy(&tsPix, &tdPix, &pastR, 0, 0, &serial, &held[3]), "drawn: not queued");
-        memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
-        pushes = 0;
-        rendererVkApplyPendingGpuCopies();
-        CHECK(vkFailures == 0 && emu.violations == v0 && lorieGpuCopyIsDone(serial) && st.diag.vkCopyCommands == copies0 &&
-              emu.copyCommands == c0 && st.diag.vkImportedDestinationDraws - dests0 == 7, "drawn: copy_commands +%u (want 0), "
-              "destination draws +%u (want 7), %d violations", st.diag.vkCopyCommands - copies0,
-              st.diag.vkImportedDestinationDraws - dests0, emu.violations - v0);
-        st.gpuInFlight.busy = 0;
-        CHECK(gles(&saved) == serial && glDrawCount == 7 && pushes == 7, "drawn: GLES %d draws, Vulkan %d", glDrawCount, pushes);
-        for (int k = 0; k < 7 && k < glDrawCount; k++)
-            CHECK(sameAsGles(k, &pushed[k]), "drawn: draw %d not what GLES draws", k);
-        lorieGpuCopyAck(&tbPix, held[0]);
-        lorieGpuCopyAck(&txPix, held[1]);
-        lorieGpuCopyAck(&txPix, held[2]);
-        lorieGpuCopyAck(&tsPix, held[3]);
+         * of depth 32 (alpha there), a rectangle past its source (the draw samples the edge), two destinations
+         * overlapping, a rectangle all outside the destination - each counted under its own condition, the last one
+         * kept as it was */
+        {
+            BoxRec overlap[2] = { { 0, 0, 20, 10 }, { 10, 0, 30, 10 } };
+            RegionRec overlapR = { 2, overlap };
+            copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws, c0 = emu.copyCommands, v0 = emu.violations;
+            xferMark();
+            CHECK(lorieTryScheduleGpuCopy(&tbPix, &tdPix, &inR, 3, 4, &serial, &held[0]) &&
+                  lorieTryScheduleGpuCopy(&txPix, &taPix, &inR, 3, 4, &serial, &held[1]) &&
+                  lorieTryScheduleGpuCopy(&txPix, &t32Pix, &inR, 3, 4, &serial, &held[2]) &&
+                  lorieTryScheduleGpuCopy(&tsPix, &tdPix, &pastR, 0, 0, &serial, &held[3]) &&
+                  lorieTryScheduleGpuCopy(&tsPix, &tdPix, &overlapR, 0, 0, &serial, &held[4]) &&
+                  lorieTryScheduleGpuCopy(&tsPix, &tdPix, &cornerR, 100, 7, &serial, &held[5]), "drawn: not queued");
+            memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
+            pushes = 0;
+            rendererVkApplyPendingGpuCopies();
+            CHECK(vkFailures == 0 && emu.violations == v0 && lorieGpuCopyIsDone(serial) && st.diag.vkCopyCommands == copies0 &&
+                  emu.copyCommands == c0 && st.diag.vkImportedDestinationDraws - dests0 == 10, "drawn: copy_commands +%u (want 0), "
+                  "destination draws +%u (want 10), %d violations", st.diag.vkCopyCommands - copies0,
+                  st.diag.vkImportedDestinationDraws - dests0, emu.violations - v0);
+            st.gpuInFlight.busy = 0;
+            CHECK(gles(&saved) == serial && glDrawCount == 10 && pushes == 10, "drawn: GLES %d draws, Vulkan %d", glDrawCount, pushes);
+            for (int k = 0; k < 10 && k < glDrawCount; k++)
+                CHECK(sameAsGles(k, &pushed[k]), "drawn: draw %d not what GLES draws", k);
+            XFER_MOVED("checked+6 FORMAT+1 RGBX_ALPHA+1 DEPTH32+1 RECT_SOURCE+1 RECT_OVERLAP+1 RECT_NONE+1 imports_GRANTED+3", "drawn");
+            CHECK(st.diag.vkXferLastNot == 1u << LORIE_VK_XFER_NOT_RECT_NONE && st.diag.vkXferLastSrcFormat == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM &&
+                  st.diag.vkXferLastDstFormat == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM && st.diag.vkXferLastSrcWidth == 50 &&
+                  st.diag.vkXferLastSrcHeight == 40 && st.diag.vkXferLastDstWidth == 64 && st.diag.vkXferLastDstHeight == 48 &&
+                  st.diag.vkXferLastDstDepth == 24 && st.diag.vkXferLastSrcUsage == usageOfBuffer(ts) &&
+                  st.diag.vkXferLastDstUsage == usageOfBuffer(td) && st.diag.vkXferLastSrcAhbUsage == X_USAGE && st.diag.vkXferLastRects == 1 &&
+                  st.diag.vkXferLastRect[0] == 0 && st.diag.vkXferLastRect[1] == 0 && st.diag.vkXferLastRect[2] == 10 &&
+                  st.diag.vkXferLastRect[3] == 10 && st.diag.vkXferLastOff[0] == 100 && st.diag.vkXferLastOff[1] == 7,
+                  "drawn: the last copy kept from it not as it was (conditions %#x, %u -> %u, %ux%u -> %ux%u depth %u)",
+                  st.diag.vkXferLastNot, st.diag.vkXferLastSrcFormat, st.diag.vkXferLastDstFormat, st.diag.vkXferLastSrcWidth,
+                  st.diag.vkXferLastSrcHeight, st.diag.vkXferLastDstWidth, st.diag.vkXferLastDstHeight, st.diag.vkXferLastDstDepth);
+            lorieGpuCopyAck(&tbPix, held[0]);
+            lorieGpuCopyAck(&txPix, held[1]);
+            lorieGpuCopyAck(&txPix, held[2]);
+            lorieGpuCopyAck(&tsPix, held[3]);
+            lorieGpuCopyAck(&tsPix, held[4]);
+            lorieGpuCopyAck(&tsPix, held[5]);
+        }
 
         /* a device that refuses the transfer usage of these AHBs: imported without it, nothing recorded, drawn */
         {
@@ -963,6 +1014,7 @@ int main(void) {
             PixmapRec rsPix = { { 50, 40, 24 }, &rsP }, rdPix = { { 64, 48, 24 }, &rdP };
             cfg.refuseTransferUsage = true;
             imports0 = st.diag.vkAhbImportSuccess, copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws;
+            xferMark();
             CHECK(lorieTryScheduleGpuCopy(&rsPix, &rdPix, &inR, 0, 0, &serial, &held[0]), "refused: not queued");
             rendererVkApplyPendingGpuCopies();
             cfg.refuseTransferUsage = false;
@@ -973,6 +1025,7 @@ int main(void) {
                   usageOfBuffer(rd) & TRANSFER_USAGE);
             CHECK(st.diag.vkCopyCommands == copies0 && st.diag.vkImportedDestinationDraws - dests0 == 2, "refused: copy_commands +%u, "
                   "destination draws +%u (want 0, 2)", st.diag.vkCopyCommands - copies0, st.diag.vkImportedDestinationDraws - dests0);
+            XFER_MOVED("checked+1 SRC_USAGE+1 DST_USAGE+1 missing_REFUSED+2 imports_REFUSED+2", "refused");
             st.gpuInFlight.busy = 0;
             lorieGpuCopyAck(&rsPix, held[0]);
         }
@@ -985,6 +1038,7 @@ int main(void) {
             PixmapRec fsPix = { { 50, 40, 24 }, &fsP }, fdstPix = { { 64, 48, 24 }, &fdstP };
             cfg.failTransferImage = true;
             imports0 = st.diag.vkAhbImportSuccess, copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws;
+            xferMark();
             CHECK(lorieTryScheduleGpuCopy(&fsPix, &fdstPix, &inR, 0, 0, &serial, &held[0]), "failed image: not queued");
             rendererVkApplyPendingGpuCopies();
             cfg.failTransferImage = false;
@@ -994,6 +1048,7 @@ int main(void) {
                   "failed image: %d failures, %u imports (want 2), %u fallbacks, copy_commands +%u, destination draws +%u (want 2)",
                   vkFailures, st.diag.vkAhbImportSuccess - imports0, st.diag.fallbackTotal - fallbacks0,
                   st.diag.vkCopyCommands - copies0, st.diag.vkImportedDestinationDraws - dests0);
+            XFER_MOVED("checked+1 SRC_USAGE+1 DST_USAGE+1 missing_FAILED+2 imports_FAILED+2", "failed image");
             st.gpuInFlight.busy = 0;
             lorieGpuCopyAck(&fsPix, held[0]);
         }
@@ -1006,6 +1061,7 @@ int main(void) {
             int features0 = imp.featureQueries;
             st.backend.vkTransferCopy = 0;
             copies0 = st.diag.vkCopyCommands, dests0 = st.diag.vkImportedDestinationDraws;
+            xferMark();
             CHECK(lorieTryScheduleGpuCopy(&tsPix, &tdPix, &inR, 0, 0, &serial, &held[0]) &&
                   lorieTryScheduleGpuCopy(&osPix, &tdPix, &inR, 0, 0, &serial, &held[1]), "off: not queued");
             rendererVkApplyPendingGpuCopies();
@@ -1014,9 +1070,21 @@ int main(void) {
                   !(usageOfBuffer(os) & TRANSFER_USAGE), "off: copy_commands +%u, destination draws +%u (want 0, 4), %d feature "
                   "queries, transfer usage %#x", st.diag.vkCopyCommands - copies0, st.diag.vkImportedDestinationDraws - dests0,
                   imp.featureQueries - features0, usageOfBuffer(os) & TRANSFER_USAGE);
+            XFER_MOVED("checked+0", "off");
             st.gpuInFlight.busy = 0;
             lorieGpuCopyAck(&tsPix, held[0]);
             lorieGpuCopyAck(&osPix, held[1]);
+
+            /* on again: the image imported while it was off has no usage, counted as not asked for */
+            st.backend.vkTransferCopy = 1;
+            xferMark();
+            CHECK(lorieTryScheduleGpuCopy(&osPix, &tdPix, &inR, 0, 0, &serial, &held[0]), "unasked: not queued");
+            rendererVkApplyPendingGpuCopies();
+            CHECK(vkFailures == 0 && lorieGpuCopyIsDone(serial), "unasked: %d failures", vkFailures);
+            XFER_MOVED("checked+1 SRC_USAGE+1 missing_UNASKED+1", "unasked");
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&osPix, held[0]);
+            st.backend.vkTransferCopy = 0;
         }
     }
 

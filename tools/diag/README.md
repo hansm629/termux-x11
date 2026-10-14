@@ -16,6 +16,8 @@ XlorieVkTiming: acquire results, acquire/submit/fence/present times, self-test, 
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
+XlorieVkTransfer: (only with TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1) checked copied not_* usage_missing_* imports_*
+                last_not last_src last_dst last_rects last_first last_off
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -43,6 +45,19 @@ and byte order, an RGBX source only into an RGBX destination below depth 32, bot
 usage (asked for only where the device allows it for that AHB; refused, the AHB is imported without it), every
 rectangle inside its source, no two destinations overlapping; every other copy is drawn as before
 (`imported_destination_draws`).
+
+`XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
+`copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under
+several): `same` (one buffer), `format` (two Vulkan formats or byte orders, e.g. BGRA into RGBX), `rgbx_alpha`
+(RGBX into a buffer with alpha), `depth32` (RGBX into RGBX of depth 32), `src_usage` / `dst_usage` (an image without
+the transfer usage), `rect_source` (a rectangle empty or past its source), `rect_overlap` (two destinations
+overlapping), `rect_none` (nothing left inside the destination). For each image without the usage,
+`usage_missing_*` says what its import got: `unasked` (imported before a copy asked for it - cached without it),
+`no_feature` (the format lacks the transfer features), `refused` (the AHB's image-format query refused it),
+`failed` (the image made with it failed, made again without it). `imports_*` counts the imports that asked for it
+by what they got (`granted` or the same reasons). `last_*` is the last copy drawn instead: its conditions, the
+source and destination (AHB format, size, the destination's depth, AHB usage, Vulkan usage), its rectangles, the
+first one and the offset.
 
 `XlorieVkSelftest` is the device self-test of how the renderer takes the X server's buffers over and gives
 them back (vk.h, lorieVkSelftest): RGBA, RGBX and BGRA, CPU -> Vulkan -> CPU and Vulkan -> CPU -> Vulkan,

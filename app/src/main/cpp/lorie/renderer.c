@@ -1837,6 +1837,47 @@ static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff,
 }
 
 /*
+ * TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdict on a copy, counted (lorie.h struct lorie_renderer_diag vkXfer*,
+ * logged every 5 seconds as XlorieVkTransfer): what kept it from vkCmdCopyImage (`not`, bit n LORIE_VK_XFER_NOT_n),
+ * why an image without the transfer usage has none, and the last copy kept from it as it was.
+ */
+static void rendererVkCountTransfer(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,
+                                    const struct lorie_vk_image *d, uint32_t why) {
+    volatile struct lorie_renderer_diag *diag = &state->diag;
+    uint32_t i;
+
+    LORIE_DIAG_ADD(state, vkXferChecked, 1);
+    for (i = 0; i < LORIE_VK_XFER_NOT_COUNT; i++)
+        if (why & 1u << i)
+            LORIE_DIAG_ADD(state, vkXferNot[i], 1);
+    if (why & 1u << LORIE_VK_XFER_NOT_SRC_USAGE)
+        LORIE_DIAG_ADD(state, vkXferUsageMissing[s->optionalVerdict % LORIE_VK_XFER_USAGE_COUNT], 1);
+    if (why & 1u << LORIE_VK_XFER_NOT_DST_USAGE)
+        LORIE_DIAG_ADD(state, vkXferUsageMissing[d->optionalVerdict % LORIE_VK_XFER_USAGE_COUNT], 1);
+    if (!why)
+        return;
+    diag->vkXferLastNot = why;
+    diag->vkXferLastSrcFormat = s->ahbFormat;
+    diag->vkXferLastDstFormat = d->ahbFormat;
+    diag->vkXferLastSrcUsage = s->usage;
+    diag->vkXferLastDstUsage = d->usage;
+    diag->vkXferLastSrcAhbUsage = s->ahbUsage;
+    diag->vkXferLastDstAhbUsage = d->ahbUsage;
+    diag->vkXferLastSrcWidth = s->width;
+    diag->vkXferLastSrcHeight = s->height;
+    diag->vkXferLastDstWidth = d->width;
+    diag->vkXferLastDstHeight = d->height;
+    diag->vkXferLastDstDepth = entry->dstDepth;
+    diag->vkXferLastRects = n;
+    diag->vkXferLastRect[0] = n ? entry->rects[0].x1 : 0;
+    diag->vkXferLastRect[1] = n ? entry->rects[0].y1 : 0;
+    diag->vkXferLastRect[2] = n ? entry->rects[0].x2 : 0;
+    diag->vkXferLastRect[3] = n ? entry->rects[0].y2 : 0;
+    diag->vkXferLastOff[0] = entry->xOff;
+    diag->vkXferLastOff[1] = entry->yOff;
+}
+
+/*
  * Experimental, TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1: an entry's rectangles as vkCmdCopyImage regions, where the
  * copy gives exactly the pixels rendererVkCopyQuad's draws give - one VkFormat and one byte order (no swizzle); an
  * RGBX source, whose 4th byte the draw reads as 1, only into an RGBX destination below depth 32 (that byte X
@@ -1849,18 +1890,32 @@ static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff,
  */
 static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,
                                       const struct lorie_vk_image *d, VkImageCopy *regions) {
-    uint32_t k, j, count = 0;
+    uint32_t k, j, count = 0, why = 0;
 
-    if (!state->backend.vkTransferCopy || s == d || s->format != d->format || s->rgbaOrder != d->rgbaOrder ||
-        (s->rgbx && (!d->rgbx || entry->dstDepth >= 32)) || !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
-        !(d->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+    if (!state->backend.vkTransferCopy)
         return 0;
+    // Every condition is looked at, each one that fails recorded (rendererVkCountTransfer): the copy is made only
+    // when none does.
+    if (s == d)
+        why |= 1u << LORIE_VK_XFER_NOT_SAME;
+    if (s->format != d->format || s->rgbaOrder != d->rgbaOrder)
+        why |= 1u << LORIE_VK_XFER_NOT_FORMAT;
+    if (s->rgbx && !d->rgbx)
+        why |= 1u << LORIE_VK_XFER_NOT_RGBX_ALPHA;
+    if (s->rgbx && d->rgbx && entry->dstDepth >= 32)
+        why |= 1u << LORIE_VK_XFER_NOT_DEPTH32;
+    if (!(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        why |= 1u << LORIE_VK_XFER_NOT_SRC_USAGE;
+    if (!(d->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        why |= 1u << LORIE_VK_XFER_NOT_DST_USAGE;
     for (k = 0; k < n; k++) {
         LorieGpuCopyRect r = entry->rects[k];
         int32_t sx = r.x1, sy = r.y1, w = r.x2 - r.x1, h = r.y2 - r.y1, dx = sx + entry->xOff, dy = sy + entry->yOff;
 
-        if (w <= 0 || h <= 0 || sx < 0 || sy < 0 || r.x2 > (int32_t) s->width || r.y2 > (int32_t) s->height)
-            return 0;
+        if (w <= 0 || h <= 0 || sx < 0 || sy < 0 || r.x2 > (int32_t) s->width || r.y2 > (int32_t) s->height) {
+            why |= 1u << LORIE_VK_XFER_NOT_RECT_SOURCE;
+            break;
+        }
         if (dx < 0)
             sx -= dx, w += dx, dx = 0;
         if (dy < 0)
@@ -1874,13 +1929,20 @@ static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n
         for (j = 0; j < count; j++)
             if (dx < regions[j].dstOffset.x + (int32_t) regions[j].extent.width && regions[j].dstOffset.x < dx + w &&
                 dy < regions[j].dstOffset.y + (int32_t) regions[j].extent.height && regions[j].dstOffset.y < dy + h)
-                return 0;
+                break;
+        if (j < count) {
+            why |= 1u << LORIE_VK_XFER_NOT_RECT_OVERLAP;
+            break;
+        }
         regions[count++] = (VkImageCopy) {
                 .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .srcOffset = { sx, sy, 0 },
                 .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstOffset = { dx, dy, 0 },
                 .extent = { (uint32_t) w, (uint32_t) h, 1 } };
     }
-    return count;
+    if (k == n && !count)
+        why |= 1u << LORIE_VK_XFER_NOT_RECT_NONE;
+    rendererVkCountTransfer(entry, n, s, d, why);
+    return why ? 0 : count;
 }
 
 /*

@@ -85,6 +85,7 @@ struct lorie_vk_image {
     uint32_t ahbFormat;
     uint64_t ahbUsage;
     bool rgbaOrder, rgbx;
+    uint8_t optionalVerdict;    /* LORIE_VK_XFER_USAGE_*: what its import got of struct lorie_vk_images' optionalUsage */
     VkFramebuffer framebuffer;  /* for rendering into it (GPU copies): made when first needed */
 };
 

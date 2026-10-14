@@ -706,8 +706,11 @@ CONTROLS = [
             // Not one the renderer has yet, or of another size: neither it nor the one looked up before is sampled.""",
      "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: an RGBX source copied as is into alpha", "renderer.c",
-     """        (s->rgbx && (!d->rgbx || entry->dstDepth >= 32)) || !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||""",
-     """        !(s->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||""",
+     """    if (s->rgbx && !d->rgbx)
+        why |= 1u << LORIE_VK_XFER_NOT_RGBX_ALPHA;
+    if (s->rgbx && d->rgbx && entry->dstDepth >= 32)
+        why |= 1u << LORIE_VK_XFER_NOT_DEPTH32;""",
+     "",
      "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a copy into an image a copy wrote before not ordered after it", "vk.c",
      """        if (r->used[i].img == dst && r->used[i].use == LORIE_VK_USE_TRANSFER_DST)""",
@@ -724,6 +727,10 @@ CONTROLS = [
         VkImageUsageFlags kept = images->optionalUsage;""",
      """    if (0) {
         VkImageUsageFlags kept = images->optionalUsage;""",
+     "tpresentcopy"),
+    ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: an image the usage was refused for counted as if never asked for it", "vk.c",
+     """            img.optionalVerdict = LORIE_VK_XFER_USAGE_REFUSED;""",
+     "",
      "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)

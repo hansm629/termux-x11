@@ -277,6 +277,20 @@ enum { LORIE_FALLBACK_CLASSES(LORIE_ENUM_CLASS) LORIE_FALLBACK_CLASS_COUNT };
 enum { LORIE_FALLBACK_REASONS(LORIE_ENUM_REASON) LORIE_FALLBACK_REASON_COUNT };
 #undef LORIE_ENUM_CLASS
 #undef LORIE_ENUM_REASON
+/* TERMUX_X11_RENDERER_VK_TRANSFER_COPY: the conditions that keep a queued Present copy from vkCmdCopyImage
+ * (renderer.c rendererVkCopyRegions; RECT_SOURCE a rectangle empty or past its source, RECT_OVERLAP two
+ * destinations overlapping, RECT_NONE nothing left inside the destination), and what an import got of the transfer usage (vk.c lorieVkImport): given, not
+ * asked for (imported while no copy asked for it), the format's features without it, refused by the AHB's
+ * image-format query, the image made with it failing */
+#define LORIE_VK_XFER_NOTS(X) X(SAME) X(FORMAT) X(RGBX_ALPHA) X(DEPTH32) X(SRC_USAGE) X(DST_USAGE) X(RECT_SOURCE) \
+    X(RECT_OVERLAP) X(RECT_NONE)
+#define LORIE_VK_XFER_USAGES(X) X(GRANTED) X(UNASKED) X(NO_FEATURE) X(REFUSED) X(FAILED)
+#define LORIE_ENUM_XFER_NOT(n) LORIE_VK_XFER_NOT_ ## n,
+#define LORIE_ENUM_XFER_USAGE(n) LORIE_VK_XFER_USAGE_ ## n,
+enum { LORIE_VK_XFER_NOTS(LORIE_ENUM_XFER_NOT) LORIE_VK_XFER_NOT_COUNT };
+enum { LORIE_VK_XFER_USAGES(LORIE_ENUM_XFER_USAGE) LORIE_VK_XFER_USAGE_COUNT };
+#undef LORIE_ENUM_XFER_NOT
+#undef LORIE_ENUM_XFER_USAGE
 
 struct lorie_renderer_diag {
     volatile uint8_t active;                    /* LORIE_ACTIVE_*: what draws the root right now */
@@ -328,6 +342,21 @@ struct lorie_renderer_diag {
     volatile uint8_t xOwnership, xRootBuffers;
     volatile uint32_t xOwnershipTransitions, xOwnershipRefused;
     volatile uint64_t xAhbCpuAcquires, xStateLockWaitUs, xGpuWaitUs, xAhbCpuLockUs, xRootCopyUs;
+
+    /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
+     * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer
+     * usage it needs, what its import got (LORIE_VK_XFER_USAGE_*); imports that asked for the usage, by what they
+     * got. The last copy kept from it: its conditions (bit n: LORIE_VK_XFER_NOT_*), both AHBs' format, size, AHB
+     * usage and Vulkan usage, the destination's depth, its rectangles, the first one and its offset. */
+    volatile uint32_t vkXferChecked;
+    volatile uint32_t vkXferNot[LORIE_VK_XFER_NOT_COUNT];
+    volatile uint32_t vkXferUsageMissing[LORIE_VK_XFER_USAGE_COUNT];
+    volatile uint32_t vkXferImports[LORIE_VK_XFER_USAGE_COUNT];
+    volatile uint32_t vkXferLastNot, vkXferLastSrcFormat, vkXferLastDstFormat, vkXferLastSrcUsage, vkXferLastDstUsage;
+    volatile uint32_t vkXferLastSrcWidth, vkXferLastSrcHeight, vkXferLastDstWidth, vkXferLastDstHeight, vkXferLastDstDepth;
+    volatile uint64_t vkXferLastSrcAhbUsage, vkXferLastDstAhbUsage;
+    volatile uint32_t vkXferLastRects;
+    volatile int32_t vkXferLastRect[4], vkXferLastOff[2];
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \
