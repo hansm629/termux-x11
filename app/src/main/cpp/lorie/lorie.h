@@ -310,26 +310,32 @@ static inline uint64_t lorieMonotonicUs(void) {
 /* A latency's samples (P9-B0): how many, their sum, how many fell at or under each bound in microseconds (the last
  * bucket: over the last bound), all counted up; and the largest since the X server last logged it, which it takes
  * back to 0. The X server logs every 5 seconds' samples: count, mean, p95 (the bound of the bucket the 95th
- * percentile falls in) and maximum. */
+ * percentile falls in) and maximum. weightedUs: each sample times the entries it held up (a submission's part times
+ * its entries, an entry's own 1) - what it adds up to in entry time, the unit of copy_total_us. */
 #define LORIE_LATENCY_BOUNDS 250, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 25000, 33000, 66000
 #define LORIE_LATENCY_BUCKETS 16
 struct lorie_latency {
     volatile uint32_t count, maxUs;
-    volatile uint64_t sumUs;
+    volatile uint64_t sumUs, weightedUs;
     volatile uint32_t buckets[LORIE_LATENCY_BUCKETS];
 };
 
-static inline void lorieLatencyAdd(volatile struct lorie_latency *l, uint64_t us) {
+static inline void lorieLatencyAddWeighted(volatile struct lorie_latency *l, uint64_t us, uint32_t entries) {
     static const uint32_t bounds[LORIE_LATENCY_BUCKETS - 1] = { LORIE_LATENCY_BOUNDS };
     uint32_t v = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us, b = 0, max;
     while (b < LORIE_LATENCY_BUCKETS - 1 && v > bounds[b])
         b++;
     __atomic_fetch_add(&l->count, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&l->sumUs, us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&l->weightedUs, us * entries, __ATOMIC_RELAXED);
     __atomic_fetch_add(&l->buckets[b], 1, __ATOMIC_RELAXED);
     max = __atomic_load_n(&l->maxUs, __ATOMIC_RELAXED);
     while (v > max && !__atomic_compare_exchange_n(&l->maxUs, &max, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
         ;
+}
+
+static inline void lorieLatencyAdd(volatile struct lorie_latency *l, uint64_t us) {
+    lorieLatencyAddWeighted(l, us, 1);
 }
 
 struct lorie_renderer_diag {
@@ -405,11 +411,13 @@ struct lorie_renderer_diag {
     /* P9-B0, the Vulkan backend's Present copies (renderer.c rendererVkCountCopies), counted once their
      * completedSerial is published. Per queued entry: from the X server queuing it to the renderer starting the
      * submission that records it (copyQueue), and to its completedSerial published (copyTotal). Per submission that
-     * records copies: the shared lock's wait (copyLock); lookups, imports, recording and the submission itself
-     * (copyRecord - in a frame the root and the cursor too); from the submission to its fence waited for
-     * (copyGpuWait). X: from the latest publish to the X server having re-executed what it completed (copyAck, once
-     * per publish). Entries and submissions on their own (standalone) or in a frame with the root. */
-    struct lorie_latency copyQueue, copyLock, copyRecord, copyGpuWait, copyTotal, copyAck;
+     * records copies (weighted by its entries): the shared lock's wait (copyLock); under it, the wait for a submitted
+     * frame to be over (copyInflightWait: lorieGpuWaitIdle, another renderer process's list); lookups, imports,
+     * recording and the submission itself (copyRecord - in a frame the root and the cursor too); from the submission
+     * to its fence waited for - the copies alone (copyGpuWait) or a frame's: its copies, the root and the cursor
+     * (copyFrameGpuWait). X: from the latest publish to the X server having re-executed what it completed (copyAck,
+     * once per publish). Entries and submissions on their own (standalone) or in a frame with the root. */
+    struct lorie_latency copyQueue, copyLock, copyInflightWait, copyRecord, copyGpuWait, copyFrameGpuWait, copyTotal, copyAck;
     volatile uint32_t copyStandaloneEntries, copyFrameEntries, copyStandaloneSubmits, copyFrameSubmits;
 };
 

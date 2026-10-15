@@ -2035,11 +2035,12 @@ static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {
 /*
  * P9-B0: those `n` entries counted once their completedSerial was published at `publishedUs` (after it: nothing
  * of the publish waits for this). Per entry: queued to `startUs` (the submission begun: the lock asked for) and
- * queued to `publishedUs`; per submission: the lock's wait, the recording up to the submission, the submission to
- * its fence waited for. Nothing without entries.
+ * queued to `publishedUs`; per submission, weighted by its entries: the lock's wait, the wait under it for a frame
+ * listed in flight (`inflightUs`), the rest up to the submission (the recording), the submission to its fence
+ * waited for - a frame's (the root and cursor too) counted apart. Nothing without entries.
  */
 static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,
-                                  uint64_t submittedUs, uint64_t fencedUs, uint64_t publishedUs) {
+                                  uint64_t inflightUs, uint64_t submittedUs, uint64_t fencedUs, uint64_t publishedUs) {
     uint32_t i;
 
     if (!n)
@@ -2048,9 +2049,10 @@ static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame
         lorieLatencyAdd(&state->diag.copyQueue, startUs > queued[i] ? startUs - queued[i] : 0);
         lorieLatencyAdd(&state->diag.copyTotal, publishedUs > queued[i] ? publishedUs - queued[i] : 0);
     }
-    lorieLatencyAdd(&state->diag.copyLock, lockedUs - startUs);
-    lorieLatencyAdd(&state->diag.copyRecord, submittedUs - lockedUs);
-    lorieLatencyAdd(&state->diag.copyGpuWait, fencedUs - submittedUs);
+    lorieLatencyAddWeighted(&state->diag.copyLock, lockedUs - startUs, n);
+    lorieLatencyAddWeighted(&state->diag.copyInflightWait, inflightUs, n);
+    lorieLatencyAddWeighted(&state->diag.copyRecord, submittedUs - lockedUs - inflightUs, n);
+    lorieLatencyAddWeighted(frame ? &state->diag.copyFrameGpuWait : &state->diag.copyGpuWait, fencedUs - submittedUs, n);
     if (frame) {
         LORIE_DIAG_ADD(state, copyFrameEntries, n);
         LORIE_DIAG_ADD(state, copyFrameSubmits, 1);
@@ -2062,7 +2064,7 @@ static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame
 
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
 static void rendererVkApplyPendingGpuCopies(void) {
-    uint64_t serial = 0, startUs, lockedUs, submittedUs = 0, fencedUs = 0;
+    uint64_t serial = 0, startUs, lockedUs, inflightUs, submittedUs = 0, fencedUs = 0;
     uint32_t readIndex = 0;
     VkResult res;
 
@@ -2077,7 +2079,9 @@ static void rendererVkApplyPendingGpuCopies(void) {
         backendSelect = true;   // asked for again first
         return;
     }
+    inflightUs = lorieMonotonicUs();
     lorieGpuWaitIdle(state, true, 0);       // a frame another renderer process listed is over first (ours always are)
+    inflightUs = lorieMonotonicUs() - inflightUs;
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
@@ -2112,7 +2116,7 @@ static void rendererVkApplyPendingGpuCopies(void) {
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
         }
-        rendererVkCountCopies(queued, n, false, startUs, lockedUs, submittedUs, fencedUs, publishedUs);
+        rendererVkCountCopies(queued, n, false, startUs, lockedUs, inflightUs, submittedUs, fencedUs, publishedUs);
     }
     if (res != VK_SUCCESS)
         rendererVkFail();
@@ -2145,7 +2149,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     struct lorie_vk_image *root = NULL;
     struct lorie_vk_quad rootQuad, cursorQuad;
     bool cursor = false, owned;
-    uint64_t serial = 0, startUs, lockedUs, submittedUs = 0, fencedUs = 0;
+    uint64_t serial = 0, startUs, lockedUs, inflightUs = 0, submittedUs = 0, fencedUs = 0;
     uint32_t readIndex = 0, index;
     int status, filter = filtering == GL_LINEAR;
     VkResult res = VK_SUCCESS;
@@ -2213,8 +2217,11 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     lockedUs = lorieMonotonicUs();
     owned = rendererVkOwnedLocked();
-    if (owned)
+    if (owned) {
+        inflightUs = lorieMonotonicUs();
         lorieGpuWaitIdle(state, true, 0);   // a frame another renderer process listed is over first (ours always are)
+        inflightUs = lorieMonotonicUs() - inflightUs;
+    }
     // The root the X server publishes now, under this lock: root double buffering swaps it under the same lock
     // (InitOutput.c lorieRootSwap), and the one looked up before may have become the buffer it draws into.
     if (owned && state->rootWindowTextureID != desc->id) {
@@ -2302,7 +2309,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
             notifyGpuCopyDone();
         }
-        rendererVkCountCopies(queued, n, true, startUs, lockedUs, submittedUs, fencedUs, publishedUs);
+        rendererVkCountCopies(queued, n, true, startUs, lockedUs, inflightUs, submittedUs, fencedUs, publishedUs);
     }
 
     if (!owned) {

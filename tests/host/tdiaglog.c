@@ -28,7 +28,7 @@ static int fails;
 
 int main(void) {
     const char *out = getenv("OUT");
-    char path[512], line[2048];
+    char path[512], line[4096];
     int i, reports = 0, deltaOk = 0, backendOk = 0, selftestLines = 0;
 
     snprintf(path, sizeof path, "%s/diag-vulkan.log", out ? out : ".");
@@ -120,9 +120,11 @@ int main(void) {
     CHECK(reports == 4 && deltaOk == 1, "gles log: %d reports, %d with the expected total and delta", reports, deltaOk);
 
     /* P9-B0: a latency's report - 100 samples, 90 of 400 us, 5 of 3 ms, 5 of 70 ms: mean 4010, p95 in the 3 ms bucket,
-     * the maximum 70 ms, taken back to 0; the next report, without samples, says so; all of 100 past the last bound */
+     * the maximum 70 ms, taken back to 0; the next report, without samples, says so; all of 100 past the last bound.
+     * A submission's part as a share of the entries' time: 10 submissions of 4 entries waiting 1 ms each, the 40
+     * entries 10 ms each in all - 40 ms of 400 ms, 10.0% */
     {
-        int latencyLines = 0, firstOk = 0, emptyOk = 0, pastOk = 0;
+        int latencyLines = 0, firstOk = 0, emptyOk = 0, pastOk = 0, shareOk = 0;
         snprintf(path, sizeof path, "%s/diag-latency.log", out ? out : ".");
         logf = fopen(path, "w");
         lorieLogRendererDiag();
@@ -133,6 +135,11 @@ int main(void) {
         lorieLogRendererDiag();
         for (i = 0; i < 100; i++)
             lorieLatencyAdd(&fakeState.diag.copyGpuWait, 70000);
+        lorieLogRendererDiag();
+        for (i = 0; i < 10; i++)
+            lorieLatencyAddWeighted(&fakeState.diag.copyLock, 1000, 4);
+        for (i = 0; i < 40; i++)
+            lorieLatencyAdd(&fakeState.diag.copyTotal, 10000);
         lorieLogRendererDiag();
         fclose(logf);
         logf = fopen(path, "r");
@@ -146,10 +153,14 @@ int main(void) {
                     emptyOk = strstr(line, " copy_standalone_entries=100(+0) ") && strstr(line, " copy_queue_us=n:0 ");
                 if (latencyLines == 4)
                     pastOk = strstr(line, " copy_gpu_wait_us=n:100,avg:70000,p95:>66000,max:70000 ") != NULL;
+                if (latencyLines == 5)
+                    shareOk = strstr(line, " copy_lock_us=n:10,avg:1000,p95:1000,max:1000,share:10.0% ") &&
+                              strstr(line, " copy_total_us=n:40,avg:10000,p95:12000,max:10000 ") && strstr(line, " copy_queue_us=n:0 ");
             }
         fclose(logf);
-        CHECK(latencyLines == 4 && firstOk && emptyOk && pastOk, "latency log: %d lines (want 4); with samples %s, without %s, past "
-              "the last bound %s", latencyLines, firstOk ? "right" : "wrong", emptyOk ? "right" : "wrong", pastOk ? "right" : "wrong");
+        CHECK(latencyLines == 5 && firstOk && emptyOk && pastOk && shareOk, "latency log: %d lines (want 5); with samples %s, "
+              "without %s, past the last bound %s, share %s", latencyLines, firstOk ? "right" : "wrong", emptyOk ? "right" : "wrong",
+              pastOk ? "right" : "wrong", shareOk ? "right" : "wrong");
         CHECK(fakeState.diag.copyQueue.maxUs == 0 && fakeState.diag.copyGpuWait.maxUs == 0, "latency: a maximum not taken back by its report");
     }
 
@@ -198,6 +209,36 @@ int main(void) {
         fclose(logf);
         CHECK(transferLines == 2 && lastOk == 1, "transfer log: %d lines (want 2), %d with the verdicts and last copy (want 1)",
               transferLines, lastOk);
+    }
+    /* every message within __android_log_print's 1024-byte buffer (longer ones are cut): the copy latency line with
+     * every part at its widest, then every line written above */
+    {
+        static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-transfer.log", "diag-wide.log" };
+        volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
+                                                   &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
+                                                   &fakeState.diag.copyTotal, &fakeState.diag.copyAck };
+        size_t longest = 0, prefix = strlen("10-07 00:00:00.000  1  1 I LorieNative: ");
+        snprintf(path, sizeof path, "%s/diag-wide.log", out ? out : ".");
+        logf = fopen(path, "w");
+        lorieLogRendererDiag();
+        fakeState.diag.copyStandaloneEntries += 999999999, fakeState.diag.copyFrameEntries += 999999999;
+        fakeState.diag.copyStandaloneSubmits += 999999999, fakeState.diag.copyFrameSubmits += 999999999;
+        for (unsigned k = 0; k < sizeof parts / sizeof *parts; k++)
+            for (i = 0; i < 1000; i++)
+                lorieLatencyAddWeighted(parts[k], 4294967295u, 1);
+        lorieLogRendererDiag();
+        fclose(logf);
+        for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {
+            snprintf(path, sizeof path, "%s/%s", out ? out : ".", logs[k]);
+            if (!(logf = fopen(path, "r")))
+                continue;
+            while (fgets(line, sizeof line, logf))
+                if (strlen(line) > prefix + 1 && strlen(line) - prefix - 1 > longest)
+                    longest = strlen(line) - prefix - 1;
+            fclose(logf);
+        }
+        CHECK(longest <= 1023, "a diagnostics message of %zu bytes: __android_log_print cuts it at 1023", longest);
+        printf("  longest diagnostics message: %zu bytes\n", longest);
     }
     printf("TDIAGLOG renderer diagnostics written by the real formatter: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;

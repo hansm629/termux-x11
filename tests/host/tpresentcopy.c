@@ -1184,8 +1184,9 @@ int main(void) {
         }
     }
 
-    /* P9-B0: each part of a Present copy timed - per entry its queue wait and its whole latency, per submission the
-     * lock, the recording and the fence; on its own or in a frame; the X server's re-execution once per publish */
+    /* P9-B0: each part of a Present copy timed - per entry its queue wait and its whole latency, per submission
+     * (weighted by its entries) the lock, the wait for another process's listed frame, the recording and the fence -
+     * a frame's apart; on its own or in a frame; the X server's re-execution once per publish */
     {
         struct lorie_renderer_diag b;
         RegionRec one = { 1, &boxes[1] };
@@ -1209,10 +1210,13 @@ int main(void) {
               MOVED(copyFrameEntries) == 0 && MOVED(copyFrameSubmits) == 0, "timed: %u/%u entries/submissions on their own, %u/%u in a frame",
               MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits), MOVED(copyFrameEntries), MOVED(copyFrameSubmits));
         CHECK(MOVED(copyQueue.count) == 1 && MOVED(copyTotal.count) == 1 && MOVED(copyLock.count) == 1 && MOVED(copyRecord.count) == 1 &&
-              MOVED(copyGpuWait.count) == 1, "timed: samples queue %u total %u lock %u record %u fence %u (want 1 each)",
-              MOVED(copyQueue.count), MOVED(copyTotal.count), MOVED(copyLock.count), MOVED(copyRecord.count), MOVED(copyGpuWait.count));
+              MOVED(copyInflightWait.count) == 1 && MOVED(copyGpuWait.count) == 1 && MOVED(copyFrameGpuWait.count) == 0,
+              "timed: samples queue %u total %u lock %u in flight %u record %u fence %u, a frame's fence %u (want 1 each, 0)",
+              MOVED(copyQueue.count), MOVED(copyTotal.count), MOVED(copyLock.count), MOVED(copyInflightWait.count), MOVED(copyRecord.count),
+              MOVED(copyGpuWait.count), MOVED(copyFrameGpuWait.count));
         CHECK(MOVED(copyQueue.sumUs) >= 5000 && MOVED(copyGpuWait.sumUs) >= 10000 &&
-              MOVED(copyTotal.sumUs) >= MOVED(copyQueue.sumUs) + MOVED(copyLock.sumUs) + MOVED(copyRecord.sumUs) + MOVED(copyGpuWait.sumUs) &&
+              MOVED(copyTotal.sumUs) >= MOVED(copyQueue.sumUs) + MOVED(copyLock.sumUs) + MOVED(copyInflightWait.sumUs) +
+                                        MOVED(copyRecord.sumUs) + MOVED(copyGpuWait.sumUs) &&
               st.diag.copyQueue.maxUs >= 5000 && st.diag.copyGpuWait.maxUs >= 10000 && st.diag.copyTotal.maxUs >= 15000,
               "timed: queue %llu us, fence %llu us, total %llu us (want >= 5000, >= 10000, >= their sum)",
               (unsigned long long) MOVED(copyQueue.sumUs), (unsigned long long) MOVED(copyGpuWait.sumUs), (unsigned long long) MOVED(copyTotal.sumUs));
@@ -1234,6 +1238,9 @@ int main(void) {
               MOVED(copyGpuWait.count) == 1, "three: %u entries, %u submissions; samples queue %u total %u lock %u record %u fence %u",
               MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits), MOVED(copyQueue.count), MOVED(copyTotal.count),
               MOVED(copyLock.count), MOVED(copyRecord.count), MOVED(copyGpuWait.count));
+        CHECK(MOVED(copyLock.weightedUs) == 3 * MOVED(copyLock.sumUs) && MOVED(copyRecord.weightedUs) == 3 * MOVED(copyRecord.sumUs) &&
+              MOVED(copyGpuWait.weightedUs) == 3 * MOVED(copyGpuWait.sumUs) && MOVED(copyQueue.weightedUs) == MOVED(copyQueue.sumUs) &&
+              MOVED(copyTotal.weightedUs) == MOVED(copyTotal.sumUs), "three: a submission's parts not weighted by its 3 entries");
         st.gpuInFlight.busy = 0;
         for (int k = 0; k < 3; k++)
             lorieGpuCopyAck(&srcPix, NULL);
@@ -1246,8 +1253,10 @@ int main(void) {
         rendererVkRedraw(&waiting);
         CHECK(lorieGpuCopyIsDone(serial) && MOVED(copyFrameEntries) == 1 && MOVED(copyFrameSubmits) == 1 &&
               MOVED(copyStandaloneEntries) == 0 && MOVED(copyStandaloneSubmits) == 0 && MOVED(copyTotal.count) == 1 &&
-              MOVED(copyGpuWait.count) == 1, "in a frame: %u/%u entries/submissions in a frame, %u/%u on their own",
-              MOVED(copyFrameEntries), MOVED(copyFrameSubmits), MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits));
+              MOVED(copyFrameGpuWait.count) == 1 && MOVED(copyGpuWait.count) == 0, "in a frame: %u/%u entries/submissions in a "
+              "frame, %u/%u on their own; fence samples %u a frame's, %u the copies' alone", MOVED(copyFrameEntries),
+              MOVED(copyFrameSubmits), MOVED(copyStandaloneEntries), MOVED(copyStandaloneSubmits), MOVED(copyFrameGpuWait.count),
+              MOVED(copyGpuWait.count));
         st.gpuInFlight.busy = 0;
         lorieGpuCopyAck(&srcPix, dstBuffer);
 
@@ -1255,9 +1264,27 @@ int main(void) {
         memcpy(&b, (const void *) &st.diag, sizeof b);
         st.drawRequested = 1;
         rendererVkRedraw(&waiting);
-        CHECK(MOVED(copyFrameSubmits) == 0 && MOVED(copyLock.count) == 0 && MOVED(copyGpuWait.count) == 0,
+        CHECK(MOVED(copyFrameSubmits) == 0 && MOVED(copyLock.count) == 0 && MOVED(copyFrameGpuWait.count) == 0,
               "a frame without copies counted as one with them");
         st.gpuInFlight.busy = 0;
+
+        /* another renderer process's frame listed in flight for 80 ms: that wait apart, not in the recording */
+        {
+            pthread_t other;
+            memcpy(&b, (const void *) &st.diag, sizeof b);
+            CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "in flight: not queued");
+            list(root->desc.id, getppid());
+            otherOver = false;
+            pthread_create(&other, NULL, otherSubmitter, NULL);
+            rendererVkApplyPendingGpuCopies();
+            pthread_join(other, NULL);
+            CHECK(lorieGpuCopyIsDone(serial) && MOVED(copyInflightWait.count) == 1 && MOVED(copyInflightWait.sumUs) >= 70000 &&
+                  MOVED(copyRecord.sumUs) < 70000 && MOVED(copyTotal.sumUs) >= MOVED(copyInflightWait.sumUs),
+                  "in flight: the wait %llu us, the recording %llu us (want >= 70000 apart, the recording without it)",
+                  (unsigned long long) MOVED(copyInflightWait.sumUs), (unsigned long long) MOVED(copyRecord.sumUs));
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&srcPix, dstBuffer);
+        }
 #undef MOVED
     }
 

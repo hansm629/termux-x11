@@ -834,23 +834,28 @@ static const char *lorieActiveName(uint8_t a) {
 }
 
 // P9-B0: one latency's samples since the last report - count, mean, p95 (the bound of the bucket the 95th
-// percentile falls in, ">66000" past the last) and the maximum, which is taken back to 0 here.
+// percentile falls in, ">66000" past the last) and the maximum, which is taken back to 0 here; with `entryUs` (the
+// entries' copy_total_us added up over the same time), the share of it this part makes up in entry time (weightedUs).
 static void lorieLatencyText(char *out, size_t size, const struct lorie_latency *now, const struct lorie_latency *before,
-                             volatile uint32_t *max) {
+                             volatile uint32_t *max, uint64_t entryUs) {
     static const uint32_t bounds[LORIE_LATENCY_BUCKETS - 1] = { LORIE_LATENCY_BOUNDS };
     uint32_t n = now->count - before->count, want = (uint32_t) (((uint64_t) n * 95 + 99) / 100), seen = 0, b;
     uint32_t top = __atomic_exchange_n(max, 0, __ATOMIC_RELAXED);
     unsigned long long mean = n ? (unsigned long long) ((now->sumUs - before->sumUs) / n) : 0;
+    unsigned long long permille = entryUs ? (unsigned long long) ((now->weightedUs - before->weightedUs) * 1000 / entryUs) : 0;
+    int used;
 
     for (b = 0; b < LORIE_LATENCY_BUCKETS - 1; b++)
         if ((seen += now->buckets[b] - before->buckets[b]) >= want)
             break;
     if (!n)
-        snprintf(out, size, "n:0");
+        used = snprintf(out, size, "n:0");
     else if (b < LORIE_LATENCY_BUCKETS - 1)
-        snprintf(out, size, "n:%u,avg:%llu,p95:%u,max:%u", n, mean, bounds[b], top);
+        used = snprintf(out, size, "n:%u,avg:%llu,p95:%u,max:%u", n, mean, bounds[b], top);
     else
-        snprintf(out, size, "n:%u,avg:%llu,p95:>%u,max:%u", n, mean, bounds[LORIE_LATENCY_BUCKETS - 2], top);
+        used = snprintf(out, size, "n:%u,avg:%llu,p95:>%u,max:%u", n, mean, bounds[LORIE_LATENCY_BUCKETS - 2], top);
+    if (n && entryUs && used > 0 && (size_t) used < size)
+        snprintf(out + used, size - (size_t) used, ",share:%llu.%llu%%", permille / 10, permille % 10);
 }
 
 static const char *lorieAhbFormatName(uint32_t f) {
@@ -931,21 +936,26 @@ static void lorieLogRendererDiag(void) {
         d.fallbackTotal ? lorieFallbackReasonNames[d.lastFallbackReason % LORIE_FALLBACK_REASON_COUNT] : "none",
         d.lastVkResult, (unsigned long long) d.lastResourceId, d.lastResourceFormat,
         (unsigned long long) d.lastResourceUsage, reasons[0] ? reasons : "none");
-    // P9-B0: the Vulkan backend's Present copies, how long each part took (lorie.h struct lorie_renderer_diag copy*).
+    // P9-B0: the Vulkan backend's Present copies, how long each part took (lorie.h struct lorie_renderer_diag copy*);
+    // each part's share of the entries' whole time (copy_total_us) in entry time.
     {
-        char queue[96], lock[96], record[96], gpu[96], total[96], ack[96];
+        char queue[112], lock[112], inflight[112], record[112], gpu[112], frameGpu[112], total[112], ack[112];
         volatile struct lorie_renderer_diag *live = &pvfb->state->diag;
-        lorieLatencyText(queue, sizeof(queue), &d.copyQueue, &prev.copyQueue, &live->copyQueue.maxUs);
-        lorieLatencyText(lock, sizeof(lock), &d.copyLock, &prev.copyLock, &live->copyLock.maxUs);
-        lorieLatencyText(record, sizeof(record), &d.copyRecord, &prev.copyRecord, &live->copyRecord.maxUs);
-        lorieLatencyText(gpu, sizeof(gpu), &d.copyGpuWait, &prev.copyGpuWait, &live->copyGpuWait.maxUs);
-        lorieLatencyText(total, sizeof(total), &d.copyTotal, &prev.copyTotal, &live->copyTotal.maxUs);
-        lorieLatencyText(ack, sizeof(ack), &d.copyAck, &prev.copyAck, &live->copyAck.maxUs);
+        uint64_t entryUs = d.copyTotal.sumUs - prev.copyTotal.sumUs;
+        lorieLatencyText(queue, sizeof(queue), &d.copyQueue, &prev.copyQueue, &live->copyQueue.maxUs, entryUs);
+        lorieLatencyText(lock, sizeof(lock), &d.copyLock, &prev.copyLock, &live->copyLock.maxUs, entryUs);
+        lorieLatencyText(inflight, sizeof(inflight), &d.copyInflightWait, &prev.copyInflightWait, &live->copyInflightWait.maxUs, entryUs);
+        lorieLatencyText(record, sizeof(record), &d.copyRecord, &prev.copyRecord, &live->copyRecord.maxUs, entryUs);
+        lorieLatencyText(gpu, sizeof(gpu), &d.copyGpuWait, &prev.copyGpuWait, &live->copyGpuWait.maxUs, entryUs);
+        lorieLatencyText(frameGpu, sizeof(frameGpu), &d.copyFrameGpuWait, &prev.copyFrameGpuWait, &live->copyFrameGpuWait.maxUs, entryUs);
+        lorieLatencyText(total, sizeof(total), &d.copyTotal, &prev.copyTotal, &live->copyTotal.maxUs, 0);
+        lorieLatencyText(ack, sizeof(ack), &d.copyAck, &prev.copyAck, &live->copyAck.maxUs, 0);
         log(INFO, "XlorieCopyLatency: copy_standalone_entries=%llu(+%llu) copy_frame_entries=%llu(+%llu) "
                   "copy_standalone_submits=%llu(+%llu) copy_frame_submits=%llu(+%llu) copy_queue_us=%s copy_lock_us=%s "
-                  "copy_record_us=%s copy_gpu_wait_us=%s copy_total_us=%s copy_ack_us=%s",
+                  "copy_inflight_wait_us=%s copy_record_us=%s copy_gpu_wait_us=%s copy_frame_gpu_wait_us=%s copy_total_us=%s "
+                  "copy_ack_us=%s",
             TD(copyStandaloneEntries), TD(copyFrameEntries), TD(copyStandaloneSubmits), TD(copyFrameSubmits),
-            queue, lock, record, gpu, total, ack);
+            queue, lock, inflight, record, gpu, frameGpu, total, ack);
     }
     // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
     if (pvfb->state->backend.vkTransferCopy) {

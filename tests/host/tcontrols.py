@@ -671,10 +671,9 @@ CONTROLS = [
      """    if ((r = vk.DeviceWaitIdle(vk.device)) != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST) {""",
      "tpresentcopy"),
     ("a frame recorded over another process's listed frame", "renderer.c",
-     """    if (owned)
+     """        inflightUs = lorieMonotonicUs();
         lorieGpuWaitIdle(state, true, 0);""",
-     """    if (0)
-        lorieGpuWaitIdle(state, true, 0);""",
+     """        inflightUs = lorieMonotonicUs();""",
      "tpresentcopy"),
     ("this process clearing another's list", "renderer.c",
      """    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n""",
@@ -763,6 +762,18 @@ CONTROLS = [
         LORIE_DIAG_ADD(state, copyFrameEntries, n);""",
      """    if (0) {
         LORIE_DIAG_ADD(state, copyFrameEntries, n);""",
+     "tpresentcopy"),
+    ("P9-B0: the wait for a frame listed in flight counted in the recording", "renderer.c",
+     """    lorieLatencyAddWeighted(&state->diag.copyRecord, submittedUs - lockedUs - inflightUs, n);""",
+     """    lorieLatencyAddWeighted(&state->diag.copyRecord, submittedUs - lockedUs, n);""",
+     "tpresentcopy"),
+    ("P9-B0: a frame's fence counted as the copies' alone", "renderer.c",
+     """    lorieLatencyAddWeighted(frame ? &state->diag.copyFrameGpuWait : &state->diag.copyGpuWait, fencedUs - submittedUs, n);""",
+     """    lorieLatencyAddWeighted(&state->diag.copyGpuWait, fencedUs - submittedUs, n);""",
+     "tpresentcopy"),
+    ("P9-B0: a submission's parts not weighted by its entries", "lorie.h",
+     """    __atomic_fetch_add(&l->weightedUs, us * entries, __ATOMIC_RELAXED);""",
+     """    __atomic_fetch_add(&l->weightedUs, us, __ATOMIC_RELAXED);""",
      "tpresentcopy"),
     ("P9-B0: the X server's re-execution counted at every event, not once per publish", "InitOutput.c",
      """    if (!published || published == counted)
