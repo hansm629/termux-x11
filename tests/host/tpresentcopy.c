@@ -194,6 +194,16 @@ static void lorie_mutex_lock(volatile int *m, volatile int *pid) {
     if (rootAtLock && m == &state->lock)
         state->rootWindowTextureID = rootAtLock;
 }
+/* the shared lock if no one holds it (lorieGpuCopySettle): a case makes a renderer process hold it (lockHolder) */
+static pid_t lockHolder;
+static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
+    if (lockHolder)
+        return false;
+    (*m)++;
+    *pid = 1;
+    return true;
+}
+#include "settleconsts_src.inc"
 #include "presentcopy_src.inc"
 
 /* the moment the renderer waits for a frame's fence: the device runs the frame */
@@ -1293,6 +1303,71 @@ int main(void) {
             lorieGpuCopyAck(&srcPix, dstBuffer);
         }
 #undef MOVED
+    }
+
+    /* P10-S1: what may still happen to a queued copy, as lorieGpuCopySettle finds it - waiting for nothing */
+    {
+        RegionRec one = { 1, &boxes[1] };
+        uint32_t dests;
+        own(70);
+        st.gpuInFlight.busy = 0;
+        connectionAlive = true;
+
+        /* not recorded: cancelled - Vulkan then skips it, completing its serial without a draw */
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "settle: not queued");
+        e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        CHECK(!e->cancelled && lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled &&
+              lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && st.lock == 0,
+              "not recorded: settled %d, cancelled %d, lock %d (want CANCELLED twice, marked, let go)", lorieGpuCopySettle(serial),
+              e->cancelled, st.lock);
+        dests = st.diag.vkImportedDestinationDraws;
+        memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(serial) && st.diag.vkImportedDestinationDraws == dests && vkFailures == 0 &&
+              lorieGpuCopySettle(serial) == LORIE_GPU_COPY_DONE, "cancelled: Vulkan drew it (%u draws) or did not complete it",
+              st.diag.vkImportedDestinationDraws - dests);
+        /* ... and GLES too */
+        glDrawCount = 0;
+        CHECK(gles(&saved) == serial && glDrawCount == 0, "cancelled: GLES drew it (%d draws)", glDrawCount);
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+
+        /* recorded, its buffers in flight with a renderer that exists: running, not marked; that frame over (its list
+         * cleared, its completion not yet published): no renderer touches it any more - settled */
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "settle: not queued");
+        e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        list(src->desc.id, getppid());
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_RUNNING && !e->cancelled, "in flight: settled %d, marked %d (want RUNNING, no)",
+              lorieGpuCopySettle(serial), e->cancelled);
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled, "its frame over: settled %d", lorieGpuCopySettle(serial));
+
+        /* in flight with a renderer process that no longer exists: settled, marked so no later renderer records it */
+        e->cancelled = 0;
+        list(root->desc.id, deadPid());
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled, "its renderer gone: settled %d, marked %d",
+              lorieGpuCopySettle(serial), e->cancelled);
+        st.gpuInFlight.busy = 0;
+
+        /* the shared lock held by a renderer that exists: running (asked again later), nothing marked; by one that died
+         * holding it, with no renderer connected: taken over, settled */
+        e->cancelled = 0;
+        lockHolder = st.lockingPid = getppid();
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_RUNNING && !e->cancelled, "lock held: settled %d, marked %d (want RUNNING, no)",
+              lorieGpuCopySettle(serial), e->cancelled);
+        connectionAlive = false;
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_RUNNING, "lock held, disconnected, holder alive: settled %d (want RUNNING)",
+              lorieGpuCopySettle(serial));
+        lockHolder = st.lockingPid = deadPid();
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled && st.lock == 0,
+              "lock held by a dead renderer: settled %d, marked %d, lock %d", lorieGpuCopySettle(serial), e->cancelled, st.lock);
+        lockHolder = 0;
+        st.lockingPid = 0;
+        connectionAlive = true;
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopySettle(serial) == LORIE_GPU_COPY_DONE, "consumed: settled %d (want DONE)", lorieGpuCopySettle(serial));
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&srcPix, dstBuffer);
     }
 
     CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");

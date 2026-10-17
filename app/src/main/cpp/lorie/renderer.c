@@ -1226,9 +1226,16 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
 
     while (state->gpuCopyQueue.readIndex != __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE)) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
-        LorieBuffer *src = rendererFindBufferWithRetry(entry.srcBufferId);
-        LorieBuffer *dst = rendererFindBufferWithRetry(entry.dstBufferId);
+        LorieBuffer *src, *dst;
 
+        if (entry.cancelled) {
+            // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            lastSerial = entry.serial;
+            state->gpuCopyQueue.readIndex++;
+            continue;
+        }
+        src = rendererFindBufferWithRetry(entry.srcBufferId);
+        dst = rendererFindBufferWithRetry(entry.dstBufferId);
         if (!src)
             log("rendererApplyPendingGpuCopies: source buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.srcBufferId);
         if (!dst)
@@ -1990,9 +1997,15 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
 
     for (; i != end; i++) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
-        LorieBuffer *src = rendererFindBufferWithRetry(entry.srcBufferId);
-        LorieBuffer *dst = rendererFindBufferWithRetry(entry.dstBufferId);
+        LorieBuffer *src, *dst;
 
+        if (entry.cancelled) {
+            // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            *serial = entry.serial;
+            continue;
+        }
+        src = rendererFindBufferWithRetry(entry.srcBufferId);
+        dst = rendererFindBufferWithRetry(entry.dstBufferId);
         if (!src || !dst)
             log("rendererVkCopies: buffer %llu not found after waiting, skipping\n",
                 (unsigned long long) (!src ? entry.srcBufferId : entry.dstBufferId));

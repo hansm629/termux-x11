@@ -372,7 +372,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,39 @@
+@@ -90,8 +91,52 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -405,6 +405,19 @@
 +#define LORIE_GPU_COPY_EARLY_POLL_FIRST 2
 +#define LORIE_GPU_COPY_EARLY_POLL_LATER 3
 +#define LORIE_GPU_COPY_EARLY_STALLED 4
++/* lorie: P10-S1 - what may still happen to an offloaded GPU copy, waiting for nothing (lorie/InitOutput.c): done,
++ * cancelled (no renderer can touch its buffers any more), or still running (or not known yet: asked again later). */
++extern int lorieGpuCopySettle(uint64_t serial);
++#define LORIE_GPU_COPY_RUNNING 0
++#define LORIE_GPU_COPY_DONE 1
++#define LORIE_GPU_COPY_CANCELLED 2
++/* lorie: P10-S1 - a presentation that ends while its GPU copy may still run leaves what the copy needs to a retired
++ * copy (present_vblank.c), let go once the copy settles: checked at every completion and tick (lorieRecheckGpuCopies),
++ * told about windows destroyed, let go at the screen's close. */
++extern void present_retire_copy(present_vblank_ptr vblank, Bool idle);
++extern void present_retired_copies_check(void);
++extern void present_retired_copies_forget_window(WindowPtr window);
++extern void present_retired_copies_drain(void);
 +
 +/* lorie: implemented in present_scmd.c; re-executes any vblank whose GPU copy has finished. */
 +extern void lorieRecheckGpuCopies(void);
@@ -413,7 +426,7 @@
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
  
 +++ ./present/present_scmd.c
-@@ -252,6 +252,21 @@
+@@ -252,6 +252,22 @@
      }
  }
  
@@ -430,12 +443,13 @@
 +        if (vblank->gpu_copy_pending && (lorieGpuCopyIsDone(vblank->gpu_copy_serial) || gpuCopyStalled))
 +            present_re_execute(vblank);
 +    }
++    present_retired_copies_check();
 +}
 +
  static void
  present_flip_idle(ScreenPtr screen)
  {
-@@ -599,6 +614,8 @@
+@@ -599,6 +615,8 @@
                      damage = &window->clipList;
  
                  DamageDamageRegion(&vblank->window->drawable, damage);
@@ -444,17 +458,138 @@
                  return;
              }
  
++++ ./present/present_screen.c
+@@ -56,6 +56,9 @@
+ {
+     present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+ 
++    /* lorie: P10-S1 - the screen's pixmaps go: so do the retired GPU copies holding some */
++    present_retired_copies_drain();
++
+     if (screen_priv->flip_destroy)
+         screen_priv->flip_destroy(screen);
+ 
+@@ -102,6 +105,9 @@
+                                window->nextSib,
+                                PresentWindowDestroyed);
+ 
++    /* lorie: P10-S1 - its retired GPU copies owe it nothing more (their fences are still triggered) */
++    present_retired_copies_forget_window(window);
++
+     if (window_priv) {
+         present_clear_window_notifies(window);
+         present_free_events(window);
 +++ ./present/present_vblank.c
-@@ -188,6 +188,16 @@
+@@ -180,6 +180,94 @@
+     return NULL;
+ }
+ 
++/* lorie: P10-S1 - what a presentation's GPU copy needs kept while it may still run, after the presentation ended:
++ * the pixmap's reference (present_vblank_create's), the X server's buffer references and pending counts (let go by
++ * lorieGpuCopyAck), its idle fence, and - for a scrapped one - the idle notification owed to its window (forgotten
++ * when the window is destroyed: the fence alone is triggered then). Let go exactly once, when the copy settles. */
++struct present_retired_copy {
++    struct xorg_list    link;
++    uint64_t            gpu_copy_serial;
++    void                *gpu_copy_dst_buffer;
++    PixmapPtr           pixmap;
++    WindowPtr           window;
++    uint32_t            serial;
++    present_fence_ptr   idle_fence;
++    Bool                idle;
++};
++
++static struct xorg_list present_retired_copies = { &present_retired_copies, &present_retired_copies };
++
++/* lorie: the presentation goes on without what its copy needs (pixmap, idle fence, buffers): out of memory, they
++ * are kept for good rather than let go early. */
++void
++present_retire_copy(present_vblank_ptr vblank, Bool idle)
++{
++    struct present_retired_copy *retired = calloc(1, sizeof (*retired));
++
++    if (retired) {
++        retired->gpu_copy_serial = vblank->gpu_copy_serial;
++        retired->gpu_copy_dst_buffer = vblank->gpu_copy_dst_buffer;
++        retired->pixmap = vblank->pixmap;
++        retired->window = idle ? vblank->window : NULL;
++        retired->serial = vblank->serial;
++        retired->idle_fence = vblank->idle_fence;
++        retired->idle = idle;
++        xorg_list_append(&retired->link, &present_retired_copies);
++    }
++    vblank->pixmap = NULL;
++    vblank->idle_fence = NULL;
++    vblank->gpu_copy_pending = FALSE;
++    vblank->gpu_copy_dst_buffer = NULL;
++}
++
++static void
++present_retired_copy_release(struct present_retired_copy *retired)
++{
++    xorg_list_del(&retired->link);
++    lorieGpuCopyAck(retired->pixmap, retired->gpu_copy_dst_buffer);
++    if (retired->idle)
++        present_pixmap_idle(retired->pixmap, retired->window, retired->serial, retired->idle_fence);
++    present_fence_destroy(retired->idle_fence);
++    dixDestroyPixmap(retired->pixmap, retired->pixmap->drawable.id);
++    free(retired);
++}
++
++/* lorie: the retired copies that settled let go (lorieRecheckGpuCopies: every completion and tick) */
++void
++present_retired_copies_check(void)
++{
++    struct present_retired_copy *retired, *tmp;
++
++    xorg_list_for_each_entry_safe(retired, tmp, &present_retired_copies, link) {
++        if (lorieGpuCopySettle(retired->gpu_copy_serial) != LORIE_GPU_COPY_RUNNING)
++            present_retired_copy_release(retired);
++    }
++}
++
++/* lorie: a window being destroyed is told nothing more: its retired copies trigger only their fence */
++void
++present_retired_copies_forget_window(WindowPtr window)
++{
++    struct present_retired_copy *retired;
++
++    xorg_list_for_each_entry(retired, &present_retired_copies, link) {
++        if (retired->window == window)
++            retired->window = NULL;
++    }
++}
++
++/* lorie: the screen closing - its pixmaps going - lets every retired copy go, telling no one */
++void
++present_retired_copies_drain(void)
++{
++    struct present_retired_copy *retired, *tmp;
++
++    xorg_list_for_each_entry_safe(retired, tmp, &present_retired_copies, link) {
++        retired->idle = FALSE;
++        present_retired_copy_release(retired);
++    }
++}
++
+ void
+ present_vblank_scrap(present_vblank_ptr vblank)
+ {
+@@ -188,6 +276,21 @@
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,
                    vblank->crtc));
  
-+    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - ack it now, while
-+     * the pixmap is still valid, or the extra buffer references lorieTryScheduleGpuCopy took
-+     * leak forever. */
++    /* lorie: an offloaded copy from vblank->pixmap may still run (P10-S1): then its buffers, its idle fence and the
++     * idle notification it owes stay with a retired copy until it settles, and this presentation goes on without
++     * them. Settled (done, or cancelled before any renderer recorded it), they go here as without a copy. */
 +    if (vblank->gpu_copy_pending) {
 +        if (!lorieGpuCopyIsDone(vblank->gpu_copy_serial))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_SCRAP);
++        if (lorieGpuCopySettle(vblank->gpu_copy_serial) == LORIE_GPU_COPY_RUNNING) {
++            present_retire_copy(vblank, TRUE);
++            vblank->flip = FALSE;
++            return;
++        }
 +        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
 +        vblank->gpu_copy_pending = FALSE;
 +    }
@@ -462,17 +597,22 @@
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +208,15 @@
+@@ -200,6 +303,20 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
-+    /* lorie: same as in present_vblank_scrap() - must run before vblank->pixmap is dropped below,
-+     * for the destroy paths that reach a still-pending vblank without going through scrap first. */
++    /* lorie: as in present_vblank_scrap() - before vblank->pixmap is dropped below, for the destroy paths that reach a
++     * still-pending vblank without going through scrap first. A destroyed presentation owes no idle notification
++     * (its fence goes untriggered, as without a copy): a retired copy keeps only its buffers and fence. */
 +    if (vblank->gpu_copy_pending) {
 +        if (!lorieGpuCopyIsDone(vblank->gpu_copy_serial))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_DESTROY);
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
-+        vblank->gpu_copy_pending = FALSE;
++        if (lorieGpuCopySettle(vblank->gpu_copy_serial) == LORIE_GPU_COPY_RUNNING)
++            present_retire_copy(vblank, FALSE);
++        else {
++            lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
++            vblank->gpu_copy_pending = FALSE;
++        }
 +    }
 +
      /* Remove vblank from window and screen lists */

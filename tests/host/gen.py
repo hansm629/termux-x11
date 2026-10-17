@@ -141,6 +141,7 @@ recipes = {
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
         + func(I, "void lorieCountCopyAck(void) {")
         + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
+        + func(I, "int lorieGpuCopySettle(uint64_t serial) {")
         + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
         + func(R, "static void rendererGlBuffer(LorieBuffer *buf) {")
         + func(R, "static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {")
@@ -164,12 +165,13 @@ recipes = {
     # scraps a queued presentation a new one overwrites in the same frame
     "presentsafety_struct": lambda: span(present("present_priv.h"), "struct present_vblank {",
                                          "    void                *gpu_copy_dst_buffer; /* opaque LorieBuffer*, held for lorieGpuCopyAck */\n};")
-        + opt(lambda: span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_EARLY_STALLED 4"),
-              "LORIE_GPU_COPY_EARLY_SCRAP", PATCH),
+        + span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
     "presentsafety": lambda: "static void\n" + func(present("present_scmd.c"), "present_re_execute(present_vblank_ptr vblank)\n{")
         + "static void\n" + func(present("present_scmd.c"), "present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
         + "void\n" + func(present("present_execute.c"), "present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)\n{")
         + "void\n" + func(present("present_execute.c"), "present_execute_post(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
+        + span(present("present_vblank.c"), "struct present_retired_copy {",
+               "        retired->idle = FALSE;\n        present_retired_copy_release(retired);\n    }\n}")
         + "void\n" + func(present("present_vblank.c"), "present_vblank_scrap(present_vblank_ptr vblank)\n{")
         + "void\n" + func(present("present_vblank.c"), "present_vblank_destroy(present_vblank_ptr vblank)\n{")
         + "static void\n" + func(present("present_screen.c"), "present_free_window_vblank(WindowPtr window)\n{")
@@ -178,6 +180,8 @@ recipes = {
           "                             uint64_t target_msc) {\n    present_vblank_ptr vblank, tmp;\n"
         + span(present("present_scmd.c"), "    if (!update && pixmap) {\n        xorg_list_for_each_entry_safe(vblank, tmp, &window_priv->vblank, window_list) {",
                "            if (vblank->flip_ready)\n                present_re_execute(vblank);\n        }\n    }") + "}\n",
+    # lorieGpuCopySettle's answers, as the patched present_priv.h defines them - tpresentcopy.c
+    "settleconsts": lambda: span(present("present_priv.h"), "#define LORIE_GPU_COPY_RUNNING 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
     # the shaders as committed (vk.c includes them)
     "vk_shaders": lambda: open(os.path.join(L, "vk_shaders.h"), encoding="utf-8").read(),
 }

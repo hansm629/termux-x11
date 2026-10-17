@@ -1583,6 +1583,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;
     entry->dstDepth = (uint8_t) dst->drawable.depth;
+    entry->cancelled = 0;
     entry->queuedUs = lorieMonotonicUs();
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
@@ -1610,6 +1611,53 @@ uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs) {
 void lorieGpuCopyDoneHandled(uint32_t receivedUs) {
     lorieRanAfter(&pvfb->state->diag.xCopyRecheck, receivedUs, &pvfb->state->diag.xCopyDonePosted,
                   &pvfb->state->diag.xCopyDoneRun, &pvfb->state->diag.xCopyDoneWaitingMax);
+}
+
+/*
+ * P10-S1: what may still happen to GPU copy `serial`, waiting for nothing - for presentations that end before it
+ * is known to be done (patches/xserver.patch: present_vblank_scrap, present_vblank_destroy, present_execute_copy,
+ * the retired copies). LORIE_GPU_COPY_DONE: its completion is published, or it left the queue (Vulkan publishes
+ * readIndex past it after its fence; GLES records, waits for its fence and publishes all under the shared lock).
+ * LORIE_GPU_COPY_CANCELLED: still queued, and no renderer can touch its buffers any more - not recorded (the renderers
+ * record under the shared lock; marked cancelled under it, it never will be), or recorded by a renderer process that
+ * no longer exists (marked too: a later renderer would otherwise record it again). LORIE_GPU_COPY_RUNNING: recorded,
+ * its buffers listed in flight by a renderer that exists - or the shared lock held by one that exists: asked again
+ * at the next completion or tick (lorieRecheckGpuCopies). Never a timeout: only those facts settle it.
+ */
+int lorieGpuCopySettle(uint64_t serial) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    int settled = LORIE_GPU_COPY_DONE;
+    bool nested;
+    uint32_t i, end;
+
+    if (lorieGpuCopyIsDone(serial))
+        return LORIE_GPU_COPY_DONE;
+    nested = st->lockingPid == getpid();    // asked while the X server holds it (recursive): no second lock
+    if (!nested && !lorie_mutex_trylock(&st->lock, &st->lockingPid)) {
+        pid_t holder = st->lockingPid;
+        // Held by a renderer that exists: asked again later. By one that died holding it: lorie_mutex_lock takes it
+        // over (it gives a lock up only when no renderer is connected and its holder is not this process).
+        if (lorieConnectionAlive() || holder <= 0 || kill(holder, 0) == 0 || errno != ESRCH)
+            return LORIE_GPU_COPY_RUNNING;
+        lorie_mutex_lock(&st->lock, &st->lockingPid);
+    }
+    end = __atomic_load_n(&st->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+    if (!lorieGpuCopyIsDone(serial))
+        for (i = st->gpuCopyQueue.readIndex; i != end; i++) {
+            LorieGpuCopyEntry *e = &st->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+            if (e->serial != serial)
+                continue;
+            if ((lorieGpuInFlight(st, e->srcBufferId) || lorieGpuInFlight(st, e->dstBufferId)) && !lorieGpuSubmitterGone(st))
+                settled = LORIE_GPU_COPY_RUNNING;
+            else {
+                e->cancelled = 1;
+                settled = LORIE_GPU_COPY_CANCELLED;
+            }
+            break;
+        }
+    if (!nested)
+        lorie_mutex_unlock(&st->lock, &st->lockingPid);
+    return settled;
 }
 
 // P10-B0: a GPU-copied presentation ended before its copy was done (patches/xserver.patch, LORIE_X_EARLY_*).

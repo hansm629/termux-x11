@@ -37,6 +37,7 @@ void lorieCountCopyAck(void);
 uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs);
 void lorieGpuCopyDoneHandled(uint32_t receivedUs);
 void lorieCountGpuCopyEarly(int how);
+int lorieGpuCopySettle(uint64_t serial);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -100,6 +101,14 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
             return;
         }
     }
+}
+
+// The lock if no one holds it, without waiting (P10-S1: what the X server may ask about without waiting for the renderer).
+static inline __always_inline bool lorie_mutex_trylock(pthread_mutex_t* mutex, pid_t* lockingPid) {
+    if (pthread_mutex_trylock(mutex))
+        return false;
+    *lockingPid = getpid();
+    return true;
 }
 
 static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex, pid_t* lockingPid) {
@@ -200,6 +209,9 @@ typedef struct {
     int16_t xOff, yOff;
     uint16_t numRects;
     uint8_t dstDepth;       /* the destination's depth: 32 keeps alpha in its RGBX 4th byte, below that it is padding */
+    uint8_t cancelled;      /* X, under the shared lock: its presentation was let go before any renderer recorded it -
+                             * the renderers (which record under that lock) skip it, its serial completed as any other's
+                             * (InitOutput.c lorieGpuCopySettle, P10-S1) */
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
 } LorieGpuCopyEntry;
 

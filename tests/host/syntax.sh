@@ -38,7 +38,7 @@ cd "$CPP"
 # The lorie sources, and the patched xserver files whose lorie hooks live in the patch itself.
 for f in lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/vk.c lorie/buffer.c \
          "$X/exa/exa_unaccel.c" "$X/exa/exa.c" "$X/present/present_execute.c" "$X/present/present_scmd.c" \
-         "$X/present/present_vblank.c"; do
+         "$X/present/present_vblank.c" "$X/present/present_screen.c"; do
     out=$("$CLANG" --target=aarch64-linux-android30 -fsyntax-only -std=gnu99 -Wno-everything \
           -Werror=implicit -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
           -Werror=int-conversion -DHAVE_DIX_CONFIG_H -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XSERVER64=1 \
