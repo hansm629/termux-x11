@@ -21,6 +21,8 @@ XlorieVkTransfer: (only with TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1) checked cop
 XlorieCopyLatency: copy_standalone_entries copy_frame_entries copy_standalone_submits copy_frame_submits
                 copy_queue_us copy_lock_us copy_inflight_wait_us copy_record_us copy_gpu_wait_us
                 copy_frame_gpu_wait_us copy_total_us copy_ack_us
+XlorieTick:     vsync_to_callback_us callback_to_tick_us ticks ticks_waiting ticks_waiting_max copy_notify_us
+                copy_recheck_us copy_done_events copy_done_waiting copy_done_waiting_max stamps_invalid copy_early
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -79,6 +81,21 @@ and total and per submission for the rest.
 `copy_ack_us`: from the renderer publishing a completion to the X server having re-executed the Present work it
 completed, once per publish (measured against the latest publish); after the total, so it has no share.
 `copy_standalone_*` and `copy_frame_*` count entries and submissions made on their own and with a frame.
+
+`XlorieTick` follows the X server's own ticks and GPU copy completions to its thread (latencies as above, without
+shares). A tick: `vsync_to_callback_us`, from the vsync's frame time Choreographer gives to its callback (64-bit
+builds only: a 32-bit `long` cannot hold the frame time), and `callback_to_tick_us`, from that callback to the tick
+(lorieRedraw) running on the X server's thread. A completion: `copy_notify_us`, from the Vulkan renderer publishing
+it to the X server's input thread receiving it, and `copy_recheck_us`, from there to the X server's thread done with
+the recheck it caused. Each pair is one event's own two CLOCK_MONOTONIC stamps - the tick and the recheck carry
+theirs to the X server's thread - and a pair out of order or over 10 s apart is counted in `stamps_invalid`, not
+timed. `ticks` and `copy_done_events` count those posted to the X server's thread; `*_waiting` is how many of them
+were posted but had not run when the report was made (waiting, not lost), `*_waiting_max` the most still waiting
+behind one when it ran since the previous report. `copy_early` counts GPU-copied presentations that ended before
+their copy was done: `scrap` overwritten by a new presentation in the same frame, `destroy` with their window,
+`first_poll` / `later_poll` when the poll for the copy could not be queued, `stalled` when the renderer had no
+surface or no connection. Each of these releases the X server's references and (but `destroy`) tells the client its
+buffer is idle while the GPU copy may still read it (`tests/host/tpresentsafety.c`, P10-S0).
 
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under

@@ -38,7 +38,7 @@ def before_first_return(body, call):
     i, r = body.find(call), body.find("return")
     return i >= 0 and (r < 0 or i < r)
 
-redraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {")
+redraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {")
 check(before_first_return(redraw, "lorieProcessOwnershipRequest();"),
       "lorieRedraw does not take up the ownership request before its first return")
 
@@ -70,7 +70,7 @@ def in_order(what, body, *steps):
         at = i + len(s_)
 
 # root double buffering: swapped after the vblanks, before the frame is allowed and the front published
-in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {"),
+in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {"),
          "loriePerformVblanks();", "lorieRootSwap(priv)", "rootDouble ? priv->twin : priv->buffer")
 
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")

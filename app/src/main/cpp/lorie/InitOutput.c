@@ -749,11 +749,40 @@ static Bool lorieRootSwap(LoriePixmapPriv *priv) {
     return !failed;
 }
 
-static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
+// P10-B0: one event's two CLOCK_MONOTONIC stamps as a latency; out of order or over 10 s apart, counted instead.
+static void lorieStampPair(volatile struct lorie_latency *l, uint64_t fromUs, uint64_t toUs) {
+    if (toUs < fromUs || toUs - fromUs > 10000000)
+        __atomic_fetch_add(&pvfb->state->diag.xStampsInvalid, 1, __ATOMIC_RELAXED);
+    else
+        lorieLatencyAdd(l, toUs - fromUs);
+}
+
+// P10-B0: a work procedure posted at `fromUs` (its low 32 bits: what a closure carries on any ABI) running now on the
+// X server's thread - its wait, and how many posted after it still wait (the most since the last report).
+static void lorieRanAfter(volatile struct lorie_latency *l, uint32_t fromUs, volatile uint32_t *posted, volatile uint32_t *run,
+                          volatile uint32_t *waitingMax) {
+    uint32_t waited = (uint32_t) lorieMonotonicUs() - fromUs, done = __atomic_add_fetch(run, 1, __ATOMIC_RELAXED);
+    int32_t behind = (int32_t) (__atomic_load_n(posted, __ATOMIC_RELAXED) - done);
+    uint32_t max = __atomic_load_n(waitingMax, __ATOMIC_RELAXED);
+    if (waited > 10000000)
+        __atomic_fetch_add(&pvfb->state->diag.xStampsInvalid, 1, __ATOMIC_RELAXED);
+    else
+        lorieLatencyAdd(l, waited);
+    while (behind > 0 && (uint32_t) behind > max &&
+           !__atomic_compare_exchange_n(waitingMax, &max, (uint32_t) behind, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+}
+
+static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
     Bool twinned, rootDouble;
+
+    // P10-B0: from its Choreographer callback to here, and the ticks still waiting behind it.
+    if (closure)
+        lorieRanAfter(&pvfb->state->diag.xCallbackToTick, (uint32_t) (uintptr_t) closure, &pvfb->state->diag.xTicksPosted,
+                      &pvfb->state->diag.xTicksRun, &pvfb->state->diag.xTicksWaitingMax);
 
     lorieProcessOwnershipRequest();
     twinned = lorieRootTwinned();
@@ -956,6 +985,25 @@ static void lorieLogRendererDiag(void) {
                   "copy_ack_us=%s",
             TD(copyStandaloneEntries), TD(copyFrameEntries), TD(copyStandaloneSubmits), TD(copyFrameSubmits),
             queue, lock, inflight, record, gpu, frameGpu, total, ack);
+    }
+    // P10-B0: the X server's ticks and GPU copy completions, from their source to its thread (struct lorie_renderer_diag
+    // x*): waiting = posted but not yet run when the report is made.
+    {
+        char vsync[112], tick[112], notify[112], recheck[112];
+        volatile struct lorie_renderer_diag *live = &pvfb->state->diag;
+        lorieLatencyText(vsync, sizeof(vsync), &d.xVsyncToCallback, &prev.xVsyncToCallback, &live->xVsyncToCallback.maxUs, 0);
+        lorieLatencyText(tick, sizeof(tick), &d.xCallbackToTick, &prev.xCallbackToTick, &live->xCallbackToTick.maxUs, 0);
+        lorieLatencyText(notify, sizeof(notify), &d.xCopyNotify, &prev.xCopyNotify, &live->xCopyNotify.maxUs, 0);
+        lorieLatencyText(recheck, sizeof(recheck), &d.xCopyRecheck, &prev.xCopyRecheck, &live->xCopyRecheck.maxUs, 0);
+        log(INFO, "XlorieTick: vsync_to_callback_us=%s callback_to_tick_us=%s ticks=%llu(+%llu) ticks_waiting=%d "
+                  "ticks_waiting_max=%u copy_notify_us=%s copy_recheck_us=%s copy_done_events=%llu(+%llu) "
+                  "copy_done_waiting=%d copy_done_waiting_max=%u stamps_invalid=%llu(+%llu) copy_early=scrap:%llu(+%llu),"
+                  "destroy:%llu(+%llu),first_poll:%llu(+%llu),later_poll:%llu(+%llu),stalled:%llu(+%llu)",
+            vsync, tick, TD(xTicksPosted), (int) (int32_t) (d.xTicksPosted - d.xTicksRun),
+            __atomic_exchange_n(&live->xTicksWaitingMax, 0, __ATOMIC_RELAXED), notify, recheck, TD(xCopyDonePosted),
+            (int) (int32_t) (d.xCopyDonePosted - d.xCopyDoneRun), __atomic_exchange_n(&live->xCopyDoneWaitingMax, 0, __ATOMIC_RELAXED),
+            TD(xStampsInvalid), TD(xCopyEarly[LORIE_X_EARLY_SCRAP]), TD(xCopyEarly[LORIE_X_EARLY_DESTROY]),
+            TD(xCopyEarly[LORIE_X_EARLY_POLL_FIRST]), TD(xCopyEarly[LORIE_X_EARLY_POLL_LATER]), TD(xCopyEarly[LORIE_X_EARLY_STALLED]));
     }
     // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
     if (pvfb->state->backend.vkTransferCopy) {
@@ -1209,10 +1257,15 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+void lorieChoreographerFrameCallback(long t, AChoreographer* d) {
+    uint64_t now = lorieMonotonicUs();
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
     if (pScreenPtr) {
-        QueueWorkProc(lorieRedraw, NULL, NULL);
+        // P10-B0: the vsync's frame time to here (a 32-bit long cannot hold it); the tick carries this callback's stamp.
+        if (sizeof(long) >= 8 && t > 0)
+            lorieStampPair(&pvfb->state->diag.xVsyncToCallback, (uint64_t) t / 1000, now);
+        __atomic_fetch_add(&pvfb->state->diag.xTicksPosted, 1, __ATOMIC_RELAXED);
+        QueueWorkProc(lorieRedraw, NULL, (void *) (uintptr_t) (uint32_t) now);
         lorieWakeServer();
     }
 }
@@ -1541,6 +1594,28 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     gpuCopyAttempts++;
     gpuCopyOffloads++;
     return TRUE;
+}
+
+// P10-B0: GPU copy completions, from the renderer's publish to the input thread (here, on it) - the low 32 bits of
+// when it was received are what the work procedure carries to the X server's thread (lorieGpuCopyDoneHandled).
+uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs) {
+    uint64_t now = lorieMonotonicUs();
+    if (publishedUs)
+        lorieStampPair(&pvfb->state->diag.xCopyNotify, publishedUs, now);
+    __atomic_fetch_add(&pvfb->state->diag.xCopyDonePosted, 1, __ATOMIC_RELAXED);
+    return (uint32_t) now;
+}
+
+// P10-B0: ... and from the input thread to the X server's thread done with the recheck it caused.
+void lorieGpuCopyDoneHandled(uint32_t receivedUs) {
+    lorieRanAfter(&pvfb->state->diag.xCopyRecheck, receivedUs, &pvfb->state->diag.xCopyDonePosted,
+                  &pvfb->state->diag.xCopyDoneRun, &pvfb->state->diag.xCopyDoneWaitingMax);
+}
+
+// P10-B0: a GPU-copied presentation ended before its copy was done (patches/xserver.patch, LORIE_X_EARLY_*).
+void lorieCountGpuCopyEarly(int how) {
+    if (how >= 0 && how < LORIE_X_EARLY_COUNT)
+        __atomic_fetch_add(&pvfb->state->diag.xCopyEarly[how], 1, __ATOMIC_RELAXED);
 }
 
 // P9-B0: from the Vulkan renderer's latest completedSerial publish to here (cmdentrypoint.c, after the X server

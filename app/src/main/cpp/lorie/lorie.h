@@ -34,6 +34,9 @@ void lorieSetStylusEnabled(Bool enabled);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
 void lorieCountCopyAck(void);
+uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs);
+void lorieGpuCopyDoneHandled(uint32_t receivedUs);
+void lorieCountGpuCopyEarly(int how);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -174,6 +177,10 @@ typedef union {
         uint8_t t;
         uint32_t count;
     } clipboardSend;
+    struct {
+        uint8_t t;
+        uint64_t publishedUs;   /* the Vulkan renderer: when it published completedSerial (lorieMonotonicUs); GLES: 0 */
+    } gpuCopyDone;
 } lorieEvent;
 
 typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
@@ -290,6 +297,14 @@ enum { LORIE_FALLBACK_REASONS(LORIE_ENUM_REASON) LORIE_FALLBACK_REASON_COUNT };
 /* ... and the device check of its one copy between two formats, BGRA into RGBX (vk.c lorieVkTransferCheck): not run,
  * byte-exact, not byte-exact (or failed on the way), not possible here (no BGRA import with the transfer usage) */
 #define LORIE_VK_XFER_CHECKS(X) X(NONE) X(PASS) X(FAIL) X(UNAVAILABLE)
+/* P10-B0: how a GPU-copied presentation ended before its copy was done (patches/xserver.patch calls
+ * lorieCountGpuCopyEarly with present_priv.h's LORIE_GPU_COPY_EARLY_*, the same values): overwritten in the same
+ * frame (present_vblank_scrap), destroyed with its window (present_vblank_destroy), its first or a later poll not
+ * queued (present_execute_copy), the renderer without a surface or disconnected (present_execute_copy, stalled) */
+#define LORIE_X_EARLY(X) X(SCRAP) X(DESTROY) X(POLL_FIRST) X(POLL_LATER) X(STALLED)
+#define LORIE_ENUM_X_EARLY(n) LORIE_X_EARLY_ ## n,
+enum { LORIE_X_EARLY(LORIE_ENUM_X_EARLY) LORIE_X_EARLY_COUNT };
+#undef LORIE_ENUM_X_EARLY
 #define LORIE_ENUM_XFER_NOT(n) LORIE_VK_XFER_NOT_ ## n,
 #define LORIE_ENUM_XFER_USAGE(n) LORIE_VK_XFER_USAGE_ ## n,
 #define LORIE_ENUM_XFER_CHECK(n) LORIE_VK_XFER_CHECK_ ## n,
@@ -419,6 +434,20 @@ struct lorie_renderer_diag {
      * once per publish). Entries and submissions on their own (standalone) or in a frame with the root. */
     struct lorie_latency copyQueue, copyLock, copyInflightWait, copyRecord, copyGpuWait, copyFrameGpuWait, copyTotal, copyAck;
     volatile uint32_t copyStandaloneEntries, copyFrameEntries, copyStandaloneSubmits, copyFrameSubmits;
+
+    /* P10-B0, X: the vsync's frame time (Choreographer's, CLOCK_MONOTONIC) to its callback (xVsyncToCallback, 64-bit
+     * only: a 32-bit long cannot hold it); the callback to the tick it posts running on the X server's thread
+     * (xCallbackToTick); a GPU copy completion published by the renderer to the X server's input thread receiving
+     * it (xCopyNotify), and received to the X server's thread done with its recheck (xCopyRecheck). Each pair is
+     * one event's own two stamps: the tick and the recheck carry theirs to the X server's thread. Ticks and
+     * completions posted to the X server's thread and run there - posted minus run is what is waiting, not lost -
+     * and the most still waiting behind one when it ran (taken back to 0 by each report). Stamps out of order (a
+     * pair with the later before the earlier, or over 10 s apart) are counted, not timed. GPU-copied presentations
+     * ended before the copy was done, by how (LORIE_X_EARLY_*). */
+    struct lorie_latency xVsyncToCallback, xCallbackToTick, xCopyNotify, xCopyRecheck;
+    volatile uint32_t xTicksPosted, xTicksRun, xTicksWaitingMax, xCopyDonePosted, xCopyDoneRun, xCopyDoneWaitingMax;
+    volatile uint32_t xStampsInvalid;
+    volatile uint32_t xCopyEarly[LORIE_X_EARLY_COUNT];
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \

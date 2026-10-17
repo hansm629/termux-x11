@@ -396,11 +396,16 @@ static GLuint gpuCopyFbo = 0;
 // GPU copy batch finishes instead of it waiting for the next vblank-tick poll.
 extern volatile int conn_fd;
 
-static void notifyGpuCopyDone(void) {
+static void notifyGpuCopyPublished(uint64_t publishedUs) {
     if (conn_fd != -1) {
-        lorieEvent e = { .type = EVENT_GPU_COPY_DONE };
+        lorieEvent e = { .gpuCopyDone = { .t = EVENT_GPU_COPY_DONE, .publishedUs = publishedUs } };
         write(conn_fd, &e, sizeof(e));
     }
+}
+
+// Without the time it was published (P10-B0 times only the Vulkan backend's, which pass it).
+static void notifyGpuCopyDone(void) {
+    notifyGpuCopyPublished(0);
 }
 
 GLuint g_texture_program = 0, gv_pos = 0, gv_coords = 0;
@@ -2114,7 +2119,7 @@ static void rendererVkApplyPendingGpuCopies(void) {
         if (serial) {
             __atomic_store_n(&state->gpuCopyQueue.completedUs, publishedUs, __ATOMIC_RELAXED);
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
-            notifyGpuCopyDone();
+            notifyGpuCopyPublished(publishedUs);
         }
         rendererVkCountCopies(queued, n, false, startUs, lockedUs, inflightUs, submittedUs, fencedUs, publishedUs);
     }
@@ -2307,7 +2312,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         if (serial) {
             __atomic_store_n(&state->gpuCopyQueue.completedUs, publishedUs, __ATOMIC_RELAXED);
             __atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);
-            notifyGpuCopyDone();
+            notifyGpuCopyPublished(publishedUs);
         }
         rendererVkCountCopies(queued, n, true, startUs, lockedUs, inflightUs, submittedUs, fencedUs, publishedUs);
     }

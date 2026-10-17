@@ -182,6 +182,12 @@ static void notifyGpuCopyDone(void) {
             notified.released = false;
     notified.completed = state->gpuCopyQueue.completedSerial;
 }
+/* the Vulkan backend's notification carries when it published (P10-B0): the stamp it stored */
+static uint64_t notifiedPublishedUs;
+static void notifyGpuCopyPublished(uint64_t publishedUs) {
+    notifiedPublishedUs = publishedUs;
+    notifyGpuCopyDone();
+}
 static void lorie_mutex_lock(volatile int *m, volatile int *pid) {
     (*m)++;
     *pid = 1;
@@ -1221,7 +1227,8 @@ int main(void) {
               "timed: queue %llu us, fence %llu us, total %llu us (want >= 5000, >= 10000, >= their sum)",
               (unsigned long long) MOVED(copyQueue.sumUs), (unsigned long long) MOVED(copyGpuWait.sumUs), (unsigned long long) MOVED(copyTotal.sumUs));
         CHECK(MOVED(copyQueue.buckets[0]) == 0 && MOVED(copyGpuWait.buckets[0]) == 0, "timed: a 5 ms wait in the first bucket");
-        CHECK(st.gpuCopyQueue.completedUs >= e->queuedUs, "timed: published before queued");
+        CHECK(st.gpuCopyQueue.completedUs >= e->queuedUs && notifiedPublishedUs == st.gpuCopyQueue.completedUs,
+              "timed: published before queued, or the notification without that publish's stamp");
         lorieCountCopyAck();
         lorieCountCopyAck();
         CHECK(MOVED(copyAck.count) == 1, "timed: the X server's re-execution counted %u times for one publish", MOVED(copyAck.count));

@@ -164,6 +164,36 @@ int main(void) {
         CHECK(fakeState.diag.copyQueue.maxUs == 0 && fakeState.diag.copyGpuWait.maxUs == 0, "latency: a maximum not taken back by its report");
     }
 
+    /* P10-B0: the X server's ticks and completions - 120 ticks posted, 118 run (2 waiting, 3 the most behind one),
+     * their waits; 50 completions all run; 2 stamps out of order; one presentation scrapped early */
+    {
+        int tickLines = 0, tickOk = 0;
+        snprintf(path, sizeof path, "%s/diag-tick.log", out ? out : ".");
+        logf = fopen(path, "w");
+        lorieLogRendererDiag();
+        fakeState.diag.xTicksPosted += 120, fakeState.diag.xTicksRun += 118, fakeState.diag.xTicksWaitingMax = 3;
+        for (i = 0; i < 118; i++)
+            lorieLatencyAdd(&fakeState.diag.xCallbackToTick, 700);
+        fakeState.diag.xCopyDonePosted += 50, fakeState.diag.xCopyDoneRun += 50;
+        for (i = 0; i < 50; i++)
+            lorieLatencyAdd(&fakeState.diag.xCopyRecheck, 1200), lorieLatencyAdd(&fakeState.diag.xCopyNotify, 100);
+        fakeState.diag.xStampsInvalid += 2;
+        fakeState.diag.xCopyEarly[LORIE_X_EARLY_SCRAP] += 1;
+        lorieLogRendererDiag();
+        fclose(logf);
+        logf = fopen(path, "r");
+        while (fgets(line, sizeof line, logf))
+            if (strstr(line, "XlorieTick:") && ++tickLines == 2)
+                tickOk = strstr(line, "XlorieTick: vsync_to_callback_us=n:0 callback_to_tick_us=n:118,avg:700,p95:750,max:700 "
+                                      "ticks=120(+120) ticks_waiting=2 ticks_waiting_max=3 copy_notify_us=n:50,avg:100,p95:250,") &&
+                         strstr(line, " copy_recheck_us=n:50,avg:1200,p95:1500,") &&
+                         strstr(line, " copy_done_events=50(+50) copy_done_waiting=0 copy_done_waiting_max=0 stamps_invalid=2(+2) "
+                                      "copy_early=scrap:1(+1),destroy:0(+0),first_poll:0(+0),later_poll:0(+0),stalled:0(+0)") != NULL;
+        fclose(logf);
+        CHECK(tickLines == 2 && tickOk, "tick log: %d lines (want 2), the second %s", tickLines, tickOk ? "right" : "wrong");
+        CHECK(fakeState.diag.xTicksWaitingMax == 0, "tick log: the most waiting not taken back by its report");
+    }
+
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY on: copies kept from vkCmdCopyImage by a BGRA source and an image whose
      * usage was refused; the last one BGRA into RGBX of depth 24 */
     snprintf(path, sizeof path, "%s/diag-transfer.log", out ? out : ".");
@@ -213,16 +243,22 @@ int main(void) {
     /* every message within __android_log_print's 1024-byte buffer (longer ones are cut): the copy latency line with
      * every part at its widest, then every line written above */
     {
-        static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-transfer.log", "diag-wide.log" };
+        static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log",
+                                            "diag-wide.log" };
         volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
                                                    &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
-                                                   &fakeState.diag.copyTotal, &fakeState.diag.copyAck };
+                                                   &fakeState.diag.copyTotal, &fakeState.diag.copyAck, &fakeState.diag.xVsyncToCallback,
+                                                   &fakeState.diag.xCallbackToTick, &fakeState.diag.xCopyNotify, &fakeState.diag.xCopyRecheck };
         size_t longest = 0, prefix = strlen("10-07 00:00:00.000  1  1 I LorieNative: ");
         snprintf(path, sizeof path, "%s/diag-wide.log", out ? out : ".");
         logf = fopen(path, "w");
         lorieLogRendererDiag();
         fakeState.diag.copyStandaloneEntries += 999999999, fakeState.diag.copyFrameEntries += 999999999;
         fakeState.diag.copyStandaloneSubmits += 999999999, fakeState.diag.copyFrameSubmits += 999999999;
+        fakeState.diag.xTicksPosted += 999999999, fakeState.diag.xCopyDonePosted += 999999999, fakeState.diag.xStampsInvalid += 999999999;
+        fakeState.diag.xTicksWaitingMax = fakeState.diag.xCopyDoneWaitingMax = 999999999;
+        for (i = 0; i < LORIE_X_EARLY_COUNT; i++)
+            fakeState.diag.xCopyEarly[i] += 999999999;
         for (unsigned k = 0; k < sizeof parts / sizeof *parts; k++)
             for (i = 0; i < 1000; i++)
                 lorieLatencyAddWeighted(parts[k], 4294967295u, 1);

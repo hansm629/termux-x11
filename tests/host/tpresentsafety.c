@@ -16,7 +16,8 @@
  * (destroy), the poll re-queue failing (first and later), the renderer without a surface or disconnected (stalled).
  * Today each of them drops the references, and all but the window's destruction tell the client its buffer is
  * idle, before the copy is done - reproduced here (REPRODUCED). The test checks each sequence as it is now, so it
- * fails if any changes: the fix for P10-S0 has to turn these expectations around. */
+ * fails if any changes: the fix for P10-S0 has to turn these expectations around. Each early end is counted once,
+ * by its kind, through lorieCountGpuCopyEarly (P10-B0); the reference case counts none. */
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -60,6 +61,12 @@ typedef struct present_window_priv { struct xorg_list vblank; } present_window_p
 
 #include "presentsafety_struct_src.inc"
 typedef struct present_vblank *present_vblank_ptr;
+#include <time.h>
+#include "diagtypes_src.inc"
+/* the kinds the patch counts are lorie.h's */
+_Static_assert(LORIE_GPU_COPY_EARLY_SCRAP == LORIE_X_EARLY_SCRAP && LORIE_GPU_COPY_EARLY_DESTROY == LORIE_X_EARLY_DESTROY &&
+               LORIE_GPU_COPY_EARLY_POLL_FIRST == LORIE_X_EARLY_POLL_FIRST && LORIE_GPU_COPY_EARLY_POLL_LATER == LORIE_X_EARLY_POLL_LATER &&
+               LORIE_GPU_COPY_EARLY_STALLED == LORIE_X_EARLY_STALLED, "patches/xserver.patch's kinds are not lorie.h's");
 
 static struct xorg_list present_exec_queue, present_flip_queue;
 static ScreenRec screen;
@@ -97,6 +104,9 @@ static void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
     step("ack", doneFor(pixmap));
 }
 static bool lorieConnectionAlive(void) { return connectionAlive; }
+/* P10-B0: the patch counts each early end, by kind (lorie.h LORIE_X_EARLY_*) */
+static int early[LORIE_X_EARLY_COUNT];
+static void lorieCountGpuCopyEarly(int how) { early[how]++; }
 static bool lorieRendererAvailable(void) { return rendererAvailable; }
 
 static present_screen_priv_ptr present_screen_priv(ScreenPtr s) { (void) s; return &screenPriv; }
@@ -164,16 +174,23 @@ static struct present_vblank *presentation(PixmapPtr pixmap) {
 }
 
 static void reset(void) {
+    memset(early, 0, sizeof early);
     trail[0] = 0;
     completed = 0;
     queueVblankFails = 0;
     connectionAlive = rendererAvailable = true;
 }
 
-/* one case: what it logged, what P10-S0 found, and whether that is the client told before the copy was done */
+/* one case: what it logged, what P10-S0 found, and whether that is the client told before the copy was done; and
+ * what the patch counted of it (P10-B0): that one kind once, or nothing */
 static int reproduced;
-static void expect(const char *what, const char *want, bool hazard) {
+static void expect(const char *what, const char *want, bool hazard, int kind) {
+    int counted = 0;
+    for (int k = 0; k < LORIE_X_EARLY_COUNT; k++)
+        counted += early[k];
     CHECK(!strcmp(trail, want), "%s: %s (want %s)", what, trail, want);
+    CHECK(kind < 0 ? counted == 0 : counted == 1 && early[kind] == 1, "%s: counted %d early ends (want %s)", what, counted,
+          kind < 0 ? "none" : "one, of its kind");
     printf("  %-58s %s%s\n", what, trail, hazard ? "   REPRODUCED" : "");
     if (hazard && !strcmp(trail, want))
         reproduced++;
@@ -199,7 +216,7 @@ int main(void) {
     /* the reference: the copy done, then the renderer's notification - everything after it */
     completed = a.copySerial;
     lorieRecheckGpuCopies();
-    expect("copy done, then the completion recheck", "ack+ idle+ complete(copy)+", false);
+    expect("copy done, then the completion recheck", "ack+ idle+ complete(copy)+", false, -1);
     CHECK(a.refs == 0, "copy done: %d references left", a.refs);
 
     /* a new presentation for the same window and frame, the copy still running: present_scmd_pixmap scraps it */
@@ -207,7 +224,7 @@ int main(void) {
     v = presentation(&a);
     trail[0] = 0;
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
-    expect("overwritten in the same frame (present_scmd_pixmap scrap)", "ack! idle!", true);
+    expect("overwritten in the same frame (present_scmd_pixmap scrap)", "ack! idle!", true, LORIE_X_EARLY_SCRAP);
     CHECK(a.refs == 0, "overwritten: the X server holds %d references while the copy runs", a.refs);
     completed = a.copySerial;
     present_execute(v, 0, 11);      /* its msc+1 event: completes as skipped */
@@ -218,7 +235,7 @@ int main(void) {
     v = presentation(&a);
     trail[0] = 0;
     present_free_window_vblank(&window);
-    expect("window destroyed (present_free_window_vblank)", "ack!", true);
+    expect("window destroyed (present_free_window_vblank)", "ack!", true, LORIE_X_EARLY_DESTROY);
     CHECK(a.refs == 0, "window destroyed: %d references left", a.refs);
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
@@ -237,7 +254,7 @@ int main(void) {
         w->queued = TRUE;
         present_execute(w, 0, 10);
     }
-    expect("its first poll not queued (present_execute_copy)", "ack! idle! complete(copy)!", true);
+    expect("its first poll not queued (present_execute_copy)", "ack! idle! complete(copy)!", true, LORIE_X_EARLY_POLL_FIRST);
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
 
@@ -247,7 +264,7 @@ int main(void) {
     trail[0] = 0;
     queueVblankFails = 1;
     present_execute(v, 0, 11);
-    expect("a later poll not queued (present_execute_copy)", "ack! idle! complete(copy)!", true);
+    expect("a later poll not queued (present_execute_copy)", "ack! idle! complete(copy)!", true, LORIE_X_EARLY_POLL_LATER);
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
 
@@ -258,7 +275,7 @@ int main(void) {
     trail[0] = 0;
     rendererAvailable = false;
     lorieRecheckGpuCopies();
-    expect("renderer without a surface (stalled)", "ack! idle! complete(skip)!", true);
+    expect("renderer without a surface (stalled)", "ack! idle! complete(skip)!", true, LORIE_X_EARLY_STALLED);
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
 
@@ -267,7 +284,7 @@ int main(void) {
     trail[0] = 0;
     connectionAlive = false;
     lorieRecheckGpuCopies();
-    expect("renderer disconnected (stalled)", "ack! idle! complete(skip)!", true);
+    expect("renderer disconnected (stalled)", "ack! idle! complete(skip)!", true, LORIE_X_EARLY_STALLED);
 
     printf("TPRESENTSAFETY a GPU-copied presentation's end, on the patched xserver: %s (%d failures; %d of 6 known early "
            "releases reproduced, P10-S0)\n", fails ? "FAIL" : "PASS", fails, reproduced);
