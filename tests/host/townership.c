@@ -253,6 +253,9 @@ static Bool QueueWorkProc(Bool (*proc)(ClientPtr, void *), __unused ClientPtr cl
     return TRUE;
 }
 static void lorieWakeServer(void) { wakes++; }
+/* P10-S1: the X server's GPU copies rechecked (patches/xserver.patch) - the renderer gone, they settle at once */
+static int rechecks;
+static void lorieRecheckGpuCopies(void) { rechecks++; }
 static pthread_cond_t *rendererCond;
 #define pthread_cond_signal(c) ((void) (c), condSignals++)
 /* a freed pixmap private is kept, never reused, so one still on the list can be seen without touching freed memory */
@@ -506,8 +509,11 @@ static void exec(const struct impl *im, struct op o) {
         queuedProc = NULL;
         lorieRendererDisconnected();                        /* input thread */
         CHECK(queuedProc && wakes == woken + 1, "%s op %d: disconnect not handed to the main thread", runName, opIndex);
-        if (queuedProc)
+        if (queuedProc) {
+            int checked = rechecks;
             queuedProc(NULL, NULL);                         /* main thread */
+            CHECK(rechecks == checked + 1, "%s op %d: the renderer gone, its GPU copies not rechecked", runName, opIndex);
+        }
         CHECK(w->state->backend.ownershipAck == LORIE_OWNERSHIP_WORD(LORIE_OWNERSHIP_SEQ(req), LORIE_OWNERSHIP_PERSISTENT),
               "%s op %d: disconnect did not answer PERSISTENT to request %u", runName, opIndex, LORIE_OWNERSHIP_SEQ(req));
         break;

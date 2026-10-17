@@ -270,13 +270,13 @@
      present_check_flip2_ptr             check_flip2;
  
 +++ ./present/present_execute.c
-@@ -34,5 +34,7 @@
+@@ -33,6 +33,8 @@
+     present_vblank_ptr      vblank = param;
      ScreenPtr               screen = vblank->screen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
--
 +    /* lorie: disarm, or miSyncTriggerFence()'s restart-scan re-fires this callback. */
 +    present_fence_set_callback(vblank->wait_fence, NULL, NULL);
-+
+ 
      screen_priv->re_execute(vblank);
  }
 @@ -67,6 +69,14 @@
@@ -294,31 +294,46 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +95,63 @@
+@@ -79,12 +89,75 @@
          return;
      }
  
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
-+    /* lorie: a GPU copy was already scheduled; poll for completion instead of blocking. */
-+    if (vblank->gpu_copy_pending && !lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
-+        !gpuCopyStalled &&
-+        Success == screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1)) {
-+        vblank->queued = TRUE;
-+        return;
-+    }
++    /* lorie: a GPU copy was already scheduled and is not known done (P10-S1): never given up while the renderer may
++     * still run it - nothing waits here. Polled again at msc+1 if that can be queued, and by lorieRecheckGpuCopies at
++     * every completion and tick in any case. A stalled renderer's copy (no surface - it still runs the copies queued -
++     * or no connection) is settled: still running, it is waited for like any other; cancelled (never ran, never will),
++     * the presentation is skipped and its buffer idle. Done meanwhile, it is presented below. */
++    if (vblank->gpu_copy_pending && (vblank->gpu_copy_cancelled || !lorieGpuCopyIsDone(vblank->gpu_copy_serial))) {
++        int settled = LORIE_GPU_COPY_CANCELLED;
 +
-+    if (vblank->gpu_copy_pending) {
-+        if (!lorieGpuCopyIsDone(vblank->gpu_copy_serial))
-+            lorieCountGpuCopyEarly(gpuCopyStalled ? LORIE_GPU_COPY_EARLY_STALLED : LORIE_GPU_COPY_EARLY_POLL_LATER);
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
-+        vblank->gpu_copy_pending = FALSE;
-+        if (gpuCopyStalled && !lorieGpuCopyIsDone(vblank->gpu_copy_serial)) {
-+            /* lorie: the renderer never actually finished this copy - tell the client it was
-+             * skipped instead of falsely reporting it as presented. */
++        if (!vblank->gpu_copy_cancelled) {
++            settled = LORIE_GPU_COPY_RUNNING;
++            if (gpuCopyStalled) {
++                if (!vblank->gpu_copy_stalled)
++                    lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_STALLED);
++                vblank->gpu_copy_stalled = TRUE;
++                settled = lorieGpuCopySettle(vblank->gpu_copy_serial);
++            }
++        }
++        if (settled == LORIE_GPU_COPY_RUNNING) {
++            if (Success != screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1))
++                lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_POLL_LATER);
++            vblank->queued = TRUE;
++            return;
++        }
++        if (settled == LORIE_GPU_COPY_CANCELLED) {
++            lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
++            vblank->gpu_copy_pending = FALSE;
 +            present_vblank_scrap(vblank);
 +            screen_priv->flush(window);
 +            return;
 +        }
++    }
++
++    if (vblank->gpu_copy_pending) {
++        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
++        vblank->gpu_copy_pending = FALSE;
 +    } else if (lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
@@ -337,16 +352,13 @@
 +            RegionDestroy(vblank->update);
 +            vblank->update = NULL;
 +        }
-+        if (Success == screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1)) {
-+            vblank->gpu_copy_pending = TRUE;
-+            vblank->queued = TRUE;
-+            return;
-+        }
-+        /* Failed to requeue for polling (e.g. OOM) - release our extra ref and treat the
-+         * presumably still in-flight GPU copy as done; same best-effort fallback as above. */
-+        if (!lorieGpuCopyIsDone(vblank->gpu_copy_serial))
++        /* Polled at msc+1 - or, that not queued (out of memory), by lorieRecheckGpuCopies at every completion and
++         * tick: the copy is waited for either way (P10-S1), never taken as done. */
++        vblank->gpu_copy_pending = TRUE;
++        vblank->queued = TRUE;
++        if (Success != screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_POLL_FIRST);
-+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
++        return;
 +    } else {
 +        present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +
@@ -372,7 +384,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,52 @@
+@@ -90,8 +91,56 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -382,6 +394,10 @@
 +    Bool                gpu_copy_pending;
 +    uint64_t            gpu_copy_serial;
 +    void                *gpu_copy_dst_buffer; /* opaque LorieBuffer*, held for lorieGpuCopyAck */
++    /* lorie: P10-S1 - its copy settled as cancelled (lorieRecheckGpuCopies): never ran, never will - its completion,
++     * published once the renderer skips it, says nothing of a copy; and whether it was seen stalled (counted once) */
++    Bool                gpu_copy_cancelled;
++    Bool                gpu_copy_stalled;
  };
  
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
@@ -426,13 +442,15 @@
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
  
 +++ ./present/present_scmd.c
-@@ -252,6 +252,22 @@
+@@ -252,6 +252,39 @@
      }
  }
  
 +/* lorie: called when the renderer notifies that a GPU copy batch finished, or that it just lost
-+ * its surface, instead of waiting for the next vblank poll. _safe iteration since
-+ * present_re_execute() may destroy the vblank. */
++ * its surface, at every tick and when the renderer disconnects - instead of waiting for the next
++ * vblank poll. _safe iteration since present_re_execute() may destroy the vblank. P10-S1: a stalled
++ * renderer's copy is re-executed only once settled (cancelled: remembered, for its completion will
++ * say nothing of a copy); one still running keeps its own poll, so none is queued twice. */
 +void
 +lorieRecheckGpuCopies(void)
 +{
@@ -440,8 +458,23 @@
 +    Bool gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
 +
 +    xorg_list_for_each_entry_safe(vblank, tmp, &present_exec_queue, event_queue) {
-+        if (vblank->gpu_copy_pending && (lorieGpuCopyIsDone(vblank->gpu_copy_serial) || gpuCopyStalled))
++        int settled;
++
++        if (!vblank->gpu_copy_pending)
++            continue;
++        if (lorieGpuCopyIsDone(vblank->gpu_copy_serial) || vblank->gpu_copy_cancelled) {
 +            present_re_execute(vblank);
++            continue;
++        }
++        if (!gpuCopyStalled)
++            continue;
++        if (!vblank->gpu_copy_stalled)
++            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_STALLED);
++        vblank->gpu_copy_stalled = TRUE;
++        if ((settled = lorieGpuCopySettle(vblank->gpu_copy_serial)) == LORIE_GPU_COPY_RUNNING)
++            continue;
++        vblank->gpu_copy_cancelled = settled == LORIE_GPU_COPY_CANCELLED;
++        present_re_execute(vblank);
 +    }
 +    present_retired_copies_check();
 +}
@@ -449,7 +482,7 @@
  static void
  present_flip_idle(ScreenPtr screen)
  {
-@@ -599,6 +615,8 @@
+@@ -599,6 +632,8 @@
                      damage = &window->clipList;
  
                  DamageDamageRegion(&vblank->window->drawable, damage);

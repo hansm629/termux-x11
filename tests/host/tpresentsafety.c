@@ -345,11 +345,12 @@ int main(void) {
     printf("  %-62s %s\n", "the screen closed with a copy running (drain)", trail);
     completed = a.copySerial;
 
-    /* still to fix (P10-S1-B): the poll not queued, the renderer stalled */
+    /* its first poll not queued: still waited for - the completion recheck (every event and tick) finds it done */
     reset();
     queueVblankFails = 1;
     current = &a;
     {
+        int polls = queued;
         struct present_vblank *w = calloc(1, sizeof *w);
         w->screen = &screen; w->window = &window; w->pixmap = &a; a.refs++; w->crtc = &crtcRec;
         w->kind = PresentCompleteKindPixmap; w->target_msc = w->exec_msc = 10;
@@ -358,23 +359,100 @@ int main(void) {
         xorg_list_append(&w->window_list, &windowPriv.vblank); xorg_list_append(&w->event_queue, &present_exec_queue);
         w->queued = TRUE;
         present_execute(w, 0, 10);
+        CHECK(!trail[0] && w->gpu_copy_pending && w->queued && queued == polls, "first poll not queued: %s, pending %d, queued %d, %d polls",
+              trail, w->gpu_copy_pending, w->queued, queued - polls);
+        lorieRecheckGpuCopies();            /* a tick, still copying: nothing */
+        gpuDone(a.copySerial);
     }
-    CHECK(!strcmp(trail, "ack! idle! complete(copy)!"), "first poll not queued: %s", trail);
-    printf("  %-62s %s   (P10-S1-B)\n", "its first poll not queued", trail);
+    expect("its first poll not queued", "ack+ idle+ complete(copy)+", LORIE_X_EARLY_POLL_FIRST);
+    clean("first poll not queued", &a, 0);
+
+    /* a later poll not queued, still copying: still waited for */
     reset();
     v = presentation(&a);
     trail[0] = 0;
     queueVblankFails = 1;
-    present_execute(v, 0, 11);
-    CHECK(!strcmp(trail, "ack! idle! complete(copy)!"), "later poll not queued: %s", trail);
-    printf("  %-62s %s   (P10-S1-B)\n", "a later poll not queued", trail);
+    present_execute(v, 0, 11);              /* its poll, the copy still running, the next not queued */
+    CHECK(!trail[0] && v->gpu_copy_pending, "later poll not queued: %s", trail);
+    gpuDone(a.copySerial);
+    expect("a later poll not queued", "ack+ idle+ complete(copy)+", LORIE_X_EARLY_POLL_LATER);
+    clean("later poll not queued", &a, 0);
+
+    /* the renderer without a surface, its copy running (it still runs the queued ones): waited for - one poll at a
+     * time, the recheck queuing none - and presented once done */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    rendererAvailable = false;
+    {
+        int polls = queued;
+        lorieRecheckGpuCopies();            /* its surface lost (notified) */
+        present_execute(v, 0, 11);          /* its poll */
+        lorieRecheckGpuCopies();            /* a tick */
+        CHECK(!trail[0] && v->gpu_copy_pending && queued - polls == 1, "no surface, running: %s, %d polls queued (want 1)", trail,
+              queued - polls);
+    }
+    gpuDone(a.copySerial);
+    expect("renderer without a surface, its copy running", "ack+ idle+ complete(copy)+", LORIE_X_EARLY_STALLED);
+    clean("no surface, running", &a, 0);
+
+    /* without a surface, not recorded: cancelled, the presentation skipped, its buffer idle; the renderer then skipping
+     * the entry (its serial completed) tells nothing more */
     reset();
     v = presentation(&a);
     trail[0] = 0;
     rendererAvailable = false;
     lorieRecheckGpuCopies();
-    CHECK(!strcmp(trail, "ack! idle! complete(skip)!"), "stalled: %s", trail);
-    printf("  %-62s %s   (P10-S1-B)\n", "renderer without a surface", trail);
+    CHECK(isCancelled(a.copySerial), "no surface, not recorded: not cancelled");
+    gpuDone(a.copySerial);                  /* the renderer consumes the cancelled entry */
+    expect("renderer without a surface, its copy not recorded", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
+    clean("no surface, not recorded", &a, 0);
+
+    /* disconnected: running with a renderer process that exists - waited for; recorded by one that no longer
+     * exists - settled, skipped; not recorded - cancelled, skipped */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    connectionAlive = false;
+    lorieRecheckGpuCopies();
+    CHECK(!trail[0], "disconnected, running: %s", trail);
+    connectionAlive = true;
+    gpuDone(a.copySerial);
+    expect("renderer disconnected, its copy running with the process alive", "ack+ idle+ complete(copy)+", LORIE_X_EARLY_STALLED);
+    clean("disconnected, running", &a, 0);
+
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    connectionAlive = false;
+    submitterGone = true;
+    lorieRecheckGpuCopies();
+    expect("renderer disconnected, its copy recorded by a process gone", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
+    clean("disconnected, renderer gone", &a, 0);
+
+    reset();
+    v = presentation(&a);
+    trail[0] = 0;
+    connectionAlive = false;
+    lorieRecheckGpuCopies();
+    expect("renderer disconnected, its copy not recorded", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
+    clean("disconnected, not recorded", &a, 0);
+
+    /* stalled with the shared lock held by the renderer: not known yet - asked again at the next tick, settled then */
+    reset();
+    v = presentation(&a);
+    trail[0] = 0;
+    rendererAvailable = false;
+    lockBusy = true;
+    lorieRecheckGpuCopies();
+    CHECK(!trail[0] && v->gpu_copy_pending, "lock busy: %s", trail);
+    lockBusy = false;
+    lorieRecheckGpuCopies();
+    expect("renderer without a surface, the shared lock busy, then free", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
+    clean("lock busy", &a, 0);
 
     printf("TPRESENTSAFETY a GPU-copied presentation's end, on the patched xserver: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;

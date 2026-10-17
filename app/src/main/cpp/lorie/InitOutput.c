@@ -239,6 +239,7 @@ static void lorieResetOwnership(void) {
 
 static Bool lorieRendererGoneWorkProc(__unused ClientPtr client, __unused void *closure) {
     lorieResetOwnership();
+    lorieRecheckGpuCopies();    // P10-S1: copies no renderer can run any more settle now, not at the next tick
     return TRUE;
 }
 
@@ -794,6 +795,9 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     if (lorieAhbPerAccess() && !twinned)
         pvfb->state->waitForNextFrame = false;
     loriePerformVblanks();
+    // P10-S1: Present GPU copies whose poll could not be queued, a stalled renderer's and the retired ones are
+    // settled at every tick too, waiting for nothing (patches/xserver.patch lorieRecheckGpuCopies).
+    lorieRecheckGpuCopies();
 
     pvfb->state->waitForNextFrame = false;
 
