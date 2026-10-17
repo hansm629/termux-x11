@@ -18,6 +18,26 @@ FAILAT = lambda: span(I, "static const char *const lorieVkFailAtNames[] = {", '"
 BI = os.path.join(BASE, "InitOutput.c")
 XS = os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "xserver")
 
+PATCH = os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "patches", "xserver.patch")
+_present = []
+
+def present(name):
+    """present/<name> as the build compiles it: a copy of the xserver's present/ with patches/xserver.patch's
+    present/ hunks applied (in OUT - the xserver checkout itself is never patched)."""
+    if not _present:
+        import re, shutil, subprocess
+        d = os.path.join(OUT, "xs-present")
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(os.path.join(d, "present"))
+        for f in os.listdir(os.path.join(XS, "present")):
+            if f.endswith((".c", ".h")):
+                shutil.copyfile(os.path.join(XS, "present", f), os.path.join(d, "present", f))
+        hunks = "".join(x for x in re.split(r"(?m)^(?=\+\+\+ \./)", open(PATCH, encoding="utf-8").read())
+                        if x.startswith("+++ ./present/"))
+        subprocess.run(["patch", "-p1", "-N", "-s", "-d", d], input=hunks, text=True, check=True)
+        _present.append(d)
+    return os.path.join(_present[0], "present", name)
+
 def opt(make, marker, path):
     """What make() extracts, if `path` has `marker` - so a recipe also builds against code from before the
     function existed, which is how a test is shown to fail there."""
@@ -138,6 +158,24 @@ recipes = {
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {"),
+    # P10-S0: the Present paths that end a presentation whose GPU copy may still run, from the patched xserver -
+    # tpresentsafety.c: the vblank as present_priv.h has it, execute (and its copy and post), re-execute, scrap,
+    # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that
+    # scraps a queued presentation a new one overwrites in the same frame
+    "presentsafety_struct": lambda: span(present("present_priv.h"), "struct present_vblank {",
+                                         "    void                *gpu_copy_dst_buffer; /* opaque LorieBuffer*, held for lorieGpuCopyAck */\n};"),
+    "presentsafety": lambda: "static void\n" + func(present("present_scmd.c"), "present_re_execute(present_vblank_ptr vblank)\n{")
+        + "static void\n" + func(present("present_scmd.c"), "present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
+        + "void\n" + func(present("present_execute.c"), "present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)\n{")
+        + "void\n" + func(present("present_execute.c"), "present_execute_post(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
+        + "void\n" + func(present("present_vblank.c"), "present_vblank_scrap(present_vblank_ptr vblank)\n{")
+        + "void\n" + func(present("present_vblank.c"), "present_vblank_destroy(present_vblank_ptr vblank)\n{")
+        + "static void\n" + func(present("present_screen.c"), "present_free_window_vblank(WindowPtr window)\n{")
+        + "void\n" + func(present("present_scmd.c"), "lorieRecheckGpuCopies(void)\n{")
+        + "static void presentOverwrite(present_window_priv_ptr window_priv, RegionPtr update, PixmapPtr pixmap, RRCrtcPtr target_crtc,\n"
+          "                             uint64_t target_msc) {\n    present_vblank_ptr vblank, tmp;\n"
+        + span(present("present_scmd.c"), "    if (!update && pixmap) {\n        xorg_list_for_each_entry_safe(vblank, tmp, &window_priv->vblank, window_list) {",
+               "            if (vblank->flip_ready)\n                present_re_execute(vblank);\n        }\n    }") + "}\n",
     # the shaders as committed (vk.c includes them)
     "vk_shaders": lambda: open(os.path.join(L, "vk_shaders.h"), encoding="utf-8").read(),
 }
