@@ -38,6 +38,7 @@ uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs);
 void lorieGpuCopyDoneHandled(uint32_t receivedUs);
 void lorieCountGpuCopyEarly(int how);
 int lorieGpuCopySettle(uint64_t serial);
+void lorieCountGpuCopyRetired(int made);
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -460,6 +461,10 @@ struct lorie_renderer_diag {
     volatile uint32_t xTicksPosted, xTicksRun, xTicksWaitingMax, xCopyDonePosted, xCopyDoneRun, xCopyDoneWaitingMax;
     volatile uint32_t xStampsInvalid;
     volatile uint32_t xCopyEarly[LORIE_X_EARLY_COUNT];
+    /* P10-S1, X: what kept those early ends from letting go early - presentations whose copy was retired (its
+     * buffers kept past the presentation, patches/xserver.patch present_retire_copy) and retired copies let go once
+     * settled (made minus let go: still held), copies cancelled before any renderer recorded them (lorieGpuCopySettle) */
+    volatile uint32_t xCopyRetired, xCopyRetiredReleased, xCopyCancelled;
 };
 
 #define LORIE_DIAG_ADD(st, field, n) \

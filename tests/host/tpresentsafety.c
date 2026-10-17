@@ -128,6 +128,9 @@ static bool lorieConnectionAlive(void) { return connectionAlive; }
 static int early[LORIE_X_EARLY_COUNT];
 static void lorieCountGpuCopyEarly(int how) { early[how]++; }
 static bool lorieRendererAvailable(void) { return rendererAvailable; }
+/* P10-S1: retired copies made and let go, as the patch counts them */
+static int retiredMade, retiredReleased;
+void lorieCountGpuCopyRetired(int made) { if (made) retiredMade++; else retiredReleased++; }
 
 static present_screen_priv_ptr present_screen_priv(ScreenPtr s) { (void) s; return &screenPriv; }
 static present_window_priv_ptr present_window_priv(WindowPtr w) { return w->priv; }
@@ -235,9 +238,9 @@ static void expect(const char *what, const char *want, int kind) {
 }
 /* nothing held after a case: every reference back, no retired copy left */
 static void clean(const char *what, PixmapPtr p, int refs) {
-    CHECK(p->refs == refs && dstPixmap.refs == 0 && xorg_list_is_empty(&present_retired_copies),
-          "%s: references %d (want %d), destination %d, retired copies %s", what, p->refs, refs, dstPixmap.refs,
-          xorg_list_is_empty(&present_retired_copies) ? "none" : "left");
+    CHECK(p->refs == refs && dstPixmap.refs == 0 && xorg_list_is_empty(&present_retired_copies) && retiredMade == retiredReleased,
+          "%s: references %d (want %d), destination %d, retired copies %s, %d made and %d let go", what, p->refs, refs, dstPixmap.refs,
+          xorg_list_is_empty(&present_retired_copies) ? "none" : "left", retiredMade, retiredReleased);
 }
 
 int main(void) {
@@ -267,7 +270,8 @@ int main(void) {
     recorded = a.copySerial;
     trail[0] = 0;
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
-    CHECK(!trail[0] && a.refs == 2 && !xorg_list_is_empty(&present_retired_copies), "overwritten, running: %s, %d references", trail, a.refs);
+    CHECK(!trail[0] && a.refs == 2 && !xorg_list_is_empty(&present_retired_copies) && retiredMade == retiredReleased + 1,
+          "overwritten, running: %s, %d references, %d retired copies held", trail, a.refs, retiredMade - retiredReleased);
     present_execute(v, 0, 11);              /* its msc+1 event: the presentation completes as skipped */
     gpuDone(a.copySerial);
     lorieRecheckGpuCopies();                /* a second completion event: nothing more */

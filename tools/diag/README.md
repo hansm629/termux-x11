@@ -23,6 +23,7 @@ XlorieCopyLatency: copy_standalone_entries copy_frame_entries copy_standalone_su
                 copy_frame_gpu_wait_us copy_total_us copy_ack_us
 XlorieTick:     vsync_to_callback_us callback_to_tick_us ticks ticks_waiting ticks_waiting_max copy_notify_us
                 copy_recheck_us copy_done_events copy_done_waiting copy_done_waiting_max stamps_invalid copy_early
+                copy_retired copy_retired_live copy_cancelled
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -91,11 +92,16 @@ the recheck it caused. Each pair is one event's own two CLOCK_MONOTONIC stamps -
 theirs to the X server's thread - and a pair out of order or over 10 s apart is counted in `stamps_invalid`, not
 timed. `ticks` and `copy_done_events` count those posted to the X server's thread; `*_waiting` is how many of them
 were posted but had not run when the report was made (waiting, not lost), `*_waiting_max` the most still waiting
-behind one when it ran since the previous report. `copy_early` counts GPU-copied presentations that ended before
-their copy was done: `scrap` overwritten by a new presentation in the same frame, `destroy` with their window,
-`first_poll` / `later_poll` when the poll for the copy could not be queued, `stalled` when the renderer had no
-surface or no connection. Each of these releases the X server's references and (but `destroy`) tells the client its
-buffer is idle while the GPU copy may still read it (`tests/host/tpresentsafety.c`, P10-S0).
+behind one when it ran since the previous report. `copy_early` counts GPU-copied presentations that came to an
+end, or to a poll that could not be queued, before their copy was done: `scrap` overwritten by a new presentation in
+the same frame, `destroy` with their window, `first_poll` / `later_poll` when the poll for the copy could not be
+queued (each time), `stalled` when the renderer had no surface or no connection (once per presentation). Before
+P10-S1 each of these let the X server's references go and told the client its buffer was idle while the copy could
+still read it (`tests/host/tpresentsafety.c`); now they are only attempts. What kept them safe: `copy_retired`, a
+presentation's copy retired - its buffers, idle fence and owed idle notification kept past the presentation until the
+copy settles - and `copy_retired_live`, those still held now; `copy_cancelled`, copies the X server cancelled before
+any renderer recorded them (the renderer skips them, completing their serial): those let go at once. A poll not
+queued, or a stalled copy still running, is simply waited for (rechecked at every completion and tick).
 
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under

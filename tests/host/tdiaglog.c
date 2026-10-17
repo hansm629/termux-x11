@@ -179,6 +179,7 @@ int main(void) {
             lorieLatencyAdd(&fakeState.diag.xCopyRecheck, 1200), lorieLatencyAdd(&fakeState.diag.xCopyNotify, 100);
         fakeState.diag.xStampsInvalid += 2;
         fakeState.diag.xCopyEarly[LORIE_X_EARLY_SCRAP] += 1;
+        fakeState.diag.xCopyRetired += 3, fakeState.diag.xCopyRetiredReleased += 2, fakeState.diag.xCopyCancelled += 1;
         lorieLogRendererDiag();
         fclose(logf);
         logf = fopen(path, "r");
@@ -188,7 +189,8 @@ int main(void) {
                                       "ticks=120(+120) ticks_waiting=2 ticks_waiting_max=3 copy_notify_us=n:50,avg:100,p95:250,") &&
                          strstr(line, " copy_recheck_us=n:50,avg:1200,p95:1500,") &&
                          strstr(line, " copy_done_events=50(+50) copy_done_waiting=0 copy_done_waiting_max=0 stamps_invalid=2(+2) "
-                                      "copy_early=scrap:1(+1),destroy:0(+0),first_poll:0(+0),later_poll:0(+0),stalled:0(+0)") != NULL;
+                                      "copy_early=scrap:1(+1),destroy:0(+0),first_poll:0(+0),later_poll:0(+0),stalled:0(+0) "
+                                      "copy_retired=3(+3) copy_retired_live=1 copy_cancelled=1(+1)") != NULL;
         fclose(logf);
         CHECK(tickLines == 2 && tickOk, "tick log: %d lines (want 2), the second %s", tickLines, tickOk ? "right" : "wrong");
         CHECK(fakeState.diag.xTicksWaitingMax == 0, "tick log: the most waiting not taken back by its report");
@@ -259,6 +261,7 @@ int main(void) {
         fakeState.diag.xTicksWaitingMax = fakeState.diag.xCopyDoneWaitingMax = 999999999;
         for (i = 0; i < LORIE_X_EARLY_COUNT; i++)
             fakeState.diag.xCopyEarly[i] += 999999999;
+        fakeState.diag.xCopyRetired += 999999999, fakeState.diag.xCopyCancelled += 999999999;
         for (unsigned k = 0; k < sizeof parts / sizeof *parts; k++)
             for (i = 0; i < 1000; i++)
                 lorieLatencyAddWeighted(parts[k], 4294967295u, 1);

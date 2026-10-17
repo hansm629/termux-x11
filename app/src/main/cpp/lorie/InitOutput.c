@@ -1002,12 +1002,14 @@ static void lorieLogRendererDiag(void) {
         log(INFO, "XlorieTick: vsync_to_callback_us=%s callback_to_tick_us=%s ticks=%llu(+%llu) ticks_waiting=%d "
                   "ticks_waiting_max=%u copy_notify_us=%s copy_recheck_us=%s copy_done_events=%llu(+%llu) "
                   "copy_done_waiting=%d copy_done_waiting_max=%u stamps_invalid=%llu(+%llu) copy_early=scrap:%llu(+%llu),"
-                  "destroy:%llu(+%llu),first_poll:%llu(+%llu),later_poll:%llu(+%llu),stalled:%llu(+%llu)",
+                  "destroy:%llu(+%llu),first_poll:%llu(+%llu),later_poll:%llu(+%llu),stalled:%llu(+%llu) "
+                  "copy_retired=%llu(+%llu) copy_retired_live=%d copy_cancelled=%llu(+%llu)",
             vsync, tick, TD(xTicksPosted), (int) (int32_t) (d.xTicksPosted - d.xTicksRun),
             __atomic_exchange_n(&live->xTicksWaitingMax, 0, __ATOMIC_RELAXED), notify, recheck, TD(xCopyDonePosted),
             (int) (int32_t) (d.xCopyDonePosted - d.xCopyDoneRun), __atomic_exchange_n(&live->xCopyDoneWaitingMax, 0, __ATOMIC_RELAXED),
             TD(xStampsInvalid), TD(xCopyEarly[LORIE_X_EARLY_SCRAP]), TD(xCopyEarly[LORIE_X_EARLY_DESTROY]),
-            TD(xCopyEarly[LORIE_X_EARLY_POLL_FIRST]), TD(xCopyEarly[LORIE_X_EARLY_POLL_LATER]), TD(xCopyEarly[LORIE_X_EARLY_STALLED]));
+            TD(xCopyEarly[LORIE_X_EARLY_POLL_FIRST]), TD(xCopyEarly[LORIE_X_EARLY_POLL_LATER]), TD(xCopyEarly[LORIE_X_EARLY_STALLED]),
+            TD(xCopyRetired), (int) (int32_t) (d.xCopyRetired - d.xCopyRetiredReleased), TD(xCopyCancelled));
     }
     // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
     if (pvfb->state->backend.vkTransferCopy) {
@@ -1654,6 +1656,8 @@ int lorieGpuCopySettle(uint64_t serial) {
             if ((lorieGpuInFlight(st, e->srcBufferId) || lorieGpuInFlight(st, e->dstBufferId)) && !lorieGpuSubmitterGone(st))
                 settled = LORIE_GPU_COPY_RUNNING;
             else {
+                if (!e->cancelled)
+                    __atomic_fetch_add(&st->diag.xCopyCancelled, 1, __ATOMIC_RELAXED);
                 e->cancelled = 1;
                 settled = LORIE_GPU_COPY_CANCELLED;
             }
@@ -1662,6 +1666,11 @@ int lorieGpuCopySettle(uint64_t serial) {
     if (!nested)
         lorie_mutex_unlock(&st->lock, &st->lockingPid);
     return settled;
+}
+
+// P10-S1: a retired copy made (made) or let go (patches/xserver.patch present_retire_copy, present_retired_copy_release).
+void lorieCountGpuCopyRetired(int made) {
+    __atomic_fetch_add(made ? &pvfb->state->diag.xCopyRetired : &pvfb->state->diag.xCopyRetiredReleased, 1, __ATOMIC_RELAXED);
 }
 
 // P10-B0: a GPU-copied presentation ended before its copy was done (patches/xserver.patch, LORIE_X_EARLY_*).

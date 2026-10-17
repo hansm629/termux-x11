@@ -781,6 +781,25 @@ CONTROLS = [
      """    if (!published)
         return;""",
      "tpresentcopy"),
+    ("P10-S1: a copy in flight with a live renderer taken as cancelled", "InitOutput.c",
+     """            if ((lorieGpuInFlight(st, e->srcBufferId) || lorieGpuInFlight(st, e->dstBufferId)) && !lorieGpuSubmitterGone(st))""",
+     """            if (0)""",
+     "tpresentcopy"),
+    ("P10-S1: Vulkan copying an entry the X server cancelled", "renderer.c",
+     """        if (entry.cancelled) {
+            // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            *serial = entry.serial;
+            continue;
+        }""",
+     "",
+     "tpresentcopy"),
+    ("P10-S1: GLES copying an entry the X server cancelled", "renderer.c",
+     """        if (entry.cancelled) {
+            // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            lastSerial = entry.serial;""",
+     """        if (0) {
+            lastSerial = entry.serial;""",
+     "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

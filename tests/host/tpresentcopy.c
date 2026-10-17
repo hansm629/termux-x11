@@ -1316,10 +1316,13 @@ int main(void) {
         /* not recorded: cancelled - Vulkan then skips it, completing its serial without a draw */
         CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "settle: not queued");
         e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
-        CHECK(!e->cancelled && lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled &&
-              lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && st.lock == 0,
-              "not recorded: settled %d, cancelled %d, lock %d (want CANCELLED twice, marked, let go)", lorieGpuCopySettle(serial),
-              e->cancelled, st.lock);
+        {
+            uint32_t counted = st.diag.xCopyCancelled;
+            CHECK(!e->cancelled && lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && e->cancelled &&
+                  lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED && st.lock == 0 && st.diag.xCopyCancelled == counted + 1,
+                  "not recorded: settled %d, cancelled %d, lock %d, counted %u (want CANCELLED twice, marked, let go, once)",
+                  lorieGpuCopySettle(serial), e->cancelled, st.lock, st.diag.xCopyCancelled - counted);
+        }
         dests = st.diag.vkImportedDestinationDraws;
         memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
         rendererVkApplyPendingGpuCopies();
