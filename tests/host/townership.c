@@ -18,7 +18,14 @@
  *   list is cleared then.
  *   Root double buffering's swap (lorieRootSwap): the front written only once the frame sampling it is over, only
  *   the damage copied (all of it when out of date), the two buffers swapped and the new front published, both
- *   unlocked again; afterwards an access to the back waits for no frame while the front is being sampled. */
+ *   unlocked again; afterwards an access to the back waits for no frame while the front is being sampled.
+ *   P11-B, its own locks (TERMUX_X11_RENDERER_ROOT_COPY_OPT=1): the back locked for reading only, the front for
+ *   writing only, each within a rect inside the buffer that holds every box copied - against a lock that, as the
+ *   mapper's contract allows, gives poison outside its rect to a read and drops what is written there (and checks
+ *   nothing was), or that ignores the rect: pixel for pixel what the swap does with its locks off, for one box, several
+ *   (some partly or wholly outside the buffer), the whole buffer, out of date, rows padded, a swap after a swap; with
+ *   the frame sampling the front over first; either lock refused, what was locked unlocked, the locks of before taken
+ *   instead and kept for the session; every lock unlocked once, none taken twice. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -57,6 +64,7 @@ typedef int Bool;
 #define max(a, b) ((a) > (b) ? (a) : (b))
 typedef struct { short x1, y1, x2, y2; } BoxRec, *BoxPtr;
 typedef struct { int n; BoxRec *rects; } RegionRec, *RegionPtr;
+typedef struct { int32_t left, top, right, bottom; } ARect;
 #define RegionRects(r) ((r)->rects)
 #define RegionNumRects(r) ((r)->n)
 #define DamageRegion(d) ((RegionPtr) (d))
@@ -70,6 +78,11 @@ typedef struct LorieBuffer {
                          * either way, as buffer.c does) */
     void *lockedData;
     uint32_t *mem;
+    /* P11-B, LorieBuffer_lockRect: refused, ignoring the rect; how many, the last one's access and rect, and what its
+     * address shows when the rect is kept */
+    int failLockRect, ignoreRect, rectLocks, lockWrite;
+    ARect lockRect;
+    uint32_t *shadow;
 } LorieBuffer;
 
 typedef struct FakePixmap { struct { void *ptr; } devPrivate; void *driverPriv; } PixmapRec, *PixmapPtr;
@@ -99,6 +112,7 @@ struct fake_pvfb {
     struct { Bool legacyDrawing; } root;
     uint64_t rootGpuCopyPending;
     Bool rootDouble, rootTwinStale;
+    Bool rootCopyOpt, rootCopyOptFailed;
     void *damage;               /* a RegionRec here: DamageRegion */
     void (*SetWindowPixmap)(WindowPtr, PixmapPtr);
     uint8_t ownership;
@@ -127,12 +141,15 @@ static void ev(const char *fmt, ...) {
 
 static LorieBuffer *buffers[64];
 static int nbuffers;
-static LorieBuffer *newBuffer(int type, int width, int height) {
+static LorieBuffer *newBufferStride(int type, int width, int height, int stride) {
     LorieBuffer *b = calloc(1, sizeof *b);
-    b->desc = (LorieBuffer_Desc) { type, (unsigned long long) nbuffers, width, height, width };
-    b->mem = calloc((size_t) width * height, 4);
+    b->desc = (LorieBuffer_Desc) { type, (unsigned long long) nbuffers, width, height, stride };
+    b->mem = calloc((size_t) stride * height, 4);
     buffers[nbuffers++] = b;
     return b;
+}
+static LorieBuffer *newBuffer(int type, int width, int height) {
+    return newBufferStride(type, width, height, width);
 }
 
 static struct fake_pvfb *checked;   /* this branch's world, on which the ownership invariants are checked */
@@ -221,12 +238,71 @@ static int LorieBuffer_lock(LorieBuffer *b, void **out) {
     ev("L%llu", b->desc.id);
     return ret;
 }
+/* P11-B: as buffer.c - the address the buffer's own, marked locked only once locked; outside the rect, what the
+ * mapper's contract leaves undefined made visible: a read gives poison, a write is lost (and caught at the unlock) */
+#define POISON 0xdeadbeefu
+static bool inRect(const ARect *r, int x, int y) { return x >= r->left && x < r->right && y >= r->top && y < r->bottom; }
+static int LorieBuffer_lockRect(LorieBuffer *b, bool write, const ARect *rect, void **out) {
+    int w, h, s;
+    if (!b)
+        return ENODEV;
+    CHECK(!b->released, "%s op %d: CPU lock of released buffer %llu", runName, opIndex, b->desc.id);
+    if (b->locked) {
+        ev("l%llu!", b->desc.id);
+        return EEXIST;
+    }
+    if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER && answered() == LORIE_OWNERSHIP_PER_ACCESS)
+        CHECK(checked->state->lock > 0, "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
+              runName, opIndex, b->desc.id);
+    if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
+        CHECK(!lorieGpuInFlight(checked->state, b->desc.id), "%s op %d: AHB %llu CPU-locked while a submitted Vulkan frame uses it",
+              runName, opIndex, b->desc.id);
+    w = b->desc.width, h = b->desc.height, s = b->desc.stride;
+    CHECK(!rect || (rect->left >= 0 && rect->top >= 0 && rect->right <= w && rect->bottom <= h && rect->left < rect->right &&
+                    rect->top < rect->bottom), "%s: AHB %llu locked with a rect outside it, or empty", runName, b->desc.id);
+    b->rectLocks++;
+    if (b->failLockRect) {
+        ev("l%llux", b->desc.id);
+        return EIO;
+    }
+    b->lockWrite = write;
+    b->lockRect = rect ? *rect : (ARect) { 0, 0, w, h };
+    b->lockedData = b->mem;
+    if (rect && !b->ignoreRect) {
+        b->shadow = malloc((size_t) s * h * 4);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < s; x++)
+                b->shadow[y * s + x] = x < w && inRect(rect, x, y) ? b->mem[y * s + x] : POISON;
+        b->lockedData = b->shadow;
+    }
+    b->locked = b->cpuHeld = 1;
+    *out = b->lockedData;
+    ev("l%llu%c", b->desc.id, write ? 'w' : 'r');
+    return 0;
+}
 static int LorieBuffer_unlock(LorieBuffer *b) {
     if (!b)
         return ENODEV;
     if (!b->locked) {
         ev("U%llu!", b->desc.id);
         return ENOENT;
+    }
+    if (b->shadow) {
+        int w = b->desc.width, h = b->desc.height, s = b->desc.stride, outside = 0, readWritten = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < s; x++) {
+                uint32_t v = b->shadow[y * s + x];
+                if (!(x < w && inRect(&b->lockRect, x, y)))
+                    outside += v != POISON;
+                else if (b->lockWrite)
+                    b->mem[y * s + x] = v;
+                else
+                    readWritten += v != b->mem[y * s + x];
+            }
+        CHECK(!outside && !readWritten, "%s: AHB %llu written outside its lock's rect (%d pixels), or while locked for reading (%d)",
+              runName, b->desc.id, outside, readWritten);
+        free(b->shadow);
+        b->shadow = NULL;
     }
     b->locked = 0;
     b->cpuHeld = 0;
@@ -315,6 +391,64 @@ static int pixman_blt(uint32_t *src, uint32_t *dst, int srcStride, int dstStride
 }
 #include "rootswap_src.inc"
 static LorieBuffer **new_bufferOf(void *priv) { return &((LoriePixmapPriv *) priv)->buffer; }
+
+/* P11-B: one swap, its own locks off or on, from the same buffers, damage and staleness; what the front holds then */
+struct swapcase {
+    const char *name;
+    int w, h, stride, n;
+    BoxRec box[4];
+    Bool stale;
+    int ignoreRect, failBack, failFront, failOld, inFlightFront;
+};
+static struct fake_state swapCaseState;
+static LoriePixmapPriv swapCasePriv;
+static uint32_t *swapOnce(const struct swapcase *c, Bool opt, Bool *ok) {
+    static RegionRec damage;
+    LorieBuffer *back, *front;
+    uint32_t *out;
+    size_t size = (size_t) c->stride * c->h;
+
+    memset(&swapCaseState, 0, sizeof swapCaseState);
+    damage = (RegionRec) { c->n, (BoxRec *) c->box };
+    nbuffers = 0;
+    back = newBufferStride(LORIEBUFFER_AHARDWAREBUFFER, c->w, c->h, c->stride);
+    front = newBufferStride(LORIEBUFFER_AHARDWAREBUFFER, c->w, c->h, c->stride);
+    for (size_t i = 0; i < size; i++)
+        back->mem[i] = 0x10000u + (uint32_t) i, front->mem[i] = 0x50000u + (uint32_t) i;
+    newWorld = (struct fake_pvfb) { .state = &swapCaseState, .ownership = LORIE_OWNERSHIP_PER_ACCESS, .damage = &damage,
+                                    .rootTwinStale = c->stale, .rootCopyOpt = opt };
+    xorg_list_init(&newWorld.ahbPersistent);
+    swapCaseState.backend.ownershipAck = LORIE_OWNERSHIP_WORD(1, LORIE_OWNERSHIP_PER_ACCESS);
+    swapCasePriv = (LoriePixmapPriv) { .buffer = back, .twin = front };
+    back->failLockRect = c->failBack;
+    front->failLockRect = c->failFront;
+    front->failLock = c->failOld;
+    back->ignoreRect = front->ignoreRect = c->ignoreRect;
+    if (c->inFlightFront) {
+        swapCaseState.gpuInFlight.ids[0] = front->desc.id;
+        swapCaseState.gpuInFlight.count = 1;
+        swapCaseState.gpuInFlight.pid = getpid();
+        swapCaseState.gpuInFlight.busy = 1;
+    }
+    checked = &newWorld;
+    runName = c->name;
+    traceLen = 0;
+    trace[0] = 0;
+    gpuWaits = gpuSlices = 0;
+    *ok = lorieRootSwap(&swapCasePriv);
+    CHECK(!back->locked && !front->locked && !back->cpuHeld && !front->cpuHeld && swapCaseState.lock == 0,
+          "%s (%s): a buffer, or the shared lock, still held", c->name, opt ? "on" : "off");
+    CHECK(!strchr(trace, '!'), "%s (%s): a lock taken twice, or nothing unlocked: %s", c->name, opt ? "on" : "off", trace);
+    CHECK(*ok ? swapCasePriv.buffer == front && swapCasePriv.twin == back && swapCaseState.rootWindowTextureID == back->desc.id
+              : swapCasePriv.buffer == back && swapCasePriv.twin == front,
+          "%s (%s): swapped %d, but the buffers say otherwise", c->name, opt ? "on" : "off", *ok);
+    CHECK(!c->inFlightFront || gpuWaits == 1, "%s (%s): %d waits for the frame sampling the front (want 1)", c->name,
+          opt ? "on" : "off", gpuWaits);
+    out = malloc(size * 4);
+    memcpy(out, front->mem, size * 4);
+    checked = NULL;
+    return out;
+}
 
 /* What a renderer frame would find, taking the shared lock now. */
 static void rendererView(const char *where) {
@@ -832,6 +966,115 @@ int main(void) {
         ok = lorieRootSwap(&sp);
         CHECK(ok && !memcmp(back->mem, front->mem, 16 * 16 * 4) && sp.buffer == back, "root swap, out of date: not all copied");
         checked = NULL;
+    }
+
+    /* P11-B: the swap's own locks (TERMUX_X11_RENDERER_ROOT_COPY_OPT=1), pixel for pixel the swap without them */
+    {
+        static const struct swapcase cases[] = {
+            { "one box", 16, 16, 16, 1, { { 2, 3, 10, 7 } } },
+            { "several boxes, one partly and one wholly outside", 16, 16, 16, 4,
+              { { 1, 1, 3, 2 }, { 12, 9, 15, 14 }, { 14, 0, 20, 3 }, { 30, 30, 40, 40 } } },
+            { "the whole buffer", 16, 16, 16, 1, { { 0, 0, 16, 16 } } },
+            { "out of date", 16, 16, 16, 1, { { 5, 5, 6, 6 } }, TRUE },
+            { "rows padded, a box to the right edge", 13, 9, 16, 2, { { 9, 2, 13, 8 }, { 0, 0, 2, 1 } } },
+            { "nothing inside the buffer to copy", 16, 16, 16, 1, { { 20, 20, 30, 30 } } },
+            { "a mapper ignoring the rect", 16, 16, 16, 2, { { 2, 3, 10, 7 }, { 11, 11, 12, 15 } }, FALSE, 1 },
+            { "the front still sampled", 16, 16, 16, 1, { { 2, 3, 10, 7 } }, FALSE, 0, 0, 0, 0, 1 },
+            { "the back's lock refused", 16, 16, 16, 1, { { 2, 3, 10, 7 } }, FALSE, 0, 1 },
+            { "the front's lock refused, the back's taken", 16, 16, 16, 1, { { 2, 3, 10, 7 } }, FALSE, 0, 0, 1 },
+            { "the front's lock refused, and the old one too", 16, 16, 16, 1, { { 2, 3, 10, 7 } }, FALSE, 0, 0, 1, 1 },
+        };
+        for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+            const struct swapcase *c = &cases[k];
+            Bool okOff, okOn, fellBack;
+            uint32_t *off = swapOnce(c, FALSE, &okOff), *on;
+            int backLocks, frontLocks, backWrite, frontWrite;
+            ARect backRect, frontRect;
+
+            on = swapOnce(c, TRUE, &okOn);
+            /* this run's two buffers, as swapOnce made them */
+            backLocks = buffers[0]->rectLocks, frontLocks = buffers[1]->rectLocks;
+            backWrite = buffers[0]->lockWrite, frontWrite = buffers[1]->lockWrite;
+            backRect = buffers[0]->lockRect, frontRect = buffers[1]->lockRect;
+            fellBack = newWorld.rootCopyOptFailed;
+            CHECK(okOn == okOff && !memcmp(on, off, (size_t) c->stride * c->h * 4), "root swap, %s: on, %s (off %s)", c->name,
+                  okOn ? "swapped" : "not swapped", okOff ? "swapped" : "not swapped");
+            /* off as before: what the boxes hold copied, the rest as it was */
+            for (int y = 0; y < c->h; y++)
+                for (int x = 0; x < c->stride; x++) {
+                    bool in = c->stale && x < c->w;
+                    for (int i = 0; i < c->n && !c->stale; i++)
+                        in |= x >= c->box[i].x1 && x < c->box[i].x2 && y >= c->box[i].y1 && y < c->box[i].y2 && x < c->w;
+                    uint32_t want = okOff && in ? 0x10000u + (uint32_t) (y * c->stride + x) : 0x50000u + (uint32_t) (y * c->stride + x);
+                    CHECK(off[y * c->stride + x] == want, "root swap, %s: off, (%d,%d) %08x (want %08x)", c->name, x, y,
+                          off[y * c->stride + x], want);
+                }
+            if (!c->failBack && !c->failFront) {
+                /* the back read, the front written, each within the same rect holding every box copied */
+                CHECK(backLocks == 1 && frontLocks == 1 && !backWrite && frontWrite && !fellBack &&
+                      !memcmp(&backRect, &frontRect, sizeof backRect),
+                      "root swap, %s: on, %d and %d own locks, the back %s, the front %s, fell back %d", c->name, backLocks,
+                      frontLocks, backWrite ? "written" : "read", frontWrite ? "written" : "read", fellBack);
+                for (int i = 0; i < c->n; i++) {
+                    int x1 = max(c->box[i].x1, 0), y1 = max(c->box[i].y1, 0), x2 = min(c->box[i].x2, c->w), y2 = min(c->box[i].y2, c->h);
+                    CHECK(c->stale || x2 <= x1 || y2 <= y1 ||
+                          (x1 >= backRect.left && y1 >= backRect.top && x2 <= backRect.right && y2 <= backRect.bottom),
+                          "root swap, %s: on, box %d outside the locks' rect", c->name, i);
+                }
+            } else
+                CHECK(fellBack && backLocks == 1 && frontLocks == (c->failBack ? 0 : 1),
+                      "root swap, %s: on, fell back %d after %d and %d own locks", c->name, fellBack, backLocks, frontLocks);
+            free(off);
+            free(on);
+        }
+
+        /* fell back once: the session's swaps take the locks of before (none of their own), and still swap */
+        {
+            Bool ok;
+            int before;
+            free(swapOnce(&cases[8], TRUE, &ok));
+            CHECK(ok && newWorld.rootCopyOptFailed, "fell back: not swapped, or not given up");
+            buffers[0]->failLockRect = 0;
+            before = buffers[0]->rectLocks + buffers[1]->rectLocks;
+            checked = &newWorld;
+            ok = lorieRootSwap(&swapCasePriv);
+            checked = NULL;
+            CHECK(ok && buffers[0]->rectLocks + buffers[1]->rectLocks == before, "fell back: its own locks taken again");
+        }
+
+        /* swaps after a swap: brought up to date whole, then twice the X server drawing into the new back and its
+         * damage copied - the two buffers the same after each, and as off */
+        {
+            static BoxRec draws[2] = { { 6, 1, 15, 12 }, { 0, 10, 4, 16 } };
+            uint32_t *res[2][2];
+            for (int v = 0; v < 2; v++) {
+                static const struct swapcase c = { "swaps after a swap", 16, 16, 16, 1, { { 0, 0, 1, 1 } }, TRUE };
+                Bool ok;
+                free(swapOnce(&c, v, &ok));
+                for (int d = 0; d < 2; d++) {
+                    static RegionRec damage2;
+                    BoxRec *b = &draws[d];
+                    for (int y = b->y1; y < b->y2; y++)     /* drawing into the back (the old front) */
+                        for (int x = b->x1; x < b->x2; x++)
+                            swapCasePriv.buffer->mem[y * 16 + x] = 0x90000u * (uint32_t) (d + 1) + (uint32_t) (y * 16 + x);
+                    damage2 = (RegionRec) { 1, b };
+                    newWorld.damage = &damage2;
+                    checked = &newWorld;
+                    ok = lorieRootSwap(&swapCasePriv) && ok;
+                    checked = NULL;
+                    CHECK(ok && !memcmp(swapCasePriv.buffer->mem, swapCasePriv.twin->mem, 16 * 16 * 4),
+                          "swaps after a swap (%s), swap %d: not swapped, or the buffers differ after it", v ? "on" : "off", d + 2);
+                }
+                for (int i = 0; i < 2; i++) {
+                    res[v][i] = malloc(16 * 16 * 4);
+                    memcpy(res[v][i], (i ? swapCasePriv.twin : swapCasePriv.buffer)->mem, 16 * 16 * 4);
+                }
+            }
+            CHECK(!memcmp(res[0][0], res[1][0], 16 * 16 * 4) && !memcmp(res[0][1], res[1][1], 16 * 16 * 4),
+                  "swaps after a swap: on, not as off");
+            for (int v = 0; v < 2; v++)
+                free(res[v][0]), free(res[v][1]);
+        }
     }
 
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

@@ -97,6 +97,9 @@ typedef struct {
     /* Root double buffering (TERMUX_X11_RENDERER_ROOT_DOUBLE=1, lorieRootSwap): asked for; the twin out of date
      * (filled whole at the next swap) */
     Bool rootDouble, rootTwinStale;
+    /* Its swap's own CPU locks (TERMUX_X11_RENDERER_ROOT_COPY_OPT=1, lorieRootSwap): asked for; given up for the
+     * session once one was refused */
+    Bool rootCopyOpt, rootCopyOptFailed;
 
     /* TERMUX_X11_X_YIELD_ON_WAKE=1 (lorieQueueUrgentWorkProc): asked for - read from other threads, atomically */
     int yieldOnWake;
@@ -351,6 +354,9 @@ void OsVendorInit(void) {
                                                 !strcmp(getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
+    // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
+    // each only within the bounds of the damage copied (lorieRootSwap).
+    lorieScreen.rootCopyOpt = getenv("TERMUX_X11_RENDERER_ROOT_COPY_OPT") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_COPY_OPT"), "1");
     // Experimental: TERMUX_X11_X_YIELD_ON_WAKE=1 lets a vsync tick or a GPU copy's completion break off the client
     // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
     __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
@@ -707,6 +713,21 @@ static Bool lorieRootTwinned(void) {
     return priv && priv->twin && lorieAhbPerAccess() && pScreenPtr->root && pScreenPtr->GetWindowPixmap(pScreenPtr->root) == screen;
 }
 
+// P11-B: the bounds of what lorieRootSwap copies - its boxes as it clips them - for its CPU locks; NULL (the whole
+// buffer) when nothing is to be copied.
+static ARect *lorieRootCopyBounds(BoxPtr box, int n, const LorieBuffer_Desc *d, ARect *bounds) {
+    int x1 = d->width, y1 = d->height, x2 = 0, y2 = 0, i;
+    for (i = 0; i < n; i++) {
+        int bx1 = max(box[i].x1, 0), by1 = max(box[i].y1, 0), bx2 = min(box[i].x2, d->width), by2 = min(box[i].y2, d->height);
+        if (bx2 > bx1 && by2 > by1)
+            x1 = min(x1, bx1), y1 = min(y1, by1), x2 = max(x2, bx2), y2 = max(y2, by2);
+    }
+    if (x2 <= x1 || y2 <= y1)
+        return NULL;
+    *bounds = (ARect) { .left = x1, .top = y1, .right = x2, .bottom = y2 };
+    return bounds;
+}
+
 /*
  * The swap, between requests, under the shared lock (the renderer reads which buffer is the front under it). The
  * front is written only once no frame uses it (lorieGpuWaitIdle); what is copied is the damage since the last swap
@@ -722,6 +743,7 @@ static Bool lorieRootSwap(LoriePixmapPriv *priv) {
     int n = pvfb->rootTwinStale ? 1 : RegionNumRects(damage), i, failed;
     uint32_t *src = NULL, *dst = NULL;
     uint64_t waitStartUs = GetTimeInMicros(), gpuStartUs, lockStartUs, copyStartUs, copyEndUs;
+    ARect bounds;
 
     if (priv->locked)
         return FALSE;   // never between requests under PER_ACCESS
@@ -730,9 +752,23 @@ static Bool lorieRootSwap(LoriePixmapPriv *priv) {
     lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(front)->id);     // the last frame sampling it
     lorieGpuWaitIdle(pvfb->state, false, d->id);
     lockStartUs = GetTimeInMicros();
-    failed = LorieBuffer_lock(back, (void **) &src);
-    failed |= LorieBuffer_lock(front, (void **) &dst);
-    failed |= !src || !dst;
+    failed = TRUE;
+    // P11-B (TERMUX_X11_RENDERER_ROOT_COPY_OPT=1): the back locked only for reading and the front only for writing,
+    // each only within the bounds of what is copied - the CPU cache upkeep of the rest spared, their addresses still
+    // the buffers' own. Either lock refused, what was locked goes, and so do these locks for the session: the ones
+    // below (reads and writes, the whole buffers) are taken instead.
+    if (pvfb->rootCopyOpt && !pvfb->rootCopyOptFailed) {
+        ARect *rect = lorieRootCopyBounds(box, n, d, &bounds);
+        failed = LorieBuffer_lockRect(back, false, rect, (void **) &src);
+        if (!failed && (failed = LorieBuffer_lockRect(front, true, rect, (void **) &dst)))
+            LorieBuffer_unlock(back);
+        pvfb->rootCopyOptFailed = failed != 0;
+    }
+    if (failed) {
+        failed = LorieBuffer_lock(back, (void **) &src);
+        failed |= LorieBuffer_lock(front, (void **) &dst);
+        failed |= !src || !dst;
+    }
     copyStartUs = GetTimeInMicros();
     for (i = 0; !failed && i < n; i++) {
         int x1 = max(box[i].x1, 0), y1 = max(box[i].y1, 0), x2 = min(box[i].x2, d->width), y2 = min(box[i].y2, d->height);
@@ -923,7 +959,7 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s x_yield_on_wake=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -934,7 +970,8 @@ static void lorieLogRendererDiag(void) {
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
-        pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off");
+        pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
+        !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on");
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "

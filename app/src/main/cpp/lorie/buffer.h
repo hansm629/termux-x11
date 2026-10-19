@@ -141,6 +141,14 @@ const LorieBuffer_Desc* _Nonnull LorieBuffer_description(LorieBuffer* _Nullable 
 int LorieBuffer_lock(LorieBuffer* _Nullable buffer, void* _Nullable * _Nonnull out);
 
 /**
+ * Lock the buffer for CPU reads only, or for CPU writes only, within `rect` (NULL: all of it). The address is the
+ * buffer's own (its top-left corner) whatever the rect; nothing outside the rect may be read or written.
+ *
+ * @return 0 on success, not 0 on failure - and then the buffer is not locked (unlike LorieBuffer_lock)
+ */
+int LorieBuffer_lockRect(LorieBuffer* _Nullable buffer, bool write, const ARect* _Nullable rect, void* _Nullable * _Nonnull out);
+
+/**
  * Unlock the AHardwareBuffer from direct CPU access.
  * See AHardwareBuffer_unlock() description for details
  *

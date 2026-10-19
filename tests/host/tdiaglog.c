@@ -20,7 +20,7 @@ static FILE *logf;
 #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
 static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; } fakeState;
-static struct { typeof(&fakeState) state; int yieldOnWake; } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
+static struct { typeof(&fakeState) state; int yieldOnWake, rootCopyOpt, rootCopyOptFailed; } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "diaglog_src.inc"
 
 static int fails;

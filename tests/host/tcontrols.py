@@ -813,6 +813,47 @@ CONTROLS = [
      """        QueueWorkProc(lorieRedraw, NULL, (void *) (uintptr_t) (uint32_t) now);
         lorieWakeServer();""",
      "twiring"),
+    ("P11-B: the root's front locked for reading", "InitOutput.c",
+     """(failed = LorieBuffer_lockRect(front, true, rect, (void **) &dst)))""",
+     """(failed = LorieBuffer_lockRect(front, false, rect, (void **) &dst)))""",
+     "townership"),
+    ("P11-B: the locks' rect from the boxes unclipped", "InitOutput.c",
+     """bx2 = min(box[i].x2, d->width), by2 = min(box[i].y2, d->height);""",
+     """bx2 = box[i].x2, by2 = box[i].y2;""",
+     "townership"),
+    ("P11-B: the locks' rect holding only the first box", "InitOutput.c",
+     """    int x1 = d->width, y1 = d->height, x2 = 0, y2 = 0, i;
+    for (i = 0; i < n; i++) {""",
+     """    int x1 = d->width, y1 = d->height, x2 = 0, y2 = 0, i;
+    for (i = 0; i < n && i < 1; i++) {""",
+     "townership"),
+    ("P11-B: the back left locked when the front's lock is refused", "InitOutput.c",
+     """(failed = LorieBuffer_lockRect(front, true, rect, (void **) &dst)))
+            LorieBuffer_unlock(back);""",
+     """(failed = LorieBuffer_lockRect(front, true, rect, (void **) &dst)))
+            ;""",
+     "townership"),
+    ("P11-B: its own locks refused, not given up", "InitOutput.c",
+     """        pvfb->rootCopyOptFailed = failed != 0;""",
+     """        ;""",
+     "townership"),
+    ("P11-B: its own locks refused, the locks of before not taken", "InitOutput.c",
+     """        pvfb->rootCopyOptFailed = failed != 0;
+    }
+    if (failed) {""",
+     """        pvfb->rootCopyOptFailed = failed != 0;
+    }
+    if (failed && !pvfb->rootCopyOpt) {""",
+     "townership"),
+    ("P11-B: a refused rect lock marked locked", "buffer.c",
+     """    if (ret)
+        return ret;     // unlike LorieBuffer_lock, not marked locked: nothing to unlock""",
+     """    (void) 0;""",
+     "tbufferlock"),
+    ("P11-B: a read lock asking to write too", "buffer.c",
+     """write ? AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,""",
+     """write ? AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,""",
+     "tbufferlock"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

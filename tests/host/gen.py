@@ -104,8 +104,15 @@ recipes = {
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {")
         + func(I, "static uint8_t lorieRequestedVkSelftest(const char *value, volatile uint8_t *invalid) {"),
-    # root double buffering's swap - townership.c
-    "rootswap": lambda: func(I, "static Bool lorieRootSwap(LoriePixmapPriv *priv) {"),
+    # root double buffering's swap, and the bounds its own locks take (P11-B) - townership.c
+    "rootswap": lambda: func(I, "static ARect *lorieRootCopyBounds(BoxPtr box, int n, const LorieBuffer_Desc *d, ARect *bounds) {")
+        + func(I, "static Bool lorieRootSwap(LoriePixmapPriv *priv) {"),
+    # P11-B: buffer.c's CPU locks as they are - tbufferlock.c
+    "bufferlock": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "typedef struct LorieBuffer LorieBuffer;")
+        + span(B, "struct LorieBuffer {", "    int32_t gpuCopyPending;\n};")
+        + func(B, "__LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {")
+        + func(B, "__LIBC_HIDDEN__ int LorieBuffer_lockRect(LorieBuffer* buffer, bool write, const ARect* rect, void** out) {")
+        + func(B, "__LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {"),
     # the Vulkan backend: instance and device, AHardwareBuffer import - tvkinit.c, tvkimport.c (fakevk.h)
     "vk": lambda: span(VH, "#define LORIE_VK_GLOBAL_FNS(X)", "    uint8_t verifiedFormats;    /* AHB formats the ownership self-test passed: 1 RGBA, 2 RGBX, 4 BGRA */\n};")
         + span(VH, "struct lorie_vk_image {", "    VkResult lastResult;\n};")

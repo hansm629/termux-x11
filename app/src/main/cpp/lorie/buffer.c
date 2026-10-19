@@ -326,6 +326,37 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     return ret;
 }
 
+// P11-B: AHardwareBuffer_lock as its contract allows: usage for the one CPU access to come, and the rect it stays in. The
+// mapper's lock gives the top-left corner of the entire buffer whatever the rect (IMapper 4.0, stable-c IMapper), and
+// what lies outside the rect is neither to be read nor written.
+__LIBC_HIDDEN__ int LorieBuffer_lockRect(LorieBuffer* buffer, bool write, const ARect* rect, void** out) {
+    int ret = 0;
+    void *data = NULL;
+    if (!buffer)
+        return ENODEV;
+
+    if (buffer->locked)
+        return EEXIST;
+
+    if (buffer->desc.type == LORIEBUFFER_REGULAR || buffer->desc.type == LORIEBUFFER_FD)
+        data = buffer->desc.data;
+    else if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
+        ret = AHardwareBuffer_lock(buffer->desc.buffer, write ? AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                                   -1, rect, &data);
+        if (!ret && !data) {
+            AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
+            ret = EINVAL;
+        }
+    }
+
+    if (ret)
+        return ret;     // unlike LorieBuffer_lock, not marked locked: nothing to unlock
+    buffer->lockedData = data;
+    buffer->locked = 1;
+    *out = data;
+    return 0;
+}
+
 __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
     int ret = 0;
     if (!buffer)
