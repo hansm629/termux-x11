@@ -519,7 +519,7 @@
          present_clear_window_notifies(window);
          present_free_events(window);
 +++ ./present/present_vblank.c
-@@ -180,6 +180,107 @@
+@@ -180,6 +180,116 @@
      return NULL;
  }
  
@@ -612,7 +612,16 @@
 +    }
 +}
 +
-+/* lorie: the screen closing - its pixmaps going - lets every retired copy go, telling no one */
++/* lorie: the screen closing lets every retired copy go, telling no one, its copy over or not: not taken as done, nor
++ * cancelled - the renderer may still run it. Nothing else is possible, nor needed:
++ * - CloseScreen comes after KillAllClients and FreeAllResources (Dispatch, dix_main), on a server reset as on an exit:
++ *   no client, window or fence is left to tell, and these pixmaps are the closing screen's - freed with it right
++ *   after, none can be kept past it;
++ * - the GPU's use of a copy's buffers was never kept safe by the X server's references: the renderer holds its own on
++ *   every buffer it copies (its LorieBuffer's AHardwareBuffer, from AHardwareBuffer_recvHandleFromUnixSocket; a Vulkan
++ *   import's own, until its VkDeviceMemory is freed) and lets them go only on its own thread, once its copies are
++ *   waited for (renderer.c: removedBuffers after the frame's fence, or the teardown after vkDeviceWaitIdle; GLES waits
++ *   for its copies under the shared lock) - this process exiting meanwhile or not. */
 +void
 +present_retired_copies_drain(void)
 +{
@@ -627,7 +636,7 @@
  void
  present_vblank_scrap(present_vblank_ptr vblank)
  {
-@@ -188,6 +289,21 @@
+@@ -188,6 +298,21 @@
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,
                    vblank->crtc));
  
@@ -649,7 +658,7 @@
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +316,20 @@
+@@ -200,6 +325,20 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
@@ -670,7 +679,7 @@
      /* Remove vblank from window and screen lists */
      xorg_list_del(&vblank->window_list);
      /* Also make sure vblank is removed from event queue (wnmd) */
-@@ -229,5 +359,8 @@
+@@ -229,5 +368,8 @@
      if (vblank->notifies)
          present_destroy_notifies(vblank->notifies, vblank->num_notifies);
  

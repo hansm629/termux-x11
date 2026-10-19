@@ -15,7 +15,9 @@
  * "idle(fence)" with the window gone - the fence alone is triggered), the presentation completed (with its mode) -
  * each marked with whether the GPU may still use the copy's buffers then ("+" it may not: done or cancelled, "!" it
  * may). No reference let go, no client told idle or presented while it may ("ack!", "idle!", "complete(copy)!"
- * never appear; a skipped presentation's completion may come first - it tells nothing about the buffer); a copy that
+ * never appear; a skipped presentation's completion may come first - it tells nothing about the buffer) - but at the
+ * screen's close ("ack(close)": then the pixmaps go with the screen, no one is left to tell, and the renderer's own
+ * references, not these, keep the buffers its GPU may still use - present_retired_copies_drain); a copy that
  * never ran completes as skipped; each reference, idle fence and notification goes exactly once; nothing is left
  * behind - every vblank and retired copy freed once (their allocations counted, and failed at will: out of memory, no
  * GPU copy is scheduled without its retired copy, and retiring one never allocates). */
@@ -109,10 +111,11 @@ static Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr u
     return TRUE;
 }
 static Bool lorieGpuCopyIsDone(uint64_t serial) { return completed >= serial; }
+static bool closing;                /* the screen closing (present_close_screen) */
 static void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
     pixmap->refs--;
     ((PixmapPtr) dst_buffer)->refs--;
-    step("ack", pixmap);
+    step(closing ? "ack(close)" : "ack", pixmap);
 }
 int lorieGpuCopySettle(uint64_t serial) {
     if (completed >= serial)
@@ -249,6 +252,16 @@ static void gpuDone(uint64_t s) {
     lorieRecheckGpuCopies();
 }
 
+/* the server's end of a generation, a reset as an exit (dix_main): every window destroyed with its presentations
+ * (FreeAllResources: present_destroy_window), then the screen closed (CloseScreen: present_close_screen) */
+static void serverClose(void) {
+    present_retired_copies_forget_window(&window);
+    present_free_window_vblank(&window);
+    closing = true;
+    present_retired_copies_drain();
+    closing = false;
+}
+
 /* one case's log and, of the early ends P10-B0 counts, which one (once), or none */
 static void expect(const char *what, const char *want, int kind) {
     int counted = 0;
@@ -361,18 +374,105 @@ int main(void) {
     clean("the next", &a, 0);
     CHECK(b.refs == 0, "the next: B holds %d references", b.refs);
 
-    /* the screen closing with a copy still running: let go, no one told */
+    /* the server closing (reset or exit) while the copy runs, overwritten or still queued: the X server's references
+     * go with the screen, no one told, its fence destroyed untriggered - and the copy is not taken as done, nor
+     * cancelled: the renderer runs it to its end, which then lets nothing more go */
     reset();
     v = presentation(&a);
     recorded = a.copySerial;
     trail[0] = 0;
-    idleFences = 0;
+    idleFences = fencesDestroyed = 0;
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
     present_execute(v, 0, 11);
-    present_retired_copies_drain();
-    CHECK(idleFences == 0 && a.refs == 0 && xorg_list_is_empty(&present_retired_copies), "screen closed: %d told idle, %d references, "
-          "retired copies %s", idleFences, a.refs, xorg_list_is_empty(&present_retired_copies) ? "none" : "left");
-    printf("  %-62s %s\n", "the screen closed with a copy running (drain)", trail);
+    serverClose();
+    CHECK(!isCancelled(a.copySerial) && completed < a.copySerial, "closed, overwritten while copying: the copy taken as %s",
+          isCancelled(a.copySerial) ? "cancelled" : "done");
+    gpuDone(a.copySerial);
+    expect("the server closed, overwritten while copying", "complete(skip)! ack(close)!", LORIE_X_EARLY_SCRAP);
+    CHECK(idleFences == 0 && fencesDestroyed == 1, "closed, overwritten: %d fences triggered, %d destroyed (want 0, 1)", idleFences,
+          fencesDestroyed);
+    clean("closed, overwritten while copying", &a, 0);
+
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    serverClose();
+    CHECK(!isCancelled(a.copySerial) && completed < a.copySerial, "closed, queued while copying: the copy taken as %s",
+          isCancelled(a.copySerial) ? "cancelled" : "done");
+    gpuDone(a.copySerial);
+    expect("the server closed, its presentation queued while copying", "ack(close)!", LORIE_X_EARLY_DESTROY);
+    CHECK(idleFences == 0 && fencesDestroyed == 1, "closed, queued: %d fences triggered, %d destroyed (want 0, 1)", idleFences,
+          fencesDestroyed);
+    clean("closed, queued while copying", &a, 0);
+
+    /* the copy done before the server closes: let go then, the client told idle - the close finds nothing */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    gpuDone(a.copySerial);
+    serverClose();
+    expect("the copy done, then the server closed", "complete(skip)! ack+ idle+", LORIE_X_EARLY_SCRAP);
+    CHECK(idleFences == 1 && fencesDestroyed == 1, "done, then closed: %d fences triggered, %d destroyed (want 1, 1)", idleFences,
+          fencesDestroyed);
+    clean("done, then closed", &a, 0);
+
+    /* cancelled before the server closes (not recorded, known once the shared lock is free): let go then */
+    reset();
+    v = presentation(&a);
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    lockBusy = true;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    lockBusy = false;
+    lorieRecheckGpuCopies();
+    CHECK(isCancelled(a.copySerial), "cancelled, then closed: not cancelled");
+    serverClose();
+    gpuDone(a.copySerial);                  /* the renderer skips the entry */
+    expect("the copy cancelled, then the server closed", "complete(skip)! ack+ idle+", LORIE_X_EARLY_SCRAP);
+    CHECK(idleFences == 1 && fencesDestroyed == 1, "cancelled, then closed: %d fences triggered, %d destroyed (want 1, 1)", idleFences,
+          fencesDestroyed);
+    clean("cancelled, then closed", &a, 0);
+
+    /* the renderer gone (its process too) before the server closes: settled at its disconnection, let go then */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    connectionAlive = false;
+    submitterGone = true;
+    lorieRecheckGpuCopies();                /* lorieRendererGoneWorkProc */
+    serverClose();
+    expect("the renderer gone, then the server closed", "complete(skip)! ack+ idle+", LORIE_X_EARLY_SCRAP);
+    CHECK(idleFences == 1 && fencesDestroyed == 1, "renderer gone, then closed: %d fences triggered, %d destroyed (want 1, 1)",
+          idleFences, fencesDestroyed);
+    clean("renderer gone, then closed", &a, 0);
+
+    /* the server closed, then the renderer gone: let go once, at the close - its disconnection finds nothing */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    serverClose();
+    connectionAlive = false;
+    submitterGone = true;
+    lorieRecheckGpuCopies();
+    expect("the server closed, then the renderer gone", "complete(skip)! ack(close)!", LORIE_X_EARLY_SCRAP);
+    CHECK(idleFences == 0 && fencesDestroyed == 1, "closed, then renderer gone: %d fences triggered, %d destroyed (want 0, 1)",
+          idleFences, fencesDestroyed);
+    clean("closed, then renderer gone", &a, 0);
     completed = a.copySerial;
 
     /* out of memory reserving its retired copy: no GPU copy scheduled - copied as without one */
