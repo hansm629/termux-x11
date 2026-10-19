@@ -97,6 +97,9 @@ typedef struct {
     /* Root double buffering (TERMUX_X11_RENDERER_ROOT_DOUBLE=1, lorieRootSwap): asked for; the twin out of date
      * (filled whole at the next swap) */
     Bool rootDouble, rootTwinStale;
+
+    /* TERMUX_X11_X_YIELD_ON_WAKE=1 (lorieQueueUrgentWorkProc): asked for - read from other threads, atomically */
+    int yieldOnWake;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -348,6 +351,10 @@ void OsVendorInit(void) {
                                                 !strcmp(getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
+    // Experimental: TERMUX_X11_X_YIELD_ON_WAKE=1 lets a vsync tick or a GPU copy's completion break off the client
+    // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
+    __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
+                     __ATOMIC_RELAXED);
 }
 
 // Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
@@ -916,7 +923,7 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -927,7 +934,7 @@ static void lorieLogRendererDiag(void) {
         d.xOwnership == LORIE_OWNERSHIP_PER_ACCESS ? "per_access" : "persistent",
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
-        pvfb->state->backend.vkTransferCopy ? "on" : "off");
+        pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off");
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -1257,6 +1264,17 @@ void lorieWakeServer(void) {
     eventfd_write(pvfb->eventFd, 1);
 }
 
+// P11-A: work for the main thread that should not wait for the client dispatch round in progress to end - a vsync tick,
+// a GPU copy's completion - queued from any thread. With TERMUX_X11_X_YIELD_ON_WAKE=1 that round is broken off at its next
+// request boundary, the work runs, and the round goes on with the rest of its slice (patches/xserver.patch: Dispatch,
+// WaitForSomething): queued before the yield is asked for, the work is always there for it. Otherwise, as any work: once
+// the round is over.
+void lorieQueueUrgentWorkProc(Bool (*proc)(ClientPtr, void *), void *closure) {
+    if (QueueWorkProc(proc, NULL, closure) && __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED))
+        __atomic_exchange_n(&dispatchYieldRequested, 1, __ATOMIC_RELEASE);
+    lorieWakeServer();
+}
+
 static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused *data) {
     // Nothing to do here. It is needed to interrupt ospoll_wait.
     eventfd_t dummy;
@@ -1271,8 +1289,7 @@ void lorieChoreographerFrameCallback(long t, AChoreographer* d) {
         if (sizeof(long) >= 8 && t > 0)
             lorieStampPair(&pvfb->state->diag.xVsyncToCallback, (uint64_t) t / 1000, now);
         __atomic_fetch_add(&pvfb->state->diag.xTicksPosted, 1, __ATOMIC_RELAXED);
-        QueueWorkProc(lorieRedraw, NULL, (void *) (uintptr_t) (uint32_t) now);
-        lorieWakeServer();
+        lorieQueueUrgentWorkProc(lorieRedraw, (void *) (uintptr_t) (uint32_t) now);
     }
 }
 

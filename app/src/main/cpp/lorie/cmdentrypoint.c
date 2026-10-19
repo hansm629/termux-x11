@@ -419,8 +419,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 break;
             }
             case EVENT_GPU_COPY_DONE:
-                QueueWorkProc(handleGpuCopyDoneEvent, NULL, (void *) (uintptr_t) lorieGpuCopyDoneReceived(e.gpuCopyDone.publishedUs));
-                lorieWakeServer();
+                lorieQueueUrgentWorkProc(handleGpuCopyDoneEvent, (void *) (uintptr_t) lorieGpuCopyDoneReceived(e.gpuCopyDone.publishedUs));
                 break;
         }
 

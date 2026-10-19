@@ -20,6 +20,91 @@
  extern _X_EXPORT void
   ShmRegisterFuncs(ScreenPtr pScreen, ShmFuncsPtr funcs);
  
++++ ./dix/dispatch.c
+@@ -175,6 +175,15 @@
+ volatile char dispatchException = 0;
+ volatile char isItTimeToYield;
+ 
++/* lorie: P11-A (TERMUX_X11_X_YIELD_ON_WAKE=1) - set by any thread, by an atomic exchange, right after it queued work
++ * (QueueWorkProc) that should not wait for the client dispatch round in progress to end: a vsync tick, a GPU copy's
++ * completion (lorie/InitOutput.c lorieQueueUrgentWorkProc). Not isItTimeToYield, which is not atomic and which every
++ * round resets: Dispatch breaks the round off at its next request boundary instead, and WaitForSomething clears it
++ * right before running the work queue - so a yield asked for is never lost, nor taken for more than its work. The
++ * round then goes on, with the rest of its slice: which client runs, and for how long, is the smart scheduler's
++ * choice as without the yield. */
++int dispatchYieldRequested;
++
+ #define SAME_SCREENS(a, b) (\
+     (a.pScreen == b.pScreen))
+ 
+@@ -276,6 +285,19 @@
+     return !xorg_list_is_empty(&ready_clients);
+ }
+ 
++/* lorie: P11-A - whether a client (maybe gone since: only compared, unlike client_is_ready) is on the ready list */
++static Bool
++client_in_ready_list(ClientPtr client)
++{
++    ClientPtr ready;
++
++    xorg_list_for_each_entry(ready, &ready_clients, ready) {
++        if (ready == client)
++            return TRUE;
++    }
++    return FALSE;
++}
++
+ /* Client has requests queued or data on the network */
+ void
+ mark_client_ready(ClientPtr client)
+@@ -476,6 +498,9 @@
+     int result;
+     ClientPtr client;
+     long start_tick;
++    /* lorie: P11-A - the round a yield broke off: its client, its slice's start, and when it was broken off */
++    ClientPtr yielded = NULL;
++    long yielded_start = 0, yielded_at = 0;
+ 
+     nextFreeClientID = 1;
+     nClients = 0;
+@@ -498,11 +523,18 @@
+ 	*****************/
+ 
+         if (!dispatchException && clients_are_ready()) {
+-            client = SmartScheduleClient();
++            /* lorie: P11-A - a round a yield broke off goes on first, its client still ready, with the rest of its
++             * slice (the time the yield took not counted) */
++            Bool resumed = yielded && client_in_ready_list(yielded);
++
++            client = resumed ? yielded : SmartScheduleClient();
+ 
+             isItTimeToYield = FALSE;
+ 
+             start_tick = SmartScheduleTime;
++            if (resumed)
++                start_tick = yielded_start + (SmartScheduleTime - yielded_at);
++            yielded = NULL;
+             while (!isItTimeToYield) {
+                 if (InputCheckPending())
+                     ProcessInputEvents();
+@@ -573,6 +605,17 @@
+                                       client->errorValue, result);
+                     break;
+                 }
++                /* lorie: P11-A - work queued that should not wait for this round: broken off here, a request boundary
++                 * (after a request: every round serves one), for WaitForSomething to run the work first thing - then
++                 * it goes on (above). Its slice spent, the round ends at the slice check as it would have, and the
++                 * work runs right after it all the same. */
++                if (__atomic_load_n(&dispatchYieldRequested, __ATOMIC_RELAXED) &&
++                    (SmartScheduleTime - start_tick) < SmartScheduleSlice) {
++                    yielded = client;
++                    yielded_start = start_tick;
++                    yielded_at = SmartScheduleTime;
++                    break;
++                }
+             }
+             FlushAllOutput();
+             if (client == SmartLastClient)
 +++ ./dix/dixutils.c
 @@ -506,18 +506,25 @@
  
@@ -133,11 +218,13 @@
          InputThreadInit();
  
 +++ ./include/os.h
-@@ -557,6 +557,8 @@
+@@ -557,6 +557,10 @@
  extern _X_EXPORT void
  ddxGiveUp(enum ExitCode error);
  extern _X_EXPORT void
 +ddxReady(void);
++/* lorie: P11-A - work queued that should not wait for the client dispatch round in progress (dix/dispatch.c) */
++extern _X_EXPORT int dispatchYieldRequested;
 +extern _X_EXPORT void
  ddxInputThreadInit(void);
  extern _X_EXPORT int
@@ -180,6 +267,18 @@
  _XFUNCPROTOBEGIN
  
  extern _X_EXPORT char *XkbIndentText(unsigned   /* size */
++++ ./os/WaitFor.c
+@@ -187,6 +187,10 @@
+     /* We need a while loop here to handle
+        crashed connections and the screen saver timeout */
+     while (1) {
++        /* lorie: P11-A - the yield any queued work asked for (dix/dispatch.c dispatchYieldRequested) is answered by the
++         * run just below: cleared first, so work queued during that run asks again rather than being forgotten */
++        if (__atomic_load_n(&dispatchYieldRequested, __ATOMIC_RELAXED))
++            __atomic_exchange_n(&dispatchYieldRequested, 0, __ATOMIC_ACQUIRE);
+         /* deal with any blocked jobs */
+         if (workQueue) {
+             ProcessWorkQueue();
 +++ ./os/osinit.c
 @@ -170,13 +170,11 @@
  #endif

@@ -32,6 +32,7 @@ void lorieHandleClipboardAnnounce(void);
 void lorieHandleClipboardData(const char* data);
 void lorieSetStylusEnabled(Bool enabled);
 void lorieWakeServer(void);
+void lorieQueueUrgentWorkProc(Bool (*proc)(struct _Client *, void *), void *closure);
 void lorieRecheckGpuCopies(void);
 void lorieCountCopyAck(void);
 uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs);

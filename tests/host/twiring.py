@@ -19,6 +19,9 @@ self-test's duration is lorieVkElapsedUs's (tvkselftest.c tests it) on both ways
 its GLES texture only when rendererGlesEager says GLES draws, a buffer found for a copy none, and GLES's frame
 makes the root's (rendererGlBuffer) before binding it.
 
+And P11-A: the vsync tick and a GPU copy's completion are queued as urgent work (lorieQueueUrgentWorkProc, which
+tdispatchyield.c tests), with TERMUX_X11_X_YIELD_ON_WAKE read when the server state is made, "1" only.
+
 usage: twiring.py <lorie source dir>
 """
 import os, sys
@@ -58,6 +61,16 @@ check(events.find("if (ready & X_NOTIFY_ERROR) {") >= 0 and before_first_return(
 init = func(I, "void OsVendorInit(void) {")
 check('lorieScreen.state->backend.requested = lorieRequestedBackend(getenv("TERMUX_X11_RENDERER_BACKEND"),' in init,
       "OsVendorInit does not read TERMUX_X11_RENDERER_BACKEND into the server state")
+
+# P11-A: the tick and the completion as urgent work - and nowhere queued as any work
+frame = func(I, "void lorieChoreographerFrameCallback(long t, AChoreographer* d) {")
+check("lorieQueueUrgentWorkProc(lorieRedraw, " in frame and "QueueWorkProc(lorieRedraw" not in frame.replace("lorieQueueUrgentWorkProc(", ""),
+      "the vsync tick not queued as urgent work")
+check("lorieQueueUrgentWorkProc(handleGpuCopyDoneEvent, " in events and
+      "QueueWorkProc(handleGpuCopyDoneEvent" not in events.replace("lorieQueueUrgentWorkProc(", ""),
+      "a GPU copy's completion not queued as urgent work")
+check('getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1")' in init,
+      "OsVendorInit does not read TERMUX_X11_X_YIELD_ON_WAKE=1")
 
 R = os.path.join(L, "renderer.c")
 def in_order(what, body, *steps):
@@ -110,6 +123,6 @@ selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *
 check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,
       "the self-test's duration not lorieVkElapsedUs's on both ways out")
 
-print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit) and the renderer's Vulkan order: %s (%d failures)" % (
+print("ownership wiring (lorieRedraw, connect, disconnect, OsVendorInit), the urgent work and the renderer's Vulkan order: %s (%d failures)" % (
     "FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

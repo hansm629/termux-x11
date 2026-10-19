@@ -38,6 +38,24 @@ def present(name):
         _present.append(d)
     return os.path.join(_present[0], "present", name)
 
+_patched = {}
+
+def patched(path):
+    """xserver/<path> as the build compiles it: a copy of that one file with patches/xserver.patch's hunks for it
+    applied (in OUT - the xserver checkout itself is never patched)."""
+    if path not in _patched:
+        import re, shutil, subprocess
+        d = os.path.join(OUT, "xs-patched")
+        os.makedirs(os.path.dirname(os.path.join(d, path)), exist_ok=True)
+        shutil.copyfile(os.path.join(XS, path), os.path.join(d, path))
+        hunks = "".join(x for x in re.split(r"(?m)^(?=\+\+\+ \./)", open(PATCH, encoding="utf-8").read())
+                        if x.startswith("+++ ./%s\n" % path))
+        if not hunks:
+            sys.exit("patches/xserver.patch has no hunks for " + path)
+        subprocess.run(["patch", "-p1", "-N", "-s", "-d", d], input=hunks, text=True, check=True)
+        _patched[path] = os.path.join(d, path)
+    return _patched[path]
+
 def opt(make, marker, path):
     """What make() extracts, if `path` has `marker` - so a recipe also builds against code from before the
     function existed, which is how a test is shown to fail there."""
@@ -180,6 +198,21 @@ recipes = {
           "                             uint64_t target_msc) {\n    present_vblank_ptr vblank, tmp;\n"
         + span(present("present_scmd.c"), "    if (!update && pixmap) {\n        xorg_list_for_each_entry_safe(vblank, tmp, &window_priv->vblank, window_list) {",
                "            if (vblank->flip_ready)\n                present_re_execute(vblank);\n        }\n    }") + "}\n",
+    # P11-A: the X server's main loop as patched - tdispatchyield.c: the work queue (dixutils.c, with its lock), the
+    # ready clients and the smart scheduler's choice of client (dispatch.c, unpatched), and Dispatch and
+    # WaitForSomething with the yield asked for by lorieQueueUrgentWorkProc (InitOutput.c) ...
+    "dispatchyield_common": lambda: span(os.path.join(XS, "include", "dixstruct.h"), "typedef struct _WorkQueue {", "} WorkQueueRec;")
+        + span(patched("dix/dixutils.c"), "WorkQueuePtr workQueue;",
+                                         "    pthread_spin_unlock(&workQueueLock);\n    return TRUE;\n}")
+        + span(patched("dix/dispatch.c"), "static struct xorg_list ready_clients;",
+               "mark_client_not_ready(ClientPtr client)\n{\n    xorg_list_del(&client->ready);\n}")
+        + "static ClientPtr\n" + func(os.path.join(XS, "dix", "dispatch.c"), "SmartScheduleClient(void)\n{"),
+    "dispatchyield": lambda: "Bool\n" + func(patched("os/WaitFor.c"), "WaitForSomething(Bool are_ready)\n{")
+        + "void\n" + func(patched("dix/dispatch.c"), "Dispatch(void)\n{")
+        + func(I, "void lorieQueueUrgentWorkProc(Bool (*proc)(ClientPtr, void *), void *closure) {"),
+    # ... and the two as the xserver has them, which the patched ones must equal with the yield never asked for
+    "dispatchyield_orig": lambda: "Bool\n" + func(os.path.join(XS, "os", "WaitFor.c"), "WaitForSomething(Bool are_ready)\n{")
+        + "void\n" + func(os.path.join(XS, "dix", "dispatch.c"), "Dispatch(void)\n{"),
     # lorieGpuCopySettle's answers, as the patched present_priv.h defines them - tpresentcopy.c
     "settleconsts": lambda: span(present("present_priv.h"), "#define LORIE_GPU_COPY_RUNNING 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
     # the shaders as committed (vk.c includes them)

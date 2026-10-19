@@ -800,6 +800,19 @@ CONTROLS = [
      """        if (0) {
             lastSerial = entry.serial;""",
      "tpresentcopy"),
+    ("P11-A: the yield asked for with TERMUX_X11_X_YIELD_ON_WAKE off", "InitOutput.c",
+     """    if (QueueWorkProc(proc, NULL, closure) && __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED))""",
+     """    if (QueueWorkProc(proc, NULL, closure))""",
+     "tdispatchyield"),
+    ("P11-A: the yield never asked for", "InitOutput.c",
+     """        __atomic_exchange_n(&dispatchYieldRequested, 1, __ATOMIC_RELEASE);""",
+     """        ;""",
+     "tdispatchyield"),
+    ("P11-A: the vsync tick queued as any work", "InitOutput.c",
+     """        lorieQueueUrgentWorkProc(lorieRedraw, (void *) (uintptr_t) (uint32_t) now);""",
+     """        QueueWorkProc(lorieRedraw, NULL, (void *) (uintptr_t) (uint32_t) now);
+        lorieWakeServer();""",
+     "twiring"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",
