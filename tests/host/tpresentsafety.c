@@ -2,7 +2,8 @@
  * patched xserver's own code (patches/xserver.patch applied to a copy of present/, gen.py "presentsafety"):
  * present_execute, present_execute_copy, present_execute_post, present_re_execute, present_vblank_scrap,
  * present_vblank_destroy, present_free_window_vblank, lorieRecheckGpuCopies, the retired copies
- * (present_retire_copy, present_retired_copies_check, _forget_window, _drain) and present_scmd_pixmap's loop that
+ * (present_retired_copy_reserve, present_retire_copy, present_retired_copies_check, _forget_window, _drain) and
+ * present_scmd_pixmap's loop that
  * scraps a queued presentation a new one overwrites in the same frame. The rest of the server is stubbed; the lorie
  * hooks are recorders. lorieGpuCopySettle answers as the real one does for the state a case sets (that one is run for
  * real against the shared queue in tpresentcopy.c): DONE once the copy's completion is published, RUNNING while the
@@ -16,7 +17,8 @@
  * may). No reference let go, no client told idle or presented while it may ("ack!", "idle!", "complete(copy)!"
  * never appear; a skipped presentation's completion may come first - it tells nothing about the buffer); a copy that
  * never ran completes as skipped; each reference, idle fence and notification goes exactly once; nothing is left
- * behind. */
+ * behind - every vblank and retired copy freed once (their allocations counted, and failed at will: out of memory, no
+ * GPU copy is scheduled without its retired copy, and retiring one never allocates). */
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -173,12 +175,33 @@ static void flush(WindowPtr w) { (void) w; }
 static void abortVblank(ScreenPtr s, WindowPtr w, RRCrtcPtr c, uint64_t id, uint64_t msc) { (void) s; (void) w; (void) c; (void) id; (void) msc; }
 static PixmapPtr getWindowPixmap(WindowPtr w) { (void) w; return &dstPixmap; }
 
+/* the patch's own allocations (vblanks, made here, counted as theirs): live, attempted, and failing while out of memory */
+static int allocs, allocCalls;
+static bool outOfMemory;
+static void *testCalloc(size_t n, size_t size) {
+    allocCalls++;
+    if (outOfMemory)
+        return NULL;
+    allocs++;
+    return calloc(n, size);
+}
+static void testFree(void *p) {
+    if (p)
+        allocs--;
+    free(p);
+}
+
 void present_execute_copy(struct present_vblank *vblank, uint64_t crtc_msc);
 void present_execute_post(struct present_vblank *vblank, uint64_t ust, uint64_t crtc_msc);
 void present_vblank_scrap(struct present_vblank *vblank);
 void present_vblank_destroy(struct present_vblank *vblank);
+Bool present_retired_copy_reserve(struct present_vblank *vblank);
 static void present_execute(struct present_vblank *vblank, uint64_t ust, uint64_t crtc_msc);
+#define calloc testCalloc
+#define free testFree
 #include "presentsafety_src.inc"
+#undef calloc
+#undef free
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL " __VA_ARGS__); printf("\n"); } } while (0)
@@ -186,6 +209,7 @@ static int fails;
 /* a client's presentation of `pixmap` to the window at msc 10, as present_scmd_pixmap queues and executes it */
 static struct present_vblank *presentation(PixmapPtr pixmap) {
     struct present_vblank *v = calloc(1, sizeof *v);
+    allocs++;                       /* present_vblank_destroy's to free */
     v->screen = &screen;
     v->window = &window;
     v->pixmap = pixmap;
@@ -212,6 +236,7 @@ static void reset(void) {
     lockBusy = submitterGone = false;
     queueVblankFails = 0;
     connectionAlive = rendererAvailable = true;
+    outOfMemory = false;
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
 }
@@ -236,11 +261,12 @@ static void expect(const char *what, const char *want, int kind) {
           kind < 0 ? "none" : "one, of its kind");
     printf("  %-62s %s\n", what, trail);
 }
-/* nothing held after a case: every reference back, no retired copy left */
+/* nothing held after a case: every reference back, no retired copy left, every vblank and retired copy freed */
 static void clean(const char *what, PixmapPtr p, int refs) {
-    CHECK(p->refs == refs && dstPixmap.refs == 0 && xorg_list_is_empty(&present_retired_copies) && retiredMade == retiredReleased,
-          "%s: references %d (want %d), destination %d, retired copies %s, %d made and %d let go", what, p->refs, refs, dstPixmap.refs,
-          xorg_list_is_empty(&present_retired_copies) ? "none" : "left", retiredMade, retiredReleased);
+    CHECK(p->refs == refs && dstPixmap.refs == 0 && xorg_list_is_empty(&present_retired_copies) && retiredMade == retiredReleased &&
+          allocs == 0, "%s: references %d (want %d), destination %d, retired copies %s, %d made and %d let go, %d allocations left",
+          what, p->refs, refs, dstPixmap.refs, xorg_list_is_empty(&present_retired_copies) ? "none" : "left", retiredMade,
+          retiredReleased, allocs);
 }
 
 int main(void) {
@@ -349,6 +375,54 @@ int main(void) {
     printf("  %-62s %s\n", "the screen closed with a copy running (drain)", trail);
     completed = a.copySerial;
 
+    /* out of memory reserving its retired copy: no GPU copy scheduled - copied as without one */
+    reset();
+    outOfMemory = true;
+    {
+        uint64_t serials = nextSerial;
+        v = presentation(&a);
+        CHECK(nextSerial == serials, "out of memory reserving: %d GPU copies scheduled", (int) (nextSerial - serials));
+    }
+    expect("out of memory reserving its retired copy", "cpu-copy+ idle+ complete(copy)+", -1);
+    clean("out of memory reserving", &a, 0);
+
+    /* out of memory once the copy is scheduled: overwritten while copying, or its window destroyed - retired all the
+     * same, into the copy reserved before (nothing allocated), let go once it is done */
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    outOfMemory = true;
+    {
+        int calls = allocCalls;
+        presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+        present_execute(v, 0, 11);
+        CHECK(allocCalls == calls && a.refs == 2 && retiredMade == retiredReleased + 1, "out of memory, overwritten: %d allocations, "
+              "%d references, %d retired copies held", allocCalls - calls, a.refs, retiredMade - retiredReleased);
+        gpuDone(a.copySerial);
+        CHECK(allocCalls == calls, "out of memory, overwritten: %d allocations letting go", allocCalls - calls);
+    }
+    expect("out of memory, overwritten while copying (scrap)", "complete(skip)! ack+ idle+", LORIE_X_EARLY_SCRAP);
+    clean("out of memory, overwritten", &a, 0);
+
+    reset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    trail[0] = 0;
+    idleFences = fencesDestroyed = 0;
+    outOfMemory = true;
+    {
+        int calls = allocCalls;
+        present_free_window_vblank(&window);
+        CHECK(allocCalls == calls && !trail[0] && a.refs == 2 && retiredMade == retiredReleased + 1, "out of memory, window destroyed: "
+              "%d allocations, %s, %d references, %d retired copies held", allocCalls - calls, trail, a.refs, retiredMade - retiredReleased);
+        gpuDone(a.copySerial);
+    }
+    expect("out of memory, its window destroyed while copying (destroy)", "ack+", LORIE_X_EARLY_DESTROY);
+    CHECK(idleFences == 0 && fencesDestroyed == 1, "out of memory, window destroyed: %d fences triggered, %d destroyed (want 0, 1)",
+          idleFences, fencesDestroyed);
+    clean("out of memory, window destroyed", &a, 0);
+
     /* its first poll not queued: still waited for - the completion recheck (every event and tick) finds it done */
     reset();
     queueVblankFails = 1;
@@ -356,6 +430,7 @@ int main(void) {
     {
         int polls = queued;
         struct present_vblank *w = calloc(1, sizeof *w);
+        allocs++;
         w->screen = &screen; w->window = &window; w->pixmap = &a; a.refs++; w->crtc = &crtcRec;
         w->kind = PresentCompleteKindPixmap; w->target_msc = w->exec_msc = 10;
         w->idle_fence = calloc(1, sizeof *w->idle_fence);

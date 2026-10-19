@@ -164,7 +164,7 @@ recipes = {
     # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that
     # scraps a queued presentation a new one overwrites in the same frame
     "presentsafety_struct": lambda: span(present("present_priv.h"), "struct present_vblank {",
-                                         "    Bool                gpu_copy_stalled;\n};")
+                                         "    struct present_retired_copy *gpu_copy_retired;\n};")
         + span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
     "presentsafety": lambda: "static void\n" + func(present("present_scmd.c"), "present_re_execute(present_vblank_ptr vblank)\n{")
         + "static void\n" + func(present("present_scmd.c"), "present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
