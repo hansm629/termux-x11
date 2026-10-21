@@ -273,7 +273,7 @@ int main(void) {
             while (logf && fgets(line, sizeof line, logf)) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
                             strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:");
-                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off\n");
+                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
             if (logf)
@@ -318,7 +318,7 @@ int main(void) {
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
-            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off\n");
+            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off vk_schedule_opt=off\n");
             if (strstr(line, "XlorieVkFramePacing:") && ++n[0] == 2)
                 pacingOk = strstr(line, "XlorieVkFramePacing: frame_start_us=100/9620/20000/50000/35000/10/4 "
                                         "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "
@@ -409,10 +409,14 @@ int main(void) {
         logf = fopen(path, "w");
         lorieLogRendererDiag();
         fakePvfb.exaLockOpt = TRUE;
+        fakeState.backend.vkScheduleOpt = 1;
         fakeState.diag.xAccessReserved += 1201, fakeState.diag.xAccessReserveFull += 2;
         fakeState.diag.copiesDeferred += 7, fakeState.diag.copiesDeferredWakes += 6;
+        fakeState.diag.rootAhead += 596, fakeState.diag.rootAheadXWaiting += 5, fakeState.diag.rootChainConsumed += 3;
+        fakeState.diag.rootAheadUnavailable += 1;
         lorieLogRendererDiag();
         fakePvfb.exaLockOpt = FALSE;
+        fakeState.backend.vkScheduleOpt = 0;
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
@@ -420,9 +424,12 @@ int main(void) {
                 continue;
             lines++;
             offOk += lines == 1 && strstr(line, "XlorieSchedule: exa_lock_opt=off x_access_reserved=0(+0) x_access_reserve_full=0(+0) "
-                                                "copies_deferred=0(+0) copies_deferred_wakes=0(+0)") != NULL;
+                                                "copies_deferred=0(+0) copies_deferred_wakes=0(+0) vk_schedule_opt=off root_ahead=0(+0) "
+                                                "root_ahead_x_waiting=0(+0) root_chain_consumed=0(+0) root_ahead_unavailable=0(+0)\n") != NULL;
             onOk += lines == 2 && strstr(line, "XlorieSchedule: exa_lock_opt=on x_access_reserved=1201(+1201) "
-                                               "x_access_reserve_full=2(+2) copies_deferred=7(+7) copies_deferred_wakes=6(+6)") != NULL;
+                                               "x_access_reserve_full=2(+2) copies_deferred=7(+7) copies_deferred_wakes=6(+6) "
+                                               "vk_schedule_opt=on root_ahead=596(+596) root_ahead_x_waiting=5(+5) "
+                                               "root_chain_consumed=3(+3) root_ahead_unavailable=1(+1)\n") != NULL;
         }
         fclose(logf);
         CHECK(lines == 2 && offOk && onOk, "schedule log: %d lines (want 2), off %s, on %s", lines, offOk ? "right" : "wrong",
@@ -476,6 +483,8 @@ int main(void) {
         fakePvfb.worstAccess.index = EXA_PREPARE_MASK, fakePvfb.worstAccess.reserved = TRUE;
         fakeState.diag.xAccessReserved += 999999999, fakeState.diag.xAccessReserveFull += 999999999;
         fakeState.diag.copiesDeferred += 999999999, fakeState.diag.copiesDeferredWakes += 999999999;
+        fakeState.diag.rootAhead += 999999999, fakeState.diag.rootAheadXWaiting += 999999999;
+        fakeState.diag.rootChainConsumed += 999999999, fakeState.diag.rootAheadUnavailable += 999999999;
         lorieLogRendererDiag();
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {

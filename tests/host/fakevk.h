@@ -87,8 +87,11 @@ static struct {
     int passesIntoImported, drawsFromImported, drawsIntoImported, draws, copyCommands, copyRegions;
     AHardwareBuffer *drawnFrom[64], *drawnInto[64];    /* draw n's X server buffers (NULL: none), at n % 64 */
     long copies, locks;
-    bool fencePending;
+    bool fencePending;              /* a submission's fence not waited for yet - any (a test clears them all with it) */
     int earlyPresents;              /* presents made before the frame's fence was waited for (on the semaphore alone) */
+    int auxCmdFail;                 /* P11-C3-B2: a second command buffer cannot be allocated */
+    int submitFailAfter;            /* the n-th submission from now fails (device lost) */
+    int submits;                    /* submissions made */
     int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
     int flushes, invalidates, downloads, hostBarriers, cpuWrites;
 } emu;
@@ -103,6 +106,7 @@ static void violation(const char *what) {
     emu.violations++;
     CHECK(0, "fake device: %s", what);
 }
+static void pendingSync(void);
 static void AHardwareBuffer_describe(const AHardwareBuffer *b, AHardwareBuffer_Desc *d) { *d = b->desc; }
 static int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *d, AHardwareBuffer **out) {
     AHardwareBuffer *b;
@@ -173,6 +177,8 @@ struct lorie_shared_server_state {
         volatile pid_t pid;
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
+        uint32_t auxCount;      /* P11-C3-B2 */
+        uint64_t auxIds[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
     struct {                    /* P11-C3-B1 */
         uint32_t count;
@@ -186,6 +192,7 @@ struct lorie_shared_server_state {
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
         volatile uint64_t doneUs;   /* P11-C3 */
+        volatile uint32_t waiting;  /* P11-C3-B2 */
     } rootCopy;
     uint64_t rootWindowTextureID;
     volatile uint8_t drawRequested, surfaceAvailable, waitForNextFrame;
@@ -340,6 +347,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL fDeviceWaitIdle(VkDevice d) {
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     emu.fencePending = false;
+    pendingSync();
     return emu.idleResult;
 }
 /* ---- what an import calls: every object counted while alive, every argument kept ---- */
@@ -531,9 +539,12 @@ struct fake_op {
     VkImageCopy regions[16];        /* vkCmdCopyImage's */
     uint32_t nregions;
 };
-static struct { struct fake_op ops[256]; int n; bool recording; } cmdObj;
+/* command buffers: the renderer's two (P11-C3-B2: a second submission) - each recorded, then pending from its
+ * submission until its fence was waited for (or the device idle); the one being recorded now */
+struct fake_cmd { struct fake_op ops[256]; int n; bool recording, allocated, pending; VkFence fence; VkDescriptorPool pools[4]; };
+static struct fake_cmd cmdObj, cmdAux, *recordingCmd = &cmdObj;
 static struct { VkFramebuffer framebuffer; VkImageView view; } framebuffers[64];
-static struct { VkDescriptorSet set; VkImageView view; VkImageLayout layout; } descriptorSets[64];
+static struct { VkDescriptorSet set; VkImageView view; VkImageLayout layout; VkDescriptorPool pool; } descriptorSets[64];
 static VkImage imageOfFramebuffer(VkFramebuffer f) {
     for (int i = 0; i < 64; i++)
         if (f && framebuffers[i].framebuffer == f)
@@ -556,10 +567,27 @@ static uint8_t *bufferBytes(VkBuffer b) {
     return NULL;
 }
 static void record(struct fake_op op) {
-    if (!cmdObj.recording || cmdObj.n == 256)
+    if (!recordingCmd->recording || recordingCmd->n == 256)
         violation("command recorded outside a command buffer being recorded, or too many");
     else
-        cmdObj.ops[cmdObj.n++] = op;
+        recordingCmd->ops[recordingCmd->n++] = op;
+}
+/* the fences submissions are pending on (emu.fencePending: any - a test that clears it clears them all) */
+static struct { VkFence fence; bool signaled, pending; } fences[16];
+static void pendingSync(void) {
+    if (emu.fencePending)
+        return;
+    cmdObj.pending = cmdAux.pending = false;
+    for (int k = 0; k < 16; k++)
+        fences[k].pending = false;
+}
+static void pendingRecount(void) {
+    emu.fencePending = false;
+    for (int k = 0; k < 16; k++)
+        emu.fencePending |= fences[k].fence && fences[k].pending;
+}
+static struct fake_cmd *cmdOf(VkCommandBuffer c) {
+    return (struct fake_cmd *) c == &cmdAux ? &cmdAux : &cmdObj;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateCommandPool(VkDevice d, const VkCommandPoolCreateInfo *i, const VkAllocationCallbacks *a, VkCommandPool *p) {
     (void) d; (void) a;
@@ -571,28 +599,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateCommandPool(VkDevice d, const VkCom
 static VKAPI_ATTR void VKAPI_CALL fDestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks *a) {
     (void) d; (void) p; (void) a;
     emu.pools--;
+    cmdObj.allocated = cmdAux.allocated = false;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *i, VkCommandBuffer *c) {
     (void) d;
     CHECK(i->commandBufferCount == 1, "fake device: one command buffer");
-    *c = (VkCommandBuffer) &cmdObj;
+    if (emu.auxCmdFail && cmdObj.allocated)
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    /* the first, the second (P11-C3-B2); a renderer made again without its pool destroyed gets the first again */
+    *c = (VkCommandBuffer) (cmdObj.allocated && !cmdAux.allocated ? &cmdAux : &cmdObj);
+    cmdOf(*c)->allocated = true;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fResetCommandBuffer(VkCommandBuffer c, VkCommandBufferResetFlags f) {
-    (void) c; (void) f;
-    cmdObj.n = 0;
-    cmdObj.recording = false;
+    (void) f;
+    pendingSync();
+    if (cmdOf(c)->pending)
+        violation("a command buffer reset while its submission runs");
+    cmdOf(c)->n = 0;
+    cmdOf(c)->recording = false;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fBeginCommandBuffer(VkCommandBuffer c, const VkCommandBufferBeginInfo *i) {
-    (void) c; (void) i;
-    cmdObj.n = 0;
-    cmdObj.recording = true;
+    (void) i;
+    pendingSync();
+    if (cmdOf(c)->pending)
+        violation("a command buffer begun while its submission runs");
+    recordingCmd = cmdOf(c);
+    recordingCmd->n = 0;
+    recordingCmd->recording = true;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fEndCommandBuffer(VkCommandBuffer c) {
-    (void) c;
-    cmdObj.recording = false;
+    cmdOf(c)->recording = false;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fCmdPipelineBarrier(VkCommandBuffer c, VkPipelineStageFlags src, VkPipelineStageFlags dst,
@@ -797,7 +836,6 @@ static void run(const struct fake_op *op) {
     }
     }
 }
-static struct { VkFence fence; bool signaled; } fences[16];
 static bool *signaled(VkFence f) {
     for (int i = 0; i < 16; i++)
         if (f && fences[i].fence == f)
@@ -822,10 +860,21 @@ static bool semaphoreSignalled(VkSemaphore s, int set) {
         semaphoresSignalled[free] = s;
     return false;
 }
+static bool *pendingOf(VkFence f) {
+    for (int i = 0; i < 16; i++)
+        if (f && fences[i].fence == f)
+            return &fences[i].pending;
+    return NULL;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) {
+    struct fake_cmd *c;
     (void) q;
+    pendingSync();
     if (emu.submitResult != VK_SUCCESS)
         return emu.submitResult;
+    if (emu.submitFailAfter > 0 && --emu.submitFailAfter == 0)
+        return VK_ERROR_DEVICE_LOST;
+    emu.submits++;
     for (uint32_t i = 0; i < s->waitSemaphoreCount; i++)
         if (!semaphoreSignalled(s->pWaitSemaphores[i], 0))
             violation("a submission waiting for a semaphore nothing signalled");
@@ -834,20 +883,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const 
             violation("a submission signalling a semaphore already signalled");
     if (f && signaled(f) && *signaled(f))
         violation("submission with a signalled fence");
-    CHECK(n == 1 && s->commandBufferCount == 1 && s->pCommandBuffers[0] == (VkCommandBuffer) &cmdObj && !cmdObj.recording,
+    /* P11-C3-B2: two may run at once - each its own command buffer and fence: none may be reused while it runs; a
+     * submission without command buffers (a semaphore wait alone) is one too */
+    c = s->commandBufferCount ? cmdOf(s->pCommandBuffers[0]) : NULL;
+    CHECK(n == 1 && s->commandBufferCount <= 1 && (!c || ((s->pCommandBuffers[0] == (VkCommandBuffer) &cmdObj ||
+          s->pCommandBuffers[0] == (VkCommandBuffer) &cmdAux) && !c->recording)),
           "fake device: submission of a command buffer still being recorded");
-    if (emu.fencePending)
-        violation("submission while the previous one's fence was not waited for");
-    for (int i = 0; i < cmdObj.n; i++) {
-        run(&cmdObj.ops[i]);
+    if (c && c->pending)
+        violation("a command buffer submitted again while its submission runs");
+    if (f && pendingOf(f) && *pendingOf(f))
+        violation("submission with the fence of a submission still running");
+    for (int i = 0; c && i < c->n; i++) {
+        run(&c->ops[i]);
         /* the host reads a download after the fence: only a barrier to HOST_READ makes it visible there */
-        if (cmdObj.ops[i].kind == OP_IMAGE_TO_BUFFER) {
+        if (c->ops[i].kind == OP_IMAGE_TO_BUFFER) {
             bool barrier = false;
-            for (int j = i + 1; j < cmdObj.n; j++)
-                if (cmdObj.ops[j].kind == OP_BUFFER_BARRIER && cmdObj.ops[j].buffer.buffer == cmdObj.ops[i].buf &&
-                    (cmdObj.ops[j].buffer.srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
-                    (cmdObj.ops[j].buffer.dstAccessMask & VK_ACCESS_HOST_READ_BIT) &&
-                    (cmdObj.ops[j].src & VK_PIPELINE_STAGE_TRANSFER_BIT) && (cmdObj.ops[j].dst & VK_PIPELINE_STAGE_HOST_BIT))
+            for (int j = i + 1; j < c->n; j++)
+                if (c->ops[j].kind == OP_BUFFER_BARRIER && c->ops[j].buffer.buffer == c->ops[i].buf &&
+                    (c->ops[j].buffer.srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                    (c->ops[j].buffer.dstAccessMask & VK_ACCESS_HOST_READ_BIT) &&
+                    (c->ops[j].src & VK_PIPELINE_STAGE_TRANSFER_BIT) && (c->ops[j].dst & VK_PIPELINE_STAGE_HOST_BIT))
                     barrier = true;
             if (barrier)
                 emu.hostBarriers++;
@@ -855,7 +910,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const 
                 violation("a copy into host memory with no barrier making it visible to the host");
         }
     }
-    emu.fencePending = f != VK_NULL_HANDLE;
+    if (c) {
+        /* the descriptor pools its sets came from are in use while it runs */
+        int np = 0;
+        memset(c->pools, 0, sizeof c->pools);
+        for (int i = 0; i < c->n && np < 4; i++)
+            if (c->ops[i].kind == OP_BIND_SET)
+                for (int k = 0; k < 64; k++)
+                    if (descriptorSets[k].set && descriptorSets[k].set == c->ops[i].set) {
+                        bool known = false;
+                        for (int m = 0; m < np; m++)
+                            known |= c->pools[m] == descriptorSets[k].pool;
+                        if (!known)
+                            c->pools[np++] = descriptorSets[k].pool;
+                    }
+        c->pending = f != VK_NULL_HANDLE;
+        c->fence = f;
+    }
+    if (f && pendingOf(f))
+        *pendingOf(f) = true;
+    pendingRecount();
     if (f && signaled(f))
         *signaled(f) = true;
     return VK_SUCCESS;
@@ -882,19 +956,31 @@ static VKAPI_ATTR void VKAPI_CALL fDestroyFence(VkDevice d, VkFence f, const VkA
 static void (*emuFenceWait)(VkFence);  /* a test's look at the moment the renderer waits for a fence */
 static VKAPI_ATTR VkResult VKAPI_CALL fWaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
     (void) d; (void) n; (void) f; (void) all;
+    pendingSync();
     if (emuFenceWait && n)
         emuFenceWait(f[0]);
     CHECK(timeout != UINT64_MAX, "fake device: an unbounded fence wait");
     if (emu.fenceResult != VK_SUCCESS)
         return emu.fenceResult;
-    for (uint32_t i = 0; i < n; i++)
+    for (uint32_t i = 0; i < n; i++) {
         if (signaled(f[i]) && !*signaled(f[i]))
             violation("waiting for a fence nothing signals");
-    emu.fencePending = false;
+        if (pendingOf(f[i]))
+            *pendingOf(f[i]) = false;
+        if (cmdObj.fence == f[i])
+            cmdObj.pending = false;
+        if (cmdAux.fence == f[i])
+            cmdAux.pending = false;
+    }
+    pendingRecount();
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fResetFences(VkDevice d, uint32_t n, const VkFence *f) {
     (void) d;
+    pendingSync();
+    for (uint32_t i = 0; i < n; i++)
+        if (pendingOf(f[i]) && *pendingOf(f[i]))
+            violation("a fence reset while its submission runs");
     for (uint32_t i = 0; i < n; i++)
         if (signaled(f[i]))
             *signaled(f[i]) = false;
@@ -1113,7 +1199,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateDescriptorSetLayout(VkDevice d, con
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fDestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(l); }
-static int setsInPool;
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreateInfo *i, const VkAllocationCallbacks *a, VkDescriptorPool *p) {
     (void) d; (void) i; (void) a;
     MADE(VkDescriptorPool, p);
@@ -1121,17 +1206,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateDescriptorPool(VkDevice d, const Vk
 }
 static VKAPI_ATTR void VKAPI_CALL fDestroyDescriptorPool(VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(p); }
 static VKAPI_ATTR VkResult VKAPI_CALL fResetDescriptorPool(VkDevice d, VkDescriptorPool p, VkDescriptorPoolResetFlags f) {
-    (void) d; (void) p; (void) f;
-    setsInPool = 0;
-    memset(descriptorSets, 0, sizeof descriptorSets);
+    (void) d; (void) f;
+    pendingSync();
+    for (int m = 0; m < 4; m++)
+        if ((cmdObj.pending && cmdObj.pools[m] == p) || (cmdAux.pending && cmdAux.pools[m] == p))
+            violation("a descriptor pool reset while a submission using its sets runs");
+    for (int k = 0; k < 64; k++)
+        if (descriptorSets[k].pool == p)
+            memset(&descriptorSets[k], 0, sizeof descriptorSets[k]);
     return VK_SUCCESS;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL fAllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo *i, VkDescriptorSet *s) {
+    int k, inPool = 0;
     (void) d;
-    if (i->descriptorSetCount != 1 || setsInPool == 32)
+    for (k = 0; k < 64; k++)
+        inPool += descriptorSets[k].set && descriptorSets[k].pool == i->descriptorPool;
+    if (i->descriptorSetCount != 1 || inPool == 32)
+        return VK_ERROR_OUT_OF_POOL_MEMORY;
+    for (k = 0; k < 64 && descriptorSets[k].set; k++)
+        ;
+    if (k == 64)
         return VK_ERROR_OUT_OF_POOL_MEMORY;
     *s = (VkDescriptorSet) nextHandle++;
-    descriptorSets[setsInPool++].set = *s;
+    descriptorSets[k].set = *s;
+    descriptorSets[k].pool = i->descriptorPool;
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fUpdateDescriptorSets(VkDevice d, uint32_t n, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {

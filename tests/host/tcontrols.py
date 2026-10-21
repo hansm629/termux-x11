@@ -676,6 +676,12 @@ CONTROLS = [
             ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
     }
+    // P11-C3-B2: the root copy submitted ahead - over by now or soon: the device runs it before this frame
+    if (vkAux.pending) {
+        rendererVkAuxFinish();
+        if (!vkActive)
+            return;
+    }
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
@@ -688,6 +694,8 @@ CONTROLS = [
     }""",
      """    state->waitForNextFrame = true;
 
+    // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
+    // once the fence was waited for, as the present below.
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
         if (diag)
             ft.presentStartUs = lorieMonotonicUs();
@@ -695,6 +703,12 @@ CONTROLS = [
         if (diag)
             ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
+    }
+    // P11-C3-B2: the root copy submitted ahead - over by now or soon: the device runs it before this frame
+    if (vkAux.pending) {
+        rendererVkAuxFinish();
+        if (!vkActive)
+            return;
     }
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
@@ -709,14 +723,19 @@ CONTROLS = [
     lorie_mutex_unlock(&state->lock, &state->lockingPid);""",
      "tpresentcopy"),
     ("a frame's buffers not listed in flight", "renderer.c",
-     """    if (res == VK_SUCCESS)
+     """    if (res == VK_SUCCESS) {
+        vkAux.chained = false;
         rendererVkInFlight();
+    }
     state->waitForNextFrame = true;""",
-     """    state->waitForNextFrame = true;""",
+     """    if (res == VK_SUCCESS) {
+        vkAux.chained = false;
+    }
+    state->waitForNextFrame = true;""",
      "tpresentcopy"),
     ("a frame's buffers never given back to the X server", "renderer.c",
-     """state->gpuInFlight.pid == getpid() && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
-     """state->gpuInFlight.pid == getpid() && 0 && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     """state->gpuInFlight.pid == getpid() && (__atomic_fetch_and(&state->gpuInFlight.busy, ~list, __ATOMIC_RELEASE) & list))""",
+     """state->gpuInFlight.pid == getpid() && 0 && (__atomic_fetch_and(&state->gpuInFlight.busy, ~list, __ATOMIC_RELEASE) & list))""",
      "tpresentcopy"),
     ("an access CPU-locking an AHB a submitted Vulkan frame uses", "InitOutput.c",
      """            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
@@ -770,12 +789,12 @@ CONTROLS = [
      "tpresentcopy"),
     ("a frame recorded over another process's listed frame", "renderer.c",
      """        inflightUs = lorieMonotonicUs();
-        lorieGpuWaitIdle(state, true, 0);""",
+        rendererVkWaitOthers();""",
      """        inflightUs = lorieMonotonicUs();""",
      "tpresentcopy"),
     ("this process clearing another's list", "renderer.c",
-     """    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n""",
-     """    if (state && __atomic_exchange_n""",
+     """    if (state && state->gpuInFlight.pid == getpid() && (__atomic_fetch_and""",
+     """    if (state && (__atomic_fetch_and""",
      "tpresentcopy"),
     ("Vulkan's tick frame allowed only after the vblanks queued their copies", "InitOutput.c",
      """    if (lorieAhbPerAccess() && !twinned)
@@ -1017,54 +1036,65 @@ CONTROLS = [
      "townership"),
     ("P11-C2: a root copy settled as copied before its fence", "renderer.c",
      """    if (res == VK_SUCCESS) {
-        rendererVkInFlight();
+        if (ahead)
+            rendererVkInFlightAux();
+        else
+            rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
-        if (diag)
-            submittedUs = lorieMonotonicUs();
+        if (w->diag)
+            w->submittedUs = lorieMonotonicUs();
     }""",
      """    if (res == VK_SUCCESS) {
-        rendererVkInFlight();
+        if (ahead)
+            rendererVkInFlightAux();
+        else
+            rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
-        if (diag)
-            submittedUs = lorieMonotonicUs();
-        rendererRootCopySettle(seq, false);
+        if (w->diag)
+            w->submittedUs = lorieMonotonicUs();
+        rendererRootCopySettle(w->seq, false);
     }""",
      "tpresentcopy"),
     ("P11-C2: a root copy's buffers not listed in flight", "renderer.c",
      """    if (res == VK_SUCCESS) {
-        rendererVkInFlight();
+        if (ahead)
+            rendererVkInFlightAux();
+        else
+            rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
-        if (diag)
-            submittedUs = lorieMonotonicUs();
+        if (w->diag)
+            w->submittedUs = lorieMonotonicUs();
     }""",
      """    if (res == VK_SUCCESS) {
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
-        if (diag)
-            submittedUs = lorieMonotonicUs();
+        if (w->diag)
+            w->submittedUs = lorieMonotonicUs();
     }""",
      "tpresentcopy"),
     ("P11-C2: a root copy drawn without the PER_ACCESS answer", "renderer.c",
      """    state->rootCopy.pid = getpid();
-    if (diag)
-        takenUs = lorieMonotonicUs();
+    if (w->diag)
+        w->takenUs = lorieMonotonicUs();
     if (!rendererVkOwnedLocked()) {""",
      """    state->rootCopy.pid = getpid();
-    if (diag)
-        takenUs = lorieMonotonicUs();
+    if (w->diag)
+        w->takenUs = lorieMonotonicUs();
     if (0) {""",
      "tpresentcopy"),
     ("P11-C2: a root copy into a buffer the renderer does not have settled as copied", "renderer.c",
-     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {
-        rendererRootCopySettle(seq, true);""",
-     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {
-        rendererRootCopySettle(seq, false);""",
+     """    if (!src || !dst || lorieCpuReserved(state, w->srcId) || lorieCpuReserved(state, w->dstId)) {
+        rendererRootCopySettle(w->seq, true);""",
+     """    if (!src || !dst || lorieCpuReserved(state, w->srcId) || lorieCpuReserved(state, w->dstId)) {
+        rendererRootCopySettle(w->seq, false);""",
      "tpresentcopy"),
     ("P11-C2: a root copy not made first in the renderer's loop", "renderer.c",
      """        if (state && rendererRootCopyPending()) {
-            if (vkActive)
-                rendererVkRootCopy();
-            else
+            if (!vkActive)
                 rendererRootCopyDecline();
+            else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())
+                rendererVkRootCopyAhead();
+            else
+                rendererVkRootCopy();
         }""",
      """        if (state && rendererRootCopyPending() && !vkActive)
             rendererRootCopyDecline();""",
@@ -1085,8 +1115,8 @@ CONTROLS = [
 # P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: the timings' own controls
 CONTROLS += [
     ("P11-C3: a root copy's fence counted as a frame's", "renderer.c",
-     """            lorieHistAdd(&dg->vkFenceRoot, vkr.fenceWaitUs);""",
-     """            lorieHistAdd(&dg->vkFrameFence, vkr.fenceWaitUs);""",
+     """            lorieHistAdd(&dg->vkFenceRoot, fenceUs);""",
+     """            lorieHistAdd(&dg->vkFrameFence, fenceUs);""",
      "tpresentcopy"),
     ("P11-C3: the copies' own fence counted as the frame's", "renderer.c",
      """            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);    // P11-C3: these copies' own fence""",
@@ -1248,7 +1278,7 @@ CONTROLS += [
      """    if (0) {""",
      "tpresentcopy"),
     ("P11-C3-B1: a root copy into a reserved buffer", "renderer.c",
-     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {""",
+     """    if (!src || !dst || lorieCpuReserved(state, w->srcId) || lorieCpuReserved(state, w->dstId)) {""",
      """    if (!src || !dst) {""",
      "tpresentcopy"),
     ("P11-C3-B1: copies left queued wake the renderer again and again", "renderer.c",
@@ -1267,6 +1297,74 @@ CONTROLS += [
      """        vk->ResetFences(vk->device, 1, &r->frameFence);
         return res;""",
      "tpresentcopy"),
+]
+
+
+# P11-C3-B2, TERMUX_X11_RENDERER_VK_SCHEDULE_OPT: the root copy ahead of the frame - its own controls
+CONTROLS += [
+    ("P11-C3-B2: the frame not chained after the root copy ahead", "renderer.c",
+     """    vkr.chainWait = vkAux.chained;      // P11-C3-B2: on the device after the root copy submitted ahead""",
+     """    vkr.chainWait = false;""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the chain semaphore never signalled", "vk.c",
+     """    if (r->chainSignal)
+        signal[signals++] = r->chain;""",
+     """    if (0)
+        signal[signals++] = r->chain;""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the root copy ahead settled as copied before its fence", "renderer.c",
+     """    vkAux.work = w;
+    vkAux.pending = vkAux.chained = true;""",
+     """    vkAux.work = w;
+    rendererRootCopySettle(w.seq, false);
+    vkAux.pending = vkAux.chained = true;""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the root copy's list kept in flight after its fence", "renderer.c",
+     """        if (ahead)
+            rendererVkAuxDone();
+        else
+            rendererVkFrameDone();""",
+     """        if (!ahead)
+            rendererVkFrameDone();""",
+     "tpresentcopy"),
+    ("P11-C3-B2: a submission over clears every list in flight", "renderer.c",
+     """    if (state && state->gpuInFlight.pid == getpid() && (__atomic_fetch_and(&state->gpuInFlight.busy, ~list, __ATOMIC_RELEASE) & list))""",
+     """    if (state && state->gpuInFlight.pid == getpid() && __atomic_exchange_n(&state->gpuInFlight.busy, 0, __ATOMIC_RELEASE))""",
+     "tpresentcopy"),
+    ("P11-C3-B2: no empty submission consumes the chain semaphore", "renderer.c",
+     """        if (lorieVkChainConsume(&vk, &vkr, state) != VK_SUCCESS)
+            rendererVkFail();""",
+     """        if (0)
+            rendererVkFail();""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the empty submission's fence not waited for", "vk.c",
+     """    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS ||
+        (res = vk->WaitForFences(vk->device, 1, &r->frameFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS ||
+        (res = vk->ResetFences(vk->device, 1, &r->frameFence)) != VK_SUCCESS) {""",
+     """    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS) {""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the X server waiting for the root copy ahead not seen", "renderer.c",
+     """    if (vkAux.pending && __atomic_load_n(&state->rootCopy.waiting, __ATOMIC_ACQUIRE) == vkAux.work.seq) {""",
+     """    if (0) {""",
+     "tpresentcopy"),
+    ("P11-C3-B2: a copy into the root copy's buffer recorded while it runs", "renderer.c",
+     """        if (vkAux.pending && (entry.srcBufferId == vkAux.work.srcId || entry.srcBufferId == vkAux.work.dstId ||""",
+     """        if (0 && (entry.srcBufferId == vkAux.work.srcId || entry.srcBufferId == vkAux.work.dstId ||""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the X server's wait for the root copy not said", "InitOutput.c",
+     """        __atomic_store_n(&st->rootCopy.waiting, seq, __ATOMIC_RELEASE);    // P11-C3-B2: a renderer may finish it first""",
+     """""",
+     "townership"),
+    ("P11-C3-B2: a frame waits for this process's own lists (the root copy ahead: for good)", "renderer.c",
+     """static void rendererVkWaitOthers(void) {
+    if (state->gpuInFlight.pid != getpid())""",
+     """static void rendererVkWaitOthers(void) {
+    if (1)""",
+     "tpresentcopy"),
+    ("P11-C3-B2: the root copy ahead without a frame to follow", "renderer.c",
+     """            else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())""",
+     """            else if (state->backend.vkScheduleOpt)""",
+     "twiring"),
 ]
 
 def copy_sources(dst):

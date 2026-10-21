@@ -105,7 +105,8 @@ struct fake_state {
     int lock, lockingPid;
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
-    struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
+    struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
+             uint32_t auxCount; uint64_t auxIds[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;     /* aux: P11-C3-B2 */
     struct { uint32_t count; uint64_t ids[LORIE_CPU_ACCESS_MAX]; volatile uint32_t releases, waiter; } cpuAccess;   /* P11-C3-B1 */
     uint64_t rootWindowTextureID;
     struct {                    /* lorie.h rootCopy (P11-C2) */
@@ -115,6 +116,7 @@ struct fake_state {
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
         volatile uint64_t doneUs;   /* P11-C3 */
+        volatile uint32_t waiting;  /* P11-C3-B2 */
     } rootCopy;
 };
 struct fake_pvfb {
@@ -197,8 +199,10 @@ static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
         return 0;
     }
     if (checked && word == &checked->state->rootCopy.done) {
-        /* P11-C2: the X server waiting for a root copy - the renderer's moment */
+        /* P11-C2: the X server waiting for a root copy - the renderer's moment; P11-C3-B2: saying so */
         CHECK(op == FUTEX_WAIT && *word == value, "%s: not a futex wait on the root copy's word", runName);
+        CHECK(checked->state->rootCopy.waiting == checked->state->rootCopy.seq, "%s: waits for root copy %u, says %u", runName,
+              checked->state->rootCopy.seq, checked->state->rootCopy.waiting);
         if (++rootWaits > 200) {
             CHECK(0, "%s: a wait for a root copy that does not end", runName);
             checked->state->rootCopy.failed = checked->state->rootCopy.done = checked->state->rootCopy.seq;
@@ -1373,6 +1377,7 @@ int main(void) {
                   "root GPU copy, %s: waited %d times (want %s), %u CPU copies instead, taken back %d", cases[k].name, rootRendererCalls,
                   cases[k].waited ? "some" : "none", rootGpuState.diag.rootCpuFallbacks - fallbacks, rootGpuState.rootCopy.cancelled == 1);
             CHECK(!cases[k].waited || rootGpuState.diag.rootCopyCpuBlockUs > 0, "root GPU copy, %s: no time waiting counted", cases[k].name);
+            CHECK(rootGpuState.rootCopy.waiting == 0, "root GPU copy, %s: still says it waits", cases[k].name);
         }
         rootConnection = rootSurface = true;
 

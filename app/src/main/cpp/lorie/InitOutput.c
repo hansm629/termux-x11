@@ -428,6 +428,10 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_EXA_LOCK_OPT=1 has a PER_ACCESS AHB access reserve the AHB for itself instead of holding
     // the shared lock - and so the renderer's frames - through the CPU drawing (loriePrepareAccess, lorie.h cpuAccess).
     lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");
+    // Experimental: TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1 has the renderer submit root double buffering's GPU copy
+    // ahead of the frame, which waits for it on the device instead of the renderer waiting for its fence (renderer.c).
+    lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&
+                                               !strcmp(getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT"), "1");
 }
 
 // A name as one word for a log line: a path's last part, up to its first space, anything else odd as '_'.
@@ -959,6 +963,7 @@ static void lorieRootCopyWait(Bool takeBack) {
     while ((done = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE)) != seq) {
         struct timespec slice = { 0, 33 * 1000000 };
         waited = TRUE;
+        __atomic_store_n(&st->rootCopy.waiting, seq, __ATOMIC_RELEASE);    // P11-C3-B2: a renderer may finish it first
         if (__atomic_load_n(&st->rootCopy.taken, __ATOMIC_ACQUIRE) != seq) {
             if (takeBack || held || !lorieConnectionAlive() || !lorieRendererAvailable() || lorieOwnershipAsked()) {
                 if (!held)
@@ -979,6 +984,8 @@ static void lorieRootCopyWait(Bool takeBack) {
         }
         syscall(SYS_futex, &st->rootCopy.done, FUTEX_WAIT, done, &slice, NULL, 0);
     }
+    if (waited)
+        __atomic_store_n(&st->rootCopy.waiting, 0, __ATOMIC_RELAXED);
     if (done == seq && __atomic_load_n(&st->rootCopy.failed, __ATOMIC_RELAXED) == seq)
         copy = TRUE;
     blockedUs = GetTimeInMicros() - startUs;
@@ -1279,7 +1286,8 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s exa_lock_opt=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s exa_lock_opt=%s "
+              "vk_schedule_opt=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -1292,12 +1300,15 @@ static void lorieLogRendererDiag(void) {
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
         !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off",
-        pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off");
+        pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off", pvfb->state->backend.vkScheduleOpt ? "on" : "off");
     // P11-C3-B: what the scheduling options did - B1's reservations instead of the shared lock, and the copies the
     // renderer left queued for one
     log(INFO, "XlorieSchedule: exa_lock_opt=%s x_access_reserved=%llu(+%llu) x_access_reserve_full=%llu(+%llu) "
-              "copies_deferred=%llu(+%llu) copies_deferred_wakes=%llu(+%llu)",
-        pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes));
+              "copies_deferred=%llu(+%llu) copies_deferred_wakes=%llu(+%llu) vk_schedule_opt=%s root_ahead=%llu(+%llu) "
+              "root_ahead_x_waiting=%llu(+%llu) root_chain_consumed=%llu(+%llu) root_ahead_unavailable=%llu(+%llu)",
+        pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes),
+        pvfb->state->backend.vkScheduleOpt ? "on" : "off", TD(rootAhead), TD(rootAheadXWaiting), TD(rootChainConsumed),
+        TD(rootAheadUnavailable));
     // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
     log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
               "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "

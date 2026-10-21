@@ -194,12 +194,18 @@ recipes = {
         + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {")
         + func(R, "static void rendererVkInFlight(void) {")
+        + func(R, "static void rendererVkInFlightAux(void) {")
+        + func(R, "static void rendererVkListDone(uint32_t list) {")
         + func(R, "static void rendererVkFrameDone(void) {")
+        + func(R, "static void rendererVkAuxDone(void) {")
         + func(R, "static void rendererVkIdle(void) {")
         + func(R, "static struct lorie_vk_quad rendererVkCopyQuad(LorieGpuCopyRect r, int16_t xOff, int16_t yOff, const LorieBuffer_Desc *src,")
         + func(R, "static void rendererVkCountTransfer(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
         + func(R, "static bool rendererVkCopyBgraIntoRgbx(const LorieGpuCopyEntry *entry, const struct lorie_vk_image *s, const struct lorie_vk_image *d) {")
         + func(R, "static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
+        # P11-C3-B2: the others' frames; a root copy ahead of the frame
+        + func(R, "static void rendererVkWaitOthers(void) {")
+        + span(R, "struct rendererVkRootWork {", "static struct { struct rendererVkRootWork work; bool pending, chained; } vkAux;")
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
         + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
@@ -213,8 +219,15 @@ recipes = {
         + func(R, "static bool rendererRootCopyPending(void) {")
         + func(R, "static void rendererRootCopySettle(uint32_t seq, bool failed) {")
         + func(R, "static void rendererRootCopyDecline(void) {")
+        + func(R, "static bool rendererVkRootCopySubmit(struct rendererVkRootWork *w, bool ahead) {")
+        + func(R, "static void rendererVkRootCopyEnd(struct rendererVkRootWork *w, bool ahead) {")
         + func(R, "static void rendererVkRootCopy(void) {")
-        + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {"),
+        + func(R, "static void rendererVkRootCopyAhead(void) {")
+        + func(R, "static void rendererVkAuxFinish(void) {")
+        + func(R, "static void rendererVkAuxSettle(void) {")
+        + func(R, "static void rendererVkAuxForget(void) {")
+        + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
+        + func(R, "static bool rendererVkFrameWanted(void) {"),
     # P10-S0: the Present paths that end a presentation whose GPU copy may still run, from the patched xserver -
     # tpresentsafety.c: the vblank as present_priv.h has it, execute (and its copy and post), re-execute, scrap,
     # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that

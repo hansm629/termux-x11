@@ -28,7 +28,11 @@ its request before it wakes the renderer; a Vulkan frame is timed only once pres
 pacing intervals start over with another session, window or device, and a root copy counts as ahead of the frame only
 in the loop pass that made it. P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT read when the server state is made, "1" only; copies
 left queued for a reservation are no reason for the renderer to run again until one is let go, its wait for that
-bounded, and they are forgotten with the session.
+bounded, and they are forgotten with the session. P11-C3-B2: TERMUX_X11_RENDERER_VK_SCHEDULE_OPT read when the server
+state is made, "1" only; the root copy submitted ahead only for a frame this pass draws, settled at the end of the pass
+should none follow; the frame waits first should the X server already wait for it, is submitted waiting for it on the
+device, and waits for its fence only after that submission; no renderer path waits for this process's own lists;
+teardown ends the second submission's list and settles a root copy left pending.
 
 usage: twiring.py <lorie source dir>
 """
@@ -180,6 +184,22 @@ in_order("the bounded wait for a release", loop, "while (rendererShouldWait(&wai
          "pthread_cond_wait(stateCond, &stateLock);")
 in_order("copies left queued forgotten with the session", loop, "if (stateChanged) {", "deferredCopies = false;", "if (windowChanged)")
 check("&& !rendererCopiesStillDeferred();\n        if (vkActive) {" in loop, "the loop runs copies left queued for a reservation alone, again and again")
+
+# P11-C3-B2: the scheduling's wiring
+check('lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&' in init and
+      '!strcmp(getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT"), "1");' in init, "OsVendorInit does not read TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1")
+in_order("root copy ahead of a frame only", loop, "if (state && rendererRootCopyPending()) {",
+         "else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())", "rendererVkRootCopyAhead();", "rendererVkRootCopy();",
+         "if (state && rendererVkFrameWanted())", "rendererVkRedraw(&waitingForBuffers);", "if (vkAux.pending || vkAux.chained)",
+         "rendererVkAuxSettle();")
+in_order("the frame after a root copy ahead", redraw, "if (vkAux.pending && __atomic_load_n(&state->rootCopy.waiting, __ATOMIC_ACQUIRE) == vkAux.work.seq) {",
+         "rendererVkAuxFinish();", "lorieVkAcquire(", "vkr.chainWait = vkAux.chained;", "lorieVkFrameQueue(", "vkAux.chained = false;",
+         "lorie_mutex_unlock(&state->lock", "rendererVkAuxFinish();", "lorieVkFrameWait(")
+for what, body in (("frame", redraw), ("copies alone", alone), ("root copy", func(R, "static bool rendererVkRootCopySubmit(struct rendererVkRootWork *w, bool ahead) {"))):
+    check("lorieGpuWaitIdle(" not in body and "rendererVkWaitOthers();" in body,
+          "the %s may wait for this process's own list (a root copy ahead)" % what)
+in_order("teardown and the second submission", func(R, "static void rendererVkTeardown(void) {"), "rendererVkIdle();", "rendererVkFrameDone();",
+         "rendererVkAuxDone();", "lorieVkRendererDestroy(&vk, &vkr);", "rendererVkAuxForget();")
 
 selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {")
 check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,

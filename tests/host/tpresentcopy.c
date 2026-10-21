@@ -187,10 +187,12 @@ static void lorie_mutex_lock(volatile int *m, volatile int *pid);
 static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pid = 0; }
 /* how things stood when the renderer gave up: its frame's fence waited for, its buffers out of the in-flight list */
 static struct { bool fencePending, busy; } atFail;
+static void rendererVkAuxForget(void);
 static void rendererVkFail(void) {
     vkFailures++;
     atFail.fencePending = emu.fencePending;
     atFail.busy = state->gpuInFlight.busy;
+    rendererVkAuxForget();      /* P11-C3-B2: as rendererVkTeardown does, once the device is idle */
 }
 /* the X server woken for a finished batch: how things stood at that moment */
 static struct { int count; bool cleared, fenceWaited, released; uint64_t completed; int presents, fenceWaits; } notified;
@@ -239,9 +241,21 @@ static int gpuMs;                   /* how long the device takes, at the next fe
 static int fenceMs[8], fenceMsCount, fenceMsAt;     /* P11-C3: how long each of the next fences takes, in order (then gpuMs) */
 static volatile bool gpuFinished;
 static volatile bool otherOver;     /* the frame another submitter listed is over (otherSubmitter) */
+/* P11-C3-B2: the order the frame's and the second submission's fences were waited for, and what stood then */
+static struct { int n; VkFence fence[8]; bool rootDone[8], auxListed[8], dstInFlight[8], rootInFlight[8]; uint32_t submits[8]; } fenceLog;
+static uint64_t fenceLogDst, fenceLogRoot;
 static void lookAtFence(VkFence fence) {
     if (fence != vkr.frameFence)
         return;             /* a swapchain image's */
+    if (fenceLog.n < 8) {
+        fenceLog.fence[fenceLog.n] = fence;
+        fenceLog.rootDone[fenceLog.n] = state->rootCopy.done == state->rootCopy.seq;
+        fenceLog.auxListed[fenceLog.n] = (state->gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX) != 0;
+        fenceLog.dstInFlight[fenceLog.n] = lorieGpuInFlight(state, fenceLogDst);
+        fenceLog.rootInFlight[fenceLog.n] = lorieGpuInFlight(state, fenceLogRoot);
+        fenceLog.submits[fenceLog.n] = (uint32_t) emu.submits;
+        fenceLog.n++;
+    }
     atFence.waits++;
     atFence.lockHeld |= state->lock != 0;
     atFence.otherOver = otherOver;
@@ -1500,6 +1514,244 @@ int main(void) {
                   "B1 published root let go: held %d, %u presented", vkr.held, st.diag.vkFramesPresented - presented);
         }
         st.cpuAccess.waiter = 0;
+    }
+
+    /* P11-C3-B2, TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1: the root copy submitted ahead of the frame, in the second
+     * submission (its own command buffer, fence and list in flight), signalling the chain semaphore; the frame recorded
+     * meanwhile and submitted waiting for it on the device. The root copy's fence waited for first, then the frame's:
+     * settled as copied at its own fence - its list (the buffer the X server draws into next) out of flight while the
+     * frame still runs; the frame waiting on the CPU for no more than its submission (after_root), not for the root
+     * copy's 10 ms. The X server already waiting for it: waited for before the frame. No frame after it, or a frame
+     * that returns early: its fence waited for and an empty submission consumes the semaphore - which works again
+     * after. A queued copy using its buffers: left for the next pass. Its submission failing: not copied; the frame's
+     * failing: copied, then Vulkan given up; its fence lost: not copied. The second submission's objects not made: the
+     * root copy as before, counted. With P11-C1's copies ahead too. */
+    {
+        LorieBuffer *ra = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 640, 480), *rb = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 640, 480);
+        LoriePixmapPriv rbP = { rb };
+        PixmapRec rbPix = { { 640, 480 }, &rbP };
+        static const LorieGpuCopyRect one[1] = { { 3, 5, 40, 30 } };
+        volatile struct lorie_renderer_diag *dg = &st.diag;
+        uint32_t ahead0, presented, submits;
+        int fails0 = vkFailures, early = emu.earlyPresents;
+        struct histMark afterRoot0, fenceRoot0;
+        uint64_t s1 = 0;
+        void *db1 = NULL;
+
+        ra->registered = rb->registered = true;
+        own(45);
+        st.backend.vkScheduleOpt = 1;
+        st.backend.vkFrameDiag = 1;
+        fenceLogDst = rb->desc.id, fenceLogRoot = root->desc.id;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        st.gpuInFlight.busy = 0;
+
+        /* ahead, then the frame */
+        ahead0 = dg->rootAhead;
+        presented = dg->vkFramesPresented;
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1;
+        st.waitForNextFrame = 0;            /* the tick */
+        CHECK(rendererVkFrameWanted(), "B2: no frame wanted after the swap");
+        afterRoot0 = mark(&dg->vkFrameAfterRoot), fenceRoot0 = mark(&dg->vkFenceRoot);
+        submits = (uint32_t) emu.submits;
+        fenceMs[0] = 10, fenceMs[1] = 0, fenceMsCount = 2, fenceMsAt = 0;
+        fenceLog.n = 0;
+        pushes = 0;
+        rendererVkRootCopyAhead();
+        CHECK(vkAux.pending && vkAux.chained && cmdAux.pending && dg->rootAhead == ahead0 + 1 && st.rootCopy.taken == rootSeq &&
+              st.rootCopy.done != rootSeq && (st.gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX) && st.gpuInFlight.auxCount == 2 &&
+              lorieGpuInFlight(state, ra->desc.id) && lorieGpuInFlight(state, rb->desc.id) && emu.submits == submits + 1 &&
+              vkRootCopyBusyUs < 10000 && st.lock == 0,
+              "B2 ahead: pending %d chained %d, aux running %d, taken %d done %d, aux listed %d (%u), %ld submissions, busy %llu us",
+              vkAux.pending, vkAux.chained, cmdAux.pending, st.rootCopy.taken == rootSeq, st.rootCopy.done == rootSeq,
+              (st.gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX) != 0, st.gpuInFlight.auxCount, (long) (emu.submits - submits),
+              (unsigned long long) vkRootCopyBusyUs);
+        rendererVkRedraw(&waiting);
+        fenceMsCount = 0;
+        st.gpuInFlight.busy = 0;
+        CHECK(vkFailures == fails0 && emu.violations == 0 && dg->vkFramesPresented == presented + 1 && !vkAux.pending && !vkAux.chained &&
+              st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && emu.submits == submits + 2,
+              "B2 frame: %d failures, %d violations, presented %u, pending %d chained %d, done %d failed %d, %ld submissions",
+              vkFailures - fails0, emu.violations, dg->vkFramesPresented - presented, vkAux.pending, vkAux.chained,
+              st.rootCopy.done == rootSeq, st.rootCopy.failed == rootSeq, (long) (emu.submits - submits));
+        CHECK(fenceLog.n == 2 && fenceLog.fence[0] != fenceLog.fence[1] && fenceLog.submits[0] == submits + 2 && !fenceLog.rootDone[0] &&
+              fenceLog.rootDone[1] && !fenceLog.auxListed[1] && !fenceLog.dstInFlight[1] && fenceLog.rootInFlight[1],
+              "B2 frame: %d fences (want the root copy's, then the frame's), the frame submitted before the first %d, at the frame's "
+              "fence settled %d, aux listed %d, its buffer in flight %d, the root in flight %d", fenceLog.n,
+              fenceLog.n > 0 && fenceLog.submits[0] == submits + 2, fenceLog.n > 1 && fenceLog.rootDone[1],
+              fenceLog.n > 1 && fenceLog.auxListed[1], fenceLog.n > 1 && fenceLog.dstInFlight[1], fenceLog.n > 1 && fenceLog.rootInFlight[1]);
+        CHECK(pushes >= 2 && fabsf((pushed[0].rect[0] + 1.f) * 640.f / 2.f - 3.f) < 1e-3f && emu.drawnInto[(emu.draws - 2) % 64] == rb->desc.buffer &&
+              emu.drawnFrom[(emu.draws - 1) % 64] == root->desc.buffer, "B2 frame: not the root copy, then the frame");
+        CHECK(newSamples(&dg->vkFrameAfterRoot, afterRoot0) == 1 && newUs(&dg->vkFrameAfterRoot, afterRoot0) < 10000 &&
+              newSamples(&dg->vkFenceRoot, fenceRoot0) == 1 && newUs(&dg->vkFenceRoot, fenceRoot0) >= 10000,
+              "B2 frame: after_root %llu us, the root copy's fence %llu us", (unsigned long long) newUs(&dg->vkFrameAfterRoot, afterRoot0),
+              (unsigned long long) newUs(&dg->vkFenceRoot, fenceRoot0));
+
+        /* the X server already waiting: the root copy waited for before the frame */
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1;
+        rendererVkRootCopyAhead();
+        st.rootCopy.waiting = rootSeq;
+        submits = (uint32_t) emu.submits;
+        fenceLog.n = 0;
+        rendererVkRedraw(&waiting);
+        st.rootCopy.waiting = 0;
+        st.gpuInFlight.busy = 0;
+        CHECK(dg->rootAheadXWaiting == 1 && fenceLog.n == 2 && fenceLog.submits[0] == submits && st.rootCopy.done == rootSeq &&
+              !vkAux.pending && !vkAux.chained && emu.violations == 0 && vkFailures == fails0,
+              "B2 X waiting: counted %u, %d fences, the root copy's before the frame's submission %d, done %d",
+              dg->rootAheadXWaiting, fenceLog.n, fenceLog.n > 0 && fenceLog.submits[0] == submits, st.rootCopy.done == rootSeq);
+
+        /* no frame after it: waited for, the semaphore consumed by an empty submission - and it works again after */
+        rootAsk(ra, rb, one, 1);
+        rendererVkRootCopyAhead();
+        submits = (uint32_t) emu.submits;
+        rendererVkAuxSettle();
+        CHECK(!vkAux.pending && !vkAux.chained && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq &&
+              dg->rootChainConsumed == 1 && emu.submits == submits + 1 && emu.violations == 0 && !emu.fencePending,
+              "B2 no frame: pending %d chained %d, done %d, consumed %u, %ld submissions", vkAux.pending, vkAux.chained,
+              st.rootCopy.done == rootSeq, dg->rootChainConsumed, (long) (emu.submits - submits));
+        /* a frame that returns early (the root not found): likewise */
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1;
+        rendererVkRootCopyAhead();
+        st.rootWindowTextureID = 999999;
+        rendererVkRedraw(&waiting);
+        st.rootWindowTextureID = root->desc.id;
+        rendererVkAuxSettle();
+        waiting = false;
+        CHECK(st.rootCopy.done == rootSeq && dg->rootChainConsumed == 2 && emu.violations == 0 && vkFailures == fails0,
+              "B2 early return: done %d, consumed %u", st.rootCopy.done == rootSeq, dg->rootChainConsumed);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(emu.violations == 0 && vkFailures == fails0, "B2: the frame after a consumed semaphore");
+
+        /* a queued copy into the root copy's buffer: not in the frame, copied by the next pass */
+        rootAsk(ra, rb, one, 1);
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rbPix, &two, 1, 1, &s1, &db1), "B2: not queued");
+        st.drawRequested = 1;
+        rendererVkRootCopyAhead();
+        rendererVkRedraw(&waiting);
+        rendererVkAuxSettle();
+        st.gpuInFlight.busy = 0;
+        CHECK(!lorieGpuCopyIsDone(s1) && st.rootCopy.done == rootSeq && emu.violations == 0, "B2: a copy into the root copy's buffer recorded "
+              "while the root copy ran (done %d)", lorieGpuCopyIsDone(s1));
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(s1) && emu.violations == 0, "B2: the copy left for the next pass not made");
+        lorieGpuCopyAck(&srcPix, db1);
+        st.gpuInFlight.busy = 0;
+
+        /* its submission failing: not copied, Vulkan given up */
+        rootAsk(ra, rb, one, 1);
+        emu.submitResult = VK_ERROR_DEVICE_LOST;
+        rendererVkRootCopyAhead();
+        emu.submitResult = VK_SUCCESS;
+        CHECK(!vkAux.pending && st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && vkFailures == fails0 + 1 &&
+              !(st.gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX), "B2 submission failing: pending %d, failed %d, %d failures",
+              vkAux.pending, st.rootCopy.failed == rootSeq, vkFailures - fails0);
+        vkFailures = fails0;
+        vkr.chainSignal = false;        /* the teardown would have made everything again */
+        emu.fencePending = false;
+
+        /* the frame's submission failing: the root copy copied all the same, then Vulkan given up */
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1;
+        rendererVkRootCopyAhead();
+        emu.submitFailAfter = 1;
+        rendererVkRedraw(&waiting);
+        emu.submitFailAfter = 0;
+        CHECK(!vkAux.pending && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && vkFailures == fails0 + 1,
+              "B2 frame failing: pending %d, done %d failed %d, %d failures", vkAux.pending, st.rootCopy.done == rootSeq,
+              st.rootCopy.failed == rootSeq, vkFailures - fails0);
+        vkFailures = fails0;
+        vkAux.chained = false;
+        vkr.chainWait = false;          /* the teardown would have made the semaphore again */
+        emu.fencePending = false;
+        st.gpuInFlight.busy = 0;
+        semaphoreSignalled(vkr.chain, 0);  /* the one the root copy signalled and no frame waited for: gone with the teardown */
+
+        /* its fence lost: not copied, Vulkan given up */
+        rootAsk(ra, rb, one, 1);
+        rendererVkRootCopyAhead();
+        emu.fenceResult = emu.idleResult = VK_ERROR_DEVICE_LOST;
+        rendererVkAuxSettle();
+        emu.fenceResult = emu.idleResult = VK_SUCCESS;
+        CHECK(!vkAux.pending && st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && vkFailures == fails0 + 1 &&
+              !(st.gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX), "B2 fence lost: pending %d, failed %d, %d failures, aux listed %d",
+              vkAux.pending, st.rootCopy.failed == rootSeq, vkFailures - fails0, (st.gpuInFlight.busy & LORIE_GPU_IN_FLIGHT_AUX) != 0);
+        vkFailures = fails0;
+        vkAux.chained = false;
+        vkr.chainWait = false;
+        semaphoreSignalled(vkr.chain, 0);
+        emu.fencePending = false;
+        st.gpuInFlight.busy = 0;
+        st.diag.lastFallbackClass = st.diag.lastFallbackReason = 0;
+
+        /* with P11-C1's copies ahead too: three submissions, two of them running at once at most */
+        st.backend.vkSubmitOpt = 1;
+        rootAsk(ra, rb, one, 1);
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &s1, &db1), "B2+C1: not queued");
+        st.drawRequested = 1;
+        submits = (uint32_t) emu.submits;
+        rendererVkRootCopyAhead();
+        fenceLog.n = 0;
+        rendererVkRedraw(&waiting);
+        rendererVkAuxSettle();
+        st.gpuInFlight.busy = 0;
+        CHECK(fenceLog.n == 3 && fenceLog.auxListed[0] && fenceLog.auxListed[1] && !fenceLog.auxListed[2],
+              "B2+C1: the copies ahead over, the root copy's list %s", fenceLog.n == 3 && fenceLog.auxListed[1] ? "kept" : "cleared too");
+        CHECK(lorieGpuCopyIsDone(s1) && st.rootCopy.done == rootSeq && emu.submits == submits + 3 && emu.violations == 0 &&
+              vkFailures == fails0, "B2+C1: done %d, root done %d, %ld submissions", lorieGpuCopyIsDone(s1), st.rootCopy.done == rootSeq,
+              (long) (emu.submits - submits));
+        lorieGpuCopyAck(&bgraPix, db1);
+        st.backend.vkSubmitOpt = 0;
+        earlyWithOption += emu.earlyPresents - early;
+
+        /* B1 and B2 together: a reserved copy left queued, the root copy ahead and the frame as without it */
+        rootAsk(ra, rb, one, 1);
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &s1, &db1), "B1+B2: not queued");
+        st.cpuAccess.ids[0] = redirected->desc.id, st.cpuAccess.count = 1;
+        presented = dg->vkFramesPresented;
+        st.drawRequested = 1;
+        rendererVkRootCopyAhead();
+        rendererVkRedraw(&waiting);
+        rendererVkAuxSettle();
+        st.gpuInFlight.busy = 0;
+        CHECK(!lorieGpuCopyIsDone(s1) && rendererCopiesStillDeferred() && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq &&
+              dg->vkFramesPresented == presented + 1 && emu.violations == 0 && vkFailures == fails0,
+              "B1+B2: copy done %d (want not), deferred %d, root done %d, presented %u", lorieGpuCopyIsDone(s1),
+              rendererCopiesStillDeferred(), st.rootCopy.done == rootSeq, dg->vkFramesPresented - presented);
+        st.cpuAccess.count = 0;
+        st.cpuAccess.releases++;
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(s1) && emu.violations == 0, "B1+B2: not copied once let go");
+        lorieGpuCopyAck(&bgraPix, db1);
+        st.cpuAccess.waiter = 0;
+        st.gpuInFlight.busy = 0;
+
+        /* the second submission's objects not made: the root copy as before, counted */
+        {
+            struct lorie_slot_saved { struct lorie_vk_slot aux; VkSemaphore chain; } saved = { vkr.aux, vkr.chain };
+            memset(&vkr.aux, 0, sizeof vkr.aux);
+            vkr.chain = VK_NULL_HANDLE;
+            cmdAux.allocated = true;    /* the pool has no other to give */
+            emu.auxCmdFail = 1;
+            rootAsk(ra, rb, one, 1);
+            rendererVkRootCopyAhead();
+            emu.auxCmdFail = 0;
+            CHECK(dg->rootAheadUnavailable == 1 && !vkAux.pending && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq &&
+                  emu.violations == 0, "B2 unavailable: counted %u, pending %d, done %d", dg->rootAheadUnavailable, vkAux.pending,
+                  st.rootCopy.done == rootSeq);
+            vkr.aux = saved.aux;
+            vkr.chain = saved.chain;
+        }
+        st.backend.vkScheduleOpt = 0;
+        st.backend.vkFrameDiag = 0;
+        ra->registered = rb->registered = false;
+        fenceLogDst = fenceLogRoot = 0;
     }
 
     /* P11-C3: the pacing intervals from given stamps (rendererVkFrameTimed): the first frame none - no false hitch;

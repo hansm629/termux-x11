@@ -203,6 +203,8 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
 #define LORIE_GPU_IN_FLIGHT_MAX 32      /* AHBs one Vulkan frame may use (vk.h LORIE_VK_MAX_FRAME_IMAGES) */
 #define LORIE_CPU_ACCESS_MAX 8          /* P11-C3-B1: AHBs the X server may hold reserved at once (cpuAccess) */
+#define LORIE_GPU_IN_FLIGHT_MAIN 1u     /* gpuInFlight.busy: the renderer's (first) submission's list, ids */
+#define LORIE_GPU_IN_FLIGHT_AUX 2u      /* P11-C3-B2: its second submission's (a root copy's), auxIds */
 
 typedef struct {
     uint64_t serial;
@@ -281,6 +283,7 @@ struct lorie_backend_control {
     volatile uint8_t vkTransferCopy;            /* X: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1 - experimental: Present copies
                                                  * by vkCmdCopyImage where that gives what the shader copy gives */
     volatile uint8_t vkFrameDiag;               /* X: TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 - P11-C3's timings (lorie_hist) */
+    volatile uint8_t vkScheduleOpt;             /* X: TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1 - P11-C3-B2 (renderer.c) */
     volatile uint8_t vkSubmitOpt;               /* X: TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1 - experimental (renderer.c
                                                  * rendererVkRedraw): the copies queued go ahead of a frame, in a
                                                  * submission of their own, in every present mode; a frame with none of
@@ -502,6 +505,11 @@ struct lorie_renderer_diag {
      * reservation instead of `lock`, and those that held `lock` because no reservation was free; the renderer's
      * passes that left a copy queued for a reserved AHB, and the X server's wakes of a renderer that did. */
     volatile uint32_t xAccessReserved, xAccessReserveFull, copiesDeferred, copiesDeferredWakes;
+    /* P11-C3-B2 (TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1), always counted: root copies submitted ahead of the frame (the
+     * frame chained after them on the device); of those, waited for first because the X server already waited for
+     * them; chain semaphores no frame waited for (an empty submission did); and root copies made the old way because
+     * the second submission's objects could not be made. */
+    volatile uint32_t rootAhead, rootAheadXWaiting, rootChainConsumed, rootAheadUnavailable;
 
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
      * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer
@@ -588,12 +596,17 @@ struct lorie_shared_server_state {
      * `pid` no longer exists (lorieGpuWaitIdle clears it then). Nothing else clears it: a lost connection or
      * elapsed time says nothing of the device. Under PER_ACCESS the X server, holding `lock`, CPU-locks no AHB
      * listed here while `busy`: the device owns those (FOREIGN ownership, vk.h) until the frame is over.
+     * P11-C3-B2: the renderer may have two submissions running - a root copy submitted ahead of the frame, in its own
+     * list (auxIds) - each list in effect while its bit of `busy` is set (LORIE_GPU_IN_FLIGHT_*), each cleared on its
+     * own once that submission is over.
      */
     struct {
         volatile uint32_t busy;
         volatile pid_t pid;
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
+        uint32_t auxCount;
+        uint64_t auxIds[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
 
     /*
@@ -631,6 +644,7 @@ struct lorie_shared_server_state {
         volatile pid_t pid;
         uint64_t srcId, dstId, queuedUs;
         volatile uint64_t doneUs;   /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: when the renderer settled `done` */
+        volatile uint32_t waiting;  /* P11-C3-B2: X - the request it waits for now (lorieRootCopyWait), else 0 */
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
     } rootCopy;
@@ -709,12 +723,15 @@ struct lorie_shared_server_state {
 
 // Whether AHB `id` (any id, 0 as well - LorieBuffer ids start at 0) is used by a submitted Vulkan frame not over.
 static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared_server_state *st, uint64_t id) {
-    uint32_t i;
-    if (!__atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE))
-        return false;
-    for (i = 0; i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
-        if (st->gpuInFlight.ids[i] == id)
-            return true;
+    uint32_t i, busy = __atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE);
+    if (busy & LORIE_GPU_IN_FLIGHT_MAIN)
+        for (i = 0; i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
+            if (st->gpuInFlight.ids[i] == id)
+                return true;
+    if (busy & LORIE_GPU_IN_FLIGHT_AUX)
+        for (i = 0; i < st->gpuInFlight.auxCount && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
+            if (st->gpuInFlight.auxIds[i] == id)
+                return true;
     return false;
 }
 

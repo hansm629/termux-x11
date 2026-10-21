@@ -10,13 +10,14 @@ XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=G
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
                 x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
                 x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off vk_frame_diag=on|off
-                exa_lock_opt=on|off
+                exa_lock_opt=on|off vk_schedule_opt=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
 XlorieVkTiming: acquire results, acquire/submit/fence/present times, copies_ahead, early_presents, self-test, device, present mode
 XlorieRootCopy: root_gpu_copy=off|on|fallback, the root double buffering copies by the renderer's GPU (P11-C2)
-XlorieSchedule: exa_lock_opt=on|off x_access_reserved x_access_reserve_full copies_deferred copies_deferred_wakes (P11-C3-B)
+XlorieSchedule: exa_lock_opt=on|off x_access_reserved x_access_reserve_full copies_deferred copies_deferred_wakes
+                vk_schedule_opt=on|off root_ahead root_ahead_x_waiting root_chain_consumed root_ahead_unavailable (P11-C3-B)
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -219,6 +220,28 @@ before.
 `XlorieSchedule`: `x_access_reserved` - accesses made under a reservation; `x_access_reserve_full` - those that held
 the lock because none was free; `copies_deferred` - renderer passes that left a copy queued for a reservation;
 `copies_deferred_wakes` - the X server's wakes of a renderer that did.
+
+### The root copy ahead of the frame (P11-C3-B2, `TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1`)
+
+Experimental, off by default; separate from `TERMUX_X11_RENDERER_VK_SUBMIT_OPT` (P11-C1). With root double buffering's
+GPU copy (`TERMUX_X11_RENDERER_ROOT_GPU_COPY=1`) every tick that swapped has the renderer make that copy first, and
+before this option the frame that follows was recorded only once the copy's fence had been waited for on the CPU
+(`after_root_us`, about 0.6 ms on average and up to 2.3 ms on the S24+). With the option, when the same loop pass
+also draws a frame, the copy is submitted - as early as before - in a second submission of its own (its own command
+buffer, descriptor pool and fence, and its own list of buffers in flight, `gpuInFlight` `auxIds`), signalling a binary
+semaphore the frame's submission then waits for on the device (Semaphore Waiting: the frame runs after the copy, both
+on one queue). The renderer does not wait for the copy's fence until the frame is submitted; it then waits for the
+copy's fence and settles it (the X server may go on: its list is cleared then, while the frame still runs), then for
+the frame's. Should the X server already be waiting for the copy when the frame starts, the copy is waited for first;
+should no frame follow in that pass (or one that returns early), the copy is waited for and an empty submission waits
+for the semaphore, so that it is unsignalled before it is signalled again. A copy queued in the meantime that would
+use one of the root copy's two buffers is left for the next pass. If the second submission's objects cannot be made,
+the copy is made as before. Nothing else changes: one frame at a time, the frame's fence waited for before it is
+presented (unless P11-C1's option says otherwise), the Present copies' completions as before.
+
+`XlorieSchedule`: `root_ahead` - root copies submitted ahead of a frame; `root_ahead_x_waiting` - of those, waited for
+first because the X server already waited; `root_chain_consumed` - semaphores no frame waited for (the empty
+submission did); `root_ahead_unavailable` - root copies made the old way for want of the second submission's objects.
 
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under

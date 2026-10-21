@@ -210,6 +210,21 @@ struct lorie_vk_quad {          /* the shaders' push constants: see shaders/quad
 #define LORIE_VK_QUAD_SWIZZLE 1u    /* red and blue swapped: GLES's .bgra program */
 #define LORIE_VK_QUAD_OPAQUE 2u     /* alpha written as one */
 
+/*
+ * P11-C3-B2 (TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1): one submission's own objects - its command buffer, descriptor
+ * pool and fence - and what it recorded: the renderer's second one (lorie_vk_renderer.aux), swapped with the
+ * current one (lorieVkSlotSwap) so that every lorieVkFrame* call records into, submits and waits for whichever is
+ * current.
+ */
+struct lorie_vk_slot {
+    VkCommandBuffer cmd;
+    VkDescriptorPool descriptors;
+    VkFence fence;
+    struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
+    uint32_t usedCount, sourceDraws, destinationDraws, draws, copies;
+    uint64_t submitCpuUs, fenceWaitUs;
+};
+
 struct lorie_vk_renderer {
     VkCommandPool pool;
     VkCommandBuffer cmd;
@@ -252,11 +267,24 @@ struct lorie_vk_renderer {
     struct { struct lorie_vk_image *img; enum lorie_vk_use use; } used[LORIE_VK_MAX_FRAME_IMAGES];
     uint32_t usedCount, sourceDraws, destinationDraws, draws, copies;
     uint64_t submitCpuUs, fenceWaitUs;
+    /* P11-C3-B2: the second submission's objects (made when first needed: lorieVkAuxCreate), and the binary semaphore
+     * that orders a submission after it on the device - the next lorieVkFrameQueue signals it (chainSignal) or
+     * waits for it (chainWait), each consumed by the submission made */
+    struct lorie_vk_slot aux;
+    VkSemaphore chain;
+    bool chainSignal, chainWait;
 };
 
 enum { LORIE_VK_FRAME_OK, LORIE_VK_FRAME_SKIP, LORIE_VK_FRAME_RECREATE, LORIE_VK_FRAME_FATAL };
 
 bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
+// P11-C3-B2: the second submission's objects and the chain semaphore, each once; false when one cannot be made.
+bool lorieVkAuxCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r);
+// P11-C3-B2: the second submission made the current one, and the current one the second.
+void lorieVkSlotSwap(struct lorie_vk_renderer *r);
+// P11-C3-B2: the chain semaphore a submission signalled and none waited for, waited for by an empty submission with
+// the current one's fence - which must not be in use - and that fence waited for (VK_SUCCESS: consumed).
+VkResult lorieVkChainConsume(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st);
 void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r);
 // The window's surface and swapchain (made again, keeping the surface, when it is already there).
 // The present mode a swapchain on r's surface is made with for `smooth` (see LORIE_VK_MAX_OUT_OF_DATE).

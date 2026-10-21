@@ -1271,9 +1271,74 @@ void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
         vk->DestroyFence(vk->device, r->frameFence, NULL);
     if (r->acquireFence)
         vk->DestroyFence(vk->device, r->acquireFence, NULL);
+    // P11-C3-B2: the second submission's (its command buffer goes with the pool)
+    if (r->aux.fence)
+        vk->DestroyFence(vk->device, r->aux.fence, NULL);
+    if (r->aux.descriptors)
+        vk->DestroyDescriptorPool(vk->device, r->aux.descriptors, NULL);
+    if (r->chain)
+        vk->DestroySemaphore(vk->device, r->chain, NULL);
     if (r->pool)
         vk->DestroyCommandPool(vk->device, r->pool, NULL);
     memset(r, 0, sizeof(*r));
+}
+
+/*
+ * P11-C3-B2: the second submission's objects, as the first one's are made (lorieVkRendererCreate), and the chain
+ * semaphore - each made once. Should one fail, those made are kept (they go with the renderer) and the rest are asked
+ * for again the next time.
+ */
+bool lorieVkAuxCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
+    VkCommandBufferAllocateInfo cmd = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = r->pool,
+                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    VkFenceCreateInfo fence = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkSemaphoreCreateInfo semaphore = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, LORIE_VK_MAX_FRAME_IMAGES };
+    VkDescriptorPoolCreateInfo pool = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                        .maxSets = LORIE_VK_MAX_FRAME_IMAGES, .poolSizeCount = 1, .pPoolSizes = &size };
+
+    if (!r->pool)
+        return false;
+    if (!r->aux.cmd && vk->AllocateCommandBuffers(vk->device, &cmd, &r->aux.cmd) != VK_SUCCESS) {
+        r->aux.cmd = VK_NULL_HANDLE;
+        return false;
+    }
+    if (!r->aux.fence && vk->CreateFence(vk->device, &fence, NULL, &r->aux.fence) != VK_SUCCESS) {
+        r->aux.fence = VK_NULL_HANDLE;
+        return false;
+    }
+    if (!r->aux.descriptors && vk->CreateDescriptorPool(vk->device, &pool, NULL, &r->aux.descriptors) != VK_SUCCESS) {
+        r->aux.descriptors = VK_NULL_HANDLE;
+        return false;
+    }
+    if (!r->chain && vk->CreateSemaphore(vk->device, &semaphore, NULL, &r->chain) != VK_SUCCESS) {
+        r->chain = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+_Static_assert(sizeof(((struct lorie_vk_slot *) 0)->used) == sizeof(((struct lorie_vk_renderer *) 0)->used),
+               "a slot's images are the renderer's");
+
+void lorieVkSlotSwap(struct lorie_vk_renderer *r) {
+    struct lorie_vk_slot current = { .cmd = r->cmd, .descriptors = r->descriptors, .fence = r->frameFence,
+                                     .usedCount = r->usedCount, .sourceDraws = r->sourceDraws,
+                                     .destinationDraws = r->destinationDraws, .draws = r->draws, .copies = r->copies,
+                                     .submitCpuUs = r->submitCpuUs, .fenceWaitUs = r->fenceWaitUs };
+    memcpy(current.used, r->used, sizeof(current.used));
+    r->cmd = r->aux.cmd;
+    r->descriptors = r->aux.descriptors;
+    r->frameFence = r->aux.fence;
+    memcpy(r->used, r->aux.used, sizeof(r->used));
+    r->usedCount = r->aux.usedCount;
+    r->sourceDraws = r->aux.sourceDraws;
+    r->destinationDraws = r->aux.destinationDraws;
+    r->draws = r->aux.draws;
+    r->copies = r->aux.copies;
+    r->submitCpuUs = r->aux.submitCpuUs;
+    r->fenceWaitUs = r->aux.fenceWaitUs;
+    r->aux = current;
 }
 
 #define LORIE_VK_TRY(call) do { if ((res = (call)) != VK_SUCCESS) goto fail; } while (0)
@@ -1789,11 +1854,22 @@ void lorieVkFrameScreen(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32
 
 VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uint32_t index, bool present,
                            volatile struct lorie_shared_server_state *st) {
+    // P11-C3-B2: the chain semaphore signalled once all of it is done; or waited for before any of it runs
+    VkSemaphore signal[2];
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    uint32_t signals = 0;
     VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &r->cmd,
-                            .signalSemaphoreCount = present ? 1 : 0, .pSignalSemaphores = present ? &r->rendered[index] : NULL };
+                            .waitSemaphoreCount = r->chainWait ? 1 : 0, .pWaitSemaphores = r->chainWait ? &r->chain : NULL,
+                            .pWaitDstStageMask = r->chainWait ? &waitStage : NULL, .pSignalSemaphores = signal };
     uint64_t start;
     VkResult res;
     uint32_t i;
+
+    if (present)
+        signal[signals++] = r->rendered[index];
+    if (r->chainSignal)
+        signal[signals++] = r->chain;
+    submit.signalSemaphoreCount = signals;
 
     // Every X server buffer the frame used goes back to the foreign owner, from the use it ended in.
     for (i = 0; i < r->usedCount; i++)
@@ -1812,6 +1888,7 @@ VkResult lorieVkFrameQueue(struct lorie_vk *vk, struct lorie_vk_renderer *r, uin
         return res;
     }
     r->submitCpuUs = lorieVkNowUs() - start;
+    r->chainSignal = r->chainWait = false;
     return VK_SUCCESS;
 }
 
@@ -1848,6 +1925,30 @@ VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, vola
     LORIE_DIAG_ADD(st, vkCopyCommands, r->copies);
     LORIE_DIAG_ADD(st, vkSubmitCpuUs, r->submitCpuUs);
     LORIE_DIAG_ADD(st, vkFenceWaitUs, r->fenceWaitUs);
+    return VK_SUCCESS;
+}
+
+/*
+ * P11-C3-B2: a submission without command buffers that waits for the chain semaphore (a semaphore wait operation
+ * unsignals it: Semaphore Waiting), with the current fence, then that fence waited for and reset - so that the
+ * semaphore is unsignalled again before it is next signalled. Nothing else is in it: nothing counted.
+ */
+VkResult lorieVkChainConsume(struct lorie_vk *vk, struct lorie_vk_renderer *r, volatile struct lorie_shared_server_state *st) {
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &r->chain,
+                            .pWaitDstStageMask = &waitStage };
+    VkResult res;
+
+    if (!r->chainWait)
+        return VK_SUCCESS;
+    if ((res = vk->QueueSubmit(vk->queue, 1, &submit, r->frameFence)) != VK_SUCCESS ||
+        (res = vk->WaitForFences(vk->device, 1, &r->frameFence, VK_TRUE, LORIE_VK_FENCE_TIMEOUT_NS)) != VK_SUCCESS ||
+        (res = vk->ResetFences(vk->device, 1, &r->frameFence)) != VK_SUCCESS) {
+        lorieVkFallback(st, LORIE_FALLBACK_CLASS_FATAL_BACKEND,
+                        res == VK_ERROR_DEVICE_LOST ? LORIE_FALLBACK_VK_DEVICE_LOST : LORIE_FALLBACK_VK_SUBMIT, res);
+        return res;
+    }
+    r->chainWait = false;
     return VK_SUCCESS;
 }
 
