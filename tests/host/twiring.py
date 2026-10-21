@@ -122,7 +122,11 @@ in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "ren
 # P11-C2: a root copy the X server asked for is made before anything else the renderer draws, once stateLock is let
 # go, and wakes the loop; the X server waits for one before it takes the shared lock (the renderer takes the request
 # under it) - in its EXA access, its ownership answer and its own drawing
-in_order("root copy in the main loop", loop, "pthread_mutex_unlock(&stateLock);", "rendererVkRootCopy();", "rendererVkRedraw(&waitingForBuffers);")
+# the loop's pass of work (rendererPass, which tpresentcopy.c runs): once stateLock is let go, before the buffers go
+rpass = func(R, "static void rendererPass(bool *waitingForBuffers) {")
+in_order("the renderer's pass in its loop", loop, "pthread_mutex_unlock(&stateLock);", "rendererPass(&waitingForBuffers);",
+         "while((buf = LorieBufferList_first(&removedBuffers)))")
+in_order("root copy in the main loop", rpass, "rendererVkRootCopy();", "rendererVkRedraw(waitingForBuffers);")
 check("rendererRootCopyPending()" in func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {"),
       "the renderer sleeps through a root copy asked for")
 for what, sig in (("EXA access", "Bool loriePrepareAccess(PixmapPtr pPix, int index) {"),
@@ -170,8 +174,8 @@ in_order("pacing over with another window", refresh, "lorieVkSwapchainDestroy(&v
          "releaseWinAndSurface(&win, &sfc);")
 in_order("pacing over with another device", func(R, "static void rendererVkTeardown(void) {"), "lorieVkDestroyDevice(&vk);",
          "rendererVkPacingReset();")
-in_order("root copy ahead of the frame, this pass only", loop, "pthread_mutex_unlock(&stateLock);", "vkRootCopyBusyUs = 0;",
-         "rendererVkRootCopy();", "rendererVkRedraw(&waitingForBuffers);")
+in_order("root copy ahead of the frame, this pass only", rpass, "vkRootCopyBusyUs = 0;", "rendererVkRootCopy();",
+         "rendererVkRedraw(waitingForBuffers);")
 
 # P11-C3-B1: the reservations' wiring
 check('lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");' in init,
@@ -183,14 +187,14 @@ in_order("the bounded wait for a release", loop, "while (rendererShouldWait(&wai
          "rendererTimespecAddUs(&deadline, LORIE_COPIES_DEFERRED_RECHECK_US);", "pthread_cond_timedwait(stateCond, &stateLock, &deadline);",
          "pthread_cond_wait(stateCond, &stateLock);")
 in_order("copies left queued forgotten with the session", loop, "if (stateChanged) {", "deferredCopies = false;", "if (windowChanged)")
-check("&& !rendererCopiesStillDeferred();\n        if (vkActive) {" in loop, "the loop runs copies left queued for a reservation alone, again and again")
+check("&& !rendererCopiesStillDeferred();\n    if (vkActive) {" in rpass, "the loop runs copies left queued for a reservation alone, again and again")
 
 # P11-C3-B2: the scheduling's wiring
 check('lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&' in init and
       '!strcmp(getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT"), "1");' in init, "OsVendorInit does not read TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1")
-in_order("root copy ahead of a frame only", loop, "if (state && rendererRootCopyPending()) {",
+in_order("root copy ahead of a frame only", rpass, "if (state && rendererRootCopyPending()) {",
          "else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())", "rendererVkRootCopyAhead();", "rendererVkRootCopy();",
-         "if (state && rendererVkFrameWanted())", "rendererVkRedraw(&waitingForBuffers);", "if (vkAux.pending || vkAux.chained)",
+         "if (state && rendererVkFrameWanted())", "rendererVkRedraw(waitingForBuffers);", "if (vkAux.pending || vkAux.chained)",
          "rendererVkAuxSettle();")
 in_order("the frame after a root copy ahead", redraw, "if (vkAux.pending && __atomic_load_n(&state->rootCopy.waiting, __ATOMIC_ACQUIRE) == vkAux.work.seq) {",
          "rendererVkAuxFinish();", "lorieVkAcquire(", "vkr.chainWait = vkAux.chained;", "lorieVkFrameQueue(", "vkAux.chained = false;",

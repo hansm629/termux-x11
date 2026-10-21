@@ -1088,16 +1088,16 @@ CONTROLS = [
         rendererRootCopySettle(w->seq, false);""",
      "tpresentcopy"),
     ("P11-C2: a root copy not made first in the renderer's loop", "renderer.c",
-     """        if (state && rendererRootCopyPending()) {
-            if (!vkActive)
-                rendererRootCopyDecline();
-            else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())
-                rendererVkRootCopyAhead();
-            else
-                rendererVkRootCopy();
-        }""",
-     """        if (state && rendererRootCopyPending() && !vkActive)
-            rendererRootCopyDecline();""",
+     """    if (state && rendererRootCopyPending()) {
+        if (!vkActive)
+            rendererRootCopyDecline();
+        else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())
+            rendererVkRootCopyAhead();
+        else
+            rendererVkRootCopy();
+    }""",
+     """    if (state && rendererRootCopyPending() && !vkActive)
+        rendererRootCopyDecline();""",
      "twiring"),
     ("P11-C2: the renderer sleeping through a root copy asked for", "renderer.c",
      """    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect || rendererRootCopyPending())""",
@@ -1282,8 +1282,10 @@ CONTROLS += [
      """    if (!src || !dst) {""",
      "tpresentcopy"),
     ("P11-C3-B1: copies left queued wake the renderer again and again", "renderer.c",
-     """    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();""",
-     """    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;""",
+     """    // P11-C3-B1: copies left queued for a reservation are pending again only once one is let go
+    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();""",
+     """    // P11-C3-B1: copies left queued for a reservation are pending again only once one is let go
+    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;""",
      "twiring"),
 ]
 
@@ -1362,8 +1364,8 @@ CONTROLS += [
     if (1)""",
      "tpresentcopy"),
     ("P11-C3-B2: the root copy ahead without a frame to follow", "renderer.c",
-     """            else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())""",
-     """            else if (state->backend.vkScheduleOpt)""",
+     """        else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())""",
+     """        else if (state->backend.vkScheduleOpt)""",
      "twiring"),
 ]
 
@@ -1377,6 +1379,41 @@ CONTROLS += [
     ("P11-C3: the gap measured from the earlier frame's start", "renderer.c",
      """    vkPacingLast.endUs = t->endUs;""",
      """    vkPacingLast.endUs = t->startUs;""",
+     "tpresentcopy"),
+]
+
+
+# the renderer's pass: Vulkan or GLES, never both - and a root copy submitted ahead settled within it
+CONTROLS += [
+    ("pass: the GLES frame not chained to the Vulkan branch", "renderer.c",
+     """    } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
+        rendererRedrawLocked(waitingForBuffers);""",
+     """    }
+    if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
+        rendererRedrawLocked(waitingForBuffers);""",
+     "tpresentcopy"),
+    ("pass: the GLES branch the root copy settling's else (b32e1a1)", "renderer.c",
+     """        if (vkAux.pending || vkAux.chained)
+            rendererVkAuxSettle();
+    } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&""",
+     """    }
+        if (vkAux.pending || vkAux.chained)
+            rendererVkAuxSettle(); else if (state && state->surfaceAvailable && !state->waitForNextFrame &&""",
+     "tpresentcopy"),
+    ("pass: GLES's copies alone in a Vulkan pass", "renderer.c",
+     """    } else if (gpuCopyPending) {
+        // Also when no window is drawn (or Vulkan failed, even in a session that asked for Vulkan only): the X""",
+     """    }
+    if (gpuCopyPending) {
+        // Also when no window is drawn (or Vulkan failed, even in a session that asked for Vulkan only): the X""",
+     "tpresentcopy"),
+    ("pass: a root copy submitted ahead left pending after the pass", "renderer.c",
+     """        // P11-C3-B2: a root copy submitted ahead and no frame after it: waited for, its chain semaphore consumed
+        if (vkAux.pending || vkAux.chained)
+            rendererVkAuxSettle();""",
+     """        // P11-C3-B2: a root copy submitted ahead and no frame after it: waited for, its chain semaphore consumed""",
      "tpresentcopy"),
 ]
 

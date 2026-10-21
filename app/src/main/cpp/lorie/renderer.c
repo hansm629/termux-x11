@@ -2967,6 +2967,50 @@ static bool rendererVkFrameWanted(void) {
            (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending);
 }
 
+/*
+ * One pass of the renderer's work, stateLock let go: a root copy the X server asked for first (P11-C2), then the frame
+ * or the copies alone - by Vulkan while it is active, else by GLES: never both in one pass. P11-C3-B2: a root copy
+ * submitted ahead of the frame and still pending once Vulkan's part of the pass is done (no frame after it, one that
+ * returned early or skipped) is waited for and its chain semaphore consumed (rendererVkAuxSettle) before the pass
+ * ends; one Vulkan's failure left is settled by the teardown (rendererVkAuxForget).
+ */
+static void rendererPass(bool *waitingForBuffers) {
+    bool gpuCopyPending;
+
+    // P11-C2: a root copy the X server asked for, first - it may be waiting for it before it can draw again.
+    // P11-C3-B2: submitted ahead of the frame this pass draws, which waits for it on the device, not the CPU.
+    vkRootCopyBusyUs = 0;      // P11-C3: only one made in this pass counts as ahead of its frame
+    if (state && rendererRootCopyPending()) {
+        if (!vkActive)
+            rendererRootCopyDecline();
+        else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())
+            rendererVkRootCopyAhead();
+        else
+            rendererVkRootCopy();
+    }
+
+    // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
+    // lock+fence with the root/cursor draw, instead of two GPU round trips per frame (unless FIFO or
+    // TERMUX_X11_RENDERER_VK_SUBMIT_OPT: then the frame sends the copies ahead in a submission of their own).
+    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();
+    if (vkActive) {
+        if (state && rendererVkFrameWanted())
+            rendererVkRedraw(waitingForBuffers);
+        else if (gpuCopyPending)
+            rendererVkApplyPendingGpuCopies();
+        // P11-C3-B2: a root copy submitted ahead and no frame after it: waited for, its chain semaphore consumed
+        if (vkAux.pending || vkAux.chained)
+            rendererVkAuxSettle();
+    } else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
+        rendererRedrawLocked(waitingForBuffers);
+    } else if (gpuCopyPending) {
+        // Also when no window is drawn (or Vulkan failed, even in a session that asked for Vulkan only): the X
+        // server waits for the copies it queued, and GLES runs them on the default surface's context.
+        rendererApplyPendingGpuCopies();
+    }
+}
+
 __noreturn static void* rendererThread(void) {
     LorieBuffer* buf;
     bool waitingForBuffers = false;
@@ -3039,38 +3083,7 @@ __noreturn static void* rendererThread(void) {
         }
         pthread_mutex_unlock(&stateLock);
 
-        // P11-C2: a root copy the X server asked for, first - it may be waiting for it before it can draw again.
-        // P11-C3-B2: submitted ahead of the frame this pass draws, which waits for it on the device, not the CPU.
-        vkRootCopyBusyUs = 0;      // P11-C3: only one made in this pass counts as ahead of its frame
-        if (state && rendererRootCopyPending()) {
-            if (!vkActive)
-                rendererRootCopyDecline();
-            else if (state->backend.vkScheduleOpt && rendererVkFrameWanted())
-                rendererVkRootCopyAhead();
-            else
-                rendererVkRootCopy();
-        }
-
-        // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
-        // lock+fence with the root/cursor draw, instead of two GPU round trips per frame (unless FIFO or
-        // TERMUX_X11_RENDERER_VK_SUBMIT_OPT: then the frame sends the copies ahead in a submission of their own).
-        bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();
-        if (vkActive) {
-            if (state && rendererVkFrameWanted())
-                rendererVkRedraw(&waitingForBuffers);
-            else if (gpuCopyPending)
-                rendererVkApplyPendingGpuCopies();
-        }
-        // P11-C3-B2: a root copy submitted ahead and no frame after it: waited for, its chain semaphore consumed
-        if (vkAux.pending || vkAux.chained)
-            rendererVkAuxSettle(); else if (state && state->surfaceAvailable && !state->waitForNextFrame &&
-            (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending)) {
-            rendererRedrawLocked(&waitingForBuffers);
-        } else if (gpuCopyPending) {
-            // Also when no window is drawn (or Vulkan failed, even in a session that asked for Vulkan only): the X
-            // server waits for the copies it queued, and GLES runs them on the default surface's context.
-            rendererApplyPendingGpuCopies();
-        }
+        rendererPass(&waitingForBuffers);
 
         pthread_spin_lock(&bufferLock);
         // Remove all buffers which were attached to GL (and their Vulkan images, if any: no frame is in flight).

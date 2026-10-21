@@ -188,11 +188,25 @@ static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pi
 /* how things stood when the renderer gave up: its frame's fence waited for, its buffers out of the in-flight list */
 static struct { bool fencePending, busy; } atFail;
 static void rendererVkAuxForget(void);
+static bool failEndsVulkan;     /* the mock tears Vulkan down as the real one does: no longer active, the surface given up */
 static void rendererVkFail(void) {
     vkFailures++;
     atFail.fencePending = emu.fencePending;
     atFail.busy = state->gpuInFlight.busy;
     rendererVkAuxForget();      /* P11-C3-B2: as rendererVkTeardown does, once the device is idle */
+    if (failEndsVulkan) {
+        vkActive = false;
+        state->surfaceAvailable = false;
+    }
+}
+/* GLES's frame and its copies alone, as the renderer's pass (rendererPass) would call them: counted */
+static int glesRedraws, glesCopies;
+static void rendererRedrawLocked(bool *waitingForBuffers) {
+    (void) waitingForBuffers;
+    glesRedraws++;
+}
+static void rendererApplyPendingGpuCopies(void) {
+    glesCopies++;
 }
 /* the X server woken for a finished batch: how things stood at that moment */
 static struct { int count; bool cleared, fenceWaited, released; uint64_t completed; int presents, fenceWaits; } notified;
@@ -1752,6 +1766,157 @@ int main(void) {
         st.backend.vkFrameDiag = 0;
         ra->registered = rb->registered = false;
         fenceLogDst = fenceLogRoot = 0;
+    }
+
+    /* The renderer's pass (rendererPass), as its loop runs it: the root copy first, then the frame or the copies alone -
+     * by Vulkan while it is active, by GLES otherwise, never both in one pass. Vulkan active: an acquire that times out
+     * (drawRequested kept), a root not there yet with copies queued, a new request with nothing ahead - no GLES frame,
+     * no GLES copies. P11-C3-B2: a root copy submitted ahead and a frame that returned early, skipped, or found the
+     * swapchain out of date - settled and its semaphore consumed within the pass, no GLES. B1 and B2 on and off, all four: Vulkan alone, the root copy
+     * settled as copied, the frame presented, a reserved copy left queued. Vulkan failing in a pass: no GLES frame in
+     * it (its window given up), GLES's in the next - and no Vulkan then. */
+    {
+        LorieBuffer *ra = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 640, 480), *rb = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 640, 480);
+        static const LorieGpuCopyRect one[1] = { { 3, 5, 40, 30 } };
+        volatile struct lorie_renderer_diag *dg = &st.diag;
+        int fails0 = vkFailures, early = emu.earlyPresents;
+        uint32_t presented, consumed;
+        uint64_t s1 = 0;
+        void *db1 = NULL;
+
+        ra->registered = rb->registered = true;
+        own(46);
+        st.surfaceAvailable = 1;
+        glesRedraws = glesCopies = 0;
+
+        /* the acquire timing out: the request kept, no GLES */
+        presented = dg->vkFramesPresented;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        emu.acquireResult = VK_TIMEOUT;
+        rendererPass(&waiting);
+        emu.acquireResult = VK_SUCCESS;
+        CHECK(glesRedraws == 0 && glesCopies == 0 && st.drawRequested && dg->vkFramesPresented == presented && emu.violations == 0 &&
+              vkFailures == fails0, "pass, acquire timed out: %d GLES frames, %d GLES copies, request %s", glesRedraws, glesCopies,
+              st.drawRequested ? "kept" : "dropped");
+
+        /* the root not there yet, a copy queued: Vulkan's copies alone, no GLES */
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &s1, &db1), "pass: not queued");
+        st.rootWindowTextureID = 999999;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        st.rootWindowTextureID = root->desc.id;
+        waiting = false;
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieGpuCopyIsDone(s1) && glesRedraws == 0 && glesCopies == 0 && emu.violations == 0, "pass, root not there: copy done %d, "
+              "%d GLES frames, %d GLES copies", lorieGpuCopyIsDone(s1), glesRedraws, glesCopies);
+        lorieGpuCopyAck(&bgraPix, db1);
+
+        /* a new request, nothing ahead: a Vulkan frame, no GLES */
+        presented = dg->vkFramesPresented;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(dg->vkFramesPresented == presented + 1 && glesRedraws == 0 && glesCopies == 0 && !vkAux.pending && !vkAux.chained,
+              "pass, a request: %u Vulkan frames, %d GLES frames, %d GLES copies", dg->vkFramesPresented - presented, glesRedraws, glesCopies);
+
+        /* B2: the root copy ahead, the frame returning early (the root not there) - settled and consumed in the pass */
+        st.backend.vkScheduleOpt = 1;
+        consumed = dg->rootChainConsumed;
+        rootAsk(ra, rb, one, 1);
+        st.rootWindowTextureID = 999999;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        st.rootWindowTextureID = root->desc.id;
+        waiting = false;
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && !vkAux.pending && !vkAux.chained &&
+              dg->rootChainConsumed == consumed + 1 && glesRedraws == 0 && glesCopies == 0 && emu.violations == 0 && !emu.fencePending,
+              "pass, ahead and an early return: done %d, pending %d chained %d, consumed %u, GLES %d/%d", st.rootCopy.done == rootSeq,
+              vkAux.pending, vkAux.chained, dg->rootChainConsumed - consumed, glesRedraws, glesCopies);
+        /* ... the acquire timing out */
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        emu.acquireResult = VK_TIMEOUT;
+        rendererPass(&waiting);
+        emu.acquireResult = VK_SUCCESS;
+        CHECK(st.rootCopy.done == rootSeq && !vkAux.pending && !vkAux.chained && dg->rootChainConsumed == consumed + 2 &&
+              glesRedraws == 0 && glesCopies == 0 && emu.violations == 0, "pass, ahead and a skipped acquire: done %d, consumed %u, GLES %d/%d",
+              st.rootCopy.done == rootSeq, dg->rootChainConsumed - consumed, glesRedraws, glesCopies);
+        /* ... the swapchain out of date (made again by the frame) */
+        rootAsk(ra, rb, one, 1);
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        emu.acquireResult = VK_ERROR_OUT_OF_DATE_KHR;
+        rendererPass(&waiting);
+        emu.acquireResult = VK_SUCCESS;
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && !vkAux.pending && !vkAux.chained &&
+              dg->rootChainConsumed == consumed + 3 && glesRedraws == 0 && glesCopies == 0 && emu.violations == 0 && vkFailures == fails0,
+              "pass, ahead and an out-of-date swapchain: done %d, consumed %u, GLES %d/%d, %d failures", st.rootCopy.done == rootSeq,
+              dg->rootChainConsumed - consumed, glesRedraws, glesCopies, vkFailures - fails0);
+        /* ... and the next pass draws, its semaphore signalled anew */
+        rootAsk(ra, rb, one, 1);
+        presented = dg->vkFramesPresented;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(dg->vkFramesPresented == presented + 1 && st.rootCopy.done == rootSeq && dg->rootChainConsumed == consumed + 3 &&
+              emu.violations == 0 && glesRedraws == 0, "pass after: %u frames, done %d", dg->vkFramesPresented - presented,
+              st.rootCopy.done == rootSeq);
+
+        /* B1 and B2, on and off: Vulkan alone, the root copy copied, the frame presented, a reserved copy left queued */
+        for (int b1 = 0; b1 < 2; b1++)
+            for (int b2 = 0; b2 < 2; b2++) {
+                uint32_t ahead = dg->rootAhead;
+                st.backend.vkScheduleOpt = (uint8_t) b2;
+                rootAsk(ra, rb, one, 1);
+                CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &s1, &db1), "pass B1 %d B2 %d: not queued", b1, b2);
+                if (b1)
+                    st.cpuAccess.ids[0] = redirected->desc.id, st.cpuAccess.count = 1;
+                presented = dg->vkFramesPresented;
+                st.drawRequested = 1, st.waitForNextFrame = 0;
+                rendererPass(&waiting);
+                st.gpuInFlight.busy = 0;
+                CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && dg->vkFramesPresented == presented + 1 &&
+                      lorieGpuCopyIsDone(s1) == !b1 && dg->rootAhead == ahead + (uint32_t) b2 && !vkAux.pending && !vkAux.chained &&
+                      glesRedraws == 0 && glesCopies == 0 && emu.violations == 0 && vkFailures == fails0,
+                      "pass B1 %d B2 %d: root done %d, %u frames, copy done %d, ahead %u, GLES %d/%d, %d violations", b1, b2,
+                      st.rootCopy.done == rootSeq, dg->vkFramesPresented - presented, lorieGpuCopyIsDone(s1), dg->rootAhead - ahead,
+                      glesRedraws, glesCopies, emu.violations);
+                if (b1) {
+                    st.cpuAccess.count = 0;
+                    st.cpuAccess.releases++;
+                    st.cpuAccess.waiter = 0;
+                    rendererPass(&waiting);
+                    st.gpuInFlight.busy = 0;
+                    CHECK(lorieGpuCopyIsDone(s1) && glesCopies == 0, "pass B1 %d B2 %d: not copied once let go", b1, b2);
+                }
+                lorieGpuCopyAck(&bgraPix, db1);
+            }
+        st.backend.vkScheduleOpt = 0;
+        earlyWithOption += emu.earlyPresents - early;
+
+        /* Vulkan failing in a pass (its frame's submission): no GLES frame in it - its window given up; GLES's in the
+         * next, and no Vulkan then */
+        failEndsVulkan = true;
+        presented = dg->vkFramesPresented;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        emu.submitResult = VK_ERROR_DEVICE_LOST;
+        rendererPass(&waiting);
+        emu.submitResult = VK_SUCCESS;
+        CHECK(vkFailures == fails0 + 1 && !vkActive && glesRedraws == 0 && glesCopies == 0, "pass, Vulkan failing: %d failures, active %d, "
+              "GLES %d/%d in the same pass", vkFailures - fails0, vkActive, glesRedraws, glesCopies);
+        st.surfaceAvailable = 1;            /* GLES has the window now (rendererSelectBackend) */
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        CHECK(glesRedraws == 1 && dg->vkFramesPresented == presented && !emu.fencePending, "pass after the fallback: %d GLES frames, %u Vulkan",
+              glesRedraws, dg->vkFramesPresented - presented);
+        failEndsVulkan = false;
+        vkActive = true;
+        vkFailures = fails0;
+        vkr.chainSignal = vkr.chainWait = false;
+        emu.fencePending = false;
+        st.gpuInFlight.busy = 0;
+        st.diag.lastFallbackClass = st.diag.lastFallbackReason = 0;
+        glesRedraws = glesCopies = 0;
+        ra->registered = rb->registered = false;
     }
 
     /* P11-C3: the pacing intervals from given stamps (rendererVkFrameTimed): the first frame none - no false hitch;

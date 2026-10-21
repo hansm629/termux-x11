@@ -227,7 +227,8 @@ recipes = {
         + func(R, "static void rendererVkAuxSettle(void) {")
         + func(R, "static void rendererVkAuxForget(void) {")
         + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
-        + func(R, "static bool rendererVkFrameWanted(void) {"),
+        + func(R, "static bool rendererVkFrameWanted(void) {")
+        + func(R, "static void rendererPass(bool *waitingForBuffers) {"),
     # P10-S0: the Present paths that end a presentation whose GPU copy may still run, from the patched xserver -
     # tpresentsafety.c: the vblank as present_priv.h has it, execute (and its copy and post), re-execute, scrap,
     # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that
