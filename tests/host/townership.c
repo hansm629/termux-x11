@@ -27,6 +27,7 @@
  *   the frame sampling the front over first; either lock refused, what was locked unlocked, the locks of before taken
  *   instead and kept for the session; every lock unlocked once, none taken twice. */
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -85,7 +86,7 @@ typedef struct LorieBuffer {
     uint32_t *shadow;
 } LorieBuffer;
 
-typedef struct FakePixmap { struct { void *ptr; } devPrivate; void *driverPriv; } PixmapRec, *PixmapPtr;
+typedef struct FakePixmap { struct { void *ptr; } devPrivate; void *driverPriv; struct { int width, height; } drawable; } PixmapRec, *PixmapPtr;
 typedef struct FakeWindow { PixmapPtr pixmap; } WindowRec, *WindowPtr;
 typedef struct FakeScreen ScreenRec, *ScreenPtr;
 struct FakeScreen {
@@ -105,6 +106,7 @@ struct fake_state {
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
     struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
+    struct { uint32_t count; uint64_t ids[LORIE_CPU_ACCESS_MAX]; volatile uint32_t releases, waiter; } cpuAccess;   /* P11-C3-B1 */
     uint64_t rootWindowTextureID;
     struct {                    /* lorie.h rootCopy (P11-C2) */
         volatile uint32_t seq, taken, cancelled, failed, done;
@@ -136,6 +138,8 @@ struct fake_pvfb {
     } rootCopy;
     int accessLocks;
     Bool frameDiag;             /* P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG */
+    struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
+    Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
 };
 
 static ScreenRec screen;
@@ -184,7 +188,14 @@ static void rendererView(const char *where);
 static int gpuWaits, gpuSlices;
 static void rootRenderer(void);
 static int rootWaits;
+static int releaseWakes;
 static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
+    if (op == FUTEX_WAKE) {
+        /* P11-C3-B1: a reservation let go, a renderer woken */
+        CHECK(checked && word == &checked->state->cpuAccess.releases, "%s op %d: an unexpected futex wake", runName, opIndex);
+        releaseWakes++;
+        return 0;
+    }
     if (checked && word == &checked->state->rootCopy.done) {
         /* P11-C2: the X server waiting for a root copy - the renderer's moment */
         CHECK(op == FUTEX_WAIT && *word == value, "%s: not a futex wait on the root copy's word", runName);
@@ -268,8 +279,11 @@ static int LorieBuffer_lock(LorieBuffer *b, void **out) {
             *out = b->lockedData;
         return EEXIST;
     }
+    /* P11-C3-B1: or reserved (cpuAccess) - never while a submitted frame uses it */
     if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER && answered() == LORIE_OWNERSHIP_PER_ACCESS)
-        CHECK(checked->state->lock > 0, "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
+        CHECK((checked->state->lock > 0 || lorieCpuReserved(checked->state, b->desc.id)) &&
+              !(lorieCpuReserved(checked->state, b->desc.id) && lorieGpuInFlight(checked->state, b->desc.id)),
+              "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
               runName, opIndex, b->desc.id);
     if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
         CHECK(!lorieGpuInFlight(checked->state, b->desc.id), "%s op %d: AHB %llu CPU-locked while a submitted Vulkan frame uses it",
@@ -300,8 +314,11 @@ static int LorieBuffer_lockRect(LorieBuffer *b, bool write, const ARect *rect, v
         ev("l%llu!", b->desc.id);
         return EEXIST;
     }
+    /* P11-C3-B1: or reserved (cpuAccess) - never while a submitted frame uses it */
     if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER && answered() == LORIE_OWNERSHIP_PER_ACCESS)
-        CHECK(checked->state->lock > 0, "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
+        CHECK((checked->state->lock > 0 || lorieCpuReserved(checked->state, b->desc.id)) &&
+              !(lorieCpuReserved(checked->state, b->desc.id) && lorieGpuInFlight(checked->state, b->desc.id)),
+              "%s op %d: AHB %llu CPU-locked outside the shared lock while PER_ACCESS is answered",
               runName, opIndex, b->desc.id);
     if (checked && b->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
         CHECK(!lorieGpuInFlight(checked->state, b->desc.id), "%s op %d: AHB %llu CPU-locked while a submitted Vulkan frame uses it",
@@ -486,7 +503,9 @@ static LorieBuffer **base_bufferOf(void *priv) { return &((LoriePixmapPriv *) pr
 /* ---- this branch ---- */
 static struct fake_pvfb newWorld, *pvfb = &newWorld;
 static void lorieRootCopyWait(Bool takeBack);
+#define lorie_shared_server_state fake_state
 #include "own_new_src.inc"
+#undef lorie_shared_server_state
 static int pixman_blt(uint32_t *src, uint32_t *dst, int srcStride, int dstStride, int srcBpp, int dstBpp, int sx, int sy,
                       int dx, int dy, int w, int h) {
     (void) srcBpp; (void) dstBpp;
@@ -607,10 +626,20 @@ static void rendererView(const char *where) {
     xorg_list_for_each_entry(priv, &checked->ahbPersistent, persistentLink)
         CHECK(!wasFreed(priv), "%s op %d, %s: a destroyed pixmap is still remembered", runName, opIndex, where);
     if (answered() == LORIE_OWNERSHIP_PER_ACCESS) {
+        /* P11-C3-B1: but for one the X server holds reserved (cpuAccess), which no renderer touches - and which no
+         * submitted frame uses, ever */
         for (i = 0; i < nbuffers; i++)
             if (!buffers[i]->released && buffers[i]->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
-                CHECK(!buffers[i]->cpuHeld, "%s op %d, %s: AHB %llu CPU-locked though PER_ACCESS is answered",
-                      runName, opIndex, where, buffers[i]->desc.id);
+                CHECK(!buffers[i]->cpuHeld || lorieCpuReserved(checked->state, buffers[i]->desc.id),
+                      "%s op %d, %s: AHB %llu CPU-locked though PER_ACCESS is answered", runName, opIndex, where,
+                      buffers[i]->desc.id);
+        for (i = 0; i < (int) checked->state->cpuAccess.count; i++) {
+            CHECK(!lorieGpuInFlight(checked->state, checked->state->cpuAccess.ids[i]),
+                  "%s op %d, %s: AHB %llu reserved while a submitted frame uses it", runName, opIndex, where,
+                  (unsigned long long) checked->state->cpuAccess.ids[i]);
+            CHECK(checked->state->cpuAccess.ids[i] != checked->state->rootWindowTextureID,
+                  "%s op %d, %s: the published root reserved", runName, opIndex, where);
+        }
     } else
         xorg_list_for_each_entry(priv, &checked->ahbPersistent, persistentLink)
             CHECK(priv->locked && priv->buffer->cpuHeld,
@@ -714,6 +743,9 @@ static void exec(const struct impl *im, struct op o) {
             CHECK(!ok && b->lockAttempts == attempts + 1, "%s op %d: PrepareAccess did not fail on a buffer that cannot be locked",
                   runName, opIndex);
             CHECK(w->state->lock == 0, "%s op %d: failed PrepareAccess left the shared lock held", runName, opIndex);
+            CHECK(!im->ownership || (w->state->cpuAccess.count == 0 && w->accessLocks == 0),
+                  "%s op %d: failed PrepareAccess left a reservation (%u) or an access lock", runName, opIndex,
+                  w->state->cpuAccess.count);
             b->failLock = 0;
             break;
         }
@@ -721,8 +753,14 @@ static void exec(const struct impl *im, struct op o) {
         if (!ok)
             break;
         if (perAccess) {
-            CHECK(w->state->lock == 1, "%s op %d: CPU access to an AHB under PER_ACCESS without the shared lock",
-                  runName, opIndex);
+            /* P11-C3-B1: or under a reservation, the shared lock let go - any AHB but the root it publishes */
+            if (im->ownership && w->exaLockOpt && b->desc.id != w->state->rootWindowTextureID)
+                CHECK(w->state->lock == 0 && w->accessLocks == 0 && lorieCpuReserved(w->state, b->desc.id) && b->cpuHeld,
+                      "%s op %d: a reserved access: shared lock %d, reserved %d, CPU-locked %d", runName, opIndex,
+                      w->state->lock, lorieCpuReserved(w->state, b->desc.id), b->cpuHeld);
+            else
+                CHECK(w->state->lock == 1 && (!im->ownership || !lorieCpuReserved(w->state, b->desc.id)),
+                      "%s op %d: CPU access to an AHB under PER_ACCESS without the shared lock", runName, opIndex);
             perAccessAcquires++;
         }
         if (p->devPrivate.ptr)
@@ -730,6 +768,9 @@ static void exec(const struct impl *im, struct op o) {
         im->finish(p, index);
         p->devPrivate.ptr = NULL;                           /* EXA hides it again */
         CHECK(w->state->lock == 0, "%s op %d: shared lock still held after FinishAccess", runName, opIndex);
+        if (im->ownership)
+            CHECK(w->state->cpuAccess.count == 0,
+                  "%s op %d: a reservation left after FinishAccess (%u)", runName, opIndex, w->state->cpuAccess.count);
         break;
     }
     case ENSURE:
@@ -819,6 +860,7 @@ static void exec(const struct impl *im, struct op o) {
           w->state->diag.xOwnership, answered());
 }
 
+static bool exaLockOpt;     /* P11-C3-B1: this branch's runs with TERMUX_X11_EXA_LOCK_OPT=1 */
 static void run(int slot, const struct impl *im, const struct op *ops, int n, uint8_t requested) {
     struct fake_state *st = calloc(1, sizeof *st);
     int i, j;
@@ -831,6 +873,8 @@ static void run(int slot, const struct impl *im, const struct op *ops, int n, ui
     screen = (ScreenRec) { &rootWin, NULL, fakeGetWindowPixmap, NULL, fakeGetScreenPixmap, fakeModifyPixmapHeader };
     rootWin.pixmap = NULL;
     *im->w = (struct fake_pvfb) { .state = st, .SetWindowPixmap = fakeSetWindowPixmap };
+    if (im->ownership)
+        im->w->exaLockOpt = exaLockOpt;
     xorg_list_init(&im->w->ahbPersistent);
     st->backend.requested = requested;
     checked = im->ownership ? im->w : NULL;
@@ -911,9 +955,9 @@ static int scenario(const char *name, uint8_t requested, int mid, int end, bool 
     return perAccessAcquires;
 }
 
-int main(void) {
+/* the ownership scenarios: this branch against 3c98ffa - with TERMUX_X11_EXA_LOCK_OPT off, then on (P11-C3-B1) */
+static void scenarios(void) {
     struct lorie_renderer_diag *d;      /* each run has its own state: rebound after it */
-    uint8_t invalid;
     int acquires, signals;
     struct op ops[MAXOPS];
     int n;
@@ -967,6 +1011,21 @@ int main(void) {
     ops[n++] = (struct op) { DRAW };
     run(1, &cur, ops, n, LORIE_BACKEND_AUTO);
     CHECK(newWorld.state->diag.xOwnershipTransitions == 2, "unknown mode: %u transitions", newWorld.state->diag.xOwnershipTransitions);
+    /* P11-C3-B1: reserved accesses counted with the option, none without */
+    CHECK(exaLockOpt ? newWorld.state->diag.xAccessReserved > 0 : newWorld.state->diag.xAccessReserved == 0,
+          "%s: %u reserved accesses", exaLockOpt ? "TERMUX_X11_EXA_LOCK_OPT on" : "off", newWorld.state->diag.xAccessReserved);
+}
+
+int main(void) {
+    uint8_t invalid;
+    struct op ops[MAXOPS];
+    int n;
+
+    exaLockOpt = false;
+    scenarios();
+    exaLockOpt = true;
+    scenarios();
+    exaLockOpt = false;
 
     /* TERMUX_X11_RENDERER_BACKEND */
     invalid = 0;
@@ -1359,6 +1418,146 @@ int main(void) {
                       diagCases[k].name, dg->xAccessLock.count, dg->xAccessGpu.count, dg->xAccess.count, diagCases[k].diag,
                       (unsigned long long) rootGpuPriv.accessStartUs);
             }
+        }
+
+        /* P11-C3-B1, TERMUX_X11_EXA_LOCK_OPT=1: a PER_ACCESS AHB access - not to the root the X server publishes -
+         * holds a reservation instead of the shared lock: taken under it once no frame uses the AHB, the shared lock let
+         * go before the CPU lock, the CPU lock gone before the reservation, let go under the shared lock again. Nested
+         * (EXA's dest, src, mask), each its own; an access to the published root holds the shared lock as before, and a
+         * reserved one inside it too; a frame using the AHB waited for first, holding the lock; no free slot: the
+         * shared lock (counted); the CPU lock refused: the reservation let go, nothing held; a renderer waiting for a
+         * release woken (its condition, the futex) - none woken otherwise; a reserved access open, the root copy into
+         * the new back waited for (no shared lock held), not taken back. */
+        {
+            LorieBuffer *xb[10];
+            LoriePixmapPriv xp[10];
+            PixmapRec xr[10];
+            struct fake_state *st = &rootGpuState;
+            uint32_t releases;
+            int signals0, wakes0, waits0;
+            Bool ok;
+
+            rootGpuWorld("B1", big, 1);
+            newWorld.exaLockOpt = TRUE;
+            newWorld.frameDiag = TRUE;
+            st->rootWindowTextureID = buffers[1]->desc.id;          /* the front: published, sampled */
+            for (int k = 0; k < 10; k++) {
+                xb[k] = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 8, 8);
+                xp[k] = (LoriePixmapPriv) { .buffer = xb[k] };
+                xr[k] = (PixmapRec) { { NULL }, &xp[k], { 8, 8 } };
+            }
+            releases = st->cpuAccess.releases;
+            signals0 = condSignals;
+            ok = loriePrepareAccess(&xr[0], EXA_PREPARE_DEST) && loriePrepareAccess(&xr[1], EXA_PREPARE_SRC) &&
+                 loriePrepareAccess(&xr[2], EXA_PREPARE_MASK);
+            CHECK(ok && st->lock == 0 && newWorld.accessLocks == 0 && st->cpuAccess.count == 3 && xb[0]->cpuHeld && xb[1]->cpuHeld &&
+                  xb[2]->cpuHeld && lorieCpuReserved(st, xb[0]->desc.id) && lorieCpuReserved(st, xb[2]->desc.id),
+                  "B1 nested: prepared %d, shared lock %d, access locks %d, %u reserved", ok, st->lock, newWorld.accessLocks,
+                  st->cpuAccess.count);
+            lorieFinishAccess(&xr[2], EXA_PREPARE_MASK);
+            lorieFinishAccess(&xr[1], EXA_PREPARE_SRC);
+            CHECK(st->cpuAccess.count == 1 && lorieCpuReserved(st, xb[0]->desc.id) && !xb[1]->cpuHeld && st->lock == 0,
+                  "B1 nested: after two finished, %u reserved", st->cpuAccess.count);
+            lorieFinishAccess(&xr[0], EXA_PREPARE_DEST);
+            CHECK(st->cpuAccess.count == 0 && st->lock == 0 && st->cpuAccess.releases == releases + 3 && !xb[0]->cpuHeld &&
+                  st->diag.xAccessReserved == 3 && condSignals == signals0 && st->diag.xAccessHold.count == 3 &&
+                  st->diag.xAccess.count == 3, "B1 nested: %u left, %u releases, %u counted, %d signals, %u holds timed",
+                  st->cpuAccess.count, st->cpuAccess.releases - releases, st->diag.xAccessReserved, condSignals - signals0,
+                  st->diag.xAccessHold.count);
+            {
+                /* each: the shared lock let go before the CPU lock; the CPU lock let go before the shared lock is taken again */
+                char want[2][64];
+                snprintf(want[0], sizeof want[0], "M+ M- L%llu ", xb[0]->desc.id);
+                snprintf(want[1], sizeof want[1], "U%llu M+ M- ", xb[0]->desc.id);
+                CHECK(strstr(trace, want[0]) && strstr(trace, want[1]), "B1 nested: the order of the locks: %s", trace);
+            }
+
+            /* the published root: the shared lock, as before - a reserved access inside it too */
+            st->rootWindowTextureID = buffers[0]->desc.id;          /* as when root double buffering is not in effect */
+            ok = loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(ok && st->lock == 1 && newWorld.accessLocks == 1 && st->cpuAccess.count == 0, "B1 published root: lock %d, %u reserved",
+                  st->lock, st->cpuAccess.count);
+            ok = loriePrepareAccess(&xr[3], EXA_PREPARE_SRC);
+            CHECK(ok && st->lock == 1 && newWorld.accessLocks == 1 && lorieCpuReserved(st, xb[3]->desc.id),
+                  "B1 inside the root's access: lock %d, access locks %d", st->lock, newWorld.accessLocks);
+            lorieFinishAccess(&xr[3], EXA_PREPARE_SRC);
+            lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(st->lock == 0 && newWorld.accessLocks == 0 && st->cpuAccess.count == 0, "B1 published root: lock %d left", st->lock);
+            st->rootWindowTextureID = buffers[1]->desc.id;
+
+            /* a frame using the AHB: waited for first, under the shared lock (fakeFutexWait checks it) */
+            waits0 = gpuWaits;
+            st->gpuInFlight.ids[0] = xb[4]->desc.id, st->gpuInFlight.count = 1, st->gpuInFlight.pid = getpid();
+            st->gpuInFlight.busy = 1;
+            ok = loriePrepareAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(ok && gpuWaits == waits0 + 1 && !st->gpuInFlight.busy && lorieCpuReserved(st, xb[4]->desc.id) && st->lock == 0,
+                  "B1 frame in flight: %d waits, reserved %d", gpuWaits - waits0, lorieCpuReserved(st, xb[4]->desc.id));
+            lorieFinishAccess(&xr[4], EXA_PREPARE_DEST);
+
+            /* no free slot: the shared lock, counted */
+            for (int k = 0; k < LORIE_CPU_ACCESS_MAX; k++)
+                loriePrepareAccess(&xr[k], EXA_PREPARE_SRC);
+            ok = loriePrepareAccess(&xr[8], EXA_PREPARE_DEST);
+            CHECK(ok && st->cpuAccess.count == LORIE_CPU_ACCESS_MAX && st->lock == 1 && newWorld.accessLocks == 1 &&
+                  !lorieCpuReserved(st, xb[8]->desc.id) && st->diag.xAccessReserveFull == 1,
+                  "B1 full: lock %d, %u reserved, %u counted full", st->lock, st->cpuAccess.count, st->diag.xAccessReserveFull);
+            lorieFinishAccess(&xr[8], EXA_PREPARE_DEST);
+            for (int k = LORIE_CPU_ACCESS_MAX - 1; k >= 0; k--)
+                lorieFinishAccess(&xr[k], EXA_PREPARE_SRC);
+            CHECK(st->lock == 0 && st->cpuAccess.count == 0, "B1 full: lock %d, %u reserved after", st->lock, st->cpuAccess.count);
+
+            /* the CPU lock refused: the reservation let go, nothing held */
+            xb[5]->failLock = 1;
+            releases = st->cpuAccess.releases;
+            ok = loriePrepareAccess(&xr[5], EXA_PREPARE_DEST);
+            xb[5]->failLock = 0;
+            CHECK(!ok && st->lock == 0 && st->cpuAccess.count == 0 && st->cpuAccess.releases == releases + 1 && newWorld.accessLocks == 0,
+                  "B1 refused: prepared %d, lock %d, %u reserved", ok, st->lock, st->cpuAccess.count);
+
+            /* a renderer waiting for a release: woken once, the waiter cleared */
+            signals0 = condSignals, wakes0 = releaseWakes;
+            loriePrepareAccess(&xr[6], EXA_PREPARE_SRC);
+            st->cpuAccess.waiter = 1;
+            lorieFinishAccess(&xr[6], EXA_PREPARE_SRC);
+            CHECK(condSignals == signals0 + 1 && releaseWakes == wakes0 + 1 && !st->cpuAccess.waiter && st->diag.copiesDeferredWakes == 1,
+                  "B1 waiter: %d signals, %d futex wakes, waiter %u", condSignals - signals0, releaseWakes - wakes0, st->cpuAccess.waiter);
+            loriePrepareAccess(&xr[6], EXA_PREPARE_SRC);
+            lorieFinishAccess(&xr[6], EXA_PREPARE_SRC);
+            CHECK(condSignals == signals0 + 1 && releaseWakes == wakes0 + 1, "B1 no waiter: woken anyway");
+
+            /* off: the shared lock throughout, nothing reserved */
+            newWorld.exaLockOpt = FALSE;
+            ok = loriePrepareAccess(&xr[7], EXA_PREPARE_SRC);
+            CHECK(ok && st->lock == 1 && st->cpuAccess.count == 0, "B1 off: lock %d, %u reserved", st->lock, st->cpuAccess.count);
+            lorieFinishAccess(&xr[7], EXA_PREPARE_SRC);
+            newWorld.exaLockOpt = TRUE;
+        }
+
+        /* a reserved access open while the new back's root copy is not settled: waited for, not taken back (no shared
+         * lock is held) */
+        {
+            LorieBuffer *other;
+            LoriePixmapPriv otherP;
+            PixmapRec otherPix;
+            Bool ok;
+            rootGpuWorld("B1 root copy", big, 1);
+            newWorld.exaLockOpt = TRUE;
+            other = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 8, 8);
+            otherP = (LoriePixmapPriv) { .buffer = other };
+            otherPix = (PixmapRec) { { NULL }, &otherP, { 8, 8 } };
+            rootRendererWaits = 1;
+            rootRendererTakes = true;
+            ok = lorieRootSwap(&rootGpuPriv) && loriePrepareAccess(&otherPix, EXA_PREPARE_SRC);
+            CHECK(ok && lorieCpuReserved(&rootGpuState, other->desc.id) && rootGpuState.lock == 0, "B1 root copy: no reserved access open");
+            ok = loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(ok && rootGpuState.rootCopy.cancelled != 1 && rootRendererCalls > 0 && rootGpuAlike() && rootGpuState.diag.rootCpuFallbacks == 0,
+                  "B1 root copy: cancelled %d, the renderer asked %d times, CPU copies %u", rootGpuState.rootCopy.cancelled == 1,
+                  rootRendererCalls, rootGpuState.diag.rootCpuFallbacks);
+            if (ok)
+                lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            lorieFinishAccess(&otherPix, EXA_PREPARE_SRC);
+            CHECK(rootGpuState.lock == 0 && rootGpuState.cpuAccess.count == 0 && newWorld.accessLocks == 0,
+                  "B1 root copy: lock %d, %u reserved after", rootGpuState.lock, rootGpuState.cpuAccess.count);
         }
 
         /* small damage: copied on the CPU at the swap, as before */

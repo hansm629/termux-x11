@@ -20,6 +20,7 @@
 static FILE *logf;
 #define log(prio, fmt, ...) fprintf(logf, "10-07 00:00:00.000  1  1 I LorieNative: " fmt "\n", ##__VA_ARGS__)
 #include "diagtypes_src.inc"
+#include "own_consts_src.inc"
 #define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1     /* the NDK's values */
 #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
@@ -34,6 +35,8 @@ static struct {
     Bool frameDiag, frameAsked;
     uint32_t framesAtAsk;
     struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
+    struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
+    Bool exaLockOpt;
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "diaglog_src.inc"
 
@@ -270,7 +273,7 @@ int main(void) {
             while (logf && fgets(line, sizeof line, logf)) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
                             strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:");
-                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off\n");
+                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
             if (logf)
@@ -305,6 +308,9 @@ int main(void) {
         fakePvfb.worstRequest.us = 25000, fakePvfb.worstRequest.client = 7, fakePvfb.worstRequest.major = 130, fakePvfb.worstRequest.minor = 3;
         strcpy(fakePvfb.worstRequest.cmd, "glmark2-es2"), strcpy(fakePvfb.worstRequest.ext, "MIT-SHM");
         lorieHistAdd(&fakeState.diag.xAccess, 800), lorieHistAdd(&fakeState.diag.xAccessLock, 50);
+        lorieHistAdd(&fakeState.diag.xAccessHold, 120);
+        fakePvfb.worstAccess.us = 19379, fakePvfb.worstAccess.width = 800, fakePvfb.worstAccess.height = 600;
+        fakePvfb.worstAccess.index = EXA_PREPARE_SRC, fakePvfb.worstAccess.reserved = TRUE;
         lorieHistAdd(&fakeState.diag.xAccessGpu, 6000), lorieHistAdd(&fakeState.diag.xTickDelay, 700);
         lorieHistAdd(&fakeState.diag.xTickWork, 300);
         lorieLogRendererDiag();
@@ -312,7 +318,7 @@ int main(void) {
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
-            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on\n");
+            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off\n");
             if (strstr(line, "XlorieVkFramePacing:") && ++n[0] == 2)
                 pacingOk = strstr(line, "XlorieVkFramePacing: frame_start_us=100/9620/20000/50000/35000/10/4 "
                                         "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "
@@ -338,10 +344,12 @@ int main(void) {
                 xOk = strstr(line, "XlorieXLatency: request_us=4/6340/25000/25000/25000/1/0 access_us=1/800/1000/1000/800/0/0 "
                                    "access_lock_us=1/50/50/50/50/0/0 access_gpu_us=1/6000/6000/6000/6000/0/0 "
                                    "tick_delay_us=1/700/750/750/700/0/0 tick_work_us=1/300/300/300/300/0/0 "
-                                   "worst_request_us=25000 worst_request=7:glmark2-es2:MIT-SHM:130.3\n") != NULL;
+                                   "worst_request_us=25000 worst_request=7:glmark2-es2:MIT-SHM:130.3 access_hold_us=1/120/200/200/120/0/0 "
+                                   "worst_access_us=19379 worst_access=800x600:src:reserved\n") != NULL;
             if (strstr(line, "XlorieXLatency:") && n[3] == 3)
                 emptyOk += strstr(line, "request_us=0 access_us=0 access_lock_us=0 access_gpu_us=0 tick_delay_us=0 tick_work_us=0 "
-                                        "worst_request_us=0 worst_request=-1:none:none:0.0\n") != NULL;
+                                        "worst_request_us=0 worst_request=-1:none:none:0.0 access_hold_us=0 worst_access_us=0 "
+                                        "worst_access=0x0:none:none\n") != NULL;
         }
         fclose(logf);
         CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3, "frame diag on: %d backend lines saying on, "
@@ -352,7 +360,7 @@ int main(void) {
         CHECK(xOk, "frame diag: the X latency line wrong");
         CHECK(emptyOk == 4, "frame diag: %d of 4 lines without samples say so and took the worst back", emptyOk);
         CHECK(!fakeState.diag.vkFrameStart.maxUs && !fakeState.diag.vkPresentDelta.maxUs && !fakeState.diag.xRequest.maxUs &&
-              !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us,
+              !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us && !fakePvfb.worstAccess.us,
               "frame diag: a maximum or worst not taken back by its report");
     }
 
@@ -394,19 +402,46 @@ int main(void) {
               "%u waits (want 1: none over 10 s)", (unsigned long long) (dg->xTickDelay.sumUs - sum), dg->xTickDelay.count - delays);
     }
 
+    /* P11-C3-B1: XlorieSchedule in every report - TERMUX_X11_EXA_LOCK_OPT off, its counters as they moved; on */
+    {
+        int lines = 0, offOk = 0, onOk = 0;
+        snprintf(path, sizeof path, "%s/diag-schedule.log", out ? out : ".");
+        logf = fopen(path, "w");
+        lorieLogRendererDiag();
+        fakePvfb.exaLockOpt = TRUE;
+        fakeState.diag.xAccessReserved += 1201, fakeState.diag.xAccessReserveFull += 2;
+        fakeState.diag.copiesDeferred += 7, fakeState.diag.copiesDeferredWakes += 6;
+        lorieLogRendererDiag();
+        fakePvfb.exaLockOpt = FALSE;
+        fclose(logf);
+        logf = fopen(path, "r");
+        while (fgets(line, sizeof line, logf)) {
+            if (!strstr(line, "XlorieSchedule:"))
+                continue;
+            lines++;
+            offOk += lines == 1 && strstr(line, "XlorieSchedule: exa_lock_opt=off x_access_reserved=0(+0) x_access_reserve_full=0(+0) "
+                                                "copies_deferred=0(+0) copies_deferred_wakes=0(+0)") != NULL;
+            onOk += lines == 2 && strstr(line, "XlorieSchedule: exa_lock_opt=on x_access_reserved=1201(+1201) "
+                                               "x_access_reserve_full=2(+2) copies_deferred=7(+7) copies_deferred_wakes=6(+6)") != NULL;
+        }
+        fclose(logf);
+        CHECK(lines == 2 && offOk && onOk, "schedule log: %d lines (want 2), off %s, on %s", lines, offOk ? "right" : "wrong",
+              onOk ? "right" : "wrong");
+    }
+
     /* every message within __android_log_print's 1024-byte buffer (longer ones are cut): the copy latency line with
      * every part at its widest, and P11-C3's lines with every timing and worst at its widest, then every line written
      * above */
     {
         static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log",
-                                            "diag-frame.log", "diag-wide.log" };
+                                            "diag-frame.log", "diag-schedule.log", "diag-wide.log" };
         volatile struct lorie_hist *hists[] = {
             &fakeState.diag.vkFrameStart, &fakeState.diag.vkPresentDelta, &fakeState.diag.vkFrameWake, &fakeState.diag.vkFrameCpu,
             &fakeState.diag.vkFrameAcquire, &fakeState.diag.vkFrameLock, &fakeState.diag.vkFrameRecord, &fakeState.diag.vkFrameSubmit,
             &fakeState.diag.vkFrameFence, &fakeState.diag.vkFramePresent, &fakeState.diag.vkFrameAfterRoot, &fakeState.diag.vkFenceRoot,
             &fakeState.diag.vkFenceCopy, &fakeState.diag.rootTake, &fakeState.diag.rootRecord, &fakeState.diag.rootResume,
             &fakeState.diag.rootBlock, &fakeState.diag.xRequest, &fakeState.diag.xAccess, &fakeState.diag.xAccessLock,
-            &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork };
+            &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork, &fakeState.diag.xAccessHold };
         volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
                                                    &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
                                                    &fakeState.diag.copyTotal, &fakeState.diag.copyAck, &fakeState.diag.xVsyncToCallback,
@@ -437,6 +472,10 @@ int main(void) {
         fakePvfb.worstRequest.us = 4294967295u, fakePvfb.worstRequest.client = 2047, fakePvfb.worstRequest.major = 255;
         fakePvfb.worstRequest.minor = 255;
         memset(fakePvfb.worstRequest.cmd, 'c', 23), memset(fakePvfb.worstRequest.ext, 'e', 23);
+        fakePvfb.worstAccess.us = 4294967295u, fakePvfb.worstAccess.width = fakePvfb.worstAccess.height = 32767;
+        fakePvfb.worstAccess.index = EXA_PREPARE_MASK, fakePvfb.worstAccess.reserved = TRUE;
+        fakeState.diag.xAccessReserved += 999999999, fakeState.diag.xAccessReserveFull += 999999999;
+        fakeState.diag.copiesDeferred += 999999999, fakeState.diag.copiesDeferredWakes += 999999999;
         lorieLogRendererDiag();
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {

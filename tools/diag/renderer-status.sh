@@ -1,6 +1,6 @@
 #!/bin/sh
 # Prints the X server's latest renderer diagnostics: the XlorieBackend, XlorieGles, XlorieVk, XlorieVkTiming,
-# XlorieVkSelftest, XlorieFallback and XlorieRootCopy lines it logs every 5 seconds (and, with
+# XlorieVkSelftest, XlorieFallback, XlorieRootCopy and XlorieSchedule lines it logs every 5 seconds (and, with
 # TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, XlorieVkFramePacing, XlorieVkPipeline, XlorieRootCopyTiming and XlorieXLatency),
 # and the renderer's GLES driver line. Nothing is computed or assumed here - these are the lines as the X server wrote them.
 #
@@ -27,12 +27,12 @@ SRC | awk '
     /XlorieFrames: renderer GLES driver:/ { drv = $0 }
     /XlorieBackend: / { b = $0 } /XlorieGles: / { g = $0 } /XlorieVk: / { v = $0 }
     /XlorieVkTiming: / { t = $0 } /XlorieVkSelftest: / { s = $0 } /XlorieFallback: / { f = $0 } /XlorieRootCopy: / { rc = $0 }
-    /XlorieVkFramePacing: / { fp = $0 } /XlorieVkPipeline: / { vp = $0 } /XlorieRootCopyTiming: / { rt = $0 } /XlorieXLatency: / { xl = $0 }
+    /XlorieSchedule: / { sc = $0 } /XlorieVkFramePacing: / { fp = $0 } /XlorieVkPipeline: / { vp = $0 } /XlorieRootCopyTiming: / { rt = $0 } /XlorieXLatency: / { xl = $0 }
     END {
         n = 0
         if (drv) { print drv; n++ }
         if (b) { print b; n++ } if (g) { print g; n++ } if (v) { print v; n++ }
         if (t) { print t; n++ } if (s) { print s; n++ } if (f) { print f; n++ } if (rc) { print rc; n++ }
-        if (fp) { print fp; n++ } if (vp) { print vp; n++ } if (rt) { print rt; n++ } if (xl) { print xl; n++ }
+        if (sc) { print sc; n++ } if (fp) { print fp; n++ } if (vp) { print vp; n++ } if (rt) { print rt; n++ } if (xl) { print xl; n++ }
         if (!b) { print "renderer-status: no XlorieBackend line found (X server not running this build, or no renderer connected yet)"; exit 1 }
     }'

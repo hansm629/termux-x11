@@ -94,6 +94,7 @@ recipes = {
     "xorglist": lambda: open(os.path.join(XS, "include", "list.h"), encoding="utf-8").read(),
     "own_consts": lambda: macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_DEST")
         + macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_SRC")
+        + macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_MASK")
         + macro(I, "CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED"),
     "own_base": lambda: own(BI, []),
     "own_new": lambda: own(I, [
@@ -107,6 +108,10 @@ recipes = {
         "static Bool lorieRendererGoneWorkProc(",
         "void lorieRendererDisconnected(void) {",
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
+        # P11-C3-B1: the reservations PER_ACCESS AHB accesses may hold instead of the shared lock
+        "static Bool lorieCpuReserve(uint64_t id) {",
+        "static Bool lorieCpuRelease(uint64_t id) {",
+        "static void lorieCpuReleasedWake(void) {",
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {")
         + func(I, "static uint8_t lorieRequestedVkSelftest(const char *value, volatile uint8_t *invalid) {"),
     # root double buffering's swap, the bounds its own locks take (P11-B), and its copy by the renderer's GPU asked
@@ -165,6 +170,7 @@ recipes = {
         + macro(H, "LORIE_GPU_IN_FLIGHT_MAX"),
     # the AHBs a submitted Vulkan frame uses, as both sides look them up (fakevk.h, townership.c)
     "inflight": lambda: func(H, "static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared_server_state *st, uint64_t id) {")
+        + func(H, "static inline __always_inline bool lorieCpuReserved(volatile struct lorie_shared_server_state *st, uint64_t id) {")
         + func(H, "static inline __always_inline bool lorieGpuAnyInFlight(volatile struct lorie_shared_server_state *st) {")
         + func(H, "static inline __always_inline bool lorieGpuSubmitterGone(volatile struct lorie_shared_server_state *st) {")
         + func(H, "static inline __always_inline void lorieGpuWaitIdle(volatile struct lorie_shared_server_state *st, bool every, uint64_t id) {"),
@@ -173,6 +179,10 @@ recipes = {
     # GLES copies (what Vulkan must match) and its Vulkan copies, alone and in a frame
     "buffertypes": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "} LorieBuffer_Desc;"),
     "presentcopy": lambda: func(B, "__LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {")
+        # P11-C3-B1: copies left queued for the X server's reservations
+        + span(R, "#define LORIE_COPIES_DEFERRED_RECHECK_US", "static uint32_t deferredAt, deferredReleases;")
+        + func(R, "static bool rendererCopyDeferred(const LorieGpuCopyEntry *entry, uint32_t index) {")
+        + func(R, "static bool rendererCopiesStillDeferred(void) {")
         + func(I, "bool lorieRendererAvailable(void) {")
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
         + func(I, "void lorieCountCopyAck(void) {")

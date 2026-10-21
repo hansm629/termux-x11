@@ -202,6 +202,7 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
 #define LORIE_GPU_IN_FLIGHT_MAX 32      /* AHBs one Vulkan frame may use (vk.h LORIE_VK_MAX_FRAME_IMAGES) */
+#define LORIE_CPU_ACCESS_MAX 8          /* P11-C3-B1: AHBs the X server may hold reserved at once (cpuAccess) */
 
 typedef struct {
     uint64_t serial;
@@ -493,6 +494,14 @@ struct lorie_renderer_diag {
      * The ticks that asked the renderer for a frame, and the ticks that found none presented since the last one did. */
     struct lorie_hist xRequest, xAccess, xAccessLock, xAccessGpu, xTickDelay, xTickWork;
     volatile uint32_t xTicksFrameWanted, xTicksFrameMissed;
+    /* P11-C3-B1, with TERMUX_X11_RENDERER_VK_FRAME_DIAG: how long each PER_ACCESS AHB access kept `lock` - all of it,
+     * or, reserved (cpuAccess), only while reserving and letting go. */
+    struct lorie_hist xAccessHold;
+
+    /* P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1), always counted: the X server's PER_ACCESS AHB accesses made under a
+     * reservation instead of `lock`, and those that held `lock` because no reservation was free; the renderer's
+     * passes that left a copy queued for a reserved AHB, and the X server's wakes of a renderer that did. */
+    volatile uint32_t xAccessReserved, xAccessReserveFull, copiesDeferred, copiesDeferredWakes;
 
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
      * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer
@@ -586,6 +595,23 @@ struct lorie_shared_server_state {
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
+
+    /*
+     * P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1): the AHBs the X server CPU-accesses without holding `lock` through the
+     * access (InitOutput.c loriePrepareAccess). Under PER_ACCESS, holding `lock`, it reserves one only once no submitted
+     * Vulkan frame lists it (gpuInFlight), lets `lock` go, CPU-locks it; after the access it unlocks it, and only then
+     * lets the reservation go, under `lock` again. A renderer, holding `lock`, records no work using a reserved AHB:
+     * a queued copy that would use one stays queued, with every copy after it (renderer.c). The root the X server
+     * publishes (rootWindowTextureID, which the renderer samples) it never reserves: accesses to it hold `lock` as
+     * before. `releases` counts the reservations let go; `waiter`, set under `lock` by a renderer that left a copy
+     * queued for one, the X server clears at the next release, waking the renderer then (rendererCond, and a futex
+     * on `releases`).
+     */
+    struct {
+        uint32_t count;
+        uint64_t ids[LORIE_CPU_ACCESS_MAX];
+        volatile uint32_t releases, waiter;
+    } cpuAccess;
 
     /*
      * P11-C2 (TERMUX_X11_RENDERER_ROOT_GPU_COPY=1): root double buffering's copy of the damage from the buffer the
@@ -688,6 +714,15 @@ static inline __always_inline bool lorieGpuInFlight(volatile struct lorie_shared
         return false;
     for (i = 0; i < st->gpuInFlight.count && i < LORIE_GPU_IN_FLIGHT_MAX; i++)
         if (st->gpuInFlight.ids[i] == id)
+            return true;
+    return false;
+}
+
+// P11-C3-B1: whether the X server holds AHB `id` reserved for a CPU access (cpuAccess); under `lock`.
+static inline __always_inline bool lorieCpuReserved(volatile struct lorie_shared_server_state *st, uint64_t id) {
+    uint32_t i;
+    for (i = 0; i < st->cpuAccess.count && i < LORIE_CPU_ACCESS_MAX; i++)
+        if (st->cpuAccess.ids[i] == id)
             return true;
     return false;
 }

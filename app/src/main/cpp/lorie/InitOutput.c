@@ -130,6 +130,16 @@ typedef struct {
         int client, major, minor;
         char cmd[24], ext[24];
     } worstRequest;
+    /* ... and its slowest PER_ACCESS AHB access - its time, its pixmap's size, EXA's index, reserved or not */
+    struct {
+        uint32_t us;
+        int width, height, index;
+        Bool reserved;
+    } worstAccess;
+
+    /* P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1, lorie.h cpuAccess): PER_ACCESS AHB accesses reserve the AHB instead of
+     * holding the shared lock through the access */
+    Bool exaLockOpt;
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -167,8 +177,12 @@ typedef struct {
     /* An AHB pixmap 3c98ffa keeps CPU-locked for its lifetime: on pvfb->ahbPersistent (lorieHoldPersistent) */
     bool persistentWanted;
     struct xorg_list persistentLink;
-    /* P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): when its PER_ACCESS access took the shared lock (0: not timed) */
+    /* P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): when its PER_ACCESS access took the shared lock (0: not timed),
+     * and how long it held it before letting it go for a reservation */
     uint64_t accessStartUs;
+    uint32_t accessHoldUs;
+    /* P11-C3-B1: its open access holds a reservation (lorie.h cpuAccess) instead of the shared lock */
+    bool reserved;
 } LoriePixmapPriv;
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
@@ -411,6 +425,9 @@ void OsVendorInit(void) {
     lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
     lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
     dispatchRequestTimed = lorieScreen.frameDiag;
+    // Experimental: TERMUX_X11_EXA_LOCK_OPT=1 has a PER_ACCESS AHB access reserve the AHB for itself instead of holding
+    // the shared lock - and so the renderer's frames - through the CPU drawing (loriePrepareAccess, lorie.h cpuAccess).
+    lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");
 }
 
 // A name as one word for a log line: a path's last part, up to its first space, anything else odd as '_'.
@@ -1262,7 +1279,7 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s exa_lock_opt=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -1275,7 +1292,12 @@ static void lorieLogRendererDiag(void) {
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
         !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off",
-        pvfb->frameDiag ? "on" : "off");
+        pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off");
+    // P11-C3-B: what the scheduling options did - B1's reservations instead of the shared lock, and the copies the
+    // renderer left queued for one
+    log(INFO, "XlorieSchedule: exa_lock_opt=%s x_access_reserved=%llu(+%llu) x_access_reserve_full=%llu(+%llu) "
+              "copies_deferred=%llu(+%llu) copies_deferred_wakes=%llu(+%llu)",
+        pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes));
     // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
     log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
               "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "
@@ -1397,12 +1419,19 @@ static void lorieLogRendererDiag(void) {
                   "worst_take_us=%u worst_record_us=%u worst_fence_us=%u",
             h[0], h[1], h[2], h[3], worst, d.rootWorstTakeUs, d.rootWorstRecordUs, d.rootWorstFenceUs);
         HT(0, xRequest), HT(1, xAccess), HT(2, xAccessLock), HT(3, xAccessGpu), HT(4, xTickDelay), HT(5, xTickWork);
+        HT(6, xAccessHold);
         log(INFO, "XlorieXLatency: request_us=%s access_us=%s access_lock_us=%s access_gpu_us=%s tick_delay_us=%s "
-                  "tick_work_us=%s worst_request_us=%u worst_request=%d:%s:%s:%d.%d",
+                  "tick_work_us=%s worst_request_us=%u worst_request=%d:%s:%s:%d.%d access_hold_us=%s worst_access_us=%u "
+                  "worst_access=%dx%d:%s:%s",
             h[0], h[1], h[2], h[3], h[4], h[5], pvfb->worstRequest.us, pvfb->worstRequest.us ? pvfb->worstRequest.client : -1,
             pvfb->worstRequest.us ? pvfb->worstRequest.cmd : "none", pvfb->worstRequest.us ? pvfb->worstRequest.ext : "none",
-            pvfb->worstRequest.us ? pvfb->worstRequest.major : 0, pvfb->worstRequest.us ? pvfb->worstRequest.minor : 0);
+            pvfb->worstRequest.us ? pvfb->worstRequest.major : 0, pvfb->worstRequest.us ? pvfb->worstRequest.minor : 0, h[6],
+            pvfb->worstAccess.us, pvfb->worstAccess.us ? pvfb->worstAccess.width : 0, pvfb->worstAccess.us ? pvfb->worstAccess.height : 0,
+            !pvfb->worstAccess.us ? "none" : pvfb->worstAccess.index == EXA_PREPARE_DEST ? "dest"
+                : pvfb->worstAccess.index == EXA_PREPARE_SRC ? "src" : pvfb->worstAccess.index == EXA_PREPARE_MASK ? "mask" : "other",
+            !pvfb->worstAccess.us ? "none" : pvfb->worstAccess.reserved ? "reserved" : "locked");
         pvfb->worstRequest.us = 0;
+        pvfb->worstAccess.us = 0;
 #undef TD32
 #undef HT
     }
@@ -2243,6 +2272,44 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
            LorieBuffer_hasGpuCopyPending(priv->buffer);
 }
 
+/*
+ * P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1, lorie.h cpuAccess), holding the shared lock: AHB `id` reserved for one CPU
+ * access of this X server - never the root it publishes (rootWindowTextureID: the renderer samples it), nor with no
+ * slot free (counted).
+ */
+static Bool lorieCpuReserve(uint64_t id) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    if (!pvfb->exaLockOpt || id == st->rootWindowTextureID)
+        return FALSE;
+    if (st->cpuAccess.count >= LORIE_CPU_ACCESS_MAX) {
+        __atomic_fetch_add(&st->diag.xAccessReserveFull, 1, __ATOMIC_RELAXED);
+        return FALSE;
+    }
+    st->cpuAccess.ids[st->cpuAccess.count++] = id;
+    __atomic_fetch_add(&st->diag.xAccessReserved, 1, __ATOMIC_RELAXED);
+    return TRUE;
+}
+
+// ... let go, holding the shared lock (its CPU lock gone already): whether a renderer waits for it - to be woken by
+// lorieCpuReleasedWake once the shared lock is let go.
+static Bool lorieCpuRelease(uint64_t id) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    uint32_t i;
+    for (i = 0; i < st->cpuAccess.count && i < LORIE_CPU_ACCESS_MAX; i++)
+        if (st->cpuAccess.ids[i] == id) {
+            st->cpuAccess.ids[i] = st->cpuAccess.ids[--st->cpuAccess.count];
+            break;
+        }
+    __atomic_fetch_add(&st->cpuAccess.releases, 1, __ATOMIC_RELEASE);
+    return __atomic_exchange_n(&st->cpuAccess.waiter, 0, __ATOMIC_RELAXED) != 0;
+}
+
+static void lorieCpuReleasedWake(void) {
+    __atomic_fetch_add(&pvfb->state->diag.copiesDeferredWakes, 1, __ATOMIC_RELAXED);
+    syscall(SYS_futex, &pvfb->state->cpuAccess.releases, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+    pthread_cond_signal(rendererCond);
+}
+
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
@@ -2269,6 +2336,15 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         }
         if (perAccessAhb)
             __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
+        // P11-C3-B1: no frame uses it now; reserved, no renderer will until FinishAccess lets it go - and the shared
+        // lock is let go before the CPU lock is taken, for the whole of the CPU access
+        if (perAccessAhb && lorieCpuReserve(LorieBuffer_description(priv->buffer)->id)) {
+            priv->reserved = TRUE;
+            if (priv->accessStartUs)
+                priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
+            pvfb->accessLocks--;
+            lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        }
     }
 
     if (!priv->locked && !priv->mem) {
@@ -2282,8 +2358,18 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             // this lock for good. (3c98ffa's own path is left as it was.)
             if (perAccessAhb) {
                 priv->accessStartUs = 0;
-                pvfb->accessLocks--;
-                lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                if (priv->reserved) {
+                    Bool wake;
+                    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                    wake = lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+                    priv->reserved = FALSE;
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                    if (wake)
+                        lorieCpuReleasedWake();
+                } else {
+                    pvfb->accessLocks--;
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                }
             }
             return FALSE;
         }
@@ -2303,6 +2389,7 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
     // PER_ACCESS: the CPU lock goes before the shared one, so the renderer can never take the shared lock
     // and use the AHB while the X server still has it CPU-locked. 3c98ffa's order is kept otherwise.
     if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
+        Bool reserved = priv->reserved, wake = FALSE;
         if (!priv->wasLocked) {
             uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
@@ -2310,12 +2397,35 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        // P11-C3-B1: likewise the CPU lock goes before the reservation, let go under the shared lock taken again
+        if (reserved) {
+            uint64_t lockedUs;
+            lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            lockedUs = priv->accessStartUs ? GetTimeInMicros() : 0;
+            wake = lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+            priv->reserved = FALSE;
+            if (lockedUs)
+                priv->accessHoldUs += (uint32_t) (GetTimeInMicros() - lockedUs);
+        } else if (priv->accessStartUs)
+            priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
         if (priv->accessStartUs) {
-            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            uint64_t us = GetTimeInMicros() - priv->accessStartUs;
+            lorieHistAdd(&pvfb->state->diag.xAccess, us);
+            lorieHistAdd(&pvfb->state->diag.xAccessHold, priv->accessHoldUs);
+            if (us > pvfb->worstAccess.us) {
+                pvfb->worstAccess.us = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+                pvfb->worstAccess.width = pPix->drawable.width;
+                pvfb->worstAccess.height = pPix->drawable.height;
+                pvfb->worstAccess.index = index;
+                pvfb->worstAccess.reserved = reserved;
+            }
             priv->accessStartUs = 0;
         }
-        pvfb->accessLocks--;
+        if (!reserved)
+            pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        if (wake)
+            lorieCpuReleasedWake();
         return;
     }
 

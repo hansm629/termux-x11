@@ -10,11 +10,13 @@ XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=G
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
                 x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
                 x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off vk_frame_diag=on|off
+                exa_lock_opt=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
 XlorieVkTiming: acquire results, acquire/submit/fence/present times, copies_ahead, early_presents, self-test, device, present mode
 XlorieRootCopy: root_gpu_copy=off|on|fallback, the root double buffering copies by the renderer's GPU (P11-C2)
+XlorieSchedule: exa_lock_opt=on|off x_access_reserved x_access_reserve_full copies_deferred copies_deferred_wakes (P11-C3-B)
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -34,7 +36,8 @@ XlorieVkPipeline: cpu_us acquire_us lock_us record_us submit_us fence_frame_us f
                 after_root_us
 XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us worst_take_us worst_record_us worst_fence_us
 XlorieXLatency: request_us access_us access_lock_us access_gpu_us tick_delay_us tick_work_us worst_request_us
-                worst_request=client:command:extension:major.minor
+                worst_request=client:command:extension:major.minor access_hold_us worst_access_us
+                worst_access=WxH:dest|src|mask:reserved|locked
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -190,11 +193,32 @@ renderer cannot record a frame meanwhile - `access_lock_us` its wait for that lo
 Vulkan frame using the AHB; `tick_delay_us` from the vsync callback to the tick running on the X server's thread
 (`callback_to_tick_us` of `XlorieTick` with its tail), `tick_work_us` the tick's work up to asking for the frame.
 
+With P11-C3-B1, `access_hold_us` is how long each such access kept the shared lock - all of it, or, reserved (below),
+only while reserving and letting go - and `worst_access_us` / `worst_access` the period's slowest access: its pixmap's
+size, EXA's index, and whether it was reserved or held the lock.
+
 Reading them: a hitch shows as `frame_start_us` h16/h33; where its time went is in the same period's other keys and
 the worst frame's breakdown - waiting for the tick (`wake_us`, `tick_delay_us`, a long `request_us`), for the X
 server's lock (`lock_us`, `access_us`), behind a root copy (`after_root_us`, `x_block_us`), on the GPU (the fences), or
 in the presentation engine (`acquire_us`, `present_us`). `tools/diag/frame-diag-session.sh` records one session in
 three marked phases for this.
+
+### EXA accesses without the shared lock (P11-C3-B1, `TERMUX_X11_EXA_LOCK_OPT=1`)
+
+Experimental, off by default. Under PER_ACCESS (Vulkan) every CPU access to an AHB used to hold the lock shared with
+the renderer for the whole access - the software drawing included (EXA has no GPU acceleration here, so an XRender
+Composite is pixman on the CPU) - and the renderer's frame waited for it (`lock_us`). With the option an access to
+any AHB but the root the X server publishes (the one the renderer samples) holds a reservation instead
+(`struct lorie_shared_server_state` `cpuAccess`): under the lock, once no submitted Vulkan frame uses the AHB, the AHB
+is reserved and the lock let go; the CPU lock is taken after that, and let go before the reservation is, under the
+lock again. A renderer records no work using a reserved AHB: a queued copy that would use one is left queued, with
+the copies after it, and the frame goes on without them; the X server wakes the renderer when it lets the
+reservation go. Accesses to the published root, and accesses when all 8 reservations are taken, hold the lock as
+before.
+
+`XlorieSchedule`: `x_access_reserved` - accesses made under a reservation; `x_access_reserve_full` - those that held
+the lock because none was free; `copies_deferred` - renderer passes that left a copy queued for a reservation;
+`copies_deferred_wakes` - the X server's wakes of a renderer that did.
 
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under

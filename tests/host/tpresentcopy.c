@@ -1395,6 +1395,109 @@ int main(void) {
         earlyWithOption += emu.earlyPresents - early;   /* the option's, above */
     }
 
+    /* P11-C3-B1 (lorie.h cpuAccess): a queued copy using a buffer the X server holds reserved is not recorded, nor any
+     * copy after it - the frame drawn without them, nothing drawn into or from the reserved buffer, the copies left
+     * queued and the X server asked to wake the renderer, a pass without a release no reason to run again; once it
+     * is let go, they are copied. Alone: nothing submitted. A cancelled copy ahead of it still completed. GLES's copies
+     * likewise. A root copy with a reserved buffer: not copied. The published root reserved (never, by the X server's
+     * rule): not sampled - the image held. */
+    {
+        LorieBuffer *bd = redirected;
+        uint64_t s1 = 0, s2 = 0, s3 = 0;
+        uint32_t read0, submits, deferred = st.diag.copiesDeferred, presented;
+        int d1, fails0 = vkFailures, waits;
+        void *db1 = NULL, *db2 = NULL, *db3 = NULL;
+
+        own(44);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);                 /* nothing queued: a frame, the image released */
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 1, 1, &s1, &db1), "B1: not queued");    /* cancelled below */
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &s2, &db2), "B1: not queued");
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 2, 2, &s3, &db3), "B1: not queued");
+        st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 3) % LORIE_GPU_COPY_QUEUE_CAPACITY].cancelled = 1;
+        st.cpuAccess.ids[0] = bd->desc.id, st.cpuAccess.count = 1;          /* the X server's reservation */
+        st.cpuAccess.waiter = 0;
+        read0 = st.gpuCopyQueue.readIndex;
+        presented = st.diag.vkFramesPresented;
+        d1 = emu.draws;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(vkFailures == fails0 && emu.violations == 0 && st.diag.vkFramesPresented == presented + 1 && emu.draws == d1 + 1 &&
+              emu.drawnFrom[d1 % 64] == root->desc.buffer, "B1 frame: presented %u, %d draws (want the root alone)",
+              st.diag.vkFramesPresented - presented, emu.draws - d1);
+        CHECK(st.gpuCopyQueue.readIndex == read0 + 1 && lorieGpuCopyIsDone(s1) && !lorieGpuCopyIsDone(s2) && !lorieGpuCopyIsDone(s3) &&
+              st.cpuAccess.waiter == 1 && st.diag.copiesDeferred == deferred + 1 && rendererCopiesStillDeferred(),
+              "B1 frame: read %u (want past the cancelled one), done %d %d %d, waiter %u, deferred %u, still %d",
+              st.gpuCopyQueue.readIndex - read0, lorieGpuCopyIsDone(s1), lorieGpuCopyIsDone(s2), lorieGpuCopyIsDone(s3),
+              st.cpuAccess.waiter, st.diag.copiesDeferred - deferred, rendererCopiesStillDeferred());
+        /* alone, the reservation still held: nothing submitted, nothing waited for */
+        submits = st.diag.vkQueueSubmits, waits = atFence.waits;
+        rendererVkApplyPendingGpuCopies();
+        CHECK(st.diag.vkQueueSubmits == submits && atFence.waits == waits && !lorieGpuCopyIsDone(s2) && st.lock == 0,
+              "B1 alone: %u submissions, %d fence waits while the reservation is held", st.diag.vkQueueSubmits - submits,
+              atFence.waits - waits);
+        /* GLES: likewise, from the same queue */
+        {
+            Queue saved;
+            uint32_t glesRead;
+            memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
+            memcpy((void *) &glesState.cpuAccess, (const void *) &st.cpuAccess, sizeof st.cpuAccess);
+            CHECK(gles(&saved) == 0 && glDrawCount == 0, "B1 GLES: copied past the reservation (%d draws)", glDrawCount);
+            glesRead = glesState.gpuCopyQueue.readIndex;
+            CHECK(glesRead == saved.readIndex, "B1 GLES: the queue moved past the reservation");
+            glesState.cpuAccess.count = 0;
+        }
+        /* let go: copied */
+        st.cpuAccess.count = 0;
+        st.cpuAccess.releases++;
+        CHECK(!rendererCopiesStillDeferred(), "B1: still deferred after the release");
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(s2) && lorieGpuCopyIsDone(s3) && vkFailures == fails0 && emu.violations == 0,
+              "B1 let go: done %d %d", lorieGpuCopyIsDone(s2), lorieGpuCopyIsDone(s3));
+        lorieGpuCopyAck(&bgraPix, db2);
+        lorieGpuCopyAck(&srcPix, db3);
+        lorieGpuCopyAck(&srcPix, db1);
+        st.gpuInFlight.busy = 0;
+
+        /* a root copy with a reserved buffer: not copied, nothing drawn */
+        {
+            LorieBuffer *ra = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48), *rb = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48);
+            static const LorieGpuCopyRect one[1] = { { 3, 5, 40, 30 } };
+            ra->registered = rb->registered = true;
+            rootAsk(ra, rb, one, 1);
+            st.cpuAccess.ids[0] = rb->desc.id, st.cpuAccess.count = 1;
+            d1 = emu.draws;
+            rendererVkRootCopy();
+            st.cpuAccess.count = 0;
+            CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && emu.draws == d1 && vkFailures == fails0,
+                  "B1 root copy: settled %d, failed %d, %d draws", st.rootCopy.done == rootSeq, st.rootCopy.failed == rootSeq,
+                  emu.draws - d1);
+            ra->registered = rb->registered = false;
+        }
+
+        /* the published root reserved: not sampled, the image held */
+        {
+            int acquires = emu.acquires2;
+            presented = st.diag.vkFramesPresented;
+            d1 = emu.draws;
+            st.cpuAccess.ids[0] = root->desc.id, st.cpuAccess.count = 1;
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            st.cpuAccess.count = 0;
+            CHECK(vkr.held && emu.draws == d1 && st.diag.vkFramesPresented == presented && st.lock == 0 && emu.acquires2 == acquires + 1,
+                  "B1 published root reserved: held %d, %d draws, %u presented", vkr.held, emu.draws - d1,
+                  st.diag.vkFramesPresented - presented);
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            st.gpuInFlight.busy = 0;
+            CHECK(!vkr.held && st.diag.vkFramesPresented == presented + 1 && emu.drawnFrom[d1 % 64] == root->desc.buffer,
+                  "B1 published root let go: held %d, %u presented", vkr.held, st.diag.vkFramesPresented - presented);
+        }
+        st.cpuAccess.waiter = 0;
+    }
+
     /* P11-C3: the pacing intervals from given stamps (rendererVkFrameTimed): the first frame none - no false hitch;
      * 8, 17 and 35 ms in their buckets, the largest the period's worst with what that frame spent; a stamp before the
      * last none (counted invalid), the next interval from it; a gap over 250 ms none (counted idle); another swapchain

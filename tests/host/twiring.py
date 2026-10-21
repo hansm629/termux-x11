@@ -26,7 +26,9 @@ takes the shared lock. P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG read when the s
 renderer's flag and Dispatch's; the tick checks the last frame it asked for before it can return early, and stamps
 its request before it wakes the renderer; a Vulkan frame is timed only once presented, and only with the flag; the
 pacing intervals start over with another session, window or device, and a root copy counts as ahead of the frame only
-in the loop pass that made it.
+in the loop pass that made it. P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT read when the server state is made, "1" only; copies
+left queued for a reservation are no reason for the renderer to run again until one is let go, its wait for that
+bounded, and they are forgotten with the session.
 
 usage: twiring.py <lorie source dir>
 """
@@ -166,6 +168,18 @@ in_order("pacing over with another device", func(R, "static void rendererVkTeard
          "rendererVkPacingReset();")
 in_order("root copy ahead of the frame, this pass only", loop, "pthread_mutex_unlock(&stateLock);", "vkRootCopyBusyUs = 0;",
          "rendererVkRootCopy();", "rendererVkRedraw(&waitingForBuffers);")
+
+# P11-C3-B1: the reservations' wiring
+check('lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");' in init,
+      "OsVendorInit does not read TERMUX_X11_EXA_LOCK_OPT=1")
+should = func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {")
+check("gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();" in should,
+      "copies left queued for a reservation wake the renderer again and again")
+in_order("the bounded wait for a release", loop, "while (rendererShouldWait(&waitingForBuffers)) {", "if (rendererCopiesStillDeferred()) {",
+         "rendererTimespecAddUs(&deadline, LORIE_COPIES_DEFERRED_RECHECK_US);", "pthread_cond_timedwait(stateCond, &stateLock, &deadline);",
+         "pthread_cond_wait(stateCond, &stateLock);")
+in_order("copies left queued forgotten with the session", loop, "if (stateChanged) {", "deferredCopies = false;", "if (windowChanged)")
+check("&& !rendererCopiesStillDeferred();\n        if (vkActive) {" in loop, "the loop runs copies left queued for a reservation alone, again and again")
 
 selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {")
 check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,

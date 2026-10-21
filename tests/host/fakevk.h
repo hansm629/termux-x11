@@ -174,6 +174,11 @@ struct lorie_shared_server_state {
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
+    struct {                    /* P11-C3-B1 */
+        uint32_t count;
+        uint64_t ids[LORIE_CPU_ACCESS_MAX];
+        volatile uint32_t releases, waiter;
+    } cpuAccess;
     struct {                    /* P11-C2 */
         volatile uint32_t seq, taken, cancelled, failed, done;
         volatile pid_t pid;

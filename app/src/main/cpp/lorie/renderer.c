@@ -1225,6 +1225,35 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
     return buf;
 }
 
+/*
+ * P11-C3-B1 (lorie.h cpuAccess): a queued copy using a buffer the X server holds reserved for a CPU access is not
+ * recorded, nor any copy after it (the queue's order kept): the pass goes on without them - its frame drawn. The
+ * X server is asked to wake the renderer when it lets a reservation go (`waiter`); until one is let go the copies
+ * left queued are no reason to run again (rendererShouldWait), and the wait for that is bounded
+ * (LORIE_COPIES_DEFERRED_RECHECK_US): its wake may come between the check and the wait.
+ */
+#define LORIE_COPIES_DEFERRED_RECHECK_US 4000
+static bool deferredCopies;
+static uint32_t deferredAt, deferredReleases;
+
+// Under the X server's lock: whether queued copy `index` waits for a reservation - the copies left queued from it.
+static bool rendererCopyDeferred(const LorieGpuCopyEntry *entry, uint32_t index) {
+    if (!state->cpuAccess.count || (!lorieCpuReserved(state, entry->srcBufferId) && !lorieCpuReserved(state, entry->dstBufferId)))
+        return false;
+    deferredCopies = true;
+    deferredAt = index;
+    deferredReleases = __atomic_load_n(&state->cpuAccess.releases, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&state->cpuAccess.waiter, 1, __ATOMIC_RELAXED);
+    LORIE_DIAG_ADD(state, copiesDeferred, 1);
+    return true;
+}
+
+// Whether the copies left queued still wait: the queue where they were left, no reservation let go since.
+static bool rendererCopiesStillDeferred(void) {
+    return deferredCopies && state && state->gpuCopyQueue.readIndex == deferredAt &&
+           __atomic_load_n(&state->cpuAccess.releases, __ATOMIC_ACQUIRE) == deferredReleases;
+}
+
 static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     bool fboSetUp = false;
     uint64_t lastSerial = 0;
@@ -1244,6 +1273,8 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             state->gpuCopyQueue.readIndex++;
             continue;
         }
+        if (rendererCopyDeferred(&entry, state->gpuCopyQueue.readIndex))
+            break;      // P11-C3-B1: left queued, with the copies after it
         src = rendererFindBufferWithRetry(entry.srcBufferId);
         dst = rendererFindBufferWithRetry(entry.dstBufferId);
         if (!src)
@@ -2015,6 +2046,8 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
             *serial = entry.serial;
             continue;
         }
+        if (rendererCopyDeferred(&entry, i))
+            break;      // P11-C3-B1: left queued, with the copies after it
         src = rendererFindBufferWithRetry(entry.srcBufferId);
         dst = rendererFindBufferWithRetry(entry.dstBufferId);
         if (!src || !dst)
@@ -2200,6 +2233,11 @@ static void rendererVkApplyPendingGpuCopies(void) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         return rendererVkFail();
     }
+    if (readIndex == state->gpuCopyQueue.readIndex) {
+        // P11-C3-B1: the first one left queued for a reservation - nothing recorded, nothing submitted
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return;
+    }
     res = lorieVkFrameQueue(&vk, &vkr, 0, false, state);
     submittedUs = lorieMonotonicUs();
     if (res == VK_SUCCESS)
@@ -2309,7 +2347,9 @@ static void rendererVkRootCopy(void) {
     queuedUs = state->rootCopy.queuedUs;
     src = rendererFindBufferWithRetry(state->rootCopy.srcId);
     dst = rendererFindBufferWithRetry(state->rootCopy.dstId);
-    if (!src || !dst) {
+    // P11-C3-B1: nor a buffer the X server holds reserved for a CPU access - it reserves neither of these (it waits
+    // for the copy before it accesses the one copied into; the other is the root it publishes): not copied, then
+    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {
         rendererRootCopySettle(seq, true);
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         return;
@@ -2525,6 +2565,19 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
             return;
         }
     }
+    // P11-C3-B1: the root reserved by the X server for a CPU access - which its rule never allows (lorie.h cpuAccess) -
+    // is not sampled: the image kept for the next frame, the copies run alone, a release waited for (bounded).
+    if (owned && lorieCpuReserved(state, desc->id)) {
+        uint32_t releases = __atomic_load_n(&state->cpuAccess.releases, __ATOMIC_ACQUIRE);
+        struct timespec slice = { 0, 33 * 1000000 };
+        __atomic_store_n(&state->cpuAccess.waiter, 1, __ATOMIC_RELAXED);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        vkr.held = true;
+        vkr.heldIndex = index;
+        rendererVkApplyPendingGpuCopies();
+        syscall(SYS_futex, &state->cpuAccess.releases, FUTEX_WAIT, releases, &slice, NULL, 0);
+        return;
+    }
     if (lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
         lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
@@ -2638,7 +2691,8 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     pthread_spin_lock(&bufferLock);
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
-    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
+    // P11-C3-B1: copies left queued for a reservation are pending again only once one is let go
+    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();
     if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect || rendererRootCopyPending())
         // If there are pending changes we should process them immediately.
         return false;
@@ -2726,8 +2780,16 @@ __noreturn static void* rendererThread(void) {
     LorieBuffer* buf;
     bool waitingForBuffers = false;
     while (true) {
-        while (rendererShouldWait(&waitingForBuffers))
-            pthread_cond_wait(stateCond, &stateLock);
+        while (rendererShouldWait(&waitingForBuffers)) {
+            if (rendererCopiesStillDeferred()) {
+                // P11-C3-B1: the X server's wake at the release, or this bound - should it have come just before
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                rendererTimespecAddUs(&deadline, LORIE_COPIES_DEFERRED_RECHECK_US);
+                pthread_cond_timedwait(stateCond, &stateLock, &deadline);
+            } else
+                pthread_cond_wait(stateCond, &stateLock);
+        }
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = NULL;
@@ -2738,6 +2800,7 @@ __noreturn static void* rendererThread(void) {
             pendingState = NULL;
             stateChanged = false;
             waitingForBuffers = false;
+            deferredCopies = false;
 
             // Another X server session (or none): nothing Vulkan holds of the last one is used again. Its buffers'
             // ids start over in a new X server, so every imported image goes now (the device idle first), not only
@@ -2797,7 +2860,7 @@ __noreturn static void* rendererThread(void) {
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame (unless FIFO or
         // TERMUX_X11_RENDERER_VK_SUBMIT_OPT: then the frame sends the copies ahead in a submission of their own).
-        bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
+        bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();
         if (vkActive) {
             if (state && state->surfaceAvailable && !state->waitForNextFrame &&
                 (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending))

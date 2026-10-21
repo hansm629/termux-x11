@@ -31,6 +31,7 @@ CONTROLS = [
      "townership"),
     ("PER_ACCESS FinishAccess lets the shared lock go before the CPU lock", "InitOutput.c",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
+        Bool reserved = priv->reserved, wake = FALSE;
         if (!priv->wasLocked) {
             uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
@@ -38,17 +39,43 @@ CONTROLS = [
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        // P11-C3-B1: likewise the CPU lock goes before the reservation, let go under the shared lock taken again
+        if (reserved) {
+            uint64_t lockedUs;
+            lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            lockedUs = priv->accessStartUs ? GetTimeInMicros() : 0;
+            wake = lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+            priv->reserved = FALSE;
+            if (lockedUs)
+                priv->accessHoldUs += (uint32_t) (GetTimeInMicros() - lockedUs);
+        } else if (priv->accessStartUs)
+            priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
         if (priv->accessStartUs) {
-            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            uint64_t us = GetTimeInMicros() - priv->accessStartUs;
+            lorieHistAdd(&pvfb->state->diag.xAccess, us);
+            lorieHistAdd(&pvfb->state->diag.xAccessHold, priv->accessHoldUs);
+            if (us > pvfb->worstAccess.us) {
+                pvfb->worstAccess.us = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+                pvfb->worstAccess.width = pPix->drawable.width;
+                pvfb->worstAccess.height = pPix->drawable.height;
+                pvfb->worstAccess.index = index;
+                pvfb->worstAccess.reserved = reserved;
+            }
             priv->accessStartUs = 0;
         }
-        pvfb->accessLocks--;
+        if (!reserved)
+            pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        if (wake)
+            lorieCpuReleasedWake();
         return;
     }""",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
-        pvfb->accessLocks--;
-        lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        Bool reserved = priv->reserved, wake = FALSE;
+        if (!reserved) {
+            pvfb->accessLocks--;
+            lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        }
         if (!priv->wasLocked) {
             uint64_t unlockStartUs = GetTimeInMicros();
             LorieBuffer_unlock(priv->buffer);
@@ -56,18 +83,42 @@ CONTROLS = [
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        // P11-C3-B1: likewise the CPU lock goes before the reservation, let go under the shared lock taken again
+        if (reserved) {
+            uint64_t lockedUs;
+            lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            lockedUs = priv->accessStartUs ? GetTimeInMicros() : 0;
+            wake = lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+            priv->reserved = FALSE;
+            if (lockedUs)
+                priv->accessHoldUs += (uint32_t) (GetTimeInMicros() - lockedUs);
+        } else if (priv->accessStartUs)
+            priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
         if (priv->accessStartUs) {
-            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            uint64_t us = GetTimeInMicros() - priv->accessStartUs;
+            lorieHistAdd(&pvfb->state->diag.xAccess, us);
+            lorieHistAdd(&pvfb->state->diag.xAccessHold, priv->accessHoldUs);
+            if (us > pvfb->worstAccess.us) {
+                pvfb->worstAccess.us = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+                pvfb->worstAccess.width = pPix->drawable.width;
+                pvfb->worstAccess.height = pPix->drawable.height;
+                pvfb->worstAccess.index = index;
+                pvfb->worstAccess.reserved = reserved;
+            }
             priv->accessStartUs = 0;
         }
+        if (reserved)
+            lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        if (wake)
+            lorieCpuReleasedWake();
         return;
     }""",
      "townership"),
     ("the PER_ACCESS FinishAccess path taken under PERSISTENT too", "InitOutput.c",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
-        if (!priv->wasLocked) {""",
+        Bool reserved = priv->reserved, wake = FALSE;""",
      """    if (lorieIsAhb(priv)) {
-        if (!priv->wasLocked) {""",
+        Bool reserved = priv->reserved, wake = FALSE;""",
      "townership"),
     ("a CPU access to an AHB under PER_ACCESS without the shared lock", "InitOutput.c",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv))
@@ -76,13 +127,16 @@ CONTROLS = [
      "",
      "townership"),
     ("a failed PrepareAccess under PER_ACCESS keeps the shared lock", "InitOutput.c",
-     """            if (perAccessAhb) {
-                priv->accessStartUs = 0;
-                pvfb->accessLocks--;
-                lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+     """                } else {
+                    pvfb->accessLocks--;
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+                }
             }
             return FALSE;""",
-     """            return FALSE;""",
+     """                } else {
+                }
+            }
+            return FALSE;""",
      "townership"),
     ("PER_ACCESS CPU accesses not counted", "InitOutput.c",
      """        if (perAccessAhb)
@@ -1000,9 +1054,9 @@ CONTROLS = [
     if (0) {""",
      "tpresentcopy"),
     ("P11-C2: a root copy into a buffer the renderer does not have settled as copied", "renderer.c",
-     """    if (!src || !dst) {
+     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {
         rendererRootCopySettle(seq, true);""",
-     """    if (!src || !dst) {
+     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {
         rendererRootCopySettle(seq, false);""",
      "tpresentcopy"),
     ("P11-C2: a root copy not made first in the renderer's loop", "renderer.c",
@@ -1111,12 +1165,11 @@ CONTROLS += [
      """    if (pvfb->frameDiag) {""",
      "townership"),
     ("P11-C3: an access's start left after its FinishAccess", "InitOutput.c",
-     """        if (priv->accessStartUs) {
-            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
-            priv->accessStartUs = 0;
-        }""",
-     """        if (priv->accessStartUs)
-            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);""",
+     """            priv->accessStartUs = 0;
+        }
+        if (!reserved)""",
+     """        }
+        if (!reserved)""",
      "townership"),
     ("P11-C3: a request's opcodes taken after it ran (it may have closed its client)", "xserver.patch",
      """+                            ddxRequestTimed(timedIndex, timedMajor, timedMinor, timedUs);""",
@@ -1134,6 +1187,73 @@ CONTROLS += [
      """            vkOwned = false;
             rendererVkPacingReset();""",
      """            vkOwned = false;""",
+     "twiring"),
+]
+
+
+# P11-C3-B1, TERMUX_X11_EXA_LOCK_OPT: the reservations' own controls
+CONTROLS += [
+    ("P11-C3-B1: the published root reserved", "InitOutput.c",
+     """    if (!pvfb->exaLockOpt || id == st->rootWindowTextureID)""",
+     """    if (!pvfb->exaLockOpt)""",
+     "townership"),
+    ("P11-C3-B1: an AHB reserved while a frame may use it (no wait first)", "InitOutput.c",
+     """        if (perAccessAhb && !priv->locked && !priv->mem) {
+            uint64_t gpuStartUs = GetTimeInMicros(), gpuUs;""",
+     """        if (perAccessAhb && !priv->locked && !priv->mem && !pvfb->exaLockOpt) {
+            uint64_t gpuStartUs = GetTimeInMicros(), gpuUs;""",
+     "townership"),
+    ("P11-C3-B1: the reservation let go before the CPU lock", "InitOutput.c",
+     """        Bool reserved = priv->reserved, wake = FALSE;
+        if (!priv->wasLocked) {""",
+     """        Bool reserved = priv->reserved, wake = FALSE;
+        if (reserved) {
+            lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+            lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        }
+        if (!priv->wasLocked) {""",
+     "townership"),
+    ("P11-C3-B1: a refused CPU lock keeps its reservation", "InitOutput.c",
+     """                    wake = lorieCpuRelease(LorieBuffer_description(priv->buffer)->id);
+                    priv->reserved = FALSE;
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);""",
+     """                    wake = FALSE;
+                    priv->reserved = FALSE;
+                    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);""",
+     "townership"),
+    ("P11-C3-B1: a reserved access counted as holding the shared lock", "InitOutput.c",
+     """            if (priv->accessStartUs)
+                priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
+            pvfb->accessLocks--;""",
+     """            if (priv->accessStartUs)
+                priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);""",
+     "townership"),
+    ("P11-C3-B1: a renderer waiting for a release never woken", "InitOutput.c",
+     """    return __atomic_exchange_n(&st->cpuAccess.waiter, 0, __ATOMIC_RELAXED) != 0;""",
+     """    return FALSE;""",
+     "townership"),
+    ("P11-C3-B1: a copy using a reserved buffer recorded", "renderer.c",
+     """    if (!state->cpuAccess.count || (!lorieCpuReserved(state, entry->srcBufferId) && !lorieCpuReserved(state, entry->dstBufferId)))""",
+     """    if (1 || (!lorieCpuReserved(state, entry->srcBufferId) && !lorieCpuReserved(state, entry->dstBufferId)))""",
+     "tpresentcopy"),
+    ("P11-C3-B1: GLES copies a reserved buffer", "renderer.c",
+     """        if (rendererCopyDeferred(&entry, state->gpuCopyQueue.readIndex))
+            break;      // P11-C3-B1: left queued, with the copies after it""",
+     """        if (0)
+            break;""",
+     "tpresentcopy"),
+    ("P11-C3-B1: copies alone submitted with none taken", "renderer.c",
+     """    if (readIndex == state->gpuCopyQueue.readIndex) {""",
+     """    if (0) {""",
+     "tpresentcopy"),
+    ("P11-C3-B1: a root copy into a reserved buffer", "renderer.c",
+     """    if (!src || !dst || lorieCpuReserved(state, state->rootCopy.srcId) || lorieCpuReserved(state, state->rootCopy.dstId)) {""",
+     """    if (!src || !dst) {""",
+     "tpresentcopy"),
+    ("P11-C3-B1: copies left queued wake the renderer again and again", "renderer.c",
+     """    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();""",
+     """    gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;""",
      "twiring"),
 ]
 
