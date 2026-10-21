@@ -425,6 +425,16 @@ struct lorie_renderer_diag {
     volatile uint32_t xOwnershipTransitions, xOwnershipRefused;
     volatile uint64_t xAhbCpuAcquires, xStateLockWaitUs, xGpuWaitUs, xAhbCpuLockUs, xRootCopyUs;
 
+    /* P11-C2, TERMUX_X11_RENDERER_ROOT_GPU_COPY (struct rootCopy below): the root's damage copies asked of the
+     * renderer (X); submitted, and completed - their fence signalled - with their rectangles, pixels in bytes and
+     * the time from the request to the completion (renderer, us: not the GPU's time alone); copied by the X server's
+     * CPU instead - the renderer could not, or the request was taken back - and copied on the CPU being smaller than
+     * asking the GPU is worth (X); the X server's time waiting for one before it could use its buffer (X, us) */
+    volatile uint32_t rootGpuCopyRequests, rootGpuCopySubmits, rootGpuCopyCompletions, rootGpuCopyRects;
+    volatile uint64_t rootGpuCopyBytes, rootGpuCopyCompletionUs;
+    volatile uint32_t rootCpuFallbacks, rootCpuSmall;
+    volatile uint64_t rootCopyCpuBlockUs;
+
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
      * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer
      * usage it needs, what its import got (LORIE_VK_XFER_USAGE_*); imports that asked for the usage, by what they
@@ -517,6 +527,27 @@ struct lorie_shared_server_state {
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
+
+    /*
+     * P11-C2 (TERMUX_X11_RENDERER_ROOT_GPU_COPY=1): root double buffering's copy of the damage from the buffer the
+     * X server drew into - the front from the swap on, which the renderer samples - into the other, the one it draws
+     * into from then on, made by the renderer's GPU instead of the X server's CPU (InitOutput.c lorieRootSwap,
+     * renderer.c rendererVkRootCopy). One at a time: the X server asks for one only once the last is settled.
+     *   X, under `lock`: the request (srcId, dstId, rects, queuedUs), then a new `seq`; or, for a request no renderer
+     *   took, `cancelled` = seq - the X server then copies it itself.
+     *   The renderer, under `lock`: `taken` = seq (and `pid`), records and submits the copy - its two AHBs listed in
+     *   gpuInFlight - and lets the lock go; once the fence signalled, `done` = seq, woken (a futex on `done`). Not
+     *   copied (no PER_ACCESS answer, a buffer missing, Vulkan not running or failing): `failed` = seq, then `done`.
+     * Until it is settled the X server CPU-locks neither buffer; it waits for it without `lock` (lorieRootCopyWait) -
+     * or, already holding `lock`, takes back a request not taken rather than wait for a renderer that needs `lock`.
+     */
+    struct {
+        volatile uint32_t seq, taken, cancelled, failed, done;
+        volatile pid_t pid;
+        uint64_t srcId, dstId, queuedUs;
+        uint32_t numRects;
+        LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+    } rootCopy;
 
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;

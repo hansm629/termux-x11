@@ -2140,6 +2140,128 @@ static void rendererVkApplyPendingGpuCopies(void) {
         rendererVkFail();
 }
 
+/* ---- P11-C2: root double buffering's copy by the GPU (lorie.h rootCopy) ---- */
+
+// A root copy the X server asked for that no renderer took, settled or saw taken back yet (read without the lock: a hint).
+static bool rendererRootCopyPending(void) {
+    uint32_t seq = state ? __atomic_load_n(&state->rootCopy.seq, __ATOMIC_ACQUIRE) : 0;
+    return seq && seq != state->rootCopy.taken && seq != state->rootCopy.cancelled && seq != state->rootCopy.done;
+}
+
+// Request `seq` settled - copied, or (failed) not, which the X server then copies itself - and the X server woken.
+static void rendererRootCopySettle(uint32_t seq, bool failed) {
+    if (failed)
+        __atomic_store_n(&state->rootCopy.failed, seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->rootCopy.done, seq, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &state->rootCopy.done, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+// Vulkan not running: the request settled as not copied, under the lock (the X server takes back the ones not taken).
+static void rendererRootCopyDecline(void) {
+    uint32_t seq;
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    seq = state->rootCopy.seq;
+    if (seq && seq != state->rootCopy.taken && seq != state->rootCopy.cancelled) {
+        state->rootCopy.taken = seq;
+        state->rootCopy.pid = getpid();
+        rendererRootCopySettle(seq, true);
+    }
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+}
+
+/*
+ * The root's damage copied from the buffer the X server drew into (the front now) into the one it draws into now
+ * (InitOutput.c lorieRootSwap), as GPU copies are drawn (lorieVkFrameCopy: imported AHBs acquired from and released
+ * to the foreign owner), ahead of everything else the loop does and alone in its submission: the X server may be
+ * waiting for it before it can draw again. Taken under the X server's lock, its two buffers listed in flight; once
+ * its fence signalled - and only then - settled as copied. Settled as not copied when it cannot be: no PER_ACCESS
+ * answer, a buffer the renderer does not have (a root gone), or Vulkan failing - the X server copies it then, once
+ * no frame uses the buffers (lorieGpuWaitIdle).
+ */
+static void rendererVkRootCopy(void) {
+    struct lorie_vk_quad quads[LORIE_GPU_COPY_MAX_RECTS];
+    LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+    struct lorie_vk_image *s = NULL, *d = NULL;
+    LorieBuffer *src, *dst;
+    uint64_t bytes = 0, queuedUs;
+    uint32_t seq, n, i;
+    VkResult res;
+
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    seq = state->rootCopy.seq;
+    if (!seq || seq == state->rootCopy.taken || seq == state->rootCopy.cancelled) {
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return;
+    }
+    state->rootCopy.taken = seq;
+    state->rootCopy.pid = getpid();
+    if (!rendererVkOwnedLocked()) {
+        // Without the X server's PER_ACCESS answer no buffer of it is touched; the answer asked for again.
+        rendererRootCopySettle(seq, true);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        vkOwned = false;
+        backendSelect = true;
+        return;
+    }
+    lorieGpuWaitIdle(state, true, 0);       // a frame another renderer process listed is over first (ours always are)
+    n = state->rootCopy.numRects < LORIE_GPU_COPY_MAX_RECTS ? state->rootCopy.numRects : LORIE_GPU_COPY_MAX_RECTS;
+    memcpy(rects, (const void *) state->rootCopy.rects, sizeof(rects[0]) * n);
+    queuedUs = state->rootCopy.queuedUs;
+    src = rendererFindBufferWithRetry(state->rootCopy.srcId);
+    dst = rendererFindBufferWithRetry(state->rootCopy.dstId);
+    if (!src || !dst) {
+        rendererRootCopySettle(seq, true);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return;
+    }
+    if (!(s = lorieVkImport(&vk, &vkImages, LorieBuffer_description(src)->id, LorieBuffer_description(src)->buffer, 0, state)) ||
+        !(d = lorieVkImport(&vk, &vkImages, LorieBuffer_description(dst)->id, LorieBuffer_description(dst)->buffer, 0, state)) ||
+        !d->attachView || lorieVkFrameBegin(&vk, &vkr) != VK_SUCCESS) {
+        if (d && !d->attachView)
+            lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMAGE_USAGE_UNSUPPORTED, VK_SUCCESS);
+        else if (s && d)
+            lorieVkFallback(state, LORIE_FALLBACK_CLASS_FATAL_BACKEND, LORIE_FALLBACK_VK_SUBMIT, VK_ERROR_INITIALIZATION_FAILED);
+        rendererRootCopySettle(seq, true);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return rendererVkFail();
+    }
+    for (i = 0; i < n; i++) {
+        quads[i] = rendererVkCopyQuad(rects[i], 0, 0, LorieBuffer_description(src), LorieBuffer_description(dst),
+                                      s->rgbaOrder != d->rgbaOrder);
+        bytes += (uint64_t) (rects[i].x2 - rects[i].x1) * (uint64_t) (rects[i].y2 - rects[i].y1) * 4;
+    }
+    if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, 0)) {
+        lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
+        rendererRootCopySettle(seq, true);
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+        return rendererVkFail();
+    }
+    res = lorieVkFrameQueue(&vk, &vkr, 0, false, state);
+    if (res == VK_SUCCESS) {
+        rendererVkInFlight();
+        LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+    }
+    lorie_mutex_unlock(&state->lock, &state->lockingPid);
+
+    if (res == VK_SUCCESS) {
+        // The device copies; the X server waits for it only once it touches the buffer it draws into now.
+        bool over;
+        res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        if (over)
+            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+    }
+    if (res == VK_SUCCESS) {
+        uint64_t now = lorieMonotonicUs();
+        LORIE_DIAG_ADD(state, rootGpuCopyCompletions, 1);
+        LORIE_DIAG_ADD(state, rootGpuCopyRects, n);
+        LORIE_DIAG_ADD(state, rootGpuCopyBytes, bytes);
+        LORIE_DIAG_ADD(state, rootGpuCopyCompletionUs, now > queuedUs ? now - queuedUs : 0);
+    }
+    rendererRootCopySettle(seq, res != VK_SUCCESS);
+    if (res != VK_SUCCESS)
+        rendererVkFail();
+}
+
 // A black frame (no X server buffer used), as GLES clears the window when the X server goes away.
 static void rendererVkClear(void) {
     uint32_t index;
@@ -2365,7 +2487,7 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect)
+    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect || rendererRootCopyPending())
         // If there are pending changes we should process them immediately.
         return false;
 
@@ -2509,6 +2631,14 @@ __noreturn static void* rendererThread(void) {
             waitingForBuffers = false;
         }
         pthread_mutex_unlock(&stateLock);
+
+        // P11-C2: a root copy the X server asked for, first - it may be waiting for it before it can draw again.
+        if (state && rendererRootCopyPending()) {
+            if (vkActive)
+                rendererVkRootCopy();
+            else
+                rendererRootCopyDecline();
+        }
 
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame (unless FIFO or

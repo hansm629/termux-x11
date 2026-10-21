@@ -14,6 +14,7 @@ XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
 XlorieVkTiming: acquire results, acquire/submit/fence/present times, copies_ahead, early_presents, self-test, device, present mode
+XlorieRootCopy: root_gpu_copy=off|on|fallback, the root double buffering copies by the renderer's GPU (P11-C2)
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -66,6 +67,17 @@ under FIFO), published at their own fence; and a frame carrying none of them is 
 submitted, before its fence is waited for. `XlorieVkTiming` `copies_ahead` counts the frames whose copies went ahead
 where they would have gone in the frame's (not under FIFO), `early_presents` the frames presented before their fence.
 The frame's fence is still waited for before the next submission (one in flight), and so is the image's acquire fence.
+`XlorieRootCopy` (P11-C2) says how root double buffering's copies went with `TERMUX_X11_RENDERER_ROOT_GPU_COPY=1`
+(experimental, Vulkan, with `TERMUX_X11_RENDERER_ROOT_DOUBLE=1`): at a swap the copy of the damage into the buffer the
+X server is to draw into is asked of the renderer's GPU and the buffers swap at once; the X server waits for the copy
+only when it first touches that buffer. `root_gpu_copy_requests` asked, `root_gpu_copy_submits` and
+`root_gpu_copy_completions` submitted and completed by the renderer (with their `_rects` and `_bytes`),
+`root_copy_completion_us` the time from each request to its completion (not the GPU's time alone),
+`root_cpu_fallbacks` the ones the X server copied on its CPU instead (the renderer could not, or the request was taken
+back: no renderer to draw, the X server holding the shared lock, an ownership answer asked for), `root_cpu_small` the
+swaps copied on the CPU at once being smaller than 1 MiB, `root_copy_cpu_block_us` the X server's time waiting for
+them, `root_copy_pending` 1 while one is not settled. `fallback`: this period only the CPU settled them. The CPU
+copies themselves still count in `XlorieBackend` `x_root_copy_us`.
 `x_yield_on_wake` is `on` when the X server was started with `TERMUX_X11_X_YIELD_ON_WAKE=1` (experimental): a vsync
 tick or a GPU copy's completion then breaks off the client dispatch round in progress at its next request boundary,
 runs right away, and the round goes on with the rest of its slice - instead of waiting for the round to end. Its

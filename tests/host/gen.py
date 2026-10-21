@@ -104,8 +104,14 @@ recipes = {
         "static uint8_t lorieRequestedBackend(const char *value, volatile uint8_t *invalid) {",
     ]) + FAILAT() + func(I, "static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *invalid) {")
         + func(I, "static uint8_t lorieRequestedVkSelftest(const char *value, volatile uint8_t *invalid) {"),
-    # root double buffering's swap, and the bounds its own locks take (P11-B) - townership.c
-    "rootswap": lambda: func(I, "static ARect *lorieRootCopyBounds(BoxPtr box, int n, const LorieBuffer_Desc *d, ARect *bounds) {")
+    # root double buffering's swap, the bounds its own locks take (P11-B), and its copy by the renderer's GPU asked
+    # for, waited for or taken back (P11-C2) - townership.c
+    "rootswap": lambda: macro(I, "LORIE_ROOT_GPU_COPY_MIN_BYTES")
+        + func(I, "static ARect *lorieRootCopyBounds(BoxPtr box, int n, const LorieBuffer_Desc *d, ARect *bounds) {")
+        + func(I, "static Bool lorieRootCopyCpu(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n, uint64_t waitStartUs) {")
+        + func(I, "static Bool lorieOwnershipAsked(void) {")
+        + func(I, "static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n) {")
+        + func(I, "static void lorieRootCopyWait(Bool takeBack) {")
         + func(I, "static Bool lorieRootSwap(LoriePixmapPriv *priv) {"),
     # P11-B: buffer.c's CPU locks as they are - tbufferlock.c
     "bufferlock": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "typedef struct LorieBuffer LorieBuffer;")
@@ -183,6 +189,10 @@ recipes = {
         + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
+        + func(R, "static bool rendererRootCopyPending(void) {")
+        + func(R, "static void rendererRootCopySettle(uint32_t seq, bool failed) {")
+        + func(R, "static void rendererRootCopyDecline(void) {")
+        + func(R, "static void rendererVkRootCopy(void) {")
         + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {"),
     # P10-S0: the Present paths that end a presentation whose GPU copy may still run, from the patched xserver -
     # tpresentsafety.c: the vblank as present_priv.h has it, execute (and its copy and post), re-execute, scrap,

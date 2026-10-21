@@ -499,6 +499,57 @@ static bool inFlightBeforeLast(int n, ...) {
     va_end(ap);
     return all;
 }
+/* P11-C2: a root copy asked for as the X server asks for it (InitOutput.c lorieRootGpuCopyAsk) */
+static uint32_t rootSeq;
+static void rootAsk(LorieBuffer *src, LorieBuffer *dst, const LorieGpuCopyRect *r, uint32_t n) {
+    state->rootCopy.srcId = src->desc.id;
+    state->rootCopy.dstId = dst->desc.id;
+    state->rootCopy.numRects = n;
+    memcpy((void *) state->rootCopy.rects, r, sizeof *r * n);
+    state->rootCopy.queuedUs = lorieMonotonicUs();
+    __atomic_store_n(&state->rootCopy.seq, ++rootSeq, __ATOMIC_RELEASE);
+}
+/* the root copy's draws (the last `n` pushed): each covers exactly rectangle k of the destination - in pixels, the
+ * clip-space corners the copy's vertex shader maps - and samples the same pixels of the source, 1:1 (both buffers the
+ * same size), unswizzled: what pixman_blt copies there, red, green and blue (an RGBX buffer's 4th byte is undefined
+ * to Vulkan, and padding to the X server's depth 24). The fake device draws no pixels: its quads are checked. */
+static bool rootQuadsExact(LorieBuffer *src, LorieBuffer *dst, const LorieGpuCopyRect *r, uint32_t n) {
+    float w = (float) dst->desc.width, h = (float) dst->desc.height, sw = (float) src->desc.width, sh = (float) src->desc.height;
+    if (pushes < (int) n || sw != w || sh != h)
+        return false;
+    for (uint32_t k = 0; k < n; k++) {
+        const struct lorie_vk_quad *q = &pushed[pushes - (int) n + (int) k];
+        const float want[8] = { (float) r[k].x1, (float) r[k].y1, (float) r[k].x2, (float) r[k].y2,
+                                (float) r[k].x1, (float) r[k].y1, (float) r[k].x2, (float) r[k].y2 };
+        const float got[8] = { (q->rect[0] + 1.f) * w / 2.f, (q->rect[1] + 1.f) * h / 2.f, (q->rect[2] + 1.f) * w / 2.f,
+                               (q->rect[3] + 1.f) * h / 2.f, q->uv[0] * sw, q->uv[1] * sh, q->uv[2] * sw, q->uv[3] * sh };
+        for (int i = 0; i < 8; i++)
+            if (fabsf(got[i] - want[i]) > 1e-3f)
+                return false;
+        if (q->flags & LORIE_VK_QUAD_SWIZZLE)
+            return false;
+    }
+    return true;
+}
+/* the X server waiting for a root copy on its futex (as lorieRootCopyWait does) while the device runs it */
+static struct { uint32_t seq; bool woke, gpuOverAtWake, timedOut; } rootWaiter;
+static void *rootWaiterThread(void *arg) {
+    (void) arg;
+    for (;;) {
+        uint32_t done = __atomic_load_n(&state->rootCopy.done, __ATOMIC_ACQUIRE);
+        struct timespec t = { 3, 0 };
+        if (done == rootWaiter.seq)
+            break;
+        if (syscall(SYS_futex, &state->rootCopy.done, FUTEX_WAIT, done, &t, NULL, 0) && errno == ETIMEDOUT) {
+            rootWaiter.timedOut = true;
+            break;
+        }
+    }
+    rootWaiter.woke = true;
+    rootWaiter.gpuOverAtWake = gpuFinished;
+    return NULL;
+}
+
 /* P11-C1: the early presents the option's cases made - none other may be made (with the option off) */
 static int earlyWithOption;
 /* P11-C1: a copy the X server queues while the renderer acquires the frame's image (after the copies went ahead) */
@@ -1058,6 +1109,135 @@ int main(void) {
     }
     st.backend.vkSubmitOpt = 0;
     earlyWithOption = emu.earlyPresents;
+
+    /* P11-C2: root double buffering's copy by the GPU (rendererVkRootCopy) - taken under the X server's lock, drawn
+     * from the buffer the X server drew into into the other as GPU copies are drawn (each buffer acquired from the
+     * foreign owner and given back), both listed in flight while the device runs it and the lock let go, settled as
+     * copied only once its fence signalled (and the X server woken then); settled as not copied - nothing drawn,
+     * for the X server to copy - without the PER_ACCESS answer, with a buffer the renderer does not have, with Vulkan
+     * not running; a failed submission or device leaves it not copied too, the buffers out of flight first */
+    {
+        LorieBuffer *ra = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48), *rb = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48);
+        static const LorieGpuCopyRect one[1] = { { 3, 5, 40, 30 } }, two[2] = { { 0, 0, 64, 10 }, { 8, 20, 30, 48 } };
+        int fails0 = vkFailures, d1, waits;
+        uint32_t submits = st.diag.vkQueueSubmits;
+
+        ra->registered = rb->registered = true;
+        fill(ra, 1, 0x22);
+        fill(rb, 2, 0x11);
+        own(41);
+        rootAsk(ra, rb, one, 1);
+        CHECK(rendererRootCopyPending(), "root copy: not pending once asked for");
+        d1 = emu.draws, waits = atFence.waits;
+        pushes = 0;                             /* the fake device keeps the first 64 */
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.taken == rootSeq && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && !rendererRootCopyPending() &&
+              vkFailures == fails0 && emu.violations == 0 && st.lock == 0, "root copy: taken %u, done %u, failed %u (want %u, %u, not it)",
+              st.rootCopy.taken, st.rootCopy.done, st.rootCopy.failed, rootSeq, rootSeq);
+        CHECK(rootQuadsExact(ra, rb, one, 1) && emu.draws - d1 == 1 && emu.drawnFrom[d1 % 64] == ra->desc.buffer &&
+              emu.drawnInto[d1 % 64] == rb->desc.buffer, "root copy: the draw not the rectangle 1:1, %d draws", emu.draws - d1);
+        CHECK(atFence.waits == waits + 1 && !atFence.lockHeld && inFlightAtFence(2, ra, rb) && !st.gpuInFlight.busy &&
+              !ra->desc.buffer->owned && !rb->desc.buffer->owned && st.diag.vkQueueSubmits == submits + 1,
+              "root copy: at its fence the lock %s, %u buffers in flight (want the two), given back %d", atFence.lockHeld ? "held" : "free",
+              atFence.count, !ra->desc.buffer->owned && !rb->desc.buffer->owned);
+        CHECK(st.diag.rootGpuCopySubmits == 1 && st.diag.rootGpuCopyCompletions == 1 && st.diag.rootGpuCopyRects == 1 &&
+              st.diag.rootGpuCopyBytes == 37 * 25 * 4, "root copy: counted %u submitted, %u completed, %u rectangles, %llu bytes",
+              st.diag.rootGpuCopySubmits, st.diag.rootGpuCopyCompletions, st.diag.rootGpuCopyRects,
+              (unsigned long long) st.diag.rootGpuCopyBytes);
+
+        /* two rectangles, the other way: the swap after the swap */
+        fill(ra, 3, 0x11);
+        rootAsk(rb, ra, two, 2);
+        pushes = 0;
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && rootQuadsExact(rb, ra, two, 2) &&
+              emu.drawnFrom[(emu.draws - 1) % 64] == rb->desc.buffer && emu.drawnInto[(emu.draws - 1) % 64] == ra->desc.buffer &&
+              vkFailures == fails0 && emu.violations == 0, "root copy, two rectangles: not drawn as they are");
+
+        /* a request the X server took back: nothing done */
+        rootAsk(ra, rb, one, 1);
+        st.rootCopy.cancelled = rootSeq;
+        d1 = emu.draws;
+        CHECK(!rendererRootCopyPending(), "root copy taken back: still pending");
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.taken != rootSeq && st.rootCopy.done != rootSeq && emu.draws == d1, "root copy taken back: taken or drawn");
+
+        /* without the PER_ACCESS answer: not copied, nothing drawn, the answer asked for again */
+        fill(rb, 2, 0x11);
+        rootAsk(ra, rb, one, 1);
+        vkOwned = false;
+        d1 = emu.draws;
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && emu.draws == d1 && backendSelect && st.lock == 0, "root copy, not owned: settled %d, failed %d, %d draws", st.rootCopy.done == rootSeq, st.rootCopy.failed == rootSeq,
+              emu.draws - d1);
+        backendSelect = false;
+        own(42);
+
+        /* a buffer the renderer does not have (a root gone): not copied, Vulkan going on */
+        rootAsk(ra, rb, one, 1);
+        st.rootCopy.dstId = 99999;
+        d1 = emu.draws;
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && emu.draws == d1 && vkFailures == fails0,
+              "root copy, a buffer missing: not settled as not copied, or Vulkan given up");
+
+        /* Vulkan not running: declined, under the lock */
+        rootAsk(ra, rb, one, 1);
+        rendererRootCopyDecline();
+        CHECK(st.rootCopy.taken == rootSeq && st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && st.lock == 0,
+              "root copy declined: not settled as not copied");
+
+        /* the submission failing: not copied, nothing in flight, Vulkan given up */
+        rootAsk(ra, rb, one, 1);
+        emu.submitResult = VK_ERROR_DEVICE_LOST;
+        rendererVkRootCopy();
+        emu.submitResult = VK_SUCCESS;
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && !st.gpuInFlight.busy && vkFailures == fails0 + 1,
+              "root copy, submission failing: settled %d failed %d, in flight %d, %d failures",
+              st.rootCopy.done == rootSeq, st.rootCopy.failed == rootSeq, st.gpuInFlight.busy, vkFailures - fails0);
+        vkFailures = fails0;
+
+        /* the device lost at the fence: not copied (its contents undefined), settled once the buffers are out of flight */
+        rootAsk(ra, rb, one, 1);
+        emu.fenceResult = VK_ERROR_DEVICE_LOST;
+        atFail.busy = true;
+        rendererVkRootCopy();
+        emu.fenceResult = VK_SUCCESS;
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && !st.gpuInFlight.busy && vkFailures == fails0 + 1 && !atFail.busy,
+              "root copy, device lost: settled %d failed %d, in flight %d at the failure", st.rootCopy.done == rootSeq,
+              st.rootCopy.failed == rootSeq, atFail.busy);
+        vkFailures = fails0;
+        st.diag.lastFallbackClass = st.diag.lastFallbackReason = 0;
+
+        /* the X server waiting on its futex while the device takes its time: woken once the copy is done - after the
+         * fence, never before */
+        {
+            pthread_t x;
+            struct timespec deadline;
+            fill(rb, 2, 0x11);
+            rootAsk(ra, rb, one, 1);
+            rootWaiter = (__typeof__(rootWaiter)) { rootSeq };
+            gpuMs = 60;
+            gpuFinished = false;
+            pthread_create(&x, NULL, rootWaiterThread, NULL);
+            usleep(10000);
+            CHECK(!rootWaiter.woke, "root copy waited for: the X server woken before anything was done");
+            rendererVkRootCopy();
+            gpuMs = 0;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 3;
+            if (pthread_timedjoin_np(x, NULL, &deadline)) {
+                CHECK(0, "root copy waited for: the X server still waiting 3 s after it was done");
+                st.rootCopy.done = rootSeq;
+                syscall(SYS_futex, &st.rootCopy.done, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+                pthread_join(x, NULL);
+            }
+            CHECK(rootWaiter.woke && !rootWaiter.timedOut && rootWaiter.gpuOverAtWake && st.rootCopy.failed != rootSeq,
+                  "root copy waited for: woken %d, timed out %d, the device done at the wake %d", rootWaiter.woke, rootWaiter.timedOut,
+                  rootWaiter.gpuOverAtWake);
+        }
+        ra->registered = rb->registered = false;
+    }
 
     /* the root published under the lock not one the renderer has: the old one not sampled, the image kept for the
      * next frame, which uses it once the root is there */

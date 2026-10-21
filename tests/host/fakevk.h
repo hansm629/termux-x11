@@ -174,6 +174,13 @@ struct lorie_shared_server_state {
         uint32_t count;
         uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX];
     } gpuInFlight;
+    struct {                    /* P11-C2 */
+        volatile uint32_t seq, taken, cancelled, failed, done;
+        volatile pid_t pid;
+        uint64_t srcId, dstId, queuedUs;
+        uint32_t numRects;
+        LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+    } rootCopy;
     uint64_t rootWindowTextureID;
     volatile uint8_t drawRequested, surfaceAvailable, waitForNextFrame;
     volatile int renderedFrames;

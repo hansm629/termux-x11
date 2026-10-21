@@ -20,7 +20,9 @@ its GLES texture only when rendererGlesEager says GLES draws, a buffer found for
 makes the root's (rendererGlBuffer) before binding it.
 
 And P11-A: the vsync tick and a GPU copy's completion are queued as urgent work (lorieQueueUrgentWorkProc, which
-tdispatchyield.c tests), with TERMUX_X11_X_YIELD_ON_WAKE read when the server state is made, "1" only.
+tdispatchyield.c tests), with TERMUX_X11_X_YIELD_ON_WAKE read when the server state is made, "1" only. P11-C2: a
+root copy asked of the renderer is made first in its loop, which it wakes, and the X server waits for one before it
+takes the shared lock.
 
 usage: twiring.py <lorie source dir>
 """
@@ -106,6 +108,18 @@ in_order("window change", refresh, "lorieVkSwapchainDestroy(&vk, &vkr);", "relea
 loop = func(R, "__noreturn static void* rendererThread(void) {")
 in_order("main loop", loop, "pthread_cond_signal(&stateChangeFinishCond);", "rendererSelectBackend();", "pthread_mutex_unlock(&stateLock);",
          "lorieVkImageRemove(&vk, &vkImages", "LorieBuffer_release(buf);")
+
+# P11-C2: a root copy the X server asked for is made before anything else the renderer draws, once stateLock is let
+# go, and wakes the loop; the X server waits for one before it takes the shared lock (the renderer takes the request
+# under it) - in its EXA access, its ownership answer and its own drawing
+in_order("root copy in the main loop", loop, "pthread_mutex_unlock(&stateLock);", "rendererVkRootCopy();", "rendererVkRedraw(&waitingForBuffers);")
+check("rendererRootCopyPending()" in func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {"),
+      "the renderer sleeps through a root copy asked for")
+for what, sig in (("EXA access", "Bool loriePrepareAccess(PixmapPtr pPix, int index) {"),
+                  ("ownership answer", "static void lorieApplyOwnership(uint8_t mode, uint32_t seq) {"),
+                  ("drawSquares", "Bool drawSquares() {")):
+    in_order("root copy waited for before the shared lock: " + what, func(I, sig), "lorieRootCopyWait(",
+             "lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);")
 # another session: the last one's imported images and ownership answer are dropped before anything else runs
 in_order("session change", loop, "if (stateChanged) {", "state = pendingState;", "vk.DeviceWaitIdle(vk.device);",
          "lorieVkImagesClear(&vk, &vkImages);", "vkOwned = false;", "if (windowChanged)")

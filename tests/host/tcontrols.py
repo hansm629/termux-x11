@@ -37,10 +37,12 @@ CONTROLS = [
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
         return;
     }""",
      """    if (lorieAhbPerAccess() && lorieIsAhb(priv)) {
+        pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
         if (!priv->wasLocked) {
             uint64_t unlockStartUs = GetTimeInMicros();
@@ -65,8 +67,10 @@ CONTROLS = [
      "",
      "townership"),
     ("a failed PrepareAccess under PER_ACCESS keeps the shared lock", "InitOutput.c",
-     """            if (perAccessAhb)
+     """            if (perAccessAhb) {
+                pvfb->accessLocks--;
                 lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            }
             return FALSE;""",
      """            return FALSE;""",
      "townership"),
@@ -103,12 +107,12 @@ CONTROLS = [
             LorieBuffer_lock(new->buffer, &new->locked);""",
      "townership"),
     ("a destroyed pixmap left on the list", "InitOutput.c",
-     """    LoriePixmapPriv *priv = driverPriv;
+     """        pvfb->rootCopy.abandoned = TRUE;
     if (priv->persistentWanted) {
         xorg_list_del(&priv->persistentLink);
         priv->persistentWanted = FALSE;
     }""",
-     """    LoriePixmapPriv *priv = driverPriv;""",
+     """        pvfb->rootCopy.abandoned = TRUE;""",
      "townership"),
     ("drawSquares lets the shared lock go before the CPU lock", "InitOutput.c",
      """    if (perAccess) {
@@ -886,6 +890,91 @@ CONTROLS = [
      """    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {""",
      """    if ((early = res == VK_SUCCESS && !serial)) {""",
      "tpresentcopy"),
+    ("P11-C2: the root's buffer CPU-locked before the copy into it settled", "InitOutput.c",
+     """    if (pvfb->rootCopy.seq && priv && priv->buffer == pvfb->rootCopy.to)
+        lorieRootCopyWait(FALSE);""",
+     """    ;""",
+     "townership"),
+    ("P11-C2: a root copy no renderer took waited for with the shared lock held", "InitOutput.c",
+     """    Bool held = pvfb->accessLocks > 0, copy = FALSE;""",
+     """    Bool held = FALSE, copy = FALSE;""",
+     "townership"),
+    ("P11-C2: an EXA access's shared lock not counted", "InitOutput.c",
+     """        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        pvfb->accessLocks++;""",
+     """        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);""",
+     "townership"),
+    ("P11-C2: a root copy no renderer will take waited for anyway", "InitOutput.c",
+     """            if (takeBack || held || !lorieConnectionAlive() || !lorieRendererAvailable() || lorieOwnershipAsked()) {""",
+     """            if (takeBack || held) {""",
+     "townership"),
+    ("P11-C2: a root copy the renderer could not make left uncopied", "InitOutput.c",
+     """    if (done == seq && __atomic_load_n(&st->rootCopy.failed, __ATOMIC_RELAXED) == seq)
+        copy = TRUE;""",
+     """    ;""",
+     "townership"),
+    ("P11-C2: a root copy taken by a renderer gone waited for", "InitOutput.c",
+     """        } else if (st->rootCopy.pid > 0 && kill(st->rootCopy.pid, 0) == -1 && errno == ESRCH) {""",
+     """        } else if (0) {""",
+     "townership"),
+    ("P11-C2: a swap's root copy asked for before the last one settled", "InitOutput.c",
+     """    lorieRootCopyWait(FALSE);   // P11-C2: the last copy asked of the GPU settled first (and the swap undone, should it have failed)""",
+     """    ;""",
+     "townership"),
+    ("P11-C2: the ownership answer given with a root copy left to the GPU", "InitOutput.c",
+     """    lorieRootCopyWait(TRUE);""",
+     """    ;""",
+     "townership"),
+    ("P11-C2: the ownership answer waiting for a renderer to take the root copy", "InitOutput.c",
+     """    lorieRootCopyWait(TRUE);""",
+     """    lorieRootCopyWait(FALSE);""",
+     "townership"),
+    ("P11-C2: a root copy settled as copied before its fence", "renderer.c",
+     """    if (res == VK_SUCCESS) {
+        rendererVkInFlight();
+        LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+    }""",
+     """    if (res == VK_SUCCESS) {
+        rendererVkInFlight();
+        LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        rendererRootCopySettle(seq, false);
+    }""",
+     "tpresentcopy"),
+    ("P11-C2: a root copy's buffers not listed in flight", "renderer.c",
+     """    if (res == VK_SUCCESS) {
+        rendererVkInFlight();
+        LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+    }""",
+     """    if (res == VK_SUCCESS) {
+        LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+    }""",
+     "tpresentcopy"),
+    ("P11-C2: a root copy drawn without the PER_ACCESS answer", "renderer.c",
+     """    state->rootCopy.pid = getpid();
+    if (!rendererVkOwnedLocked()) {""",
+     """    state->rootCopy.pid = getpid();
+    if (0) {""",
+     "tpresentcopy"),
+    ("P11-C2: a root copy into a buffer the renderer does not have settled as copied", "renderer.c",
+     """    if (!src || !dst) {
+        rendererRootCopySettle(seq, true);""",
+     """    if (!src || !dst) {
+        rendererRootCopySettle(seq, false);""",
+     "tpresentcopy"),
+    ("P11-C2: a root copy not made first in the renderer's loop", "renderer.c",
+     """        if (state && rendererRootCopyPending()) {
+            if (vkActive)
+                rendererVkRootCopy();
+            else
+                rendererRootCopyDecline();
+        }""",
+     """        if (state && rendererRootCopyPending() && !vkActive)
+            rendererRootCopyDecline();""",
+     "twiring"),
+    ("P11-C2: the renderer sleeping through a root copy asked for", "renderer.c",
+     """    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect || rendererRootCopyPending())""",
+     """    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending || backendSelect)""",
+     "twiring"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

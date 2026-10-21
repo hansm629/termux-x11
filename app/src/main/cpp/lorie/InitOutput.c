@@ -100,10 +100,30 @@ typedef struct {
     /* Its swap's own CPU locks (TERMUX_X11_RENDERER_ROOT_COPY_OPT=1, lorieRootSwap): asked for; given up for the
      * session once one was refused */
     Bool rootCopyOpt, rootCopyOptFailed;
+    /* P11-C2, its copy by the renderer's GPU (TERMUX_X11_RENDERER_ROOT_GPU_COPY=1, lorie.h rootCopy): asked for; the
+     * last request's number; the request not settled yet (seq 0: none) - its buffers and boxes, for the CPU copy
+     * should it come to that, and whether they went meanwhile (abandoned); the shared locks EXA's open accesses hold
+     * (loriePrepareAccess), which a renderer would wait for */
+    Bool rootGpuCopy;
+    uint32_t rootCopySeq;
+    struct {
+        uint32_t seq;
+        LorieBuffer *from, *to;
+        int n;
+        BoxRec boxes[LORIE_GPU_COPY_MAX_RECTS];
+        Bool abandoned;
+    } rootCopy;
+    int accessLocks;
 
     /* TERMUX_X11_X_YIELD_ON_WAKE=1 (lorieQueueUrgentWorkProc): asked for - read from other threads, atomically */
     int yieldOnWake;
 } lorieScreenInfo;
+
+// P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
+// copies ran at about 2.6 GB/s on the CPU (x_root_copy_us), so 1 MiB took about 0.4 ms, about a round trip to the
+// renderer's GPU and back.
+#define LORIE_ROOT_GPU_COPY_MIN_BYTES (1u << 20)
+static void lorieRootCopyWait(Bool takeBack);
 
 ScreenPtr pScreenPtr;
 static lorieScreenInfo lorieScreen = {
@@ -191,6 +211,9 @@ static void lorieDropPersistent(LoriePixmapPriv *priv) {
 static void lorieApplyOwnership(uint8_t mode, uint32_t seq) {
     LoriePixmapPriv *priv;
 
+    // P11-C2: no root copy left to a GPU that may lose the buffers - taken back, if not taken: the renderer waits for
+    // this answer, or another one, which gets the shared state only once it is given, is to take over
+    lorieRootCopyWait(TRUE);
     lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
     if (mode != pvfb->ownership) {
         // Every AHB locked: not before a Vulkan frame that may still run (a new or lost connection) is over.
@@ -360,6 +383,9 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
     // each only within the bounds of the damage copied (lorieRootSwap).
     lorieScreen.rootCopyOpt = getenv("TERMUX_X11_RENDERER_ROOT_COPY_OPT") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_COPY_OPT"), "1");
+    // Experimental: TERMUX_X11_RENDERER_ROOT_GPU_COPY=1 has the renderer's GPU make that swap's copy, after the swap
+    // (lorieRootGpuCopyAsk, lorieRootCopyWait).
+    lorieScreen.rootGpuCopy = getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY"), "1");
     // Experimental: TERMUX_X11_X_YIELD_ON_WAKE=1 lets a vsync tick or a GPU copy's completion break off the client
     // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
     __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
@@ -483,7 +509,9 @@ Bool drawSquares() {
     // PER_ACCESS: drawn into where 3c98ffa would have it CPU-locked, under the shared lock for the drawing only.
     Bool perAccess = !pixels && lorieAhbPerAccess() && priv && priv->persistentWanted;
     if (perAccess) {
-        uint64_t waitStartUs = GetTimeInMicros(), gpuStartUs, lockStartUs;
+        uint64_t waitStartUs, gpuStartUs, lockStartUs;
+        lorieRootCopyWait(FALSE);   // P11-C2: not into the root's buffer before its copy settled
+        waitStartUs = GetTimeInMicros();
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
         gpuStartUs = GetTimeInMicros();
         lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
@@ -732,25 +760,18 @@ static ARect *lorieRootCopyBounds(BoxPtr box, int n, const LorieBuffer_Desc *d, 
 }
 
 /*
- * The swap, between requests, under the shared lock (the renderer reads which buffer is the front under it). The
- * front is written only once no frame uses it (lorieGpuWaitIdle); what is copied is the damage since the last swap
- * (Damage on the screen pixmap sees every drawing into it), or all of it when the twin is out of date. False, and
- * nothing swapped, if a buffer cannot be CPU-locked.
+ * The CPU copy of a swap, the shared lock held: from the buffer the X server drew into (`back`) into the other
+ * (`front`) - once no frame uses either (the last one sampling the front among them) - the damage since the last
+ * swap (Damage on the screen pixmap sees every drawing into it), or all of it when the twin is out of date. False,
+ * and nothing copied, if a buffer cannot be CPU-locked. `waitStartUs`: when the shared lock was asked for.
  */
-static Bool lorieRootSwap(LoriePixmapPriv *priv) {
-    LorieBuffer *back = priv->buffer, *front = priv->twin;
+static Bool lorieRootCopyCpu(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n, uint64_t waitStartUs) {
     const LorieBuffer_Desc *d = LorieBuffer_description(back);
-    RegionPtr damage = DamageRegion(pvfb->damage);
-    BoxRec full = { 0, 0, (short) d->width, (short) d->height };
-    BoxPtr box = pvfb->rootTwinStale ? &full : RegionRects(damage);
-    int n = pvfb->rootTwinStale ? 1 : RegionNumRects(damage), i, failed;
+    int i, failed;
     uint32_t *src = NULL, *dst = NULL;
-    uint64_t waitStartUs = GetTimeInMicros(), gpuStartUs, lockStartUs, copyStartUs, copyEndUs;
+    uint64_t gpuStartUs, lockStartUs, copyStartUs, copyEndUs;
     ARect bounds;
 
-    if (priv->locked)
-        return FALSE;   // never between requests under PER_ACCESS
-    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
     gpuStartUs = GetTimeInMicros();
     lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(front)->id);     // the last frame sampling it
     lorieGpuWaitIdle(pvfb->state, false, d->id);
@@ -786,14 +807,163 @@ static Bool lorieRootSwap(LoriePixmapPriv *priv) {
     __atomic_fetch_add(&pvfb->state->diag.xAhbCpuAcquires, 2, __ATOMIC_RELAXED);
     __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, (copyStartUs - lockStartUs) + (GetTimeInMicros() - copyEndUs), __ATOMIC_RELAXED);
     __atomic_fetch_add(&pvfb->state->diag.xRootCopyUs, copyEndUs - copyStartUs, __ATOMIC_RELAXED);
-    if (!failed) {
+    return !failed;
+}
+
+// P11-C2: a renderer waits for the ownership answer the X server's thread gives (rendererVkOwnership).
+static Bool lorieOwnershipAsked(void) {
+    return LORIE_OWNERSHIP_SEQ(__atomic_load_n(&pvfb->state->backend.ownershipRequest, __ATOMIC_ACQUIRE)) !=
+           LORIE_OWNERSHIP_SEQ(__atomic_load_n(&pvfb->state->backend.ownershipAck, __ATOMIC_ACQUIRE));
+}
+
+/*
+ * P11-C2 (TERMUX_X11_RENDERER_ROOT_GPU_COPY=1), the shared lock held: the swap's copy asked of the renderer's GPU
+ * (lorie.h rootCopy) - its boxes clipped as the CPU copy clips them, those past the last slot copied within the
+ * bounds of the rest (outside the damage both buffers hold the same) - if a renderer is there to make it, none
+ * waits for this thread's ownership answer, and it is big enough to be worth a GPU round trip. False otherwise:
+ * the CPU copies it.
+ */
+static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    const LorieBuffer_Desc *d = LorieBuffer_description(back);
+    LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+    uint64_t bytes = 0;
+    int i, k = 0;
+
+    if (!pvfb->rootGpuCopy || !lorieConnectionAlive() || !lorieRendererAvailable() || lorieOwnershipAsked())
+        return FALSE;
+    for (i = 0; i < n; i++) {
+        int x1 = max(box[i].x1, 0), y1 = max(box[i].y1, 0), x2 = min(box[i].x2, d->width), y2 = min(box[i].y2, d->height);
+        LorieGpuCopyRect *r = &rects[LORIE_GPU_COPY_MAX_RECTS - 1];
+        if (x2 <= x1 || y2 <= y1)
+            continue;
+        if (k < LORIE_GPU_COPY_MAX_RECTS)
+            rects[k++] = (LorieGpuCopyRect) { (int16_t) x1, (int16_t) y1, (int16_t) x2, (int16_t) y2 };
+        else
+            *r = (LorieGpuCopyRect) { (int16_t) min(r->x1, x1), (int16_t) min(r->y1, y1), (int16_t) max(r->x2, x2), (int16_t) max(r->y2, y2) };
+    }
+    for (i = 0; i < k; i++)
+        bytes += (uint64_t) (rects[i].x2 - rects[i].x1) * (uint64_t) (rects[i].y2 - rects[i].y1) * 4;
+    if (bytes < LORIE_ROOT_GPU_COPY_MIN_BYTES) {
+        __atomic_fetch_add(&st->diag.rootCpuSmall, 1, __ATOMIC_RELAXED);
+        return FALSE;
+    }
+    st->rootCopy.srcId = d->id;
+    st->rootCopy.dstId = LorieBuffer_description(front)->id;
+    st->rootCopy.numRects = (uint32_t) k;
+    memcpy((void *) st->rootCopy.rects, rects, sizeof(rects[0]) * (size_t) k);
+    st->rootCopy.queuedUs = lorieMonotonicUs();
+    if (!++pvfb->rootCopySeq)
+        ++pvfb->rootCopySeq;    // 0 is none
+    __atomic_store_n(&st->rootCopy.seq, pvfb->rootCopySeq, __ATOMIC_RELEASE);
+    pvfb->rootCopy.seq = pvfb->rootCopySeq;
+    pvfb->rootCopy.from = back;
+    pvfb->rootCopy.to = front;
+    pvfb->rootCopy.n = k;
+    for (i = 0; i < k; i++)
+        pvfb->rootCopy.boxes[i] = (BoxRec) { rects[i].x1, rects[i].y1, rects[i].x2, rects[i].y2 };
+    pvfb->rootCopy.abandoned = FALSE;
+    __atomic_fetch_add(&st->diag.rootGpuCopyRequests, 1, __ATOMIC_RELAXED);
+    pthread_cond_signal(rendererCond);
+    return TRUE;
+}
+
+/*
+ * P11-C2: the root copy asked of the renderer's GPU settled, before the X server touches its buffers. Waited for
+ * without the shared lock, which the renderer takes the request under; copied here on the CPU instead when the
+ * renderer could not (`failed`) or when, not taken yet, the request is taken back (`cancelled`) because no renderer
+ * will take it soon: this thread holds the shared lock (an EXA access open), no renderer can draw, one waits for
+ * the ownership answer this thread gives, or the caller says so (`takeBack`). A request taken is waited for while its
+ * renderer exists (as
+ * lorieGpuWaitIdle); one whose buffers went (abandoned) is not copied. Should the CPU copy fail too, the swap is
+ * undone - the X server draws into the buffer that has everything again - and the twin brought up to date whole.
+ */
+static void lorieRootCopyWait(Bool takeBack) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    uint32_t seq = pvfb->rootCopy.seq, done = 0;
+    Bool held = pvfb->accessLocks > 0, copy = FALSE;
+    uint64_t startUs;
+
+    if (!seq)
+        return;
+    startUs = GetTimeInMicros();
+    while ((done = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE)) != seq) {
+        struct timespec slice = { 0, 33 * 1000000 };
+        if (__atomic_load_n(&st->rootCopy.taken, __ATOMIC_ACQUIRE) != seq) {
+            if (takeBack || held || !lorieConnectionAlive() || !lorieRendererAvailable() || lorieOwnershipAsked()) {
+                if (!held)
+                    lorie_mutex_lock(&st->lock, &st->lockingPid);
+                if (st->rootCopy.taken != seq) {
+                    st->rootCopy.cancelled = seq;
+                    copy = TRUE;
+                }
+                if (!held)
+                    lorie_mutex_unlock(&st->lock, &st->lockingPid);
+                if (copy)
+                    break;
+                continue;   // taken meanwhile: waited for
+            }
+        } else if (st->rootCopy.pid > 0 && kill(st->rootCopy.pid, 0) == -1 && errno == ESRCH) {
+            copy = TRUE;    // taken by a renderer process gone: its device work ended with it (lorieGpuSubmitterGone)
+            break;
+        }
+        syscall(SYS_futex, &st->rootCopy.done, FUTEX_WAIT, done, &slice, NULL, 0);
+    }
+    if (done == seq && __atomic_load_n(&st->rootCopy.failed, __ATOMIC_RELAXED) == seq)
+        copy = TRUE;
+    __atomic_fetch_add(&st->diag.rootCopyCpuBlockUs, GetTimeInMicros() - startUs, __ATOMIC_RELAXED);
+    if (copy && !pvfb->rootCopy.abandoned) {
+        uint64_t waitStartUs = GetTimeInMicros();
+        LoriePixmapPriv *priv = lorieRootWindowPixmapPriv();
+        if (!held)
+            lorie_mutex_lock(&st->lock, &st->lockingPid);
+        if (!lorieRootCopyCpu(pvfb->rootCopy.from, pvfb->rootCopy.to, pvfb->rootCopy.boxes, pvfb->rootCopy.n, waitStartUs) &&
+            priv && priv->buffer == pvfb->rootCopy.to && priv->twin == pvfb->rootCopy.from) {
+            priv->buffer = pvfb->rootCopy.from;
+            priv->twin = pvfb->rootCopy.to;
+            pvfb->rootTwinStale = TRUE;
+        }
+        if (!held)
+            lorie_mutex_unlock(&st->lock, &st->lockingPid);
+        __atomic_fetch_add(&st->diag.rootCpuFallbacks, 1, __ATOMIC_RELAXED);
+    }
+    pvfb->rootCopy.seq = 0;
+}
+
+/*
+ * The swap, between requests, under the shared lock (the renderer reads which buffer is the front under it): the
+ * damage copied from the back into the front - by the CPU here (lorieRootCopyCpu), or, P11-C2, by the renderer's
+ * GPU after the swap, the X server waiting for it only once it touches its new back (lorieRootCopyWait) - and the
+ * two swapped. False, and nothing swapped, if a buffer cannot be CPU-locked.
+ */
+static Bool lorieRootSwap(LoriePixmapPriv *priv) {
+    LorieBuffer *back, *front;
+    const LorieBuffer_Desc *d;
+    RegionPtr damage = DamageRegion(pvfb->damage);
+    BoxRec full;
+    BoxPtr box;
+    int n;
+    uint64_t waitStartUs;
+    Bool swapped;
+
+    if (priv->locked)
+        return FALSE;   // never between requests under PER_ACCESS
+    lorieRootCopyWait(FALSE);   // P11-C2: the last copy asked of the GPU settled first (and the swap undone, should it have failed)
+    back = priv->buffer, front = priv->twin, d = LorieBuffer_description(back);
+    full = (BoxRec) { 0, 0, (short) d->width, (short) d->height };
+    box = pvfb->rootTwinStale ? &full : RegionRects(damage);
+    n = pvfb->rootTwinStale ? 1 : RegionNumRects(damage);
+    waitStartUs = GetTimeInMicros();
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    swapped = lorieRootGpuCopyAsk(back, front, box, n) || lorieRootCopyCpu(back, front, box, n, waitStartUs);
+    if (swapped) {
         priv->buffer = front;
         priv->twin = back;
         pvfb->rootTwinStale = FALSE;
         pvfb->state->rootWindowTextureID = LorieBuffer_description(back)->id;
     }
     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
-    return !failed;
+    return swapped;
 }
 
 // P10-B0: one event's two CLOCK_MONOTONIC stamps as a latency; out of order or over 10 s apart, counted instead.
@@ -975,6 +1145,15 @@ static void lorieLogRendererDiag(void) {
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
         !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off");
+    // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
+    log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
+              "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "
+              "root_copy_completion_us=%llu(+%llu) root_cpu_fallbacks=%llu(+%llu) root_cpu_small=%llu(+%llu) "
+              "root_copy_cpu_block_us=%llu(+%llu) root_copy_pending=%d",
+        !pvfb->rootGpuCopy ? "off" : d.rootCpuFallbacks != prev.rootCpuFallbacks && d.rootGpuCopyCompletions == prev.rootGpuCopyCompletions
+                                     ? "fallback" : "on",
+        TD(rootGpuCopyRequests), TD(rootGpuCopySubmits), TD(rootGpuCopyCompletions), TD(rootGpuCopyRects), TD(rootGpuCopyBytes),
+        TD(rootGpuCopyCompletionUs), TD(rootCpuFallbacks), TD(rootCpuSmall), TD(rootCopyCpuBlockUs), pvfb->rootCopy.seq ? 1 : 0);
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -1854,6 +2033,11 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
 
 void lorieExaDestroyPixmap(__unused ScreenPtr pScreen, void *driverPriv) {
     LoriePixmapPriv *priv = driverPriv;
+    // P11-C2: a root copy between buffers that go is not the X server's to make any more (the renderer holds its own
+    // references to them meanwhile); the request is still settled before the next one is made
+    if (pvfb->rootCopy.seq && priv->buffer && (priv->buffer == pvfb->rootCopy.to || priv->buffer == pvfb->rootCopy.from ||
+                                               priv->twin == pvfb->rootCopy.to || priv->twin == pvfb->rootCopy.from))
+        pvfb->rootCopy.abandoned = TRUE;
     if (priv->persistentWanted) {
         xorg_list_del(&priv->persistentLink);
         priv->persistentWanted = FALSE;
@@ -1894,9 +2078,13 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
+    // P11-C2: the root's buffer not before the copy into it the GPU was asked for settled
+    if (pvfb->rootCopy.seq && priv && priv->buffer == pvfb->rootCopy.to)
+        lorieRootCopyWait(FALSE);
     if (lorieNeedsGpuLock(pPix, priv, index)) {
         uint64_t waitStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+        pvfb->accessLocks++;
         // PER_ACCESS: the renderer lets the lock go while the device runs a frame; not while it uses this one.
         if (perAccessAhb && !priv->locked && !priv->mem) {
             uint64_t gpuStartUs = GetTimeInMicros();
@@ -1916,8 +2104,10 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             dprintf(2, "Failed to lock buffer, err %d\n", err);
             // PER_ACCESS: no FinishAccess follows a failed PrepareAccess, and the renderer would wait on
             // this lock for good. (3c98ffa's own path is left as it was.)
-            if (perAccessAhb)
+            if (perAccessAhb) {
+                pvfb->accessLocks--;
                 lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            }
             return FALSE;
         }
         priv->wasLocked = FALSE;
@@ -1943,12 +2133,15 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
         return;
     }
 
-    if (lorieNeedsGpuLock(pPix, priv, index))
+    if (lorieNeedsGpuLock(pPix, priv, index)) {
+        pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    }
 
     if (!priv->wasLocked) {
         LorieBuffer_unlock(priv->buffer);

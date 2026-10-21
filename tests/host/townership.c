@@ -106,6 +106,13 @@ struct fake_state {
     struct lorie_backend_control backend;
     struct { volatile uint32_t busy; volatile pid_t pid; uint32_t count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } gpuInFlight;
     uint64_t rootWindowTextureID;
+    struct {                    /* lorie.h rootCopy (P11-C2) */
+        volatile uint32_t seq, taken, cancelled, failed, done;
+        volatile pid_t pid;
+        uint64_t srcId, dstId, queuedUs;
+        uint32_t numRects;
+        LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+    } rootCopy;
 };
 struct fake_pvfb {
     struct fake_state *state;
@@ -117,6 +124,16 @@ struct fake_pvfb {
     void (*SetWindowPixmap)(WindowPtr, PixmapPtr);
     uint8_t ownership;
     struct xorg_list ahbPersistent;
+    Bool rootGpuCopy;           /* P11-C2: InitOutput.c's own */
+    uint32_t rootCopySeq;
+    struct {
+        uint32_t seq;
+        struct LorieBuffer *from, *to;
+        int n;
+        BoxRec boxes[LORIE_GPU_COPY_MAX_RECTS];
+        Bool abandoned;
+    } rootCopy;
+    int accessLocks;
 };
 
 static ScreenRec screen;
@@ -163,7 +180,19 @@ static void rendererView(const char *where);
 /* the submitter of a listed frame: the X server's futex wait on gpuInFlight.busy is where the frame becomes over
  * (the submitter clears the list) once `gpuSlices` 33 ms slices timed out before it */
 static int gpuWaits, gpuSlices;
+static void rootRenderer(void);
+static int rootWaits;
 static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
+    if (checked && word == &checked->state->rootCopy.done) {
+        /* P11-C2: the X server waiting for a root copy - the renderer's moment */
+        CHECK(op == FUTEX_WAIT && *word == value, "%s: not a futex wait on the root copy's word", runName);
+        if (++rootWaits > 200) {
+            CHECK(0, "%s: a wait for a root copy that does not end", runName);
+            checked->state->rootCopy.failed = checked->state->rootCopy.done = checked->state->rootCopy.seq;
+        }
+        rootRenderer();
+        return 0;
+    }
     gpuWaits++;
     CHECK(op == FUTEX_WAIT && *word == value, "%s op %d: not a futex wait on the list's word", runName, opIndex);
     if (checked)
@@ -210,10 +239,26 @@ static void LorieBuffer_convert(LorieBuffer *b, int8_t type, __unused int8_t for
     b->lockedData = NULL;
     ev("V%llu", b->desc.id);
 }
+/* P11-C2: a renderer process that took a root copy and is gone (a child reaped), and whether a root copy that is not
+ * settled - not done, not taken back, its renderer not gone - uses buffer `b`: the X server CPU-locks no such one */
+static pid_t rootDeadPid;
+static bool rootCopyUnsettled(LorieBuffer *b) {
+    struct fake_state *st;
+    uint32_t seq;
+    if (!checked || !b)
+        return false;
+    st = checked->state;
+    seq = st->rootCopy.seq;
+    return seq && seq != st->rootCopy.done && seq != st->rootCopy.cancelled &&
+           !(st->rootCopy.taken == seq && rootDeadPid && st->rootCopy.pid == rootDeadPid) &&
+           (b->desc.id == st->rootCopy.srcId || b->desc.id == st->rootCopy.dstId);
+}
 static int LorieBuffer_lock(LorieBuffer *b, void **out) {
     int ret = 0;
     if (!b)
         return ENODEV;
+    CHECK(!rootCopyUnsettled(b), "%s op %d: AHB %llu CPU-locked while a root copy using it is not settled", runName, opIndex,
+          b->desc.id);
     CHECK(!b->released, "%s op %d: CPU lock of released buffer %llu", runName, opIndex, b->desc.id);
     if (b->locked) {                /* as buffer.c */
         ev("L%llu!", b->desc.id);
@@ -246,6 +291,8 @@ static int LorieBuffer_lockRect(LorieBuffer *b, bool write, const ARect *rect, v
     int w, h, s;
     if (!b)
         return ENODEV;
+    CHECK(!rootCopyUnsettled(b), "%s op %d: AHB %llu CPU-locked while a root copy using it is not settled", runName, opIndex,
+          b->desc.id);
     CHECK(!b->released, "%s op %d: CPU lock of released buffer %llu", runName, opIndex, b->desc.id);
     if (b->locked) {
         ev("l%llu!", b->desc.id);
@@ -310,6 +357,55 @@ static int LorieBuffer_unlock(LorieBuffer *b) {
     ev("U%llu", b->desc.id);
     return 0;
 }
+/* P11-C2: the renderer's side of a root copy the X server asked for (rootCopy), as a case sets it - what it does when
+ * the X server waits for it: after `rootRendererWaits` waits (having taken it at the first, with `rootRendererTakes`),
+ * copy it - each rectangle's pixels from the request's source into its destination, as its GPU would - fail it, or
+ * take it and be gone. A request no renderer took must not be waited for with the shared lock held: the renderer
+ * takes it under that lock. */
+enum { ROOT_COPIES, ROOT_FAILS, ROOT_TAKES_AND_DIES };
+static int rootRendererDoes, rootRendererWaits, rootRendererCalls;
+static bool rootRendererTakes;
+static LorieBuffer *bufferWithId(uint64_t id) {
+    for (int i = 0; i < nbuffers; i++)
+        if (buffers[i]->desc.id == id)
+            return buffers[i];
+    return NULL;
+}
+static void rootRenderer(void) {
+    struct fake_state *st = checked->state;
+    uint32_t seq = st->rootCopy.seq;
+    LorieBuffer *src = bufferWithId(st->rootCopy.srcId), *dst = bufferWithId(st->rootCopy.dstId);
+    rootRendererCalls++;
+    if (st->rootCopy.taken != seq)
+        CHECK(st->lock == 0, "%s: a root copy no renderer took waited for with the shared lock held", runName);
+    CHECK(!src || !dst || (!src->cpuHeld && !dst->cpuHeld), "%s: a root copy's buffer CPU-locked while it is waited for", runName);
+    if (seq == st->rootCopy.done || seq == st->rootCopy.cancelled)
+        return;
+    if (rootRendererWaits > 0) {
+        rootRendererWaits--;
+        if (rootRendererTakes)
+            st->rootCopy.taken = seq, st->rootCopy.pid = getpid();
+        return;
+    }
+    if (st->rootCopy.taken == seq && st->rootCopy.pid == rootDeadPid)
+        return;
+    st->rootCopy.taken = seq;
+    st->rootCopy.pid = getpid();
+    if (rootRendererDoes == ROOT_TAKES_AND_DIES) {
+        st->rootCopy.pid = rootDeadPid;
+        return;
+    }
+    if (rootRendererDoes == ROOT_COPIES && src && dst)
+        for (uint32_t k = 0; k < st->rootCopy.numRects; k++) {
+            LorieGpuCopyRect r = st->rootCopy.rects[k];
+            for (int y = r.y1; y < r.y2; y++)
+                memcpy(dst->mem + (size_t) y * dst->desc.stride + r.x1, src->mem + (size_t) y * src->desc.stride + r.x1,
+                       (size_t) (r.x2 - r.x1) * 4);
+        }
+    else
+        st->rootCopy.failed = seq;
+    st->rootCopy.done = seq;
+}
 static void lorie_mutex_lock(int *m, __unused int *pid) {
     ++*m;
     ev("M+");
@@ -322,6 +418,10 @@ static void lorie_mutex_unlock(int *m, __unused int *pid) {
 }
 static uint64_t fakeNow;
 static uint64_t GetTimeInMicros(void) { return fakeNow += 3; }
+/* P11-C2: a renderer connected, with a surface - as a case sets them */
+static bool rootConnection = true, rootSurface = true;
+static bool lorieConnectionAlive(void) { return rootConnection; }
+static bool lorieRendererAvailable(void) { return rootSurface; }
 static Bool (*queuedProc)(ClientPtr, void *);
 static int wakes, condSignals;
 static Bool QueueWorkProc(Bool (*proc)(ClientPtr, void *), __unused ClientPtr client, __unused void *closure) {
@@ -381,6 +481,7 @@ static LorieBuffer **base_bufferOf(void *priv) { return &((LoriePixmapPriv *) pr
 
 /* ---- this branch ---- */
 static struct fake_pvfb newWorld, *pvfb = &newWorld;
+static void lorieRootCopyWait(Bool takeBack);
 #include "own_new_src.inc"
 static int pixman_blt(uint32_t *src, uint32_t *dst, int srcStride, int dstStride, int srcBpp, int dstBpp, int sx, int sy,
                       int dx, int dy, int w, int h) {
@@ -389,8 +490,51 @@ static int pixman_blt(uint32_t *src, uint32_t *dst, int srcStride, int dstStride
         memcpy(dst + (size_t) (dy + y) * dstStride + dx, src + (size_t) (sy + y) * srcStride + sx, (size_t) w * 4);
     return 1;
 }
+#define lorie_shared_server_state fake_state
 #include "rootswap_src.inc"
+#undef lorie_shared_server_state
 static LorieBuffer **new_bufferOf(void *priv) { return &((LoriePixmapPriv *) priv)->buffer; }
+
+/* P11-C2: a root double buffering world for the GPU copy - both buffers alike (base pixels) but for what the X server
+ * drew into the back since the last swap (the damage's boxes, drawn pixels); the screen pixmap's private its */
+static struct fake_state rootGpuState;
+static LoriePixmapPriv rootGpuPriv;
+static PixmapRec rootGpuPix;
+static RegionRec rootGpuDamage;
+static void rootGpuWorld(const char *name, BoxRec *boxes, int n) {
+    const int w = 512, h = 520;
+    LorieBuffer *back, *front;
+    memset(&rootGpuState, 0, sizeof rootGpuState);
+    nbuffers = 0;
+    back = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, w, h);
+    front = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, w, h);
+    for (int i = 0; i < w * h; i++)
+        back->mem[i] = front->mem[i] = 0x10000u + (uint32_t) i;
+    for (int k = 0; k < n; k++)
+        for (int y = max(boxes[k].y1, 0); y < min(boxes[k].y2, h); y++)
+            for (int x = max(boxes[k].x1, 0); x < min(boxes[k].x2, w); x++)
+                back->mem[y * w + x] = 0x900000u + (uint32_t) (y * w + x);
+    rootGpuDamage = (RegionRec) { n, boxes };
+    newWorld = (struct fake_pvfb) { .state = &rootGpuState, .ownership = LORIE_OWNERSHIP_PER_ACCESS, .damage = &rootGpuDamage,
+                                    .rootGpuCopy = TRUE };
+    xorg_list_init(&newWorld.ahbPersistent);
+    rootGpuState.backend.ownershipAck = rootGpuState.backend.ownershipRequest = LORIE_OWNERSHIP_WORD(1, LORIE_OWNERSHIP_PER_ACCESS);
+    rootGpuPriv = (LoriePixmapPriv) { .buffer = back, .twin = front };
+    rootGpuPix = (PixmapRec) { { NULL }, &rootGpuPriv };
+    screen.devPrivate = &rootGpuPix;
+    checked = &newWorld;
+    runName = name;
+    traceLen = 0;
+    trace[0] = 0;
+    rootRendererDoes = ROOT_COPIES;
+    rootRendererWaits = rootRendererCalls = rootWaits = 0;
+    rootRendererTakes = false;
+    rootConnection = rootSurface = true;
+}
+// whether the world's two buffers hold the same pixels
+static bool rootGpuAlike(void) {
+    return !memcmp(buffers[0]->mem, buffers[1]->mem, (size_t) 512 * 520 * 4);
+}
 
 /* P11-B: one swap, its own locks off or on, from the same buffers, damage and staleness; what the front holds then */
 struct swapcase {
@@ -1075,6 +1219,200 @@ int main(void) {
             for (int v = 0; v < 2; v++)
                 free(res[v][0]), free(res[v][1]);
         }
+    }
+
+    /* P11-C2, TERMUX_X11_RENDERER_ROOT_GPU_COPY=1: the swap asks the renderer's GPU for its copy and swaps at once -
+     * no CPU copy, no CPU lock, no wait for the frame sampling the front; the X server's first access to its new back
+     * waits, without the shared lock, until the copy settles; the copy it may have to make itself (the renderer could
+     * not, or the request was taken back) is the CPU copy of before. Through all of it the X server CPU-locks neither
+     * buffer of a copy not settled (rootCopyUnsettled) and never waits for a request no renderer took holding the
+     * shared lock (rootRenderer). */
+    {
+        static BoxRec big[1] = { { 0, 0, 512, 512 } };     /* 1 MiB of pixels: worth the GPU */
+        static const struct {
+            const char *name;
+            int does, waits;
+            bool takes;
+            int stall;          /* 1 no connection, 2 no surface, 3 the ownership answer asked for, 4 an EXA access open */
+            bool waited, fallback, cancelled;
+        } cases[] = {
+            { "the renderer copies it", ROOT_COPIES, 0, false, 0, true, false, false },
+            { "the renderer copies it, slowly (taken at once)", ROOT_COPIES, 3, true, 0, true, false, false },
+            { "the renderer copies it, slowly (taken late)", ROOT_COPIES, 3, false, 0, true, false, false },
+            { "the renderer cannot", ROOT_FAILS, 0, false, 0, true, true, false },
+            { "the renderer takes it and is gone", ROOT_TAKES_AND_DIES, 0, false, 0, true, true, false },
+            { "no connection: taken back", ROOT_COPIES, 0, false, 1, false, true, true },
+            { "no surface: taken back", ROOT_COPIES, 0, false, 2, false, true, true },
+            { "the ownership answer asked for: taken back", ROOT_COPIES, 0, false, 3, false, true, true },
+            { "an EXA access open (the shared lock held): taken back", ROOT_COPIES, 0, false, 4, false, true, true },
+            { "no connection, taken already: waited for", ROOT_COPIES, 2, true, 1, true, false, false },
+        };
+        {
+            pid_t dead = fork();
+            if (!dead)
+                _exit(0);
+            waitpid(dead, NULL, 0);
+            rootDeadPid = dead;
+        }
+        for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+            LorieBuffer *back, *front, *other = NULL;
+            LoriePixmapPriv otherP = {0};
+            PixmapRec otherPix = { { NULL }, &otherP };
+            uint32_t fallbacks;
+            Bool ok;
+
+            rootGpuWorld(cases[k].name, big, 1);
+            back = buffers[0], front = buffers[1];
+            rootRendererDoes = cases[k].does;
+            rootRendererWaits = cases[k].waits;
+            rootRendererTakes = cases[k].takes;
+            if (cases[k].stall == 4) {
+                other = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 8, 8);
+                otherP = (LoriePixmapPriv) { .buffer = other };
+            }
+            ok = lorieRootSwap(&rootGpuPriv);
+            CHECK(ok && rootGpuPriv.buffer == front && rootGpuPriv.twin == back && rootGpuState.rootWindowTextureID == back->desc.id &&
+                  !newWorld.rootTwinStale && rootGpuState.rootCopy.seq == 1 && rootGpuState.rootCopy.srcId == back->desc.id &&
+                  rootGpuState.rootCopy.dstId == front->desc.id && rootGpuState.rootCopy.numRects == 1 &&
+                  rootGpuState.diag.rootGpuCopyRequests == 1 && rootGpuState.diag.xRootCopyUs == 0,
+                  "root GPU copy, %s: the swap: swapped %d, request %u from %llu into %llu, %u rectangles", cases[k].name, ok,
+                  rootGpuState.rootCopy.seq, (unsigned long long) rootGpuState.rootCopy.srcId,
+                  (unsigned long long) rootGpuState.rootCopy.dstId, rootGpuState.rootCopy.numRects);
+            CHECK(!strstr(trace, "L") && !strstr(trace, "l") && front->mem[0] == 0x10000u,
+                  "root GPU copy, %s: the swap CPU-locked a buffer, or copied: %s", cases[k].name, trace);
+            if (cases[k].stall == 1)
+                rootConnection = false;
+            else if (cases[k].stall == 2)
+                rootSurface = false;
+            else if (cases[k].stall == 3)
+                rootGpuState.backend.ownershipRequest = LORIE_OWNERSHIP_WORD(2, LORIE_OWNERSHIP_PERSISTENT);
+            else if (cases[k].stall == 4)
+                CHECK(loriePrepareAccess(&otherPix, EXA_PREPARE_DEST) && newWorld.accessLocks == 1, "root GPU copy, %s: no access open",
+                      cases[k].name);
+            if (cases[k].takes && cases[k].stall == 1) {
+                /* taken before the connection went: the renderer exists, the copy is waited for */
+                rootGpuState.rootCopy.taken = 1;
+                rootGpuState.rootCopy.pid = getpid();
+            }
+            fallbacks = rootGpuState.diag.rootCpuFallbacks;
+            /* the X server's first access to its new back */
+            ok = loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(ok && rootGpuPix.devPrivate.ptr == front->mem && newWorld.rootCopy.seq == 0,
+                  "root GPU copy, %s: the access: %d, its pixels %s, the request %s", cases[k].name, ok,
+                  rootGpuPix.devPrivate.ptr == front->mem ? "the new back's" : "elsewhere", newWorld.rootCopy.seq ? "unsettled" : "settled");
+            if (ok)
+                lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            if (cases[k].stall == 4)
+                lorieFinishAccess(&otherPix, EXA_PREPARE_DEST);
+            CHECK(rootGpuAlike(), "root GPU copy, %s: the new back not what the old one held", cases[k].name);
+            CHECK((rootRendererCalls > 0) == cases[k].waited && (rootGpuState.diag.rootCpuFallbacks == fallbacks + 1) == cases[k].fallback &&
+                  (rootGpuState.rootCopy.cancelled == 1) == cases[k].cancelled && newWorld.accessLocks == 0 && rootGpuState.lock == 0,
+                  "root GPU copy, %s: waited %d times (want %s), %u CPU copies instead, taken back %d", cases[k].name, rootRendererCalls,
+                  cases[k].waited ? "some" : "none", rootGpuState.diag.rootCpuFallbacks - fallbacks, rootGpuState.rootCopy.cancelled == 1);
+            CHECK(!cases[k].waited || rootGpuState.diag.rootCopyCpuBlockUs > 0, "root GPU copy, %s: no time waiting counted", cases[k].name);
+        }
+        rootConnection = rootSurface = true;
+
+        /* small damage: copied on the CPU at the swap, as before */
+        {
+            static BoxRec small[1] = { { 3, 4, 40, 30 } };
+            rootGpuWorld("small damage", small, 1);
+            CHECK(lorieRootSwap(&rootGpuPriv) && rootGpuState.rootCopy.seq == 0 && rootGpuState.diag.rootCpuSmall == 1 && rootGpuAlike() &&
+                  rootGpuState.diag.xRootCopyUs > 0, "small damage: asked of the GPU, or not copied at the swap");
+        }
+
+        /* the option off: copied on the CPU at the swap, as before - whatever the damage */
+        rootGpuWorld("the option off", big, 1);
+        newWorld.rootGpuCopy = FALSE;
+        CHECK(lorieRootSwap(&rootGpuPriv) && rootGpuState.rootCopy.seq == 0 && rootGpuState.diag.rootCpuSmall == 0 && rootGpuAlike(),
+              "the option off: asked of the GPU, or not copied at the swap");
+
+        /* more boxes than a request holds: those past its last slot within the bounds of the rest - every one copied */
+        {
+            static BoxRec many[20];      /* bands, as a region's boxes are */
+            for (int i = 0; i < 20; i++)
+                many[i] = (BoxRec) { (short) (i & 1), (short) (i * 26), (short) (512 - (i & 1)), (short) (i * 26 + 26) };
+            rootGpuWorld("twenty boxes", many, 20);
+            CHECK(lorieRootSwap(&rootGpuPriv) && rootGpuState.rootCopy.numRects == LORIE_GPU_COPY_MAX_RECTS,
+                  "twenty boxes: %u rectangles asked for", rootGpuState.rootCopy.numRects);
+            CHECK(loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST), "twenty boxes: no access");
+            lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(rootGpuAlike(), "twenty boxes: not every box copied");
+        }
+
+        /* swaps after a swap: the X server drawing into its new back, its damage then copied by the GPU too */
+        {
+            static BoxRec second[1] = { { 0, 8, 512, 520 } };
+            rootGpuWorld("swaps after a swap", big, 1);
+            CHECK(lorieRootSwap(&rootGpuPriv), "swaps after a swap: the first not swapped");
+            CHECK(loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST), "swaps after a swap: no access");
+            for (int y = 8; y < 520; y++)               /* drawn into the new back */
+                for (int x = 0; x < 512; x++)
+                    rootGpuPriv.buffer->mem[y * 512 + x] = 0x700000u + (uint32_t) (y * 512 + x);
+            lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            rootGpuDamage = (RegionRec) { 1, second };
+            CHECK(lorieRootSwap(&rootGpuPriv) && rootGpuState.rootCopy.seq == 2 && rootGpuPriv.buffer == buffers[0] &&
+                  rootGpuState.rootCopy.srcId == buffers[1]->desc.id, "swaps after a swap: the second not asked of the GPU");
+            CHECK(loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST), "swaps after a swap: no second access");
+            lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+            CHECK(rootGpuAlike() && buffers[0]->mem[8 * 512] == 0x700000u + 8 * 512, "swaps after a swap: the buffers differ after it");
+        }
+
+        /* the ownership answer moving to PERSISTENT (the AHBs CPU-locked for good): the request taken back and copied
+         * first, never left to a renderer that waits for this very answer */
+        rootGpuWorld("the ownership answer", big, 1);
+        CHECK(lorieRootSwap(&rootGpuPriv), "the ownership answer: not swapped");
+        rootGpuState.backend.ownershipRequest = LORIE_OWNERSHIP_WORD(2, LORIE_OWNERSHIP_PERSISTENT);
+        lorieApplyOwnership(LORIE_OWNERSHIP_PERSISTENT, 2);
+        CHECK(rootGpuState.rootCopy.cancelled == 1 && rootRendererCalls == 0 && newWorld.rootCopy.seq == 0 && rootGpuAlike() &&
+              newWorld.ownership == LORIE_OWNERSHIP_PERSISTENT, "the ownership answer: the root copy not settled first");
+
+        /* a renderer connecting (or gone) puts the ownership back - the new one gets the shared state only after: a
+         * request no renderer took taken back at once, not waited for */
+        rootGpuWorld("a renderer connecting", big, 1);
+        CHECK(lorieRootSwap(&rootGpuPriv), "a renderer connecting: not swapped");
+        lorieResetOwnership();
+        CHECK(rootGpuState.rootCopy.cancelled == 1 && rootRendererCalls == 0 && newWorld.rootCopy.seq == 0 && rootGpuAlike(),
+              "a renderer connecting: the root copy waited for (%d times), or not copied", rootRendererCalls);
+
+        /* the CPU copy failing too: the swap undone, the twin brought up to date whole next time */
+        rootGpuWorld("the CPU copy failing", big, 1);
+        rootRendererDoes = ROOT_FAILS;
+        CHECK(lorieRootSwap(&rootGpuPriv), "the CPU copy failing: not swapped");
+        buffers[1]->failLock = 1;
+        CHECK(loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST) || 1, "");
+        buffers[1]->failLock = 0;
+        CHECK(rootGpuPriv.buffer == buffers[0] && rootGpuPriv.twin == buffers[1] && newWorld.rootTwinStale,
+              "the CPU copy failing: the swap not undone");
+        if (rootGpuPix.devPrivate.ptr)
+            lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+
+        /* the screen pixmap destroyed with a request not settled: not copied by the X server any more, settled
+         * before the next one is asked for */
+        {
+            static BoxRec again[1] = { { 0, 0, 512, 512 } };
+            LorieBuffer *oldBack, *oldFront;
+            rootGpuWorld("the screen pixmap destroyed", big, 1);
+            oldBack = buffers[0], oldFront = buffers[1];
+            rootRendererDoes = ROOT_FAILS;
+            CHECK(lorieRootSwap(&rootGpuPriv), "destroyed: not swapped");
+            lorieExaDestroyPixmap(NULL, &rootGpuPriv);
+            CHECK(newWorld.rootCopy.abandoned && oldBack->released && oldFront->released, "destroyed: not abandoned");
+            /* a new screen pixmap's swap: the old request settled (failed, nothing copied), the new one asked for */
+            {
+                LorieBuffer *nb = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 512, 520), *nf = newBuffer(LORIEBUFFER_AHARDWAREBUFFER, 512, 520);
+                uint32_t fallbacks = rootGpuState.diag.rootCpuFallbacks;
+                rootGpuPriv = (LoriePixmapPriv) { .buffer = nb, .twin = nf };
+                rootGpuDamage = (RegionRec) { 1, again };
+                rootRendererDoes = ROOT_COPIES;
+                CHECK(lorieRootSwap(&rootGpuPriv) && rootGpuState.rootCopy.seq == 2 && rootGpuState.rootCopy.dstId == nf->desc.id &&
+                      rootGpuState.diag.rootCpuFallbacks == fallbacks && rootRendererCalls > 0,
+                      "destroyed: the next request %u, %u CPU copies of the old one", rootGpuState.rootCopy.seq,
+                      rootGpuState.diag.rootCpuFallbacks - fallbacks);
+            }
+        }
+        checked = NULL;
+        screen.devPrivate = NULL;
     }
 
     printf("TOWNERSHIP AHB CPU ownership against 3c98ffa's own code: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
