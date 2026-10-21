@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Negative controls: each breaks one rule of the code under test, in a copy of the sources, and the test
 that guards that rule must then fail. A control whose text is no longer in the sources stops with an error
-rather than passing, so a control cannot quietly stop testing anything.
+rather than passing, so a control cannot quietly stop testing anything. A control of "xserver.patch" changes a copy
+of patches/xserver.patch (line for line, so its hunks still apply), which gen.py then applies instead.
 
 usage: tcontrols.py <lorie source dir> <output dir> <3c98ffa lorie source dir>
 """
@@ -37,6 +38,10 @@ CONTROLS = [
             priv->locked = NULL;
             priv->wasLocked = FALSE;
         }
+        if (priv->accessStartUs) {
+            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            priv->accessStartUs = 0;
+        }
         pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
         return;
@@ -50,6 +55,10 @@ CONTROLS = [
             __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
             priv->locked = NULL;
             priv->wasLocked = FALSE;
+        }
+        if (priv->accessStartUs) {
+            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            priv->accessStartUs = 0;
         }
         return;
     }""",
@@ -68,6 +77,7 @@ CONTROLS = [
      "townership"),
     ("a failed PrepareAccess under PER_ACCESS keeps the shared lock", "InitOutput.c",
      """            if (perAccessAhb) {
+                priv->accessStartUs = 0;
                 pvfb->accessLocks--;
                 lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
             }
@@ -656,8 +666,8 @@ CONTROLS = [
      "tpresentcopy"),
     ("an access CPU-locking an AHB a submitted Vulkan frame uses", "InitOutput.c",
      """            lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
-            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);""",
-     """            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);""",
+            gpuUs = GetTimeInMicros() - gpuStartUs;""",
+     """            gpuUs = GetTimeInMicros() - gpuStartUs;""",
      "townership"),
     ("drawSquares into a root a submitted Vulkan frame uses", "InitOutput.c",
      """        lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
@@ -918,8 +928,8 @@ CONTROLS = [
      """    ;""",
      "townership"),
     ("P11-C2: a root copy no renderer took waited for with the shared lock held", "InitOutput.c",
-     """    Bool held = pvfb->accessLocks > 0, copy = FALSE;""",
-     """    Bool held = FALSE, copy = FALSE;""",
+     """    Bool held = pvfb->accessLocks > 0, copy = FALSE, waited = FALSE;""",
+     """    Bool held = FALSE, copy = FALSE, waited = FALSE;""",
      "townership"),
     ("P11-C2: an EXA access's shared lock not counted", "InitOutput.c",
      """        lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
@@ -1068,6 +1078,58 @@ CONTROLS += [
         vkRootCopyBusyUs = 0;""",
      """        ft.afterRootUs = vkRootCopyBusyUs;""",
      "tpresentcopy"),
+    ("P11-C3: a bucket's bound counted in the bucket above (16.667 ms over 16.667 ms)", "lorie.h",
+     """    while (b < LORIE_HIST_BUCKETS - 1 && v > bounds[b])""",
+     """    while (b < LORIE_HIST_BUCKETS - 1 && v >= bounds[b])""",
+     "tdiaglog"),
+    ("P11-C3: p99 reported as p95", "InitOutput.c",
+     """    static const uint32_t percent[2] = { 95, 99 };""",
+     """    static const uint32_t percent[2] = { 95, 95 };""",
+     "tdiaglog"),
+    ("P11-C3: a timing's maximum not taken back by its report", "InitOutput.c",
+     """    uint32_t n = now->count - before->count, top = __atomic_exchange_n(max, 0, __ATOMIC_RELAXED), over16 = 0, over33 = 0;""",
+     """    uint32_t n = now->count - before->count, top = __atomic_load_n(max, __ATOMIC_RELAXED), over16 = 0, over33 = 0;""",
+     "tdiaglog"),
+    ("P11-C3: the frame diagnostics' lines written with the option off", "InitOutput.c",
+     """    if (pvfb->frameDiag) {
+        char h[10][112];""",
+     """    if (1) {
+        char h[10][112];""",
+     "tdiaglog"),
+    ("P11-C3: a tick that asked for no frame leaves the last request standing", "InitOutput.c",
+     """        __atomic_fetch_add(&pvfb->state->diag.xTicksFrameMissed, 1, __ATOMIC_RELAXED);
+    pvfb->frameAsked = FALSE;""",
+     """        __atomic_fetch_add(&pvfb->state->diag.xTicksFrameMissed, 1, __ATOMIC_RELAXED);""",
+     "tdiaglog"),
+    ("P11-C3: a frame presented by GLES not seen by the tick", "InitOutput.c",
+     """    return __atomic_load_n(&pvfb->state->diag.vkFramesPresented, __ATOMIC_RELAXED) +
+           __atomic_load_n(&pvfb->state->diag.eglSwapBuffers, __ATOMIC_RELAXED);""",
+     """    return __atomic_load_n(&pvfb->state->diag.vkFramesPresented, __ATOMIC_RELAXED);""",
+     "tdiaglog"),
+    ("P11-C3: the X server's resume timed for a copy it never waited for", "InitOutput.c",
+     """    if (waited && pvfb->frameDiag) {""",
+     """    if (pvfb->frameDiag) {""",
+     "townership"),
+    ("P11-C3: an access's start left after its FinishAccess", "InitOutput.c",
+     """        if (priv->accessStartUs) {
+            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            priv->accessStartUs = 0;
+        }""",
+     """        if (priv->accessStartUs)
+            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);""",
+     "townership"),
+    ("P11-C3: a request's opcodes taken after it ran (it may have closed its client)", "xserver.patch",
+     """+                            ddxRequestTimed(timedIndex, timedMajor, timedMinor, timedUs);""",
+     """+                            ddxRequestTimed(client->index, client->majorOp, client->minorOp, timedUs);""",
+     "tdispatchyield"),
+    ("P11-C3: the clock read for every request with the option off", "xserver.patch",
+     """+                        CARD64 timedUs = dispatchRequestTimed ? GetTimeInMicros() : 0;""",
+     """+                        CARD64 timedUs = GetTimeInMicros();""",
+     "tdispatchyield"),
+    ("P11-C3: the option read into the renderer's flag only", "InitOutput.c",
+     """    dispatchRequestTimed = lorieScreen.frameDiag;""",
+     """""",
+     "twiring"),
     ("P11-C3: the pacing not started over with another X server session", "renderer.c",
      """            vkOwned = false;
             rendererVkPacingReset();""",
@@ -1089,13 +1151,20 @@ for n, (what, file, old, new, test) in enumerate(CONTROLS):
     shutil.rmtree(work, ignore_errors=True)
     copy_sources(src)
     os.makedirs(gen)
-    path = os.path.join(src, file)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", OUT=gen)
+    if file == "xserver.patch":
+        path = os.path.join(work, file)
+        shutil.copyfile(os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "patches", file), path)
+        env["LORIE_XSERVER_PATCH"] = path
+        if old.count("\n") != new.count("\n"):
+            sys.exit("control %r: changes the patch's line count - its hunks would not apply" % what)
+    else:
+        path = os.path.join(src, file)
     text = open(path, encoding="utf-8").read()
     if text.count(old) != 1:
         sys.exit("control %r: its text is in %s %d times, not once - update the control" % (what, file, text.count(old)))
     open(path, "w", encoding="utf-8").write(text.replace(old, new))
 
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", OUT=gen)
     if test == "twiring":
         r = subprocess.run([sys.executable, os.path.join(HERE, "twiring.py"), src], capture_output=True, text=True, env=env)
     else:

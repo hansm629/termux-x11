@@ -5,7 +5,11 @@
  * Two runs, the counters moved as each backend's successful calls would move them: $OUT/diag-vulkan.log
  * (active VULKAN, imports, draws, submits, presents) and $OUT/diag-gles.log (active GLES, EGLImages, GLES
  * frames, swaps). Here it checks only that every report came out with its keys and the deltas right; and the
- * TERMUX_X11_RENDERER_VK_TRANSFER_COPY line: none while it is off, its verdicts and last copy while it is on. */
+ * TERMUX_X11_RENDERER_VK_TRANSFER_COPY line: none while it is off, its verdicts and last copy while it is on; and
+ * P11-C3's TERMUX_X11_RENDERER_VK_FRAME_DIAG lines: none while it is off, while it is on each timing's count, mean,
+ * percentiles, maximum and frames over 16.667 and 33.333 ms from the samples given, and the period's worst; and the
+ * ticks' frame bookkeeping (lorieTickTimed, lorieTickAsked): a frame asked for and none presented by the next tick
+ * counted as missed - only then. */
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -19,9 +23,18 @@ static FILE *logf;
 #define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1     /* the NDK's values */
 #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
-static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; } fakeState;
-static struct { typeof(&fakeState) state; int yieldOnWake, rootCopyOpt, rootCopyOptFailed, rootGpuCopy; struct { uint32_t seq; } rootCopy; }
-    fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
+typedef int Bool;
+#define TRUE 1
+#define FALSE 0
+static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint64_t frameWantedUs; } fakeState;
+static struct {
+    typeof(&fakeState) state;
+    int yieldOnWake, rootCopyOpt, rootCopyOptFailed, rootGpuCopy;
+    struct { uint32_t seq; } rootCopy;
+    Bool frameDiag, frameAsked;
+    uint32_t framesAtAsk;
+    struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
+} fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "diaglog_src.inc"
 
 static int fails;
@@ -243,11 +256,157 @@ int main(void) {
         CHECK(transferLines == 2 && lastOk == 1, "transfer log: %d lines (want 2), %d with the verdicts and last copy (want 1)",
               transferLines, lastOk);
     }
+    /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG. Off (every log above): none of its lines, the backend line says so.
+     * On: frame starts 8, 17 and 35 ms apart - 90, 6 and 4 of them: mean 9620, p95 in the 20 ms bucket, p99 in the
+     * 50 ms one, maximum 35000, 10 over 16.667 ms, 4 over 33.333; the bounds themselves not over them, a microsecond
+     * more over (16667, 16668, 33333, 33334); past the last bound ">100000"; each fence its own; the period's worst
+     * frame, root copy and request. The next report: "0" for each, the maxima and the worst taken back. */
+    {
+        static const char *const offLogs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log" };
+        int offLines = 0, offBackend = 0, backendLines = 0, onBackend = 0, n[4] = { 0 }, pacingOk = 0, pipelineOk = 0, rootOk = 0, xOk = 0, emptyOk = 0;
+        for (unsigned k = 0; k < sizeof offLogs / sizeof *offLogs; k++) {
+            snprintf(path, sizeof path, "%s/%s", out ? out : ".", offLogs[k]);
+            logf = fopen(path, "r");
+            while (logf && fgets(line, sizeof line, logf)) {
+                offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
+                            strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:");
+                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off\n");
+                backendLines += strstr(line, "XlorieBackend:") != NULL;
+            }
+            if (logf)
+                fclose(logf);
+        }
+        CHECK(offLines == 0 && backendLines == 17 && offBackend == backendLines, "frame diag off: %d of its lines (want 0), "
+              "%d of %d backend lines saying off (want 17)", offLines, offBackend, backendLines);
+
+        snprintf(path, sizeof path, "%s/diag-frame.log", out ? out : ".");
+        logf = fopen(path, "w");
+        fakePvfb.frameDiag = 1;
+        lorieLogRendererDiag();
+        for (i = 0; i < 100; i++)
+            lorieHistAdd(&fakeState.diag.vkFrameStart, i < 90 ? 8000 : i < 96 ? 17000 : 35000);
+        lorieHistAdd(&fakeState.diag.vkPresentDelta, 16667), lorieHistAdd(&fakeState.diag.vkPresentDelta, 16668);
+        lorieHistAdd(&fakeState.diag.vkPresentDelta, 33333), lorieHistAdd(&fakeState.diag.vkPresentDelta, 33334);
+        lorieHistAdd(&fakeState.diag.vkFrameWake, 200000);
+        fakeState.diag.vkFrameIdleGaps += 2, fakeState.diag.vkFrameStampsInvalid += 1;
+        fakeState.diag.xTicksFrameWanted += 120, fakeState.diag.xTicksFrameMissed += 7;
+        fakeState.diag.vkWorstStartUs = 35000, fakeState.diag.vkWorstWakeUs = 500, fakeState.diag.vkWorstAcquireUs = 21000;
+        fakeState.diag.vkWorstLockUs = 300, fakeState.diag.vkWorstFenceUs = 9000, fakeState.diag.vkWorstPresentUs = 1200;
+        fakeState.diag.vkWorstAfterRootUs = 4000;
+        lorieHistAdd(&fakeState.diag.vkFrameFence, 3000), lorieHistAdd(&fakeState.diag.vkFenceRoot, 1500);
+        lorieHistAdd(&fakeState.diag.vkFenceCopy, 700);
+        lorieHistAdd(&fakeState.diag.rootTake, 400), lorieHistAdd(&fakeState.diag.rootRecord, 250);
+        lorieHistAdd(&fakeState.diag.rootResume, 90), lorieHistAdd(&fakeState.diag.rootBlock, 2000);
+        fakeState.diag.rootWorstUs = 5000, fakeState.diag.rootWorstTakeUs = 400, fakeState.diag.rootWorstRecordUs = 250;
+        fakeState.diag.rootWorstFenceUs = 4000;
+        for (i = 0; i < 3; i++)
+            lorieHistAdd(&fakeState.diag.xRequest, 120);
+        lorieHistAdd(&fakeState.diag.xRequest, 25000);
+        fakePvfb.worstRequest.us = 25000, fakePvfb.worstRequest.client = 7, fakePvfb.worstRequest.major = 130, fakePvfb.worstRequest.minor = 3;
+        strcpy(fakePvfb.worstRequest.cmd, "glmark2-es2"), strcpy(fakePvfb.worstRequest.ext, "MIT-SHM");
+        lorieHistAdd(&fakeState.diag.xAccess, 800), lorieHistAdd(&fakeState.diag.xAccessLock, 50);
+        lorieHistAdd(&fakeState.diag.xAccessGpu, 6000), lorieHistAdd(&fakeState.diag.xTickDelay, 700);
+        lorieHistAdd(&fakeState.diag.xTickWork, 300);
+        lorieLogRendererDiag();
+        lorieLogRendererDiag();
+        fclose(logf);
+        logf = fopen(path, "r");
+        while (fgets(line, sizeof line, logf)) {
+            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on\n");
+            if (strstr(line, "XlorieVkFramePacing:") && ++n[0] == 2)
+                pacingOk = strstr(line, "XlorieVkFramePacing: frame_start_us=100/9620/20000/50000/35000/10/4 "
+                                        "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "
+                                        "idle_gaps=2(+2) stamps_invalid=1(+1) ticks_frame_wanted=120(+120) ticks_frame_missed=7(+7) "
+                                        "worst_start_us=35000 worst_wake_us=500 worst_acquire_us=21000 worst_lock_us=300 "
+                                        "worst_fence_us=9000 worst_present_us=1200 worst_after_root_us=4000\n") != NULL;
+            if (strstr(line, "XlorieVkFramePacing:") && n[0] == 3)
+                emptyOk += strstr(line, "XlorieVkFramePacing: frame_start_us=0 present_delta_us=0 wake_us=0 idle_gaps=2(+0) "
+                                        "stamps_invalid=1(+0) ticks_frame_wanted=120(+0) ticks_frame_missed=7(+0) worst_start_us=0 ") != NULL;
+            if (strstr(line, "XlorieVkPipeline:") && ++n[1] == 2)
+                pipelineOk = strstr(line, "XlorieVkPipeline: cpu_us=0 acquire_us=0 lock_us=0 record_us=0 submit_us=0 "
+                                          "fence_frame_us=1/3000/3000/3000/3000/0/0 fence_root_us=1/1500/1500/1500/1500/0/0 "
+                                          "fence_copy_us=1/700/750/750/700/0/0 present_us=0 after_root_us=0\n") != NULL;
+            if (strstr(line, "XlorieVkPipeline:") && n[1] == 3)
+                emptyOk += strstr(line, "fence_frame_us=0 fence_root_us=0 fence_copy_us=0 ") != NULL;
+            if (strstr(line, "XlorieRootCopyTiming:") && ++n[2] == 2)
+                rootOk = strstr(line, "XlorieRootCopyTiming: take_us=1/400/500/500/400/0/0 record_us=1/250/300/300/250/0/0 "
+                                      "resume_us=1/90/100/100/90/0/0 x_block_us=1/2000/2000/2000/2000/0/0 worst_total_us=5000 "
+                                      "worst_take_us=400 worst_record_us=250 worst_fence_us=4000\n") != NULL;
+            if (strstr(line, "XlorieRootCopyTiming:") && n[2] == 3)
+                emptyOk += strstr(line, "take_us=0 record_us=0 resume_us=0 x_block_us=0 worst_total_us=0 ") != NULL;
+            if (strstr(line, "XlorieXLatency:") && ++n[3] == 2)
+                xOk = strstr(line, "XlorieXLatency: request_us=4/6340/25000/25000/25000/1/0 access_us=1/800/1000/1000/800/0/0 "
+                                   "access_lock_us=1/50/50/50/50/0/0 access_gpu_us=1/6000/6000/6000/6000/0/0 "
+                                   "tick_delay_us=1/700/750/750/700/0/0 tick_work_us=1/300/300/300/300/0/0 "
+                                   "worst_request_us=25000 worst_request=7:glmark2-es2:MIT-SHM:130.3\n") != NULL;
+            if (strstr(line, "XlorieXLatency:") && n[3] == 3)
+                emptyOk += strstr(line, "request_us=0 access_us=0 access_lock_us=0 access_gpu_us=0 tick_delay_us=0 tick_work_us=0 "
+                                        "worst_request_us=0 worst_request=-1:none:none:0.0\n") != NULL;
+        }
+        fclose(logf);
+        CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3, "frame diag on: %d backend lines saying on, "
+              "lines %d/%d/%d/%d (want 3 each)", onBackend, n[0], n[1], n[2], n[3]);
+        CHECK(pacingOk, "frame diag: the pacing line's timings or worst frame wrong");
+        CHECK(pipelineOk, "frame diag: the pipeline line's fences not each their own");
+        CHECK(rootOk, "frame diag: the root copy timing line wrong");
+        CHECK(xOk, "frame diag: the X latency line wrong");
+        CHECK(emptyOk == 4, "frame diag: %d of 4 lines without samples say so and took the worst back", emptyOk);
+        CHECK(!fakeState.diag.vkFrameStart.maxUs && !fakeState.diag.vkPresentDelta.maxUs && !fakeState.diag.xRequest.maxUs &&
+              !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us,
+              "frame diag: a maximum or worst not taken back by its report");
+    }
+
+    /* P11-C3: the ticks' frame bookkeeping. The first tick: nothing asked before, nothing missed. A tick asking for a
+     * frame, the next one with none presented since: missed (once - the one after it asked for none); with one presented
+     * (Vulkan's or GLES's): not; a tick that asked for none: nothing missed after it. Each tick's wait from its callback (the stamps' low 32 bits, across their
+     * wrap too); none without a callback or over 10 s. The request's stamp and its work. */
+    {
+        volatile struct lorie_renderer_diag *dg = &fakeState.diag;
+        uint32_t missed = dg->xTicksFrameMissed, wanted = dg->xTicksFrameWanted, delays = dg->xTickDelay.count;
+        uint64_t sum = dg->xTickDelay.sumUs, now = lorieMonotonicUs(), work = dg->xTickWork.count;
+        fakePvfb.frameAsked = FALSE;
+        lorieTickTimed(now, (uint32_t) now - 700, TRUE);
+        CHECK(dg->xTicksFrameMissed == missed && dg->xTickDelay.count == delays + 1 && dg->xTickDelay.sumUs == sum + 700,
+              "ticks: the first one missed %u, its wait %llu us", dg->xTicksFrameMissed - missed,
+              (unsigned long long) (dg->xTickDelay.sumUs - sum));
+        lorieTickAsked(now);
+        CHECK(fakePvfb.frameAsked && dg->xTicksFrameWanted == wanted + 1 && dg->xTickWork.count == work + 1 &&
+              fakeState.frameWantedUs >= now, "ticks: asking for a frame not recorded");
+        lorieTickTimed(now + 8333, 0, FALSE);
+        CHECK(dg->xTicksFrameMissed == missed + 1 && dg->xTickDelay.count == delays + 1, "ticks: none presented, %u missed (want 1), "
+              "%u waits without a callback", dg->xTicksFrameMissed - missed, dg->xTickDelay.count - delays - 1);
+        lorieTickTimed(now + 16666, 0, FALSE);    /* the tick before asked for none: still none presented, nothing more missed */
+        CHECK(dg->xTicksFrameMissed == missed + 1, "ticks: a tick after one that asked for none, %u more missed",
+              dg->xTicksFrameMissed - missed - 1);
+        lorieTickAsked(now + 8333);
+        dg->vkFramesPresented++;
+        lorieTickTimed(now + 16666, 0, FALSE);
+        lorieTickAsked(now + 16666);
+        dg->eglSwapBuffers++;
+        lorieTickTimed(now + 25000, 0, FALSE);
+        CHECK(dg->xTicksFrameMissed == missed + 1, "ticks: a frame presented, still %u missed", dg->xTicksFrameMissed - missed - 1);
+        lorieTickTimed(now + 33333, 0, FALSE);    /* the tick before asked for none */
+        CHECK(dg->xTicksFrameMissed == missed + 1, "ticks: none asked for, %u missed", dg->xTicksFrameMissed - missed - 1);
+        sum = dg->xTickDelay.sumUs, delays = dg->xTickDelay.count;
+        lorieTickTimed(0x100000100ull, 0xffffff00u, TRUE);
+        lorieTickTimed(now, (uint32_t) now - 20000000, TRUE);
+        CHECK(dg->xTickDelay.count == delays + 1 && dg->xTickDelay.sumUs == sum + 0x200, "ticks: across the wrap %llu us (want 512), "
+              "%u waits (want 1: none over 10 s)", (unsigned long long) (dg->xTickDelay.sumUs - sum), dg->xTickDelay.count - delays);
+    }
+
     /* every message within __android_log_print's 1024-byte buffer (longer ones are cut): the copy latency line with
-     * every part at its widest, then every line written above */
+     * every part at its widest, and P11-C3's lines with every timing and worst at its widest, then every line written
+     * above */
     {
         static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log",
-                                            "diag-wide.log" };
+                                            "diag-frame.log", "diag-wide.log" };
+        volatile struct lorie_hist *hists[] = {
+            &fakeState.diag.vkFrameStart, &fakeState.diag.vkPresentDelta, &fakeState.diag.vkFrameWake, &fakeState.diag.vkFrameCpu,
+            &fakeState.diag.vkFrameAcquire, &fakeState.diag.vkFrameLock, &fakeState.diag.vkFrameRecord, &fakeState.diag.vkFrameSubmit,
+            &fakeState.diag.vkFrameFence, &fakeState.diag.vkFramePresent, &fakeState.diag.vkFrameAfterRoot, &fakeState.diag.vkFenceRoot,
+            &fakeState.diag.vkFenceCopy, &fakeState.diag.rootTake, &fakeState.diag.rootRecord, &fakeState.diag.rootResume,
+            &fakeState.diag.rootBlock, &fakeState.diag.xRequest, &fakeState.diag.xAccess, &fakeState.diag.xAccessLock,
+            &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork };
         volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
                                                    &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
                                                    &fakeState.diag.copyTotal, &fakeState.diag.copyAck, &fakeState.diag.xVsyncToCallback,
@@ -266,6 +425,18 @@ int main(void) {
         for (unsigned k = 0; k < sizeof parts / sizeof *parts; k++)
             for (i = 0; i < 1000; i++)
                 lorieLatencyAddWeighted(parts[k], 4294967295u, 1);
+        for (unsigned k = 0; k < sizeof hists / sizeof *hists; k++)
+            for (i = 0; i < 1000; i++)
+                lorieHistAdd(hists[k], 4294967295u);
+        fakeState.diag.vkFrameIdleGaps += 999999999, fakeState.diag.vkFrameStampsInvalid += 999999999;
+        fakeState.diag.xTicksFrameWanted += 999999999, fakeState.diag.xTicksFrameMissed += 999999999;
+        fakeState.diag.vkWorstStartUs = fakeState.diag.vkWorstWakeUs = fakeState.diag.vkWorstAcquireUs = 4294967295u;
+        fakeState.diag.vkWorstLockUs = fakeState.diag.vkWorstFenceUs = fakeState.diag.vkWorstPresentUs = 4294967295u;
+        fakeState.diag.vkWorstAfterRootUs = fakeState.diag.rootWorstUs = fakeState.diag.rootWorstTakeUs = 4294967295u;
+        fakeState.diag.rootWorstRecordUs = fakeState.diag.rootWorstFenceUs = 4294967295u;
+        fakePvfb.worstRequest.us = 4294967295u, fakePvfb.worstRequest.client = 2047, fakePvfb.worstRequest.major = 255;
+        fakePvfb.worstRequest.minor = 255;
+        memset(fakePvfb.worstRequest.cmd, 'c', 23), memset(fakePvfb.worstRequest.ext, 'e', 23);
         lorieLogRendererDiag();
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {

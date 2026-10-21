@@ -18,7 +18,8 @@ FAILAT = lambda: span(I, "static const char *const lorieVkFailAtNames[] = {", '"
 BI = os.path.join(BASE, "InitOutput.c")
 XS = os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "xserver")
 
-PATCH = os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "patches", "xserver.patch")
+# patches/xserver.patch - or, for a negative control, a changed copy of it (tcontrols.py)
+PATCH = os.environ.get("LORIE_XSERVER_PATCH") or os.path.join(HERE, "..", "..", "app", "src", "main", "cpp", "patches", "xserver.patch")
 _present = []
 
 def present(name):
@@ -83,7 +84,11 @@ recipes = {
     # the renderer diagnostics, as lorie.h declares them and the X server logs them - tdiaglog.c
     "diagtypes": lambda: span(H, "enum { LORIE_ACTIVE_NONE = 0", "__ATOMIC_RELAXED); } while (0)"),
     "diaglog": lambda: span(I, "static const char *lorieActiveName(uint8_t a) {", "#undef LORIE_NAME") + FAILAT()
-        + func(I, "static void lorieLogRendererDiag(void) {"),
+        + func(I, "static void lorieLogRendererDiag(void) {")
+        # P11-C3: the tick's frame bookkeeping
+        + func(I, "static uint32_t lorieFramesShown(void) {")
+        + func(I, "static void lorieTickTimed(uint64_t tickUs, uint32_t postedUs, Bool posted) {")
+        + func(I, "static void lorieTickAsked(uint64_t tickUs) {"),
     # AHB CPU ownership - townership.c: xserver's list, EXA's access indices, then every pixmap path that takes
     # or drops a CPU lock, as 3c98ffa has them ("own_base") and as they are now, with the handshake ("own_new")
     "xorglist": lambda: open(os.path.join(XS, "include", "list.h"), encoding="utf-8").read(),

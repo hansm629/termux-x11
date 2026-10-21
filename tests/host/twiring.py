@@ -22,9 +22,11 @@ makes the root's (rendererGlBuffer) before binding it.
 And P11-A: the vsync tick and a GPU copy's completion are queued as urgent work (lorieQueueUrgentWorkProc, which
 tdispatchyield.c tests), with TERMUX_X11_X_YIELD_ON_WAKE read when the server state is made, "1" only. P11-C2: a
 root copy asked of the renderer is made first in its loop, which it wakes, and the X server waits for one before it
-takes the shared lock. P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG): a Vulkan frame is timed only once presented, and
-only with the flag; the pacing intervals start over with another session, window or device, and a root copy counts
-as ahead of the frame only in the loop pass that made it.
+takes the shared lock. P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG read when the server state is made, "1" only, into the
+renderer's flag and Dispatch's; the tick checks the last frame it asked for before it can return early, and stamps
+its request before it wakes the renderer; a Vulkan frame is timed only once presented, and only with the flag; the
+pacing intervals start over with another session, window or device, and a root copy counts as ahead of the frame only
+in the loop pass that made it.
 
 usage: twiring.py <lorie source dir>
 """
@@ -136,6 +138,14 @@ in_order("GLES frame", func(R, "void rendererRedrawLocked(bool* waitingForBuffer
          "LorieBuffer_bindTexture(buffer);")
 
 # P11-C3: the frame diagnostics' wiring
+check('lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");' in init
+      and "lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;" in init and "dispatchRequestTimed = lorieScreen.frameDiag;" in init,
+      "OsVendorInit does not read TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 into the renderer's flag and Dispatch's")
+xredraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {")
+check(before_first_return(xredraw, "lorieTickTimed(tickUs, ") and "uint64_t tickUs = pvfb->frameDiag ? lorieMonotonicUs() : 0;" in xredraw,
+      "lorieRedraw does not check the last frame asked for before its first return, or reads the clock with the option off")
+check("        if (tickUs)\n            lorieTickAsked(tickUs);\n        pthread_cond_signal(rendererCond);" in xredraw,
+      "lorieRedraw does not stamp its request right before waking the renderer")
 in_order("Vulkan frame timed", redraw, "bool diag = state->backend.vkFrameDiag;", "lorieVkFrameWait(", "ft.fenceUs = vkr.fenceWaitUs;",
          "lorieVkPresent(", "state->renderedFrames++;", "if (diag) {", "rendererVkFrameTimed(&ft);")
 def guarded(body, line_index):

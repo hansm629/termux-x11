@@ -112,6 +112,7 @@ struct fake_state {
         uint64_t srcId, dstId, queuedUs;
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+        volatile uint64_t doneUs;   /* P11-C3 */
     } rootCopy;
 };
 struct fake_pvfb {
@@ -134,6 +135,7 @@ struct fake_pvfb {
         Bool abandoned;
     } rootCopy;
     int accessLocks;
+    Bool frameDiag;             /* P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG */
 };
 
 static ScreenRec screen;
@@ -404,6 +406,8 @@ static void rootRenderer(void) {
         }
     else
         st->rootCopy.failed = seq;
+    if (st->backend.vkFrameDiag)
+        st->rootCopy.doneUs = lorieMonotonicUs();   /* as rendererRootCopySettle (P11-C3) */
     st->rootCopy.done = seq;
 }
 static void lorie_mutex_lock(int *m, __unused int *pid) {
@@ -1312,6 +1316,50 @@ int main(void) {
             CHECK(!cases[k].waited || rootGpuState.diag.rootCopyCpuBlockUs > 0, "root GPU copy, %s: no time waiting counted", cases[k].name);
         }
         rootConnection = rootSurface = true;
+
+        /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG=1: a copy the X server had to wait for - its wait, and from the
+         * renderer settling it to the X server going on; the access after it - its wait for the shared lock, for a
+         * frame using the buffer, its hold of the lock; a copy settled before the X server needed it: no wait, so
+         * neither; taken back: the wait, no resume; off: none of them, nothing stamped */
+        {
+            static const struct { const char *name; bool diag, early; int stall; uint32_t block, resume; } diagCases[] = {
+                { "frame diag: waited for", true, false, 0, 1, 1 },
+                { "frame diag: settled before it was needed", true, true, 0, 0, 0 },
+                { "frame diag: taken back", true, false, 1, 1, 0 },
+                { "frame diag off: waited for", false, false, 0, 0, 0 },
+            };
+            for (size_t k = 0; k < sizeof diagCases / sizeof *diagCases; k++) {
+                volatile struct lorie_renderer_diag *dg = &rootGpuState.diag;
+                Bool ok;
+                rootGpuWorld(diagCases[k].name, big, 1);
+                newWorld.frameDiag = diagCases[k].diag;
+                rootGpuState.backend.vkFrameDiag = diagCases[k].diag;
+                rootRendererWaits = 2;
+                rootRendererTakes = true;
+                ok = lorieRootSwap(&rootGpuPriv);
+                if (diagCases[k].early) {
+                    rootRendererWaits = 0;
+                    rootRenderer();             /* the renderer done before the X server comes to the buffer */
+                }
+                if (diagCases[k].stall == 1)
+                    rootConnection = false, rootRendererTakes = false;
+                ok = ok && loriePrepareAccess(&rootGpuPix, EXA_PREPARE_DEST);
+                if (ok)
+                    lorieFinishAccess(&rootGpuPix, EXA_PREPARE_DEST);
+                rootConnection = true;
+                CHECK(ok && rootGpuAlike() && dg->rootBlock.count == diagCases[k].block && dg->rootResume.count == diagCases[k].resume,
+                      "%s: %u waits, %u resumes timed (want %u, %u)", diagCases[k].name, dg->rootBlock.count, dg->rootResume.count,
+                      diagCases[k].block, diagCases[k].resume);
+                CHECK(dg->rootResume.maxUs < 1000000 && (diagCases[k].diag || !rootGpuState.rootCopy.doneUs),
+                      "%s: resumed %u us after it was settled, stamped %d", diagCases[k].name, dg->rootResume.maxUs,
+                      rootGpuState.rootCopy.doneUs != 0);
+                CHECK(dg->xAccessLock.count == diagCases[k].diag && dg->xAccessGpu.count == diagCases[k].diag &&
+                      dg->xAccess.count == diagCases[k].diag && !rootGpuPriv.accessStartUs,
+                      "%s: the access's lock wait %u, frame wait %u, hold %u timed (want %d each), its start left %llu",
+                      diagCases[k].name, dg->xAccessLock.count, dg->xAccessGpu.count, dg->xAccess.count, diagCases[k].diag,
+                      (unsigned long long) rootGpuPriv.accessStartUs);
+            }
+        }
 
         /* small damage: copied on the CPU at the swap, as before */
         {

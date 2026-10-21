@@ -40,6 +40,8 @@
 
 #include "globals.h"
 #include "property.h"
+#include "client.h"
+#include "extnsionst.h"
 #include "lorie.h"
 
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -117,6 +119,17 @@ typedef struct {
 
     /* TERMUX_X11_X_YIELD_ON_WAKE=1 (lorieQueueUrgentWorkProc): asked for - read from other threads, atomically */
     int yieldOnWake;
+
+    /* P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, lorie.h struct lorie_hist): asked for; whether the last tick asked
+     * the renderer for a frame, and the frames presented then (lorieFramesShown); the period's slowest client request
+     * (ddxRequestTimed) - its time, its client's index and command, its opcodes and their extension */
+    Bool frameDiag, frameAsked;
+    uint32_t framesAtAsk;
+    struct {
+        uint32_t us;
+        int client, major, minor;
+        char cmd[24], ext[24];
+    } worstRequest;
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -154,6 +167,8 @@ typedef struct {
     /* An AHB pixmap 3c98ffa keeps CPU-locked for its lifetime: on pvfb->ahbPersistent (lorieHoldPersistent) */
     bool persistentWanted;
     struct xorg_list persistentLink;
+    /* P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): when its PER_ACCESS access took the shared lock (0: not timed) */
+    uint64_t accessStartUs;
 } LoriePixmapPriv;
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
@@ -390,6 +405,43 @@ void OsVendorInit(void) {
     // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
     __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
                      __ATOMIC_RELAXED);
+    // Diagnostics: TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 times the Vulkan frames, the root copies, and the X server's
+    // requests, ticks and AHB accesses, logged every 5 seconds (XlorieVkFramePacing and the lines after it). Off, none
+    // of them reads a clock.
+    lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
+    lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
+    dispatchRequestTimed = lorieScreen.frameDiag;
+}
+
+// A name as one word for a log line: a path's last part, up to its first space, anything else odd as '_'.
+static void lorieDiagWord(char *out, size_t size, const char *in) {
+    size_t i = 0;
+    const char *base = in ? strrchr(in, '/') : NULL;
+    for (in = base ? base + 1 : in ?: "unknown"; *in && *in != ' ' && i + 1 < size; in++)
+        out[i++] = (*in >= 'a' && *in <= 'z') || (*in >= 'A' && *in <= 'Z') || (*in >= '0' && *in <= '9') ||
+                   *in == '-' || *in == '.' || *in == '_' ? *in : '_';
+    out[i] = 0;
+}
+
+/*
+ * P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): one client request's handling, from right before its request procedure
+ * to right after it (dix/dispatch.c Dispatch, which reads the clock only while this is on); what it was is taken
+ * before it ran, as it may have closed its own client. The period's slowest is kept with its client's command name
+ * and its extension's name.
+ */
+void ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs) {
+    CARD64 us = GetTimeInMicros() - startUs;
+    lorieHistAdd(&pvfb->state->diag.xRequest, us);
+    if (us > pvfb->worstRequest.us) {
+        ClientPtr client = clientIndex >= 0 && clientIndex < MAXCLIENTS ? clients[clientIndex] : NULL;
+        ExtensionEntry *ext = major >= EXTENSION_BASE ? GetExtensionEntry(major) : NULL;
+        pvfb->worstRequest.us = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+        pvfb->worstRequest.client = clientIndex;
+        pvfb->worstRequest.major = major;
+        pvfb->worstRequest.minor = major >= EXTENSION_BASE ? minor : 0;
+        lorieDiagWord(pvfb->worstRequest.cmd, sizeof(pvfb->worstRequest.cmd), client ? GetClientCmdName(client) : NULL);
+        lorieDiagWord(pvfb->worstRequest.ext, sizeof(pvfb->worstRequest.ext), major < EXTENSION_BASE ? "core" : ext ? ext->name : NULL);
+    }
 }
 
 // Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
@@ -881,14 +933,15 @@ static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr bo
 static void lorieRootCopyWait(Bool takeBack) {
     struct lorie_shared_server_state *st = pvfb->state;
     uint32_t seq = pvfb->rootCopy.seq, done = 0;
-    Bool held = pvfb->accessLocks > 0, copy = FALSE;
-    uint64_t startUs;
+    Bool held = pvfb->accessLocks > 0, copy = FALSE, waited = FALSE;
+    uint64_t startUs, blockedUs;
 
     if (!seq)
         return;
     startUs = GetTimeInMicros();
     while ((done = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE)) != seq) {
         struct timespec slice = { 0, 33 * 1000000 };
+        waited = TRUE;
         if (__atomic_load_n(&st->rootCopy.taken, __ATOMIC_ACQUIRE) != seq) {
             if (takeBack || held || !lorieConnectionAlive() || !lorieRendererAvailable() || lorieOwnershipAsked()) {
                 if (!held)
@@ -911,7 +964,15 @@ static void lorieRootCopyWait(Bool takeBack) {
     }
     if (done == seq && __atomic_load_n(&st->rootCopy.failed, __ATOMIC_RELAXED) == seq)
         copy = TRUE;
-    __atomic_fetch_add(&st->diag.rootCopyCpuBlockUs, GetTimeInMicros() - startUs, __ATOMIC_RELAXED);
+    blockedUs = GetTimeInMicros() - startUs;
+    __atomic_fetch_add(&st->diag.rootCopyCpuBlockUs, blockedUs, __ATOMIC_RELAXED);
+    // P11-C3: a wait the X server had to make; and, the renderer having settled the copy meanwhile, from that to here
+    if (waited && pvfb->frameDiag) {
+        uint64_t now = lorieMonotonicUs(), doneUs = __atomic_load_n(&st->rootCopy.doneUs, __ATOMIC_RELAXED);
+        lorieHistAdd(&st->diag.rootBlock, blockedUs);
+        if (done == seq && doneUs && doneUs <= now)
+            lorieHistAdd(&st->diag.rootResume, now - doneUs);
+    }
     if (copy && !pvfb->rootCopy.abandoned) {
         uint64_t waitStartUs = GetTimeInMicros();
         LoriePixmapPriv *priv = lorieRootWindowPixmapPriv();
@@ -990,16 +1051,48 @@ static void lorieRanAfter(volatile struct lorie_latency *l, uint32_t fromUs, vol
         ;
 }
 
+// P11-C3: the frames the renderer presented so far, Vulkan's and GLES's (never taken back to 0, as renderedFrames is).
+static uint32_t lorieFramesShown(void) {
+    return __atomic_load_n(&pvfb->state->diag.vkFramesPresented, __ATOMIC_RELAXED) +
+           __atomic_load_n(&pvfb->state->diag.eglSwapBuffers, __ATOMIC_RELAXED);
+}
+
+/*
+ * P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1), a tick run at `tickUs`: its wait from its Choreographer callback (posted
+ * at `postedUs`, low 32 bits, when `posted`), and whether the frame the last tick asked for was presented by now.
+ */
+static void lorieTickTimed(uint64_t tickUs, uint32_t postedUs, Bool posted) {
+    uint32_t waited = (uint32_t) tickUs - postedUs;
+    if (posted && waited <= 10000000)
+        lorieHistAdd(&pvfb->state->diag.xTickDelay, waited);
+    if (pvfb->frameAsked && lorieFramesShown() == pvfb->framesAtAsk)
+        __atomic_fetch_add(&pvfb->state->diag.xTicksFrameMissed, 1, __ATOMIC_RELAXED);
+    pvfb->frameAsked = FALSE;
+}
+
+// P11-C3: that tick asking the renderer for a frame - when (for the renderer's wake), the frames presented by then, its work.
+static void lorieTickAsked(uint64_t tickUs) {
+    uint64_t now = lorieMonotonicUs();
+    pvfb->frameAsked = TRUE;
+    pvfb->framesAtAsk = lorieFramesShown();
+    __atomic_store_n(&pvfb->state->frameWantedUs, now, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&pvfb->state->diag.xTicksFrameWanted, 1, __ATOMIC_RELAXED);
+    lorieHistAdd(&pvfb->state->diag.xTickWork, now - tickUs);
+}
+
 static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     int status, nonEmpty;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
     Bool twinned, rootDouble;
+    uint64_t tickUs = pvfb->frameDiag ? lorieMonotonicUs() : 0;
 
     // P10-B0: from its Choreographer callback to here, and the ticks still waiting behind it.
     if (closure)
         lorieRanAfter(&pvfb->state->diag.xCallbackToTick, (uint32_t) (uintptr_t) closure, &pvfb->state->diag.xTicksPosted,
                       &pvfb->state->diag.xTicksRun, &pvfb->state->diag.xTicksWaitingMax);
+    if (tickUs)
+        lorieTickTimed(tickUs, (uint32_t) (uintptr_t) closure, closure != NULL);
 
     lorieProcessOwnershipRequest();
     twinned = lorieRootTwinned();
@@ -1064,6 +1157,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
         // for all drawing operations to be finished.
         // Renderer thread will check the `drawRequested` flag right before going to sleep.
+        if (tickUs)
+            lorieTickAsked(tickUs);
         pthread_cond_signal(rendererCond);
     }
 
@@ -1107,6 +1202,41 @@ static void lorieLatencyText(char *out, size_t size, const struct lorie_latency 
         snprintf(out + used, size - (size_t) used, ",share:%llu.%llu%%", permille / 10, permille % 10);
 }
 
+/*
+ * P11-C3: one timing's samples since the last report (struct lorie_hist) as n/avg/p95/p99/max/h16/h33, microseconds:
+ * how many, their mean, p95 and p99 (the bound of the bucket each falls in, ">100000" past the last), the maximum
+ * (taken back to 0 here), and how many were over 16.667 ms and over 33.333 ms. "0" when there were none.
+ */
+static void lorieHistText(char *out, size_t size, const struct lorie_hist *now, const struct lorie_hist *before,
+                          volatile uint32_t *max) {
+    static const uint32_t bounds[LORIE_HIST_BUCKETS - 1] = { LORIE_HIST_BOUNDS };
+    static const uint32_t percent[2] = { 95, 99 };
+    uint32_t n = now->count - before->count, top = __atomic_exchange_n(max, 0, __ATOMIC_RELAXED), over16 = 0, over33 = 0;
+    char p[2][16];
+    int i, b;
+
+    if (!n) {
+        snprintf(out, size, "0");
+        return;
+    }
+    for (b = LORIE_HIST_OVER_16MS; b < LORIE_HIST_BUCKETS; b++)
+        over16 += now->buckets[b] - before->buckets[b];
+    for (b = LORIE_HIST_OVER_33MS; b < LORIE_HIST_BUCKETS; b++)
+        over33 += now->buckets[b] - before->buckets[b];
+    for (i = 0; i < 2; i++) {
+        uint32_t want = (uint32_t) (((uint64_t) n * percent[i] + 99) / 100), seen = 0;
+        for (b = 0; b < LORIE_HIST_BUCKETS - 1; b++)
+            if ((seen += now->buckets[b] - before->buckets[b]) >= want)
+                break;
+        if (b < LORIE_HIST_BUCKETS - 1)
+            snprintf(p[i], sizeof(p[i]), "%u", bounds[b]);
+        else
+            snprintf(p[i], sizeof(p[i]), ">%u", bounds[LORIE_HIST_BUCKETS - 2]);
+    }
+    snprintf(out, size, "%u/%llu/%s/%s/%u/%u/%u", n, (unsigned long long) ((now->sumUs - before->sumUs) / n), p[0], p[1],
+             top, over16, over33);
+}
+
 static const char *lorieAhbFormatName(uint32_t f) {
     return f == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ? "RGBA" : f == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM ? "RGBX"
          : f == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? "BGRA" : "other";
@@ -1132,7 +1262,7 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -1144,7 +1274,8 @@ static void lorieLogRendererDiag(void) {
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
-        !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off");
+        !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off",
+        pvfb->frameDiag ? "on" : "off");
     // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
     log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
               "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "
@@ -1237,6 +1368,43 @@ static void lorieLogRendererDiag(void) {
             TD(xStampsInvalid), TD(xCopyEarly[LORIE_X_EARLY_SCRAP]), TD(xCopyEarly[LORIE_X_EARLY_DESTROY]),
             TD(xCopyEarly[LORIE_X_EARLY_POLL_FIRST]), TD(xCopyEarly[LORIE_X_EARLY_POLL_LATER]), TD(xCopyEarly[LORIE_X_EARLY_STALLED]),
             TD(xCopyRetired), (int) (int32_t) (d.xCopyRetired - d.xCopyRetiredReleased), TD(xCopyCancelled));
+    }
+    // P11-C3, only while TERMUX_X11_RENDERER_VK_FRAME_DIAG=1: the Vulkan frames' pacing and parts, the root copies' parts,
+    // and the X server's requests, accesses and ticks (lorie.h struct lorie_hist, lorieHistText). The worst_* fields are
+    // the period's largest interval or slowest item with what it spent - read while the renderer may write them.
+    if (pvfb->frameDiag) {
+        char h[10][112];
+        volatile struct lorie_renderer_diag *live = &pvfb->state->diag;
+#define HT(i, f) lorieHistText(h[i], sizeof(h[i]), &d.f, &prev.f, &live->f.maxUs)
+#define TD32(f) d.f, d.f - prev.f
+        uint32_t worst = __atomic_exchange_n(&live->vkWorstStartUs, 0, __ATOMIC_RELAXED);
+        HT(0, vkFrameStart), HT(1, vkPresentDelta), HT(2, vkFrameWake);
+        log(INFO, "XlorieVkFramePacing: frame_start_us=%s present_delta_us=%s wake_us=%s idle_gaps=%u(+%u) "
+                  "stamps_invalid=%u(+%u) ticks_frame_wanted=%u(+%u) ticks_frame_missed=%u(+%u) worst_start_us=%u "
+                  "worst_wake_us=%u worst_acquire_us=%u worst_lock_us=%u worst_fence_us=%u worst_present_us=%u "
+                  "worst_after_root_us=%u",
+            h[0], h[1], h[2], TD32(vkFrameIdleGaps), TD32(vkFrameStampsInvalid), TD32(xTicksFrameWanted),
+            TD32(xTicksFrameMissed), worst, d.vkWorstWakeUs, d.vkWorstAcquireUs, d.vkWorstLockUs, d.vkWorstFenceUs,
+            d.vkWorstPresentUs, d.vkWorstAfterRootUs);
+        HT(0, vkFrameCpu), HT(1, vkFrameAcquire), HT(2, vkFrameLock), HT(3, vkFrameRecord), HT(4, vkFrameSubmit);
+        HT(5, vkFrameFence), HT(6, vkFenceRoot), HT(7, vkFenceCopy), HT(8, vkFramePresent), HT(9, vkFrameAfterRoot);
+        log(INFO, "XlorieVkPipeline: cpu_us=%s acquire_us=%s lock_us=%s record_us=%s submit_us=%s fence_frame_us=%s "
+                  "fence_root_us=%s fence_copy_us=%s present_us=%s after_root_us=%s",
+            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
+        worst = __atomic_exchange_n(&live->rootWorstUs, 0, __ATOMIC_RELAXED);
+        HT(0, rootTake), HT(1, rootRecord), HT(2, rootResume), HT(3, rootBlock);
+        log(INFO, "XlorieRootCopyTiming: take_us=%s record_us=%s resume_us=%s x_block_us=%s worst_total_us=%u "
+                  "worst_take_us=%u worst_record_us=%u worst_fence_us=%u",
+            h[0], h[1], h[2], h[3], worst, d.rootWorstTakeUs, d.rootWorstRecordUs, d.rootWorstFenceUs);
+        HT(0, xRequest), HT(1, xAccess), HT(2, xAccessLock), HT(3, xAccessGpu), HT(4, xTickDelay), HT(5, xTickWork);
+        log(INFO, "XlorieXLatency: request_us=%s access_us=%s access_lock_us=%s access_gpu_us=%s tick_delay_us=%s "
+                  "tick_work_us=%s worst_request_us=%u worst_request=%d:%s:%s:%d.%d",
+            h[0], h[1], h[2], h[3], h[4], h[5], pvfb->worstRequest.us, pvfb->worstRequest.us ? pvfb->worstRequest.client : -1,
+            pvfb->worstRequest.us ? pvfb->worstRequest.cmd : "none", pvfb->worstRequest.us ? pvfb->worstRequest.ext : "none",
+            pvfb->worstRequest.us ? pvfb->worstRequest.major : 0, pvfb->worstRequest.us ? pvfb->worstRequest.minor : 0);
+        pvfb->worstRequest.us = 0;
+#undef TD32
+#undef HT
     }
     // TERMUX_X11_RENDERER_VK_TRANSFER_COPY's verdicts (renderer.c rendererVkCountTransfer), only while it is on.
     if (pvfb->state->backend.vkTransferCopy) {
@@ -2085,11 +2253,19 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         uint64_t waitStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
         pvfb->accessLocks++;
+        // P11-C3: its wait for the lock, and its hold of it from here (lorieFinishAccess)
+        if (perAccessAhb && pvfb->frameDiag) {
+            priv->accessStartUs = GetTimeInMicros();
+            lorieHistAdd(&pvfb->state->diag.xAccessLock, priv->accessStartUs - waitStartUs);
+        }
         // PER_ACCESS: the renderer lets the lock go while the device runs a frame; not while it uses this one.
         if (perAccessAhb && !priv->locked && !priv->mem) {
-            uint64_t gpuStartUs = GetTimeInMicros();
+            uint64_t gpuStartUs = GetTimeInMicros(), gpuUs;
             lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
-            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, GetTimeInMicros() - gpuStartUs, __ATOMIC_RELAXED);
+            gpuUs = GetTimeInMicros() - gpuStartUs;
+            __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, gpuUs, __ATOMIC_RELAXED);
+            if (pvfb->frameDiag)
+                lorieHistAdd(&pvfb->state->diag.xAccessGpu, gpuUs);
         }
         if (perAccessAhb)
             __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
@@ -2105,6 +2281,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             // PER_ACCESS: no FinishAccess follows a failed PrepareAccess, and the renderer would wait on
             // this lock for good. (3c98ffa's own path is left as it was.)
             if (perAccessAhb) {
+                priv->accessStartUs = 0;
                 pvfb->accessLocks--;
                 lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
             }
@@ -2132,6 +2309,10 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
             __atomic_fetch_add(&pvfb->state->diag.xAhbCpuLockUs, GetTimeInMicros() - unlockStartUs, __ATOMIC_RELAXED);
             priv->locked = NULL;
             priv->wasLocked = FALSE;
+        }
+        if (priv->accessStartUs) {
+            lorieHistAdd(&pvfb->state->diag.xAccess, GetTimeInMicros() - priv->accessStartUs);
+            priv->accessStartUs = 0;
         }
         pvfb->accessLocks--;
         lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);

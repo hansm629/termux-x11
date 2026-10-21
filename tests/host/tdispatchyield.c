@@ -12,7 +12,11 @@
  * On, every tick and completion runs right after the request in progress when it was queued - never behind the rest of
  * a round - each once, in the order queued; a round still serves at least one request; and the clients are served
  * exactly as off - the same requests in the same order, the same priorities: the round a yield broke off goes on with
- * the rest of its slice, so which client runs, and for how long, stays the smart scheduler's choice. */
+ * the rest of its slice, so which client runs, and for how long, stays the smart scheduler's choice.
+ *
+ * P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, dispatchRequestTimed): each request handed to ddxRequestTimed once, after
+ * it ran, with its client, its opcodes as they were before it ran, and its start; off, never, and no clock read; either
+ * way the same requests, rounds and work as without it. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -25,6 +29,7 @@
 typedef int Bool;
 typedef uint8_t CARD8;
 typedef uint16_t CARD16;
+typedef uint64_t CARD64;
 #define TRUE 1
 #define FALSE 0
 #define Success 0
@@ -63,6 +68,7 @@ static ClientPtr SmartLastClient;
 static int SmartLastIndex[SMART_MAX_PRIORITY - SMART_MIN_PRIORITY + 1];
 volatile char dispatchException, isItTimeToYield;
 int dispatchYieldRequested;                     /* patches/xserver.patch dix/dispatch.c */
+int dispatchRequestTimed;                       /* P11-C3, the same */
 static int nextFreeClientID, nClients;
 static long maxBigRequestSize = 4194303;
 static ClientPtr currentClient;
@@ -84,6 +90,20 @@ static void FlushIfCriticalOutputPending(void) {}
 static ExtensionEntry *GetExtensionEntry(int major) { (void) major; return NULL; }
 static int XaceHookDispatch(ClientPtr c, int major) { (void) c; (void) major; return Success; }
 static long GetTimeInMillis(void) { return SmartScheduleTime; }
+/* P11-C3: the clock in microseconds (each request's cost in ms, as the smart scheduler counts it); and the requests the
+ * DDX was handed, as InitOutput.c's ddxRequestTimed takes them */
+static int clockReads;
+static uint64_t GetTimeInMicros(void) {
+    clockReads++;
+    return (uint64_t) SmartScheduleTime * 1000 + 1000000;
+}
+static struct { int index, major, minor; uint64_t us; } timedReq[4096];
+static int ntimed;
+static void ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs) {
+    if (ntimed < 4096)
+        timedReq[ntimed] = (typeof(timedReq[0])) { clientIndex, major, minor, GetTimeInMicros() - startUs };
+    ntimed++;
+}
 static void CloseDownClient(ClientPtr c) { mark_client_not_ready(c); }
 static void SendErrorToClient(ClientPtr c, int major, int minor, unsigned long value, int error) {
     (void) c; (void) major; (void) minor; (void) value; (void) error;
@@ -186,6 +206,7 @@ static void fire(int at) {
         post('C', false, at);
 }
 
+static bool scribble;               /* P11-C3: a request leaves its client's opcodes changed (as one closing it would) */
 static int request(ClientPtr c) {
     char s[2] = { c->name, 0 };
     requests++;
@@ -194,6 +215,8 @@ static int request(ClientPtr c) {
     c->served++;
     c->pending--;
     SmartScheduleTime += c->cost;
+    if (scribble)
+        c->majorOp = 200, c->minorOp = 9, c->index += 100;
     log1(s);
     fire(requests);
     return Success;
@@ -201,6 +224,8 @@ static int request(ClientPtr c) {
 static int (*requestVector[256])(ClientPtr);
 static xReq req = { .reqType = 1 };
 static int ReadRequestFromClient(ClientPtr c) {
+    if (scribble && c->index > 100)
+        c->index -= 100;            /* the scribbled one back, for the loop's own use */
     if (c->pending <= 0) {
         mark_client_not_ready(c);
         lastReadEmpty = true;
@@ -269,6 +294,7 @@ static void run(void (*dispatch)(void), int yield, const struct script *s, struc
     memset(SmartLastIndex, 0, sizeof SmartLastIndex);
     dispatchException = isItTimeToYield = 0;
     dispatchYieldRequested = 0;
+    ntimed = clockReads = 0;
     pvfb->yieldOnWake = yield;
     for (int i = 0; i < 256; i++)
         requestVector[i] = request;
@@ -431,6 +457,35 @@ int main(void) {
               half[1][0], half[1][1], half[0][0], half[0][1]);
         printf("  %-72s first 400: off a %d b %d, on a %d b %d\n", "two clients streaming: their share", half[0][0], half[0][1],
                half[1][0], half[1][1]);
+    }
+
+    /* P11-C3: two clients, requests of 1 and 3 ms, ticks and completions; the yield off and on. Timed: every request
+     * once, its client and opcodes as before it ran - though it left them changed - and its time; served, rounds and
+     * work exactly as untimed. Untimed: ddxRequestTimed never called, the clock never read. */
+    {
+        static const struct script s = { "timed requests", { 50, 50 }, { 1, 3 }, { 16, 7 }, { { 0 } } };
+        for (int yield = 0; yield < 2; yield++) {
+            int untimedCalls, untimedReads, bad = 0;
+            dispatchRequestTimed = 0;
+            run(Dispatch, yield, &s, off);
+            untimedCalls = ntimed, untimedReads = clockReads;
+            dispatchRequestTimed = 1;
+            scribble = true;
+            run(Dispatch, yield, &s, on);
+            scribble = false;
+            dispatchRequestTimed = 0;
+            for (int i = 0; i < ntimed && i < 4096; i++) {
+                int client = timedReq[i].index - 1;
+                bad += client < 0 || client > 1 || timedReq[i].major != 1 || timedReq[i].minor != 0 ||
+                       timedReq[i].us != (uint64_t) s.cost[client] * 1000;
+            }
+            CHECK(untimedCalls == 0 && untimedReads == 0, "timed requests (yield %d): untimed, %d requests handed on, %d clock reads",
+                  yield, untimedCalls, untimedReads);
+            CHECK(ntimed == 100 && bad == 0, "timed requests (yield %d): %d handed on (want 100), %d with the wrong client, "
+                  "opcodes or time", yield, ntimed, bad);
+            CHECK(!strcmp(on->trail, off->trail) && on->rounds == off->rounds && !memcmp(on->served, off->served, sizeof on->served),
+                  "timed requests (yield %d): served otherwise than untimed", yield);
+        }
     }
 
     printf("TDISPATCHYIELD the X server's main loop with TERMUX_X11_X_YIELD_ON_WAKE off and on: %s (%d failures)\n",
