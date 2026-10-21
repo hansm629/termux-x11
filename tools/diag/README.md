@@ -32,7 +32,8 @@ XlorieTick:     vsync_to_callback_us callback_to_tick_us ticks ticks_waiting tic
 (only with TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, P11-C3:)
 XlorieVkFramePacing: frame_start_us present_delta_us wake_us idle_gaps stamps_invalid ticks_frame_wanted
                 ticks_frame_missed worst_start_us worst_wake_us worst_acquire_us worst_lock_us worst_fence_us
-                worst_present_us worst_after_root_us
+                worst_present_us worst_after_root_us worst_prev_cpu_us worst_prev_lock_us worst_prev_fence_us
+                worst_prev_after_root_us worst_gap_us worst_unasked_us
 XlorieVkPipeline: cpu_us acquire_us lock_us record_us submit_us fence_frame_us fence_root_us fence_copy_us present_us
                 after_root_us
 XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us worst_take_us worst_record_us worst_fence_us
@@ -169,7 +170,12 @@ that asked the renderer for a frame, `ticks_frame_missed` the ticks that found n
 GLES's) since the last one asked - a frame later than one refresh. `worst_start_us` is the period's largest frame
 interval, and the frame that ended it spent `worst_wake_us` waking, `worst_acquire_us` in `vkAcquireNextImageKHR`,
 `worst_lock_us` waiting for the X server's lock, `worst_fence_us` on its own fence, `worst_present_us` in
-`vkQueuePresentKHR`, and `worst_after_root_us` in a root copy made right before it.
+`vkQueuePresentKHR`, and `worst_after_root_us` in a root copy made right before it. Those are the frame that ended the
+interval; the one that began it - which is the one that took long, when the interval is long because a frame was -
+spent `worst_prev_cpu_us` from its start to its end, `worst_prev_lock_us` of that waiting for the lock,
+`worst_prev_fence_us` on its fence, `worst_prev_after_root_us` behind a root copy; `worst_gap_us` is from its end to the
+next frame's start, and `worst_unasked_us` how much of that gap passed before a tick asked for that frame - a long one
+says the X server had nothing new to show (its clients, or the X server itself, were the ones late), not the renderer.
 
 `XlorieVkPipeline`, the same frames' parts: `cpu_us` from the frame's start to its end (everything below and the
 rest), `acquire_us`, `lock_us` (the X server's shared lock), `record_us` (from holding the lock to submitting: the

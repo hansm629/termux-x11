@@ -486,6 +486,10 @@ struct lorie_renderer_diag {
     volatile uint32_t vkFrameIdleGaps, vkFrameStampsInvalid;
     volatile uint32_t vkWorstStartUs, vkWorstWakeUs, vkWorstAcquireUs, vkWorstLockUs, vkWorstFenceUs, vkWorstPresentUs,
                       vkWorstAfterRootUs;
+    /* ... and the frame that began that interval - the one that may have taken long: its whole, its wait for the
+     * lock, its fence, the root copy before it - then the gap from its end to the next start, and of that gap how long
+     * no tick asked for a frame (the X server had nothing new to show) */
+    volatile uint32_t vkWorstPrevCpuUs, vkWorstPrevLockUs, vkWorstPrevFenceUs, vkWorstPrevAfterRootUs, vkWorstGapUs, vkWorstUnaskedUs;
     /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the
      * X server had to wait for one (lorieRootCopyWait), that wait, and from the renderer settling the copy to the X
      * server going on. The period's slowest request to completion and its parts (its fence: vkFenceRoot's). */

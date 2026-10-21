@@ -1791,6 +1791,13 @@ int main(void) {
               newSamples(&dg->vkFrameWake, wake) == 1, "timed frames: the worst %u us, acquire %u, fence %u, after root %u, lock %u, "
               "present %u, wake %u", dg->vkWorstStartUs, dg->vkWorstAcquireUs, dg->vkWorstFenceUs, dg->vkWorstAfterRootUs,
               dg->vkWorstLockUs, dg->vkWorstPresentUs, dg->vkWorstWakeUs);
+        /* the frame that began it (17 ms after the one before it, 1100 us long, its lock 50 us): the gap from its end
+         * to the next start, 33900 us, of which 33400 with nothing asked */
+        CHECK(dg->vkWorstPrevCpuUs == 1100 && dg->vkWorstPrevLockUs == 50 && dg->vkWorstPrevFenceUs == 0 &&
+              dg->vkWorstPrevAfterRootUs == 0 && dg->vkWorstGapUs == 33900 && dg->vkWorstUnaskedUs == 33400,
+              "timed frames: the frame before the worst interval %u us (lock %u, fence %u, after root %u), gap %u, unasked %u",
+              dg->vkWorstPrevCpuUs, dg->vkWorstPrevLockUs, dg->vkWorstPrevFenceUs, dg->vkWorstPrevAfterRootUs, dg->vkWorstGapUs,
+              dg->vkWorstUnaskedUs);
         start = mark(&dg->vkFrameStart);
         FRAME(t - 100);                          /* out of order */
         t += 8000, FRAME(t);

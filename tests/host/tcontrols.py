@@ -1367,6 +1367,19 @@ CONTROLS += [
      "twiring"),
 ]
 
+
+# P11-C3: the worst interval's frame before it - the one that began it - and the gap after it
+CONTROLS += [
+    ("P11-C3: the worst interval's earlier frame not kept", "renderer.c",
+     """    vkPacingLast.cpuUs = t->endUs - t->startUs;""",
+     """    vkPacingLast.cpuUs = 0;""",
+     "tpresentcopy"),
+    ("P11-C3: the gap measured from the earlier frame's start", "renderer.c",
+     """    vkPacingLast.endUs = t->endUs;""",
+     """    vkPacingLast.endUs = t->startUs;""",
+     "tpresentcopy"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

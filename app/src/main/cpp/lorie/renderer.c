@@ -368,9 +368,12 @@ static uint32_t vkOwnershipSeq;
 // on. Another swapchain, window, X server session or device starts them over: no interval spans one.
 static uint64_t vkPacingLastStartUs, vkPacingLastPresentUs;
 static VkSwapchainKHR vkPacingSwapchain;
+// ... and what that last frame spent, and when it ended
+static struct { uint64_t endUs, cpuUs, lockUs, fenceUs, afterRootUs; } vkPacingLast;
 static void rendererVkPacingReset(void) {
     vkPacingLastStartUs = vkPacingLastPresentUs = 0;
     vkPacingSwapchain = VK_NULL_HANDLE;
+    memset(&vkPacingLast, 0, sizeof(vkPacingLast));
 }
 
 // Counted after the real call (see rendererMaybeSkipEglSwapBuffers, which can skip a swap and still
@@ -2246,6 +2249,7 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
     if (t->afterRootUs)
         lorieHistAdd(&d->vkFrameAfterRoot, t->afterRootUs);
     if (sampled == LORIE_VK_INTERVAL_SAMPLED && interval > d->vkWorstStartUs) {
+        uint64_t lastEndUs = vkPacingLast.endUs;
         d->vkWorstStartUs = (uint32_t) interval;
         d->vkWorstWakeUs = (uint32_t) wake;
         d->vkWorstAcquireUs = (uint32_t) t->acquireUs;
@@ -2253,7 +2257,19 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
         d->vkWorstFenceUs = (uint32_t) t->fenceUs;
         d->vkWorstPresentUs = (uint32_t) (t->presentStartUs ? t->presentEndUs - t->presentStartUs : 0);
         d->vkWorstAfterRootUs = (uint32_t) t->afterRootUs;
+        // the frame that began it, and the gap after it (its end on the same clock, before this start)
+        d->vkWorstPrevCpuUs = (uint32_t) vkPacingLast.cpuUs;
+        d->vkWorstPrevLockUs = (uint32_t) vkPacingLast.lockUs;
+        d->vkWorstPrevFenceUs = (uint32_t) vkPacingLast.fenceUs;
+        d->vkWorstPrevAfterRootUs = (uint32_t) vkPacingLast.afterRootUs;
+        d->vkWorstGapUs = (uint32_t) (lastEndUs && lastEndUs <= t->startUs ? t->startUs - lastEndUs : 0);
+        d->vkWorstUnaskedUs = (uint32_t) (lastEndUs && t->wantedUs > lastEndUs && t->wantedUs <= t->startUs ? t->wantedUs - lastEndUs : 0);
     }
+    vkPacingLast.endUs = t->endUs;
+    vkPacingLast.cpuUs = t->endUs - t->startUs;
+    vkPacingLast.lockUs = t->lockedUs - t->lockStartUs;
+    vkPacingLast.fenceUs = t->fenceUs;
+    vkPacingLast.afterRootUs = t->afterRootUs;
 }
 
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).

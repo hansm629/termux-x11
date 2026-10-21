@@ -1415,10 +1415,12 @@ static void lorieLogRendererDiag(void) {
         log(INFO, "XlorieVkFramePacing: frame_start_us=%s present_delta_us=%s wake_us=%s idle_gaps=%u(+%u) "
                   "stamps_invalid=%u(+%u) ticks_frame_wanted=%u(+%u) ticks_frame_missed=%u(+%u) worst_start_us=%u "
                   "worst_wake_us=%u worst_acquire_us=%u worst_lock_us=%u worst_fence_us=%u worst_present_us=%u "
-                  "worst_after_root_us=%u",
+                  "worst_after_root_us=%u worst_prev_cpu_us=%u worst_prev_lock_us=%u worst_prev_fence_us=%u "
+                  "worst_prev_after_root_us=%u worst_gap_us=%u worst_unasked_us=%u",
             h[0], h[1], h[2], TD32(vkFrameIdleGaps), TD32(vkFrameStampsInvalid), TD32(xTicksFrameWanted),
             TD32(xTicksFrameMissed), worst, d.vkWorstWakeUs, d.vkWorstAcquireUs, d.vkWorstLockUs, d.vkWorstFenceUs,
-            d.vkWorstPresentUs, d.vkWorstAfterRootUs);
+            d.vkWorstPresentUs, d.vkWorstAfterRootUs, d.vkWorstPrevCpuUs, d.vkWorstPrevLockUs, d.vkWorstPrevFenceUs,
+            d.vkWorstPrevAfterRootUs, d.vkWorstGapUs, d.vkWorstUnaskedUs);
         HT(0, vkFrameCpu), HT(1, vkFrameAcquire), HT(2, vkFrameLock), HT(3, vkFrameRecord), HT(4, vkFrameSubmit);
         HT(5, vkFrameFence), HT(6, vkFenceRoot), HT(7, vkFenceCopy), HT(8, vkFramePresent), HT(9, vkFrameAfterRoot);
         log(INFO, "XlorieVkPipeline: cpu_us=%s acquire_us=%s lock_us=%s record_us=%s submit_us=%s fence_frame_us=%s "

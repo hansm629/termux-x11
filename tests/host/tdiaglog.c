@@ -296,6 +296,8 @@ int main(void) {
         fakeState.diag.vkWorstStartUs = 35000, fakeState.diag.vkWorstWakeUs = 500, fakeState.diag.vkWorstAcquireUs = 21000;
         fakeState.diag.vkWorstLockUs = 300, fakeState.diag.vkWorstFenceUs = 9000, fakeState.diag.vkWorstPresentUs = 1200;
         fakeState.diag.vkWorstAfterRootUs = 4000;
+        fakeState.diag.vkWorstPrevCpuUs = 21926, fakeState.diag.vkWorstPrevLockUs = 19345, fakeState.diag.vkWorstPrevFenceUs = 1598;
+        fakeState.diag.vkWorstPrevAfterRootUs = 573, fakeState.diag.vkWorstGapUs = 5, fakeState.diag.vkWorstUnaskedUs = 0;
         lorieHistAdd(&fakeState.diag.vkFrameFence, 3000), lorieHistAdd(&fakeState.diag.vkFenceRoot, 1500);
         lorieHistAdd(&fakeState.diag.vkFenceCopy, 700);
         lorieHistAdd(&fakeState.diag.rootTake, 400), lorieHistAdd(&fakeState.diag.rootRecord, 250);
@@ -324,7 +326,9 @@ int main(void) {
                                         "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "
                                         "idle_gaps=2(+2) stamps_invalid=1(+1) ticks_frame_wanted=120(+120) ticks_frame_missed=7(+7) "
                                         "worst_start_us=35000 worst_wake_us=500 worst_acquire_us=21000 worst_lock_us=300 "
-                                        "worst_fence_us=9000 worst_present_us=1200 worst_after_root_us=4000\n") != NULL;
+                                        "worst_fence_us=9000 worst_present_us=1200 worst_after_root_us=4000 worst_prev_cpu_us=21926 "
+                                        "worst_prev_lock_us=19345 worst_prev_fence_us=1598 worst_prev_after_root_us=573 worst_gap_us=5 "
+                                        "worst_unasked_us=0\n") != NULL;
             if (strstr(line, "XlorieVkFramePacing:") && n[0] == 3)
                 emptyOk += strstr(line, "XlorieVkFramePacing: frame_start_us=0 present_delta_us=0 wake_us=0 idle_gaps=2(+0) "
                                         "stamps_invalid=1(+0) ticks_frame_wanted=120(+0) ticks_frame_missed=7(+0) worst_start_us=0 ") != NULL;
@@ -476,6 +480,8 @@ int main(void) {
         fakeState.diag.vkWorstLockUs = fakeState.diag.vkWorstFenceUs = fakeState.diag.vkWorstPresentUs = 4294967295u;
         fakeState.diag.vkWorstAfterRootUs = fakeState.diag.rootWorstUs = fakeState.diag.rootWorstTakeUs = 4294967295u;
         fakeState.diag.rootWorstRecordUs = fakeState.diag.rootWorstFenceUs = 4294967295u;
+        fakeState.diag.vkWorstPrevCpuUs = fakeState.diag.vkWorstPrevLockUs = fakeState.diag.vkWorstPrevFenceUs = 4294967295u;
+        fakeState.diag.vkWorstPrevAfterRootUs = fakeState.diag.vkWorstGapUs = fakeState.diag.vkWorstUnaskedUs = 4294967295u;
         fakePvfb.worstRequest.us = 4294967295u, fakePvfb.worstRequest.client = 2047, fakePvfb.worstRequest.major = 255;
         fakePvfb.worstRequest.minor = 255;
         memset(fakePvfb.worstRequest.cmd, 'c', 23), memset(fakePvfb.worstRequest.ext, 'e', 23);
