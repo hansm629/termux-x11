@@ -1829,7 +1829,10 @@ VkResult lorieVkFrameWait(struct lorie_vk *vk, struct lorie_vk_renderer *r, vola
         // neither: the frame stays not over.
         idle = vk->DeviceWaitIdle(vk->device);
         *over = idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST || res == VK_ERROR_DEVICE_LOST;
-        vk->ResetFences(vk->device, 1, &r->frameFence);
+        // Not over, the fence is left as it is: one still associated with a queue command not yet completed may not be
+        // reset (VUID-vkResetFences-pFences-01123) - the teardown that follows waits for the device again first.
+        if (*over)
+            vk->ResetFences(vk->device, 1, &r->frameFence);
         return res;
     }
     *over = true;

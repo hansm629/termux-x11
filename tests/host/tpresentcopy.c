@@ -885,9 +885,13 @@ int main(void) {
             emu.fenceResult = VK_SUCCESS;
             CHECK(vkFailures == 1 && st.gpuInFlight.busy && st.gpuInFlight.pid == getpid() && !lorieGpuCopyIsDone(serial),
                   "device not known idle: list %s", st.gpuInFlight.busy ? "kept" : "cleared");
+            /* nor its fence reset: it may still be associated with the submission (VUID-vkResetFences-pFences-01123) */
+            CHECK(signaled(vkr.frameFence) && *signaled(vkr.frameFence) && emu.violations == 0,
+                  "device not known idle: the fence reset, %d violations", emu.violations);
             idle = emu.deviceWaits;
             rendererVkIdle();           /* rendererVkFail's teardown, before anything else */
             rendererVkFrameDone();
+            vk.ResetFences(vk.device, 1, &vkr.frameFence);  /* the teardown destroys it; the same renderer goes on here */
             CHECK(emu.deviceWaits == idle + 3 && !st.gpuInFlight.busy, "teardown: vkDeviceWaitIdle asked %d times (want 3), list %s",
                   emu.deviceWaits - idle, st.gpuInFlight.busy ? "kept" : "cleared");
             st.gpuInFlight.busy = 0;    /* if left set, reported above: not left to stall the frames after */

@@ -1257,6 +1257,18 @@ CONTROLS += [
      "twiring"),
 ]
 
+
+# a frame's fence not known to be over is never reset
+CONTROLS += [
+    ("vk: a fence not known to be over reset", "vk.c",
+     """        if (*over)
+            vk->ResetFences(vk->device, 1, &r->frameFence);
+        return res;""",
+     """        vk->ResetFences(vk->device, 1, &r->frameFence);
+        return res;""",
+     "tpresentcopy"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):
