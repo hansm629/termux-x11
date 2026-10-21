@@ -6,7 +6,12 @@ present, no imported-image draw, a GLES frame or swap in the window, a fallback,
 the window - and too few reports is "insufficient", never a pass.
 
 And the same against the logs tdiaglog.c wrote with the X server's real formatter, when given its output
-directory: the Vulkan run passes --expect vulkan only, the GLES run --expect gles only.
+directory: the Vulkan run passes --expect vulkan only, the GLES run --expect gles only; renderer-status.sh prints the
+latest of P11-C3's TERMUX_X11_RENDERER_VK_FRAME_DIAG lines there are, none where there are none.
+
+And frame-diag-session.sh (P11-C3) as it runs on a device, its waits and Android's tools faked: the three phases'
+marks in order, each in the log (as LorieNative) and in the file, the X server's lines from the session's start after
+them, nothing else left behind; a warning when the session has no pacing report.
 
 usage: tdiag.py <tools/diag> [<host test output dir>]
 """
@@ -111,6 +116,58 @@ if len(sys.argv) > 2:
                                capture_output=True, text=True)
             check(r.returncode == (0 if run_ == expect else 1), "real-format %s log, --expect %s: exit %d\n%s" % (
                 run_, expect, r.returncode, r.stdout))
+
+code, out = run("renderer-status.sh", vk_good)
+check(not any(k in out for k in ("XlorieVkFramePacing:", "XlorieVkPipeline:", "XlorieRootCopyTiming:", "XlorieXLatency:")),
+      "renderer-status: frame diagnostics lines out of nothing\n" + out)
+if len(sys.argv) > 2:
+    p = os.path.join(sys.argv[2], "diag-frame.log")
+    r = subprocess.run(["sh", os.path.join(D, "renderer-status.sh"), "--file", p], capture_output=True, text=True)
+    check(r.returncode == 0 and all(r.stdout.count(k) == 1 for k in ("XlorieVkFramePacing:", "XlorieVkPipeline:",
+          "XlorieRootCopyTiming:", "XlorieXLatency:")) and "XlorieVkFramePacing: frame_start_us=0 " in r.stdout,
+          "renderer-status on the real frame diagnostics log: %d\n%s" % (r.returncode, r.stdout))
+
+# frame-diag-session.sh, with Android's logcat and log and the waits faked
+def session(pacing):
+    with tempfile.TemporaryDirectory() as t:
+        fake = os.path.join(t, "bin")
+        os.makedirs(fake)
+        calls = os.path.join(t, "calls")
+        tools = {
+            "logcat": 'echo "logcat $*" >> %s\necho "10-21 10:00:01.000  9  9 I LorieNative: XlorieBackend: active=VULKAN"\n%s' % (
+                calls, 'echo "10-21 10:00:06.000  9  9 I LorieNative: XlorieVkFramePacing: frame_start_us=0"' if pacing else ""),
+            "log": 'echo "log $*" >> %s' % calls,
+            "sleep": 'echo "sleep $*" >> %s' % calls,
+        }
+        for name, body in tools.items():
+            with open(os.path.join(fake, name), "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(fake, name), 0o755)
+        out = os.path.join(t, "session.log")
+        env = dict(os.environ, PATH=fake + os.pathsep + os.environ.get("PATH", ""), HOME=t)
+        r = subprocess.run(["sh", os.path.join(D, "frame-diag-session.sh"), out], input="\n\n", capture_output=True,
+                           text=True, env=env, timeout=60)
+        saved = open(out).read() if os.path.exists(out) else ""
+        made = open(calls).read() if os.path.exists(calls) else ""
+        left = sorted(os.listdir(t))
+    return r, saved, made, left
+
+r, saved, made, left = session(True)
+phases = ["phase=idle start", "phase=idle end", "phase=glmark2 start", "phase=glmark2 end", "phase=glmark2+move start",
+          "phase=glmark2+move end"]
+logged = [l[len("log -t LorieNative XlorieMark: "):] for l in made.splitlines() if l.startswith("log -t LorieNative XlorieMark: ")]
+marked = [l.split("XlorieMark: ", 1)[1].rsplit(" at ", 1)[0] for l in saved.splitlines() if l.startswith("XlorieMark: ")]
+sleeps = [l for l in made.splitlines() if l.startswith("sleep ")]
+check(r.returncode == 0 and logged == phases and marked == phases, "frame-diag-session: exit %d, marks logged %s, in the file %s\n%s" % (
+      r.returncode, logged, marked, r.stdout + r.stderr))
+check(sleeps == ["sleep 10", "sleep 10", "sleep 20", "sleep 6"], "frame-diag-session: waits %s" % sleeps)
+check("logcat -d -v threadtime -T " in made and " -s LorieNative:I" in made and
+      saved.index("XlorieVkFramePacing:") < saved.index("XlorieMark: "), "frame-diag-session: the X server's lines not saved first\n" + saved)
+check(left == ["bin", "calls", "session.log"] and "1 pacing reports" in r.stdout and "no XlorieVkFramePacing" not in r.stderr,
+      "frame-diag-session: left %s, said %s" % (left, r.stdout + r.stderr))
+r, saved, made, left = session(False)
+check(r.returncode == 0 and "no XlorieVkFramePacing line" in r.stderr, "frame-diag-session without a pacing report: no warning\n" +
+      r.stdout + r.stderr)
 
 print("renderer diagnostics scripts (%d cases): %s (%d failures)" % (len(cases), "FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

@@ -9,7 +9,7 @@ in its own log, which Termux can read with `logcat -d`:
 XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
                 x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
-                x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off
+                x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off vk_frame_diag=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
@@ -26,6 +26,15 @@ XlorieCopyLatency: copy_standalone_entries copy_frame_entries copy_standalone_su
 XlorieTick:     vsync_to_callback_us callback_to_tick_us ticks ticks_waiting ticks_waiting_max copy_notify_us
                 copy_recheck_us copy_done_events copy_done_waiting copy_done_waiting_max stamps_invalid copy_early
                 copy_retired copy_retired_live copy_cancelled
+(only with TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, P11-C3:)
+XlorieVkFramePacing: frame_start_us present_delta_us wake_us idle_gaps stamps_invalid ticks_frame_wanted
+                ticks_frame_missed worst_start_us worst_wake_us worst_acquire_us worst_lock_us worst_fence_us
+                worst_present_us worst_after_root_us
+XlorieVkPipeline: cpu_us acquire_us lock_us record_us submit_us fence_frame_us fence_root_us fence_copy_us present_us
+                after_root_us
+XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us worst_take_us worst_record_us worst_fence_us
+XlorieXLatency: request_us access_us access_lock_us access_gpu_us tick_delay_us tick_work_us worst_request_us
+                worst_request=client:command:extension:major.minor
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -131,6 +140,62 @@ copy settles - and `copy_retired_live`, those still held now; `copy_cancelled`, 
 any renderer recorded them (the renderer skips them, completing their serial): those let go at once. A poll not
 queued, or a stalled copy still running, is simply waited for (rechecked at every completion and tick).
 
+### Frame pacing (P11-C3, `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1`)
+
+Diagnostics only, off by default: started with `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1` the X server writes four more
+lines every 5 seconds and `XlorieBackend` says `vk_frame_diag=on`. Off, none of these timings reads a clock - the
+renderer's frames, the root copies and the X server's requests, ticks and accesses are timed only while it is on; the
+existing lines (`XlorieFrames` with its GLES frame statistics included) stay as they are either way. Everything is
+CLOCK_MONOTONIC microseconds, gathered into fixed histograms in the shared state (no per-frame log, no lock):
+
+`key=n/avg/p95/p99/max/h16/h33`: the samples of the last 5 seconds - how many, their mean, p95 and p99 (each the bound
+of the bucket it falls in; the bounds are 50 us .. 8 ms, 8.5, 9, 10, 12, 14, 16.667, 20, 25, 33.333, 50, 100 ms, and
+`>100000` past the last), the largest, and how many were over 16.667 ms (two 120 Hz refreshes) and over 33.333 ms.
+`key=0` when there were none. Counters are `N(+d)` as above; `worst_*` belong to one item, the period's largest, and
+are taken back to 0 with each report (the renderer may write them while the X server reads: a near-simultaneous
+pair can mix two frames).
+
+`XlorieVkFramePacing`, one sample per Vulkan screen frame presented: `frame_start_us`, from the last frame's start to
+this one's (the interval a viewer sees as pacing); `present_delta_us`, from the last `vkQueuePresentKHR` call to this
+one's; `wake_us`, from the X server's tick asking for a frame to the renderer starting it (only for a request made
+after the last frame started - an older one that frame took up). The first frame on a swapchain, window, X server
+session or device has no interval (no false hitch); an interval over 250 ms is an idle desktop, counted in
+`idle_gaps`, not timed; a stamp before the last is counted in `stamps_invalid`. `ticks_frame_wanted` counts the ticks
+that asked the renderer for a frame, `ticks_frame_missed` the ticks that found no frame presented (Vulkan's or
+GLES's) since the last one asked - a frame later than one refresh. `worst_start_us` is the period's largest frame
+interval, and the frame that ended it spent `worst_wake_us` waking, `worst_acquire_us` in `vkAcquireNextImageKHR`,
+`worst_lock_us` waiting for the X server's lock, `worst_fence_us` on its own fence, `worst_present_us` in
+`vkQueuePresentKHR`, and `worst_after_root_us` in a root copy made right before it.
+
+`XlorieVkPipeline`, the same frames' parts: `cpu_us` from the frame's start to its end (everything below and the
+rest), `acquire_us`, `lock_us` (the X server's shared lock), `record_us` (from holding the lock to submitting: the
+copies taken, images imported, the frame recorded), `submit_us` (`vkQueueSubmit`), `present_us` (the present call).
+Three fences, each counted once, in its own key: `fence_frame_us` the screen frame's own fence (with the Present
+copies it carries, when they go in its submission), `fence_root_us` a root copy's (P11-C2), `fence_copy_us` the Present
+copies sent in a submission of their own (P11-C1, FIFO, or no frame); together they make up `vk_fence_wait_us` in
+`XlorieVkTiming`. `after_root_us` is a root copy made in the same renderer loop pass right before a frame, the whole
+of it (its fence included) - time that frame waited behind it.
+
+`XlorieRootCopyTiming`, the root double buffering copies by the renderer's GPU (`TERMUX_X11_RENDERER_ROOT_GPU_COPY=1`):
+`take_us` from the X server's request to the renderer taking it, `record_us` from there to its submission; its fence
+is `fence_root_us` above. Where the X server had to wait for one (its next access to the buffer, or its next swap):
+`x_block_us` that wait, `resume_us` from the renderer settling the copy to the X server going on. A copy settled
+before the X server needed it costs no wait and is in neither. `worst_*`: the period's slowest copy, from its request
+to its completion, and its parts.
+
+`XlorieXLatency`, the X server's side: `request_us` each client request's handling in Dispatch, and the period's
+slowest as `worst_request=client:command:extension:major.minor` (the client's index and command name, `core` for a
+core request); `access_us` how long an EXA access to an AHB under PER_ACCESS (Vulkan) held the shared lock - the
+renderer cannot record a frame meanwhile - `access_lock_us` its wait for that lock, `access_gpu_us` its wait for a
+Vulkan frame using the AHB; `tick_delay_us` from the vsync callback to the tick running on the X server's thread
+(`callback_to_tick_us` of `XlorieTick` with its tail), `tick_work_us` the tick's work up to asking for the frame.
+
+Reading them: a hitch shows as `frame_start_us` h16/h33; where its time went is in the same period's other keys and
+the worst frame's breakdown - waiting for the tick (`wake_us`, `tick_delay_us`, a long `request_us`), for the X
+server's lock (`lock_us`, `access_us`), behind a root copy (`after_root_us`, `x_block_us`), on the GPU (the fences), or
+in the presentation engine (`acquire_us`, `present_us`). `tools/diag/frame-diag-session.sh` records one session in
+three marked phases for this.
+
 `XlorieVkTransfer` says why copies were drawn instead. `checked` counts the queued copies looked at, `copied` is
 `copy_commands`. Each `not_*` counts the copies one condition kept from `vkCmdCopyImage` (a copy can count under
 several): `same` (one buffer), `format` (two Vulkan formats or byte orders, e.g. BGRA into RGBX), `rgbx_alpha`
@@ -160,6 +225,11 @@ the iteration, the byte and its expected and actual value, and the VkResult.
 ## Scripts
 
 `renderer-status.sh [--file LOG]` - prints the latest of those lines (and the GLES driver line).
+
+`frame-diag-session.sh [OUT]` (P11-C3) - with the X server started with `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1`: three
+phases marked in the log (`XlorieMark: phase=...`, also in the file with their times) - the screen left alone for 10 s,
+glmark2 alone for 10 s, glmark2 while XFCE windows are moved for 20 s - each started when you press Enter, then the
+X server's `LorieNative` lines from the session's start saved to OUT (default `~/frame-diag-<date>-<time>.log`).
 
 `renderer-proof.sh --expect vulkan|gles [--reports N] [--file LOG]` - judges the last N reports (default 3,
 15 seconds) and prints every check with its numbers; exit 0 PASS, 1 FAIL, 2 not enough reports.
