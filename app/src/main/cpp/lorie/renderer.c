@@ -2160,16 +2160,23 @@ static void rendererVkClear(void) {
  * (rendererVkFrameDone), before the completed serial is published. The swapchain image is acquired before taking
  * the lock, presented after the fence. None of GLES's swap heuristics (backpressure guard, high-refresh limiter, DeX present skip,
  * coalescing) are fed from here: Vulkan has its own timings (vk_* in the diagnostics).
+ *
+ * P11-C1 (TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1), still one submission in flight at a time: the copies queued go ahead
+ * in a submission of their own in every present mode, as under FIFO - published at their own fence, waiting neither
+ * for the image nor for the screen's draw; and a frame carrying none of the X server's copies is presented as soon
+ * as it is submitted - the presentation engine waits for it on the GPU (rendered[index]) - while this thread waits
+ * for its fence. A frame that does carry copies (queued after those went ahead) keeps the order above: their
+ * completion is published before the present call, never after it.
  */
 static void rendererVkRedraw(bool *waitingForBuffers) {
     LorieBuffer *buffer;
     LorieBuffer_Desc *desc;
     struct lorie_vk_image *root = NULL;
     struct lorie_vk_quad rootQuad, cursorQuad;
-    bool cursor = false, owned;
+    bool cursor = false, owned, submitOpt = state->backend.vkSubmitOpt, early;
     uint64_t serial = 0, startUs, lockedUs, inflightUs = 0, submittedUs = 0, fencedUs = 0;
     uint32_t readIndex = 0, index;
-    int status, filter = filtering == GL_LINEAR;
+    int status, presented = LORIE_VK_FRAME_OK, filter = filtering == GL_LINEAR;
     VkResult res = VK_SUCCESS;
 
     pthread_spin_lock(&bufferLock);
@@ -2208,8 +2215,10 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     if (vkr.recreate && !lorieVkSwapchainCreate(&vk, &vkr, win, state))
         return rendererVkFail();
     // FIFO: the image below may come only with the display's next refresh, and the copies queued do not wait for
-    // it - they go in a submission of their own first. Otherwise they go in the frame's.
-    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+    // it - they go in a submission of their own first. Otherwise they go in the frame's - or, P11-C1, first too.
+    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR || submitOpt) {
+        if (vkr.presentMode != VK_PRESENT_MODE_FIFO_KHR && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex)
+            LORIE_DIAG_ADD(state, vkCopiesAhead, 1);
         rendererVkApplyPendingGpuCopies();
         if (!vkActive)
             return;     // failed (rendererVkFail)
@@ -2307,6 +2316,12 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
+    // once the fence was waited for, as the present below.
+    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        presented = lorieVkPresent(&vk, &vkr, index, state);
+        LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
+    }
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
@@ -2336,7 +2351,9 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     }
     if (res != VK_SUCCESS)
         return rendererVkFail();
-    if (lorieVkPresent(&vk, &vkr, index, state) == LORIE_VK_FRAME_FATAL)
+    if (!early)
+        presented = lorieVkPresent(&vk, &vkr, index, state);
+    if (presented == LORIE_VK_FRAME_FATAL)
         return rendererVkFail();
     state->renderedFrames++;
 }
@@ -2494,7 +2511,8 @@ __noreturn static void* rendererThread(void) {
         pthread_mutex_unlock(&stateLock);
 
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
-        // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
+        // lock+fence with the root/cursor draw, instead of two GPU round trips per frame (unless FIFO or
+        // TERMUX_X11_RENDERER_VK_SUBMIT_OPT: then the frame sends the copies ahead in a submission of their own).
         bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
         if (vkActive) {
             if (state && state->surfaceAvailable && !state->waitForNextFrame &&

@@ -590,6 +590,12 @@ CONTROLS = [
      """    state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
+    // once the fence was waited for, as the present below.
+    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        presented = lorieVkPresent(&vk, &vkr, index, state);
+        LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
+    }
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
@@ -600,6 +606,10 @@ CONTROLS = [
     }""",
      """    state->waitForNextFrame = true;
 
+    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        presented = lorieVkPresent(&vk, &vkr, index, state);
+        LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
+    }
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
@@ -686,16 +696,12 @@ CONTROLS = [
      """    loriePerformVblanks();""",
      "twiring"),
     ("FIFO copies held up by the frame's swapchain image", "renderer.c",
-     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
-        rendererVkApplyPendingGpuCopies();""",
-     """    if (0) {
-        rendererVkApplyPendingGpuCopies();""",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR || submitOpt) {""",
+     """    if (submitOpt) {""",
      "tpresentcopy"),
-    ("copies in a submission of their own whatever the present mode", "renderer.c",
-     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
-        rendererVkApplyPendingGpuCopies();""",
-     """    if (1) {
-        rendererVkApplyPendingGpuCopies();""",
+    ("copies in a submission of their own whatever the present mode, the option off", "renderer.c",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR || submitOpt) {""",
+     """    if (1) {""",
      "tpresentcopy"),
     ("the root swap writing the front while a frame samples it", "InitOutput.c",
      """    lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(front)->id);     // the last frame sampling it
@@ -854,6 +860,32 @@ CONTROLS = [
      """write ? AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,""",
      """write ? AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,""",
      "tbufferlock"),
+    ("P11-C1: the copies not ahead of the frame", "renderer.c",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR || submitOpt) {""",
+     """    if (vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR) {""",
+     "tpresentcopy"),
+    ("P11-C1: a frame carrying copies presented before they are published", "renderer.c",
+     """    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {""",
+     """    if ((early = submitOpt && res == VK_SUCCESS)) {""",
+     "tpresentcopy"),
+    ("P11-C1: an early present's failure not taken up", "renderer.c",
+     """    if (presented == LORIE_VK_FRAME_FATAL)
+        return rendererVkFail();
+    state->renderedFrames++;""",
+     """    if (!early && presented == LORIE_VK_FRAME_FATAL)
+        return rendererVkFail();
+    state->renderedFrames++;""",
+     "tpresentcopy"),
+    ("P11-C1: a frame presented early presented again after its fence", "renderer.c",
+     """    if (!early)
+        presented = lorieVkPresent(&vk, &vkr, index, state);""",
+     """    if (1)
+        presented = lorieVkPresent(&vk, &vkr, index, state);""",
+     "tpresentcopy"),
+    ("P11-C1: frames presented early with the option off", "renderer.c",
+     """    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {""",
+     """    if ((early = res == VK_SUCCESS && !serial)) {""",
+     "tpresentcopy"),
     ("TERMUX_X11_RENDERER_VK_TRANSFER_COPY: a region not clipped to the destination", "renderer.c",
      """        if (w > (int32_t) d->width - dx)
             w = (int32_t) d->width - dx;""",

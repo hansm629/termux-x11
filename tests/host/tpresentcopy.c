@@ -41,7 +41,17 @@
  *   made with it: imported without it, nothing recorded, drawn; BGRA into RGBX of depth 24 once the device check
  *   passed: copied as raw bits, every byte the source's and what the shader copy (quad.frag, modelled from the
  *   quad's flags) gives, red and blue apart in every source pixel - not passed, or depth 32: drawn; the option off: drawn, even between images that have the usage, and no import asks
- *   for it. */
+ *   for it.
+ *   TERMUX_X11_RENDERER_VK_SUBMIT_OPT (P11-C1), one submission in flight at a time still: under MAILBOX the copies
+ *   queued before a frame go ahead of it in a submission of their own and are published at its fence - their two
+ *   buffers alone in flight then, before the frame is submitted or presented - and the frame, carrying none, is
+ *   presented before its fence is waited for (the presentation engine on its semaphore), the root alone in flight
+ *   then; a copy queued while the image is acquired goes in the frame, which is then presented only after it is
+ *   published; with the image not given (the acquire timing out) the copies are published all the same (off: not
+ *   before a frame gets an image); an entry cancelled goes ahead too, skipped and completed; presented early and out
+ *   of date - the fence waited for, the buffers given back, the swapchain made again for the next frame; presented
+ *   early and the surface lost - the renderer gives up only after the fence and the buffers; FIFO not counted as the
+ *   option's. Off, no frame is ever presented before its fence. */
 #define _GNU_SOURCE         /* pthread_timedjoin_np: an X server thread never let go must not hang the test */
 #include <errno.h>
 #include <limits.h>
@@ -169,11 +179,20 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) { return LorieBuffe
 static uint64_t rootAtLock;     /* non-zero: the root id the X server publishes as the renderer takes the lock */
 static void lorie_mutex_lock(volatile int *m, volatile int *pid);
 static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pid = 0; }
-static void rendererVkFail(void) { vkFailures++; }
+/* how things stood when the renderer gave up: its frame's fence waited for, its buffers out of the in-flight list */
+static struct { bool fencePending, busy; } atFail;
+static void rendererVkFail(void) {
+    vkFailures++;
+    atFail.fencePending = emu.fencePending;
+    atFail.busy = state->gpuInFlight.busy;
+}
 /* the X server woken for a finished batch: how things stood at that moment */
-static struct { int count; bool cleared, fenceWaited, released; uint64_t completed; } notified;
+static struct { int count; bool cleared, fenceWaited, released; uint64_t completed; int presents, fenceWaits; } notified;
+static int fenceWaits(void);
 static void notifyGpuCopyDone(void) {
     notified.count++;
+    notified.presents = emu.presents;
+    notified.fenceWaits = fenceWaits();
     notified.cleared = !state->gpuInFlight.busy;
     notified.fenceWaited = !emu.fencePending;
     notified.released = true;
@@ -207,7 +226,9 @@ static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
 #include "presentcopy_src.inc"
 
 /* the moment the renderer waits for a frame's fence: the device runs the frame */
-static struct { int waits; bool lockHeld, otherOver; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } atFence;
+static struct { int waits; bool lockHeld, otherOver; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; int presents;
+                struct { uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } prev; } atFence;
+static int fenceWaits(void) { return atFence.waits; }
 static int gpuMs;                   /* how long the device takes, at the next fence */
 static volatile bool gpuFinished;
 static volatile bool otherOver;     /* the frame another submitter listed is over (otherSubmitter) */
@@ -217,6 +238,10 @@ static void lookAtFence(VkFence fence) {
     atFence.waits++;
     atFence.lockHeld |= state->lock != 0;
     atFence.otherOver = otherOver;
+    atFence.presents = emu.presents;
+    atFence.prev.busy = atFence.busy;
+    atFence.prev.count = atFence.count;
+    memcpy(atFence.prev.ids, atFence.ids, sizeof atFence.ids);
     atFence.busy = state->gpuInFlight.busy;
     atFence.count = state->gpuInFlight.count;
     memcpy(atFence.ids, (const void *) state->gpuInFlight.ids, sizeof atFence.ids);
@@ -457,6 +482,31 @@ static int notAsShader(LorieBuffer *src, LorieBuffer *dst, const BoxRec *box, in
             }
     }
     return wrong;
+}
+
+// whether the fence waited for before the last found exactly these buffers in flight
+static bool inFlightBeforeLast(int n, ...) {
+    va_list ap;
+    bool all = atFence.prev.busy && atFence.prev.count == (uint32_t) n;
+    va_start(ap, n);
+    for (int i = 0; i < n; i++) {
+        uint64_t id = va_arg(ap, LorieBuffer *)->desc.id;
+        bool found = false;
+        for (uint32_t k = 0; k < atFence.prev.count; k++)
+            found |= atFence.prev.ids[k] == id;
+        all &= found;
+    }
+    va_end(ap);
+    return all;
+}
+/* P11-C1: the early presents the option's cases made - none other may be made (with the option off) */
+static int earlyWithOption;
+/* P11-C1: a copy the X server queues while the renderer acquires the frame's image (after the copies went ahead) */
+static struct { PixmapPtr src, dst; uint64_t serial; void *dstBuffer; bool queued; } duringAcquire;
+static void queueDuringAcquire(void) {
+    if (duringAcquire.src && !duringAcquire.queued)
+        duringAcquire.queued = lorieTryScheduleGpuCopy(duringAcquire.src, duringAcquire.dst, NULL, 0, 0, &duringAcquire.serial,
+                                                       &duringAcquire.dstBuffer);
 }
 
 int main(void) {
@@ -863,6 +913,151 @@ int main(void) {
         vkr.smooth = false;
         vkr.recreate = true;
     }
+
+    /* P11-C1, TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1 - still one submission in flight at a time (the fake device fails
+     * a submission made before the last one's fence was waited for) */
+    st.backend.vkSubmitOpt = 1;
+    {
+        int waits, presents, early = emu.earlyPresents, n0, d1, fails0 = vkFailures;
+        uint32_t ahead = st.diag.vkCopiesAhead, earlyCount = st.diag.vkEarlyPresents, presented;
+
+        /* MAILBOX, a copy queued before the frame: ahead of it, in a submission of its own, published at its own
+         * fence - its buffers alone in flight then, before the frame was submitted or presented; the frame,
+         * carrying no copy, presented before its fence was waited for, the root alone in flight */
+        own(31);
+        rendererVkRedraw(&waiting);             /* the present mode asked for above made again: MAILBOX */
+        st.gpuInFlight.busy = 0;
+        CHECK(vkr.presentMode == VK_PRESENT_MODE_MAILBOX_KHR, "submit opt: the swapchain not MAILBOX");
+        submits0 = st.diag.vkQueueSubmits;
+        ahead = st.diag.vkCopiesAhead;
+        earlyCount = st.diag.vkEarlyPresents;
+        early = emu.earlyPresents;
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &serial, &dstBuffer), "submit opt: not queued");
+        waits = atFence.waits, presents = emu.presents, n0 = notified.count, d1 = emu.draws;
+        presented = st.diag.vkFramesPresented;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(vkFailures == fails0 && emu.violations == 0 && st.lock == 0 && st.diag.vkQueueSubmits == submits0 + 2 &&
+              st.diag.vkCopiesAhead == ahead + 1 && st.diag.vkFramesPresented == presented + 1,
+              "submit opt, a copy queued before the frame: %d failures, %d violations, %u submissions (want 2), %u ahead, %u presented",
+              vkFailures - fails0, emu.violations, st.diag.vkQueueSubmits - submits0, st.diag.vkCopiesAhead - ahead,
+              st.diag.vkFramesPresented - presented);
+        CHECK(lorieGpuCopyIsDone(serial) && notified.count == n0 + 1 && notified.fenceWaits == waits + 1 && notified.presents == presents &&
+              notified.cleared && notified.released && notified.fenceWaited,
+              "submit opt, a copy queued before the frame: published %d times, after %d fences (want 1), %d presents (want 0), "
+              "in flight %s", notified.count - n0, notified.fenceWaits - waits, notified.presents - presents,
+              notified.cleared ? "cleared" : "not cleared");
+        CHECK(atFence.waits == waits + 2 && inFlightBeforeLast(2, bgra, redirected) && inFlightAtFence(1, root) &&
+              atFence.presents == presents + 1 && emu.earlyPresents == early + 1 && st.diag.vkEarlyPresents == earlyCount + 1,
+              "submit opt, a copy queued before the frame: the copy's fence with %u buffers (want its two), the frame's with %u "
+              "(want the root), presented %d times before the frame's fence (want 1)", atFence.prev.count, atFence.count,
+              atFence.presents - presents);
+        CHECK(emu.draws - d1 == 2 && emu.drawnFrom[d1 % 64] == bgra->desc.buffer && emu.drawnInto[d1 % 64] == redirected->desc.buffer &&
+              emu.drawnFrom[(d1 + 1) % 64] == root->desc.buffer && !emu.drawnInto[(d1 + 1) % 64],
+              "submit opt, a copy queued before the frame: not the copy, then the root on screen");
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+
+        /* a copy queued while the frame's image is acquired (after the copies went ahead): in the frame - which is
+         * presented only once that copy is published, as with the option off */
+        duringAcquire = (__typeof__(duringAcquire)) { &bgraPix, &redirectedPix };
+        emuOnAcquire = queueDuringAcquire;
+        submits0 = st.diag.vkQueueSubmits;
+        ahead = st.diag.vkCopiesAhead, early = emu.earlyPresents, presents = emu.presents, n0 = notified.count;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        emuOnAcquire = NULL;
+        CHECK(duringAcquire.queued && lorieGpuCopyIsDone(duringAcquire.serial) && st.diag.vkQueueSubmits == submits0 + 1 &&
+              st.diag.vkCopiesAhead == ahead && notified.count == n0 + 1 && notified.presents == presents &&
+              emu.presents == presents + 1 && emu.earlyPresents == early && inFlightAtFence(3, bgra, redirected, root) &&
+              vkFailures == fails0 && emu.violations == 0,
+              "submit opt, a copy queued during the acquire: queued %d, done %d, %u submissions (want 1), published after %d "
+              "presents (want 0), %d early presents (want 0)", duringAcquire.queued, lorieGpuCopyIsDone(duringAcquire.serial),
+              st.diag.vkQueueSubmits - submits0, notified.presents - presents, emu.earlyPresents - early);
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&bgraPix, duringAcquire.dstBuffer);
+
+        /* the image not given (the acquire timing out): the copy queued is published all the same - with the option
+         * off it waits for the next frame that gets an image */
+        for (int v = 0; v < 2; v++) {
+            uint64_t s;
+            void *db;
+            st.backend.vkSubmitOpt = (uint8_t) v;
+            CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0, &s, &db), "acquire timing out: not queued");
+            emu.acquireResult = VK_TIMEOUT;
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            emu.acquireResult = VK_SUCCESS;
+            CHECK(lorieGpuCopyIsDone(s) == (v == 1) && vkFailures == fails0 && emu.violations == 0,
+                  "acquire timing out, the option %s: the copy %s", v ? "on" : "off", lorieGpuCopyIsDone(s) ? "done" : "not done");
+            rendererVkRedraw(&waiting);         /* the image given: the copy done either way */
+            CHECK(lorieGpuCopyIsDone(s) && vkFailures == fails0 && emu.violations == 0, "acquire timing out, the option %s: never done",
+                  v ? "on" : "off");
+            st.gpuInFlight.busy = 0;
+            lorieGpuCopyAck(&bgraPix, db);
+        }
+        st.backend.vkSubmitOpt = 1;
+
+        /* an entry the X server cancelled: ahead too, skipped and completed, nothing drawn from it */
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0, &serial, &dstBuffer), "cancelled: not queued");
+        st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY].cancelled = 1;
+        d1 = emu.draws;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(lorieGpuCopyIsDone(serial) && emu.draws - d1 == 1 && emu.drawnFrom[d1 % 64] == root->desc.buffer && vkFailures == fails0 &&
+              emu.violations == 0, "cancelled: done %d, %d draws (want the root's alone)", lorieGpuCopyIsDone(serial), emu.draws - d1);
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+
+        /* presented early, out of date: the frame's fence still waited for, its buffers given back, the swapchain made
+         * again for the next frame - no failure */
+        {
+            int made = emu.swapchainsMade;
+            emu.presentResult = VK_ERROR_OUT_OF_DATE_KHR;
+            early = emu.earlyPresents;
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            emu.presentResult = VK_SUCCESS;
+            CHECK(emu.earlyPresents == early + 1 && vkr.recreate && !st.gpuInFlight.busy && !emu.fencePending && vkFailures == fails0 &&
+                  emu.violations == 0, "early present out of date: recreate %d, in flight %d, fence %s, %d failures", vkr.recreate,
+                  st.gpuInFlight.busy, emu.fencePending ? "not waited for" : "waited for", vkFailures - fails0);
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            CHECK(emu.swapchainsMade == made + 1 && !vkr.recreate && vkFailures == fails0 && emu.violations == 0,
+                  "early present out of date: the swapchain not made again by the next frame");
+        }
+
+        /* presented early, the surface lost: the renderer gives up only once the frame's fence was waited for and its
+         * buffers given back */
+        emu.presentResult = VK_ERROR_SURFACE_LOST_KHR;
+        st.drawRequested = 1;
+        atFail.fencePending = atFail.busy = true;
+        rendererVkRedraw(&waiting);
+        emu.presentResult = VK_SUCCESS;
+        CHECK(vkFailures == fails0 + 1 && !atFail.fencePending && !atFail.busy && emu.violations == 0,
+              "early present failing: %d failures, at the failure the fence %s and the buffers %s", vkFailures - fails0,
+              atFail.fencePending ? "not waited for" : "waited for", atFail.busy ? "still in flight" : "given back");
+        vkFailures = fails0;
+        st.diag.lastFallbackClass = st.diag.lastFallbackReason = 0;
+
+        /* FIFO: the copies went ahead already - not counted as the option's */
+        own(32);
+        vkr.smooth = true;
+        vkr.recreate = true;
+        ahead = st.diag.vkCopiesAhead;
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0, &serial, &dstBuffer), "FIFO with the option: not queued");
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(vkr.presentMode == VK_PRESENT_MODE_FIFO_KHR && lorieGpuCopyIsDone(serial) && st.diag.vkCopiesAhead == ahead &&
+              vkFailures == fails0 && emu.violations == 0, "FIFO with the option: done %d, counted ahead %u", lorieGpuCopyIsDone(serial),
+              st.diag.vkCopiesAhead - ahead);
+        st.gpuInFlight.busy = 0;
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+        vkr.smooth = false;
+        vkr.recreate = true;
+    }
+    st.backend.vkSubmitOpt = 0;
+    earlyWithOption = emu.earlyPresents;
 
     /* the root published under the lock not one the renderer has: the old one not sampled, the image kept for the
      * next frame, which uses it once the root is there */
@@ -1376,6 +1571,8 @@ int main(void) {
     CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",
           emu.violations);
+    CHECK(emu.earlyPresents == earlyWithOption, "%d presents before their frame's fence with TERMUX_X11_RENDERER_VK_SUBMIT_OPT off",
+          emu.earlyPresents - earlyWithOption);
     printf("TPRESENTCOPY a Present copy from the X server through Vulkan and back, as GLES does it: %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);
     return fails != 0;

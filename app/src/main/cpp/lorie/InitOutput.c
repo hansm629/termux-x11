@@ -352,6 +352,9 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1, Present copies by vkCmdCopyImage where equivalent (renderer.c).
     lorieScreen.state->backend.vkTransferCopy = getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY") &&
                                                 !strcmp(getenv("TERMUX_X11_RENDERER_VK_TRANSFER_COPY"), "1");
+    // Experimental: TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1, the Vulkan frames' submissions and presents (renderer.c).
+    lorieScreen.state->backend.vkSubmitOpt = getenv("TERMUX_X11_RENDERER_VK_SUBMIT_OPT") &&
+                                             !strcmp(getenv("TERMUX_X11_RENDERER_VK_SUBMIT_OPT"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
@@ -959,7 +962,7 @@ static void lorieLogRendererDiag(void) {
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
-              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s",
+              "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -971,7 +974,7 @@ static void lorieLogRendererDiag(void) {
         d.xOwnershipTransitions, d.xOwnershipRefused, TD(xAhbCpuAcquires), TD(xStateLockWaitUs), TD(xGpuWaitUs),
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
-        !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on");
+        !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off");
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -985,10 +988,11 @@ static void lorieLogRendererDiag(void) {
         TD(vkQueuePresentSuccess), TD(vkFramesPresented));
     log(INFO, "XlorieVkTiming: acquire_success=%llu(+%llu) acquire_suboptimal=%llu(+%llu) acquire_timeout=%llu(+%llu) "
               "acquire_not_ready=%llu(+%llu) acquire_out_of_date=%llu(+%llu) acquire_wait_us=%llu(+%llu) "
-              "submit_cpu_us=%llu(+%llu) fence_wait_us=%llu(+%llu) present_call_us=%llu(+%llu) selftest=%s "
-              "device=\"%s\" driver_version=0x%x api_version=0x%x present_mode=\"%s\"",
+              "submit_cpu_us=%llu(+%llu) fence_wait_us=%llu(+%llu) present_call_us=%llu(+%llu) copies_ahead=%llu(+%llu) "
+              "early_presents=%llu(+%llu) selftest=%s device=\"%s\" driver_version=0x%x api_version=0x%x present_mode=\"%s\"",
         TD(vkAcquireSuccess), TD(vkAcquireSuboptimal), TD(vkAcquireTimeout), TD(vkAcquireNotReady),
         TD(vkAcquireOutOfDate), TD(vkAcquireWaitUs), TD(vkSubmitCpuUs), TD(vkFenceWaitUs), TD(vkPresentCallUs),
+        TD(vkCopiesAhead), TD(vkEarlyPresents),
         d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none",
         (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode);
     log(INFO, "XlorieVkSelftest: result=%s compares=%llu(+%llu) iterations=%u formats_passed=0x%x formats_unavailable=0x%x "

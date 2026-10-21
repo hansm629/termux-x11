@@ -9,11 +9,11 @@ in its own log, which Termux can read with `logcat -d`:
 XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=GLES|VULKAN|NONE ownership=...
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
                 x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
-                x_yield_on_wake=on|off root_copy_opt=on|off|fallback
+                x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
-XlorieVkTiming: acquire results, acquire/submit/fence/present times, self-test, device, present mode
+XlorieVkTiming: acquire results, acquire/submit/fence/present times, copies_ahead, early_presents, self-test, device, present mode
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -60,6 +60,12 @@ root double buffering): its swap then locks the back for CPU reads only and the 
 within the bounds of the damage copied, instead of both for reads and writes, whole. `fallback` once such a lock was
 refused: the swaps of the session then take the whole-buffer locks again. Its effect shows in `x_ahb_cpu_lock_us` (all
 the X server's AHB locks, not only the swap's), `x_root_copy_us` and `x_state_lock_wait_us`.
+`vk_submit_opt` is `on` when the X server was started with `TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1` (experimental,
+Vulkan): the copies queued when a frame is drawn go ahead of it in a submission of their own in every present mode (as
+under FIFO), published at their own fence; and a frame carrying none of them is presented right after it is
+submitted, before its fence is waited for. `XlorieVkTiming` `copies_ahead` counts the frames whose copies went ahead
+where they would have gone in the frame's (not under FIFO), `early_presents` the frames presented before their fence.
+The frame's fence is still waited for before the next submission (one in flight), and so is the image's acquire fence.
 `x_yield_on_wake` is `on` when the X server was started with `TERMUX_X11_X_YIELD_ON_WAKE=1` (experimental): a vsync
 tick or a GPU copy's completion then breaks off the client dispatch round in progress at its next request boundary,
 runs right away, and the round goes on with the rest of its slice - instead of waiting for the round to end. Its

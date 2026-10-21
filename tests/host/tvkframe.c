@@ -14,7 +14,8 @@
  *   between is a failure, and a presented frame starts the count over. A frame: each X server buffer acquired once from
  *   FOREIGN, moved between uses, released once; draws counted only after the fence; a failed or injected
  *   submission moves no counter and acquires nothing; a fence that does not signal is waited out (device idle)
- *   before returning. Present: each result handled; the frame's fence waited for before it. */
+ *   before returning. Present: each result handled; the frame's fence waited for before it (lorieVkFrameSubmit), and
+ *   what it waits for a semaphore a submission signalled - never one signalled twice. */
 #include "fakevk.h"
 
 static struct lorie_shared_server_state st;
@@ -371,6 +372,9 @@ int main(void) {
             for (unsigned k = 0; k < sizeof t / sizeof *t; k++) {
                 uint32_t presented = st.diag.vkFramesPresented;
                 r.recreate = false;
+                /* a frame into image 0 first: its semaphore is what the present waits for */
+                CHECK(lorieVkFrameBegin(&vk, &r) == VK_SUCCESS && lorieVkFrameSubmit(&vk, &r, 0, true, &st) == VK_SUCCESS,
+                      "present %d: no frame submitted before it", t[k].result);
                 emu.presentResult = t[k].result;
                 CHECK(lorieVkPresent(&vk, &r, 0, &st) == t[k].want && (st.diag.vkFramesPresented == presented + 1) == t[k].counted &&
                       r.recreate == (t[k].result == VK_ERROR_OUT_OF_DATE_KHR), "present %d: handled wrongly", t[k].result);
@@ -402,6 +406,7 @@ int main(void) {
           emu.live, emu.swapchains, emu.surfaces, emu.fences, imp.images, imp.memories, imp.views, emu.ahbLive);
     lorieVkDestroyDevice(&vk);
 
+    CHECK(emu.earlyPresents == 0, "%d presents before their frame's fence was waited for", emu.earlyPresents);
     printf("TVKFRAME swapchain and frames on a small device: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
 }

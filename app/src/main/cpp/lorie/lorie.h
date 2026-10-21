@@ -279,6 +279,10 @@ struct lorie_backend_control {
     volatile uint8_t vkSelftestInvalid;         /* X: the variable was set, to something else */
     volatile uint8_t vkTransferCopy;            /* X: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1 - experimental: Present copies
                                                  * by vkCmdCopyImage where that gives what the shader copy gives */
+    volatile uint8_t vkSubmitOpt;               /* X: TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1 - experimental (renderer.c
+                                                 * rendererVkRedraw): the copies queued go ahead of a frame, in a
+                                                 * submission of their own, in every present mode; a frame with none of
+                                                 * them is presented before its fence is waited for */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };
@@ -385,6 +389,9 @@ struct lorie_renderer_diag {
     volatile uint32_t vkQueueSubmits, vkQueuePresentSuccess, vkFramesPresented;
     volatile uint32_t vkAcquireSuccess, vkAcquireSuboptimal, vkAcquireTimeout, vkAcquireNotReady, vkAcquireOutOfDate;
     volatile uint64_t vkAcquireWaitUs, vkSubmitCpuUs, vkFenceWaitUs, vkPresentCallUs;
+    /* TERMUX_X11_RENDERER_VK_SUBMIT_OPT: frames whose queued copies went ahead in a submission of their own where
+     * they would have gone in the frame's (not FIFO); frames presented before their fence was waited for */
+    volatile uint32_t vkCopiesAhead, vkEarlyPresents;
     volatile uint8_t vkSelftest;                /* 0 not run, 1 passed, 2 failed */
     /* the ownership self-test (vk.c lorieVkSelftest): byte-exact compares that passed, iterations per format and
      * direction, formats that passed / could not be tested (bit 0 RGBA, 1 RGBX, 2 BGRA), its duration; where it

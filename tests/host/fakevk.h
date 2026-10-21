@@ -88,6 +88,7 @@ static struct {
     AHardwareBuffer *drawnFrom[64], *drawnInto[64];    /* draw n's X server buffers (NULL: none), at n % 64 */
     long copies, locks;
     bool fencePending;
+    int earlyPresents;              /* presents made before the frame's fence was waited for (on the semaphore alone) */
     int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
     int flushes, invalidates, downloads, hostBarriers, cpuWrites;
 } emu;
@@ -789,10 +790,34 @@ static bool *signaled(VkFence f) {
             return &fences[i].signaled;
     return NULL;
 }
+/* binary semaphores signalled and not yet waited on: a signal must find its semaphore unsignalled, a wait (a
+ * submission's, a present's) one a submission signalled - and leaves it unsignalled */
+static VkSemaphore semaphoresSignalled[32];
+static bool semaphoreSignalled(VkSemaphore s, int set) {
+    int i, free = -1;
+    for (i = 0; i < 32; i++) {
+        if (s && semaphoresSignalled[i] == s) {
+            if (set == 0)
+                semaphoresSignalled[i] = VK_NULL_HANDLE;
+            return true;
+        }
+        if (!semaphoresSignalled[i] && free < 0)
+            free = i;
+    }
+    if (set == 1 && free >= 0)
+        semaphoresSignalled[free] = s;
+    return false;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *s, VkFence f) {
     (void) q;
     if (emu.submitResult != VK_SUCCESS)
         return emu.submitResult;
+    for (uint32_t i = 0; i < s->waitSemaphoreCount; i++)
+        if (!semaphoreSignalled(s->pWaitSemaphores[i], 0))
+            violation("a submission waiting for a semaphore nothing signalled");
+    for (uint32_t i = 0; i < s->signalSemaphoreCount; i++)
+        if (semaphoreSignalled(s->pSignalSemaphores[i], 1))
+            violation("a submission signalling a semaphore already signalled");
     if (f && signaled(f) && *signaled(f))
         violation("submission with a signalled fence");
     CHECK(n == 1 && s->commandBufferCount == 1 && s->pCommandBuffers[0] == (VkCommandBuffer) &cmdObj && !cmdObj.recording,
@@ -989,8 +1014,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL fGetSwapchainImagesKHR(VkDevice d, VkSwapc
     *n = count;
     return VK_SUCCESS;
 }
+static void (*emuOnAcquire)(void);   /* a test's moment while the renderer acquires an image */
 static VKAPI_ATTR VkResult VKAPI_CALL fAcquireNextImageKHR(VkDevice d, VkSwapchainKHR s, uint64_t timeout, VkSemaphore sem, VkFence f, uint32_t *index) {
     (void) d; (void) s;
+    if (emuOnAcquire)
+        emuOnAcquire();
     CHECK(timeout != UINT64_MAX && !sem && f, "fake device: acquire with an unbounded wait, a semaphore, or no fence");
     emu.acquires2++;
     if (signaled(f) && *signaled(f))
@@ -1005,7 +1033,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL fAcquireNextImageKHR(VkDevice d, VkSwapcha
 static VKAPI_ATTR VkResult VKAPI_CALL fQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *info) {
     (void) q;
     CHECK(info->waitSemaphoreCount == 1 && info->swapchainCount == 1, "fake device: present without its semaphore");
-    CHECK(!emu.fencePending, "fake device: present before the frame's fence was waited for");
+    /* the presentation engine waits on the GPU for what the semaphore says: the frame's fence need not be waited for */
+    if (!semaphoreSignalled(info->pWaitSemaphores[0], 0))
+        violation("present waiting for a semaphore no submission signalled");
+    if (emu.fencePending)
+        emu.earlyPresents++;
     emu.presents++;
     return emu.presentResult;
 }
@@ -1109,7 +1141,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateSemaphore(VkDevice d, const VkSemap
     MADE(VkSemaphore, s);
     return VK_SUCCESS;
 }
-static VKAPI_ATTR void VKAPI_CALL fDestroySemaphore(VkDevice d, VkSemaphore s, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(s); }
+static VKAPI_ATTR void VKAPI_CALL fDestroySemaphore(VkDevice d, VkSemaphore s, const VkAllocationCallbacks *a) {
+    (void) d; (void) a;
+    semaphoreSignalled(s, 0);
+    GONE(s);
+}
 static VKAPI_ATTR void VKAPI_CALL fGetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r) {
     (void) d; (void) i;
     *r = (VkMemoryRequirements) { 512 * 512 * 4, 256, 0x7 };
