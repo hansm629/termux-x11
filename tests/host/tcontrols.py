@@ -412,8 +412,10 @@ CONTROLS = [
         lorieVkSwapchainDestroy(&vk, &vkr);
         vkActive = false;
     }
+    rendererVkPacingReset();
     releaseWinAndSurface(&win, &sfc);""",
      """    vkActive = false;
+    rendererVkPacingReset();
     releaseWinAndSurface(&win, &sfc);""",
      "twiring"),
     ("a Vulkan failure not torn down", "renderer.c",
@@ -434,9 +436,11 @@ CONTROLS = [
     ("the last session's ownership answer kept for the next", "renderer.c",
      """            }
             vkOwned = false;
+            rendererVkPacingReset();
 
             if (state) {""",
      """            }
+            rendererVkPacingReset();
 
             if (state) {""",
      "twiring"),
@@ -512,12 +516,16 @@ CONTROLS = [
      "tpresentcopy"),
     ("the copies alone published though their submission failed", "renderer.c",
      """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (res == VK_SUCCESS && state->backend.vkFrameDiag)
+            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);    // P11-C3: these copies' own fence
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
         uint64_t queued[LORIE_GPU_COPY_QUEUE_CAPACITY], publishedUs;
         uint32_t n = rendererVkQueuedTimes(readIndex, queued);""",
      """            rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (res == VK_SUCCESS && state->backend.vkFrameDiag)
+            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);    // P11-C3: these copies' own fence
     }
     if (1) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -597,7 +605,11 @@ CONTROLS = [
     // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
     // once the fence was waited for, as the present below.
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        if (diag)
+            ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
     }
     if (res == VK_SUCCESS) {
@@ -607,11 +619,17 @@ CONTROLS = [
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (diag)
+            ft.fenceUs = vkr.fenceWaitUs;   // this frame's own fence (P11-C3)
     }""",
      """    state->waitForNextFrame = true;
 
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        if (diag)
+            ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
     }
     if (res == VK_SUCCESS) {
@@ -621,6 +639,8 @@ CONTROLS = [
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (diag)
+            ft.fenceUs = vkr.fenceWaitUs;   // this frame's own fence (P11-C3)
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);""",
      "tpresentcopy"),
@@ -881,10 +901,12 @@ CONTROLS = [
     state->renderedFrames++;""",
      "tpresentcopy"),
     ("P11-C1: a frame presented early presented again after its fence", "renderer.c",
-     """    if (!early)
-        presented = lorieVkPresent(&vk, &vkr, index, state);""",
-     """    if (1)
-        presented = lorieVkPresent(&vk, &vkr, index, state);""",
+     """    if (!early) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();""",
+     """    if (1) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();""",
      "tpresentcopy"),
     ("P11-C1: frames presented early with the option off", "renderer.c",
      """    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {""",
@@ -933,10 +955,14 @@ CONTROLS = [
      """    if (res == VK_SUCCESS) {
         rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        if (diag)
+            submittedUs = lorieMonotonicUs();
     }""",
      """    if (res == VK_SUCCESS) {
         rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        if (diag)
+            submittedUs = lorieMonotonicUs();
         rendererRootCopySettle(seq, false);
     }""",
      "tpresentcopy"),
@@ -944,15 +970,23 @@ CONTROLS = [
      """    if (res == VK_SUCCESS) {
         rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        if (diag)
+            submittedUs = lorieMonotonicUs();
     }""",
      """    if (res == VK_SUCCESS) {
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        if (diag)
+            submittedUs = lorieMonotonicUs();
     }""",
      "tpresentcopy"),
     ("P11-C2: a root copy drawn without the PER_ACCESS answer", "renderer.c",
      """    state->rootCopy.pid = getpid();
+    if (diag)
+        takenUs = lorieMonotonicUs();
     if (!rendererVkOwnedLocked()) {""",
      """    state->rootCopy.pid = getpid();
+    if (diag)
+        takenUs = lorieMonotonicUs();
     if (0) {""",
      "tpresentcopy"),
     ("P11-C2: a root copy into a buffer the renderer does not have settled as copied", "renderer.c",
@@ -981,6 +1015,64 @@ CONTROLS = [
      """        if (0)
             w = (int32_t) d->width - dx;""",
      "tpresentcopy"),
+]
+
+
+# P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: the timings' own controls
+CONTROLS += [
+    ("P11-C3: a root copy's fence counted as a frame's", "renderer.c",
+     """            lorieHistAdd(&dg->vkFenceRoot, vkr.fenceWaitUs);""",
+     """            lorieHistAdd(&dg->vkFrameFence, vkr.fenceWaitUs);""",
+     "tpresentcopy"),
+    ("P11-C3: the copies' own fence counted as the frame's", "renderer.c",
+     """            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);    // P11-C3: these copies' own fence""",
+     """            lorieHistAdd(&state->diag.vkFrameFence, vkr.fenceWaitUs);""",
+     "tpresentcopy"),
+    ("P11-C3: every fence's wait so far as the frame's", "renderer.c",
+     """            ft.fenceUs = vkr.fenceWaitUs;   // this frame's own fence (P11-C3)""",
+     """            ft.fenceUs = state->diag.vkFenceWaitUs;""",
+     "tpresentcopy"),
+    ("P11-C3: the copies' fence sampled with the option off", "renderer.c",
+     """        if (res == VK_SUCCESS && state->backend.vkFrameDiag)
+            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);""",
+     """        if (res == VK_SUCCESS)
+            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);""",
+     "tpresentcopy"),
+    ("P11-C3: a root copy's end stamped with the option off", "renderer.c",
+     """    if (state->backend.vkFrameDiag)
+        state->rootCopy.doneUs = lorieMonotonicUs();""",
+     """    state->rootCopy.doneUs = lorieMonotonicUs();""",
+     "tpresentcopy"),
+    ("P11-C3: the first frame after a reset an interval (from 0)", "renderer.c",
+     """    if (!prev)
+        return LORIE_VK_INTERVAL_FIRST;""",
+     """    if (!prev && 0)
+        return LORIE_VK_INTERVAL_FIRST;""",
+     "tpresentcopy"),
+    ("P11-C3: an idle gap's bound taken as a gap", "renderer.c",
+     """    if (now - prev > LORIE_VK_IDLE_GAP_US)""",
+     """    if (now - prev >= LORIE_VK_IDLE_GAP_US)""",
+     "tpresentcopy"),
+    ("P11-C3: a stamp before the last sampled as a huge interval", "renderer.c",
+     """    if (now < prev)
+        return LORIE_VK_INTERVAL_INVALID;""",
+     """    if (0)
+        return LORIE_VK_INTERVAL_INVALID;""",
+     "tpresentcopy"),
+    ("P11-C3: a tick's request the last frame took up already taken as this one's wake", "renderer.c",
+     """    if (t->wantedUs && t->wantedUs > lastStartUs && t->wantedUs <= t->startUs""",
+     """    if (t->wantedUs && t->wantedUs <= t->startUs""",
+     "tpresentcopy"),
+    ("P11-C3: the root copy kept as ahead of every later frame", "renderer.c",
+     """        ft.afterRootUs = vkRootCopyBusyUs;
+        vkRootCopyBusyUs = 0;""",
+     """        ft.afterRootUs = vkRootCopyBusyUs;""",
+     "tpresentcopy"),
+    ("P11-C3: the pacing not started over with another X server session", "renderer.c",
+     """            vkOwned = false;
+            rendererVkPacingReset();""",
+     """            vkOwned = false;""",
+     "twiring"),
 ]
 
 def copy_sources(dst):

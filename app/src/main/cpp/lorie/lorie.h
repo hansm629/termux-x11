@@ -279,6 +279,7 @@ struct lorie_backend_control {
     volatile uint8_t vkSelftestInvalid;         /* X: the variable was set, to something else */
     volatile uint8_t vkTransferCopy;            /* X: TERMUX_X11_RENDERER_VK_TRANSFER_COPY=1 - experimental: Present copies
                                                  * by vkCmdCopyImage where that gives what the shader copy gives */
+    volatile uint8_t vkFrameDiag;               /* X: TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 - P11-C3's timings (lorie_hist) */
     volatile uint8_t vkSubmitOpt;               /* X: TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1 - experimental (renderer.c
                                                  * rendererVkRedraw): the copies queued go ahead of a frame, in a
                                                  * submission of their own, in every present mode; a frame with none of
@@ -371,6 +372,39 @@ static inline void lorieLatencyAdd(volatile struct lorie_latency *l, uint64_t us
     lorieLatencyAddWeighted(l, us, 1);
 }
 
+/*
+ * P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): a timing's samples on bounds fine around a 120 Hz refresh (8.333 ms)
+ * that hold 16.667 and 33.333 ms (two and four refreshes): how many, their sum, how many fell at or under each bound
+ * in microseconds (the last bucket: over the last bound), all counted up; and the largest since the X server last
+ * logged it, which it takes back to 0. The X server logs every 5 seconds' samples: count, mean, p95 and p99 (the
+ * bound of the bucket each falls in) and maximum, and how many were over 16.667 ms and over 33.333 ms (h16, h33).
+ */
+#define LORIE_HIST_BOUNDS 50, 100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 8500, \
+                          9000, 10000, 12000, 14000, 16667, 20000, 25000, 33333, 50000, 100000
+#define LORIE_HIST_BUCKETS 27
+#define LORIE_HIST_OVER_16MS 21     /* the buckets from this one on: over 16.667 ms */
+#define LORIE_HIST_OVER_33MS 24     /* over 33.333 ms */
+_Static_assert(sizeof((uint32_t[]) { LORIE_HIST_BOUNDS }) == sizeof(uint32_t) * (LORIE_HIST_BUCKETS - 1),
+               "LORIE_HIST_BUCKETS is LORIE_HIST_BOUNDS and one over the last");
+struct lorie_hist {
+    volatile uint32_t count, maxUs;
+    volatile uint64_t sumUs;
+    volatile uint32_t buckets[LORIE_HIST_BUCKETS];
+};
+
+static inline void lorieHistAdd(volatile struct lorie_hist *h, uint64_t us) {
+    static const uint32_t bounds[LORIE_HIST_BUCKETS - 1] = { LORIE_HIST_BOUNDS };
+    uint32_t v = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us, b = 0, max;
+    while (b < LORIE_HIST_BUCKETS - 1 && v > bounds[b])
+        b++;
+    __atomic_fetch_add(&h->count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&h->sumUs, us, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&h->buckets[b], 1, __ATOMIC_RELAXED);
+    max = __atomic_load_n(&h->maxUs, __ATOMIC_RELAXED);
+    while (v > max && !__atomic_compare_exchange_n(&h->maxUs, &max, v, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        ;
+}
+
 struct lorie_renderer_diag {
     volatile uint8_t active;                    /* LORIE_ACTIVE_*: what draws the root right now */
 
@@ -434,6 +468,31 @@ struct lorie_renderer_diag {
     volatile uint64_t rootGpuCopyBytes, rootGpuCopyCompletionUs;
     volatile uint32_t rootCpuFallbacks, rootCpuSmall;
     volatile uint64_t rootCopyCpuBlockUs;
+
+    /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG (struct lorie_hist), CLOCK_MONOTONIC microseconds throughout.
+     * The renderer's Vulkan screen frames (renderer.c rendererVkFrameTimed), one sample per frame presented: the
+     * interval since the last frame's start, and since the last present call (none for the first after a swapchain
+     * is made, none over 250 ms: idle gaps, counted apart, as stamps out of order are); from the X server's tick
+     * asking for it to its start (wake); its start to its end (cpu); its acquire, its wait for the X server's lock,
+     * its recording, its vkQueueSubmit, its fence (that frame's own), its vkQueuePresentKHR call; a root copy made
+     * right before it in the same loop pass (after_root). The fences of the root copies and of the Present copies
+     * submitted alone, each its own. The period's largest frame interval and what the frame after it spent. */
+    struct lorie_hist vkFrameStart, vkPresentDelta, vkFrameWake, vkFrameCpu, vkFrameAcquire, vkFrameLock, vkFrameRecord,
+                      vkFrameSubmit, vkFrameFence, vkFramePresent, vkFrameAfterRoot, vkFenceRoot, vkFenceCopy;
+    volatile uint32_t vkFrameIdleGaps, vkFrameStampsInvalid;
+    volatile uint32_t vkWorstStartUs, vkWorstWakeUs, vkWorstAcquireUs, vkWorstLockUs, vkWorstFenceUs, vkWorstPresentUs,
+                      vkWorstAfterRootUs;
+    /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the
+     * X server had to wait for one (lorieRootCopyWait), that wait, and from the renderer settling the copy to the X
+     * server going on. The period's slowest request to completion and its parts (its fence: vkFenceRoot's). */
+    struct lorie_hist rootTake, rootRecord, rootResume, rootBlock;
+    volatile uint32_t rootWorstUs, rootWorstTakeUs, rootWorstRecordUs, rootWorstFenceUs;
+    /* X: each client request's handling (Dispatch); each PER_ACCESS AHB access's hold of the shared lock (from taking
+     * it in PrepareAccess to letting it go in FinishAccess), its wait for that lock and for a Vulkan frame using the
+     * AHB; each tick's wait from its Choreographer callback, and its work up to asking for the frame (lorieRedraw).
+     * The ticks that asked the renderer for a frame, and the ticks that found none presented since the last one did. */
+    struct lorie_hist xRequest, xAccess, xAccessLock, xAccessGpu, xTickDelay, xTickWork;
+    volatile uint32_t xTicksFrameWanted, xTicksFrameMissed;
 
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
      * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer
@@ -545,6 +604,7 @@ struct lorie_shared_server_state {
         volatile uint32_t seq, taken, cancelled, failed, done;
         volatile pid_t pid;
         uint64_t srcId, dstId, queuedUs;
+        volatile uint64_t doneUs;   /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: when the renderer settled `done` */
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
     } rootCopy;
@@ -554,6 +614,8 @@ struct lorie_shared_server_state {
 
     /* A signal to renderer to update root window texture content from shared fragment if needed */
     volatile uint8_t drawRequested;
+    /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: when the X server's tick last asked for a frame (lorieMonotonicUs) */
+    volatile uint64_t frameWantedUs;
 
     /* We should avoid triggering renderer if there is no output surface */
     volatile uint8_t surfaceAvailable;

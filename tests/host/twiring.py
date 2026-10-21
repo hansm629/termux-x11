@@ -22,7 +22,9 @@ makes the root's (rendererGlBuffer) before binding it.
 And P11-A: the vsync tick and a GPU copy's completion are queued as urgent work (lorieQueueUrgentWorkProc, which
 tdispatchyield.c tests), with TERMUX_X11_X_YIELD_ON_WAKE read when the server state is made, "1" only. P11-C2: a
 root copy asked of the renderer is made first in its loop, which it wakes, and the X server waits for one before it
-takes the shared lock.
+takes the shared lock. P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG): a Vulkan frame is timed only once presented, and
+only with the flag; the pacing intervals start over with another session, window or device, and a root copy counts
+as ahead of the frame only in the loop pass that made it.
 
 usage: twiring.py <lorie source dir>
 """
@@ -132,6 +134,28 @@ check("rendererAttachToGL" not in func(R, "static LorieBuffer *rendererFindBuffe
       "a buffer found for a copy gets a GLES texture whoever copies")
 in_order("GLES frame", func(R, "void rendererRedrawLocked(bool* waitingForBuffers) {"), "rendererGlBuffer(buffer);",
          "LorieBuffer_bindTexture(buffer);")
+
+# P11-C3: the frame diagnostics' wiring
+in_order("Vulkan frame timed", redraw, "bool diag = state->backend.vkFrameDiag;", "lorieVkFrameWait(", "ft.fenceUs = vkr.fenceWaitUs;",
+         "lorieVkPresent(", "state->renderedFrames++;", "if (diag) {", "rendererVkFrameTimed(&ft);")
+def guarded(body, line_index):
+    """the statement on that line is under `if (diag)`: the nearest line above it indented less says so"""
+    lines = body.split("\n")
+    indent = len(lines[line_index]) - len(lines[line_index].lstrip())
+    for k in range(line_index - 1, -1, -1):
+        if lines[k].strip() and len(lines[k]) - len(lines[k].lstrip()) < indent:
+            return lines[k].strip() in ("if (diag)", "if (diag) {")
+    return False
+stamps = [k for k, l in enumerate(redraw.split("\n")) if "lorieMonotonicUs()" in l and ("ft." in l or "acquireStartUs" in l)]
+check(len(stamps) == 9 and all(guarded(redraw, k) or "diag ? lorieMonotonicUs() : 0" in redraw.split("\n")[k] for k in stamps) and
+      "rendererVkFrameTimed" not in alone, "a Vulkan frame's stamps (%d) not all under the frame diagnostics' flag" % len(stamps))
+in_order("pacing over with another session", loop, "if (stateChanged) {", "rendererVkPacingReset();", "if (windowChanged)")
+in_order("pacing over with another window", refresh, "lorieVkSwapchainDestroy(&vk, &vkr);", "rendererVkPacingReset();",
+         "releaseWinAndSurface(&win, &sfc);")
+in_order("pacing over with another device", func(R, "static void rendererVkTeardown(void) {"), "lorieVkDestroyDevice(&vk);",
+         "rendererVkPacingReset();")
+in_order("root copy ahead of the frame, this pass only", loop, "pthread_mutex_unlock(&stateLock);", "vkRootCopyBusyUs = 0;",
+         "rendererVkRootCopy();", "rendererVkRedraw(&waitingForBuffers);")
 
 selftest = func(os.path.join(L, "vk.c"), "bool lorieVkSelftest(struct lorie_vk *vk, volatile struct lorie_shared_server_state *st, uint32_t iterations) {")
 check(selftest.count("st->diag.vkSelftestUs = lorieVkElapsedUs(&t0, &t1);") == 2 and "tv_nsec" not in selftest,

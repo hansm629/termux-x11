@@ -188,6 +188,12 @@ recipes = {
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
         + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
+        # P11-C3: the Vulkan frames' timings
+        + span(R, "// P11-C3: the last Vulkan frame's start and present call", "    vkPacingSwapchain = VK_NULL_HANDLE;\n}")
+        + span(R, "// Gaps between frames longer than this", "static uint64_t vkRootCopyBusyUs;")
+        + span(R, "enum { LORIE_VK_INTERVAL_SAMPLED,", "};") + func(R, "static int rendererVkInterval(")
+        + span(R, "struct rendererVkFrameTimes {", "};")
+        + func(R, "static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static bool rendererRootCopyPending(void) {")
         + func(R, "static void rendererRootCopySettle(uint32_t seq, bool failed) {")

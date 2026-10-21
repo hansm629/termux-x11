@@ -51,7 +51,13 @@
  *   before a frame gets an image); an entry cancelled goes ahead too, skipped and completed; presented early and out
  *   of date - the fence waited for, the buffers given back, the swapchain made again for the next frame; presented
  *   early and the surface lost - the renderer gives up only after the fence and the buffers; FIFO not counted as the
- *   option's. Off, no frame is ever presented before its fence. */
+ *   option's. Off, no frame is ever presented before its fence.
+ *   TERMUX_X11_RENDERER_VK_FRAME_DIAG (P11-C3): each fence in its own timing, once - a root copy's, the copies sent
+ *   ahead of a frame, the frame's (the copies in it when they go in its submission) - adding up to vk_fence_wait_us;
+ *   a root copy right before a frame as its after_root, once; a tick's request as the frame's wake, once; the pacing
+ *   intervals from given stamps (rendererVkFrameTimed): none for the first frame, 8, 17 and 35 ms in their buckets, the
+ *   worst frame's parts, a stamp out of order and a gap over 250 ms counted once each and not timed, another swapchain
+ *   starting over. Off: no sample, no stamp, the frames as on. */
 #define _GNU_SOURCE         /* pthread_timedjoin_np: an X server thread never let go must not hang the test */
 #include <errno.h>
 #include <limits.h>
@@ -164,7 +170,7 @@ static volatile int viewportX, viewportY, viewportW = 1080, viewportH = 2400, ex
 #define CVT_H_GRANULARITY 8
 static ANativeWindow window = { 1080, 2400 }, *win = &window;
 static pthread_spinlock_t bufferLock;
-static LorieBuffer bufs[64];
+static LorieBuffer bufs[96];
 static int nbufs, vkFailures;
 #define buffers rendererBuffers     /* fakevk.h has its own `buffers` */
 static int buffers, removedBuffers;
@@ -230,6 +236,7 @@ static struct { int waits; bool lockHeld, otherOver; uint32_t busy, count; uint6
                 struct { uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; } prev; } atFence;
 static int fenceWaits(void) { return atFence.waits; }
 static int gpuMs;                   /* how long the device takes, at the next fence */
+static int fenceMs[8], fenceMsCount, fenceMsAt;     /* P11-C3: how long each of the next fences takes, in order (then gpuMs) */
 static volatile bool gpuFinished;
 static volatile bool otherOver;     /* the frame another submitter listed is over (otherSubmitter) */
 static void lookAtFence(VkFence fence) {
@@ -245,7 +252,9 @@ static void lookAtFence(VkFence fence) {
     atFence.busy = state->gpuInFlight.busy;
     atFence.count = state->gpuInFlight.count;
     memcpy(atFence.ids, (const void *) state->gpuInFlight.ids, sizeof atFence.ids);
-    if (gpuMs)
+    if (fenceMsAt < fenceMsCount)
+        usleep((useconds_t) fenceMs[fenceMsAt++] * 1000);
+    else if (gpuMs)
         usleep(gpuMs * 1000);
     gpuFinished = true;
 }
@@ -323,6 +332,10 @@ static LorieBuffer *buffer(uint32_t format, uint32_t width, uint32_t height) {
     AHardwareBuffer_Desc d = { .width = width, .height = height, .layers = 1, .format = format, .usage = X_USAGE };
     LorieBuffer *b = &bufs[nbufs++];
     AHardwareBuffer *a = NULL;
+    if (nbufs > (int) (sizeof bufs / sizeof *bufs)) {
+        printf("  FAIL more buffers than bufs holds\n");
+        exit(1);
+    }
     CHECK(AHardwareBuffer_allocate(&d, &a) == 0, "no buffer");
     AHardwareBuffer_describe(a, &d);
     b->desc = (LorieBuffer_Desc) { .width = (int32_t) d.width, .height = (int32_t) d.height, .stride = (int32_t) d.stride,
@@ -549,6 +562,24 @@ static void *rootWaiterThread(void *arg) {
     rootWaiter.gpuOverAtWake = gpuFinished;
     return NULL;
 }
+
+/* P11-C3: every timing's samples so far (struct lorie_hist counts), and one timing's samples and sum since `before` */
+static volatile struct lorie_hist *const allHists[] = {
+    &st.diag.vkFrameStart, &st.diag.vkPresentDelta, &st.diag.vkFrameWake, &st.diag.vkFrameCpu, &st.diag.vkFrameAcquire,
+    &st.diag.vkFrameLock, &st.diag.vkFrameRecord, &st.diag.vkFrameSubmit, &st.diag.vkFrameFence, &st.diag.vkFramePresent,
+    &st.diag.vkFrameAfterRoot, &st.diag.vkFenceRoot, &st.diag.vkFenceCopy, &st.diag.rootTake, &st.diag.rootRecord,
+    &st.diag.rootResume, &st.diag.rootBlock, &st.diag.xRequest, &st.diag.xAccess, &st.diag.xAccessLock, &st.diag.xAccessGpu,
+    &st.diag.xTickDelay, &st.diag.xTickWork };
+static uint32_t histSamples(void) {
+    uint32_t n = 0;
+    for (size_t i = 0; i < sizeof allHists / sizeof *allHists; i++)
+        n += allHists[i]->count;
+    return n;
+}
+struct histMark { uint32_t count; uint64_t sumUs; };
+static struct histMark mark(volatile struct lorie_hist *h) { return (struct histMark) { h->count, h->sumUs }; }
+static uint32_t newSamples(volatile struct lorie_hist *h, struct histMark before) { return h->count - before.count; }
+static uint64_t newUs(volatile struct lorie_hist *h, struct histMark before) { return h->sumUs - before.sumUs; }
 
 /* P11-C1: the early presents the option's cases made - none other may be made (with the option off) */
 static int earlyWithOption;
@@ -1237,6 +1268,204 @@ int main(void) {
                   rootWaiter.gpuOverAtWake);
         }
         ra->registered = rb->registered = false;
+    }
+
+    /* P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG=1: each fence in its own timing - a root copy's 30 ms in fence_root
+     * alone, the copies a frame sends ahead (TERMUX_X11_RENDERER_VK_SUBMIT_OPT) 10 ms in fence_copy alone, the frame's
+     * 20 ms in fence_frame alone: one sample each, together exactly what vk_fence_wait_us counts; the root copy right
+     * before the frame as its after_root, once; its parts, and when it was settled (for the X server's resume); a
+     * tick's request before the frame as its wake; the first frame no interval, the next one; copies in the frame's own
+     * submission (the option off) in the frame's fence. Off: nothing sampled, nothing stamped, the frames as on. */
+    {
+        LorieBuffer *ra = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48), *rb = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, 64, 48);
+        static const LorieGpuCopyRect one[1] = { { 3, 5, 40, 30 } };
+        volatile struct lorie_renderer_diag *dg = &st.diag;
+        struct histMark fRoot, fCopy, fFrame, after, take, rec, wake, start, delta, cpu, present;
+        uint64_t total, queuedUs;
+        int fails0 = vkFailures, early = emu.earlyPresents;
+        uint32_t presented, samples;
+
+        ra->registered = rb->registered = true;
+        own(43);
+        st.backend.vkFrameDiag = 1;
+        st.backend.vkSubmitOpt = 1;
+        rendererVkPacingReset();
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);             /* the swapchain the frames below are timed on */
+        rendererVkPacingReset();
+        st.gpuInFlight.busy = 0;
+        fRoot = mark(&dg->vkFenceRoot), fCopy = mark(&dg->vkFenceCopy), fFrame = mark(&dg->vkFrameFence);
+        after = mark(&dg->vkFrameAfterRoot), take = mark(&dg->rootTake), rec = mark(&dg->rootRecord), wake = mark(&dg->vkFrameWake);
+        start = mark(&dg->vkFrameStart), delta = mark(&dg->vkPresentDelta), cpu = mark(&dg->vkFrameCpu);
+        present = mark(&dg->vkFramePresent);
+        total = dg->vkFenceWaitUs;
+        st.rootCopy.doneUs = 0;
+        fenceMs[0] = 30, fenceMs[1] = 10, fenceMs[2] = 20, fenceMsCount = 3, fenceMsAt = 0;
+        rootAsk(ra, rb, one, 1);
+        queuedUs = st.rootCopy.queuedUs;
+        vkRootCopyBusyUs = 0;                   /* as the main loop does before each pass's root copy */
+        rendererVkRootCopy();
+        CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && st.rootCopy.doneUs >= queuedUs &&
+              newSamples(&dg->rootTake, take) == 1 && newSamples(&dg->rootRecord, rec) == 1 && newSamples(&dg->vkFenceRoot, fRoot) == 1 &&
+              dg->rootWorstUs >= 30000 && dg->rootWorstFenceUs >= 30000,
+              "frame diag, root copy: settled %d, stamped %d, take %u record %u fence %u samples, worst %u us fence %u us",
+              st.rootCopy.done == rootSeq, st.rootCopy.doneUs >= queuedUs, newSamples(&dg->rootTake, take),
+              newSamples(&dg->rootRecord, rec), newSamples(&dg->vkFenceRoot, fRoot), dg->rootWorstUs, dg->rootWorstFenceUs);
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &serial, &dstBuffer), "frame diag: not queued");
+        presented = st.diag.vkFramesPresented;
+        st.frameWantedUs = lorieMonotonicUs();  /* the tick asking for it */
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        fenceMsCount = 0;
+        st.gpuInFlight.busy = 0;
+        CHECK(vkFailures == fails0 && emu.violations == 0 && st.diag.vkFramesPresented == presented + 1 && lorieGpuCopyIsDone(serial),
+              "frame diag: the frame not presented, or its copy not done");
+        CHECK(newSamples(&dg->vkFenceRoot, fRoot) == 1 && newSamples(&dg->vkFenceCopy, fCopy) == 1 &&
+              newSamples(&dg->vkFrameFence, fFrame) == 1 && newUs(&dg->vkFenceRoot, fRoot) >= 30000 &&
+              newUs(&dg->vkFenceCopy, fCopy) >= 10000 && newUs(&dg->vkFrameFence, fFrame) >= 20000 &&
+              newUs(&dg->vkFenceRoot, fRoot) + newUs(&dg->vkFenceCopy, fCopy) + newUs(&dg->vkFrameFence, fFrame) == dg->vkFenceWaitUs - total,
+              "frame diag, fences: root %u samples %llu us, copy %u %llu us, frame %u %llu us; vk_fence_wait_us moved %llu us",
+              newSamples(&dg->vkFenceRoot, fRoot), (unsigned long long) newUs(&dg->vkFenceRoot, fRoot),
+              newSamples(&dg->vkFenceCopy, fCopy), (unsigned long long) newUs(&dg->vkFenceCopy, fCopy),
+              newSamples(&dg->vkFrameFence, fFrame), (unsigned long long) newUs(&dg->vkFrameFence, fFrame),
+              (unsigned long long) (dg->vkFenceWaitUs - total));
+        CHECK(newSamples(&dg->vkFrameAfterRoot, after) == 1 && newUs(&dg->vkFrameAfterRoot, after) >= 30000 &&
+              newSamples(&dg->vkFrameWake, wake) == 1 && newSamples(&dg->vkFrameStart, start) == 0 &&
+              newSamples(&dg->vkPresentDelta, delta) == 0 && newSamples(&dg->vkFrameCpu, cpu) == 1 &&
+              newSamples(&dg->vkFramePresent, present) == 1 && newUs(&dg->vkFrameCpu, cpu) >= 30000,
+              "frame diag, the frame: after_root %u (%llu us), wake %u, start %u and present delta %u (want 0: the first), cpu %u "
+              "(%llu us), present %u", newSamples(&dg->vkFrameAfterRoot, after),
+              (unsigned long long) newUs(&dg->vkFrameAfterRoot, after), newSamples(&dg->vkFrameWake, wake),
+              newSamples(&dg->vkFrameStart, start), newSamples(&dg->vkPresentDelta, delta), newSamples(&dg->vkFrameCpu, cpu),
+              (unsigned long long) newUs(&dg->vkFrameCpu, cpu), newSamples(&dg->vkFramePresent, present));
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+
+        /* the next frame: no root copy before it, the tick's request already taken up - an interval now */
+        after = mark(&dg->vkFrameAfterRoot), wake = mark(&dg->vkFrameWake);
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(newSamples(&dg->vkFrameAfterRoot, after) == 0 && newSamples(&dg->vkFrameWake, wake) == 0 &&
+              newSamples(&dg->vkFrameStart, start) == 1 && newSamples(&dg->vkPresentDelta, delta) == 1,
+              "frame diag, the next frame: after_root %u, wake %u (want 0 each), start %u, present delta %u (want 1 each)",
+              newSamples(&dg->vkFrameAfterRoot, after), newSamples(&dg->vkFrameWake, wake), newSamples(&dg->vkFrameStart, start),
+              newSamples(&dg->vkPresentDelta, delta));
+
+        /* the option off: the copy in the frame's submission, its time in the frame's fence */
+        st.backend.vkSubmitOpt = 0;
+        fCopy = mark(&dg->vkFenceCopy), fFrame = mark(&dg->vkFrameFence);
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &serial, &dstBuffer), "frame diag: not queued");
+        fenceMs[0] = 15, fenceMsCount = 1, fenceMsAt = 0;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        fenceMsCount = 0;
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieGpuCopyIsDone(serial) && newSamples(&dg->vkFenceCopy, fCopy) == 0 && newSamples(&dg->vkFrameFence, fFrame) == 1 &&
+              newUs(&dg->vkFrameFence, fFrame) >= 15000, "frame diag, copies in the frame: copy fence %u samples, frame fence %u "
+              "(%llu us)", newSamples(&dg->vkFenceCopy, fCopy), newSamples(&dg->vkFrameFence, fFrame),
+              (unsigned long long) newUs(&dg->vkFrameFence, fFrame));
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+
+        /* off: the same root copy, copy and frame - nothing sampled or stamped */
+        st.backend.vkFrameDiag = 0;
+        st.backend.vkSubmitOpt = 1;
+        samples = histSamples();
+        st.rootCopy.doneUs = 0;
+        presented = st.diag.vkFramesPresented;
+        total = dg->vkFenceWaitUs;
+        fenceMs[0] = fenceMs[1] = fenceMs[2] = 2, fenceMsCount = 3, fenceMsAt = 0;
+        rootAsk(ra, rb, one, 1);
+        vkRootCopyBusyUs = 0;
+        rendererVkRootCopy();
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 5, 7, &serial, &dstBuffer), "frame diag off: not queued");
+        st.frameWantedUs = lorieMonotonicUs();
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        fenceMsCount = 0;
+        st.gpuInFlight.busy = 0;
+        CHECK(st.rootCopy.done == rootSeq && lorieGpuCopyIsDone(serial) && st.diag.vkFramesPresented == presented + 1 &&
+              vkFailures == fails0 && emu.violations == 0, "frame diag off: the root copy, copy or frame not made");
+        CHECK(histSamples() == samples && !st.rootCopy.doneUs && !vkRootCopyBusyUs && dg->vkFenceWaitUs > total,
+              "frame diag off: %u samples taken, settled stamped %d, root copy time kept %d", histSamples() - samples,
+              st.rootCopy.doneUs != 0, vkRootCopyBusyUs != 0);
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+        st.backend.vkSubmitOpt = 0;
+        st.frameWantedUs = 0;
+        ra->registered = rb->registered = false;
+        earlyWithOption += emu.earlyPresents - early;   /* the option's, above */
+    }
+
+    /* P11-C3: the pacing intervals from given stamps (rendererVkFrameTimed): the first frame none - no false hitch;
+     * 8, 17 and 35 ms in their buckets, the largest the period's worst with what that frame spent; a stamp before the
+     * last none (counted invalid), the next interval from it; a gap over 250 ms none (counted idle); another swapchain
+     * starting over; a frame without a present call no present interval and no present time; its wake only for a
+     * request made after the last frame started and before this one did */
+    {
+        volatile struct lorie_renderer_diag *dg = &st.diag;
+        VkSwapchainKHR real = vkr.swapchain;
+        struct histMark start, delta, wake, present;
+        uint32_t invalid = dg->vkFrameIdleGaps, idle, bucket8, bucket20, bucket50;
+        uint64_t t = 5000000;
+#define FRAME(at, ...) rendererVkFrameTimed(&(struct rendererVkFrameTimes) { .startUs = (at), .lockStartUs = (at) + 100, \
+            .lockedUs = (at) + 150, .submitStartUs = (at) + 400, .submittedUs = (at) + 450, .presentStartUs = (at) + 900, \
+            .presentEndUs = (at) + 1000, .endUs = (at) + 1100, __VA_ARGS__ })
+        invalid = dg->vkFrameStampsInvalid, idle = dg->vkFrameIdleGaps;
+        rendererVkPacingReset();
+        dg->vkWorstStartUs = 0;
+        start = mark(&dg->vkFrameStart), delta = mark(&dg->vkPresentDelta), wake = mark(&dg->vkFrameWake);
+        present = mark(&dg->vkFramePresent);
+        bucket8 = dg->vkFrameStart.buckets[14], bucket20 = dg->vkFrameStart.buckets[21], bucket50 = dg->vkFrameStart.buckets[24];
+        FRAME(t);
+        CHECK(newSamples(&dg->vkFrameStart, start) == 0 && newSamples(&dg->vkPresentDelta, delta) == 0 &&
+              newSamples(&dg->vkFramePresent, present) == 1, "timed frames: the first one an interval");
+        t += 8000, FRAME(t);
+        t += 17000, FRAME(t);
+        t += 35000, FRAME(t, .acquireUs = 21000, .fenceUs = 9000, .afterRootUs = 4000, .wantedUs = t - 500);
+        CHECK(newSamples(&dg->vkFrameStart, start) == 3 && newUs(&dg->vkFrameStart, start) == 60000 &&
+              newSamples(&dg->vkPresentDelta, delta) == 3 && dg->vkFrameStart.buckets[14] == bucket8 + 1 &&
+              dg->vkFrameStart.buckets[21] == bucket20 + 1 && dg->vkFrameStart.buckets[24] == bucket50 + 1,
+              "timed frames, 8, 17, 35 ms: %u intervals of %llu us in all, buckets 8 ms +%u, 20 ms +%u, 50 ms +%u",
+              newSamples(&dg->vkFrameStart, start), (unsigned long long) newUs(&dg->vkFrameStart, start),
+              dg->vkFrameStart.buckets[14] - bucket8, dg->vkFrameStart.buckets[21] - bucket20, dg->vkFrameStart.buckets[24] - bucket50);
+        CHECK(dg->vkWorstStartUs == 35000 && dg->vkWorstAcquireUs == 21000 && dg->vkWorstFenceUs == 9000 &&
+              dg->vkWorstAfterRootUs == 4000 && dg->vkWorstLockUs == 50 && dg->vkWorstPresentUs == 100 && dg->vkWorstWakeUs == 500 &&
+              newSamples(&dg->vkFrameWake, wake) == 1, "timed frames: the worst %u us, acquire %u, fence %u, after root %u, lock %u, "
+              "present %u, wake %u", dg->vkWorstStartUs, dg->vkWorstAcquireUs, dg->vkWorstFenceUs, dg->vkWorstAfterRootUs,
+              dg->vkWorstLockUs, dg->vkWorstPresentUs, dg->vkWorstWakeUs);
+        start = mark(&dg->vkFrameStart);
+        FRAME(t - 100);                          /* out of order */
+        t += 8000, FRAME(t);
+        CHECK(dg->vkFrameStampsInvalid == invalid + 1 && newSamples(&dg->vkFrameStart, start) == 1 &&
+              newUs(&dg->vkFrameStart, start) == 8100, "timed frames, a stamp before the last: %u invalid, %u intervals (%llu us)",
+              dg->vkFrameStampsInvalid - invalid, newSamples(&dg->vkFrameStart, start), (unsigned long long) newUs(&dg->vkFrameStart, start));
+        start = mark(&dg->vkFrameStart);
+        t += 300000, FRAME(t);                   /* idle */
+        t += 8000, FRAME(t);
+        CHECK(dg->vkFrameIdleGaps == idle + 1 && newSamples(&dg->vkFrameStart, start) == 1 && newUs(&dg->vkFrameStart, start) == 8000,
+              "timed frames, a 300 ms gap: %u idle, %u intervals", dg->vkFrameIdleGaps - idle, newSamples(&dg->vkFrameStart, start));
+        start = mark(&dg->vkFrameStart), idle = dg->vkFrameIdleGaps;
+        t += 250000, FRAME(t);
+        t += 250001, FRAME(t);
+        CHECK(newSamples(&dg->vkFrameStart, start) == 1 && newUs(&dg->vkFrameStart, start) == 250000 && dg->vkFrameIdleGaps == idle + 1,
+              "timed frames: 250 ms %s, a microsecond more %s", newSamples(&dg->vkFrameStart, start) ? "an interval" : "not one",
+              dg->vkFrameIdleGaps == idle + 1 ? "a gap" : "not one");
+        start = mark(&dg->vkFrameStart);
+        vkr.swapchain = (VkSwapchainKHR) (uintptr_t) 0x5150;
+        t += 8000, FRAME(t);
+        vkr.swapchain = real;
+        t += 8000, FRAME(t);
+        CHECK(newSamples(&dg->vkFrameStart, start) == 0, "timed frames, other swapchains: %u intervals across them",
+              newSamples(&dg->vkFrameStart, start));
+        delta = mark(&dg->vkPresentDelta), present = mark(&dg->vkFramePresent), wake = mark(&dg->vkFrameWake);
+        t += 8000, FRAME(t, .presentStartUs = 0, .presentEndUs = 0, .wantedUs = t - 9000);  /* before the last start */
+        t += 8000, FRAME(t, .wantedUs = t + 10);                                            /* after its own start */
+        CHECK(newSamples(&dg->vkPresentDelta, delta) == 1 && newSamples(&dg->vkFramePresent, present) == 1 &&
+              newSamples(&dg->vkFrameWake, wake) == 0, "timed frames: without a present call, present samples %u and %u (want 1, 1: "
+              "the one after), wake %u (want 0)", newSamples(&dg->vkPresentDelta, delta), newSamples(&dg->vkFramePresent, present),
+              newSamples(&dg->vkFrameWake, wake));
+#undef FRAME
+        rendererVkPacingReset();
+        dg->vkWorstStartUs = 0;
     }
 
     /* the root published under the lock not one the renderer has: the old one not sampled, the image kept for the

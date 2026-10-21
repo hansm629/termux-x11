@@ -364,6 +364,15 @@ static struct lorie_vk_renderer vkr;
 static bool vkReady, vkActive, vkFailed, vkOwned, vkGiveBack, backendSelect;
 static uint32_t vkOwnershipSeq;
 
+// P11-C3: the last Vulkan frame's start and present call, for the pacing intervals, and the swapchain they were made
+// on. Another swapchain, window, X server session or device starts them over: no interval spans one.
+static uint64_t vkPacingLastStartUs, vkPacingLastPresentUs;
+static VkSwapchainKHR vkPacingSwapchain;
+static void rendererVkPacingReset(void) {
+    vkPacingLastStartUs = vkPacingLastPresentUs = 0;
+    vkPacingSwapchain = VK_NULL_HANDLE;
+}
+
 // Counted after the real call (see rendererMaybeSkipEglSwapBuffers, which can skip a swap and still
 // return EGL_TRUE), and only for a window surface: the default one is the ImageReader's, never shown.
 static void rendererNoteEglSwap(EGLSurface surface, EGLBoolean ok) {
@@ -931,6 +940,7 @@ void rendererRefreshContext(void) {
         lorieVkSwapchainDestroy(&vk, &vkr);
         vkActive = false;
     }
+    rendererVkPacingReset();
     releaseWinAndSurface(&win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
@@ -1710,6 +1720,7 @@ static void rendererVkTeardown(void) {
         lorieVkDestroyDevice(&vk);
     }
     vkReady = vkActive = vkOwned = false;
+    rendererVkPacingReset();
 }
 
 /*
@@ -2080,6 +2091,86 @@ static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame
     }
 }
 
+/* ---- P11-C3, TERMUX_X11_RENDERER_VK_FRAME_DIAG: the screen frames' timings (lorie.h struct lorie_hist) ---- */
+
+// Gaps between frames longer than this: nothing asked to be drawn (an idle desktop), not a slow frame.
+#define LORIE_VK_IDLE_GAP_US 250000
+
+// A root copy's time in this loop pass, ahead of the frame that may follow it (rendererVkRootCopy).
+static uint64_t vkRootCopyBusyUs;
+
+/*
+ * One interval between two of the renderer's events, against the last (`*last`, 0: none yet), sampled unless it is the
+ * first, its stamp is before the last, or it is a gap over LORIE_VK_IDLE_GAP_US; which of these, and the interval in *us
+ * when sampled.
+ */
+enum { LORIE_VK_INTERVAL_SAMPLED, LORIE_VK_INTERVAL_FIRST, LORIE_VK_INTERVAL_INVALID, LORIE_VK_INTERVAL_IDLE };
+static int rendererVkInterval(volatile struct lorie_hist *h, uint64_t *last, uint64_t now, uint64_t *us) {
+    uint64_t prev = *last;
+    *last = now;
+    if (!prev)
+        return LORIE_VK_INTERVAL_FIRST;
+    if (now < prev)
+        return LORIE_VK_INTERVAL_INVALID;
+    if (now - prev > LORIE_VK_IDLE_GAP_US)
+        return LORIE_VK_INTERVAL_IDLE;
+    *us = now - prev;
+    lorieHistAdd(h, *us);
+    return LORIE_VK_INTERVAL_SAMPLED;
+}
+
+// A screen frame's stamps (lorieMonotonicUs) and the durations taken around it; 0: not reached (no present call).
+struct rendererVkFrameTimes {
+    uint64_t startUs, wantedUs, acquireUs, lockStartUs, lockedUs, inflightUs, submitStartUs, submittedUs, fenceUs,
+             presentStartUs, presentEndUs, endUs, afterRootUs;
+};
+
+/*
+ * A frame presented: its samples, and, should its start make the period's largest interval, what it spent; a start
+ * before the last one's, or long after it, counted once (the present call's interval goes the same way). Its wake only
+ * for a tick's request made after the last frame started (an older one that frame took up already) and before this
+ * one did.
+ */
+static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
+    volatile struct lorie_renderer_diag *d = &state->diag;
+    uint64_t interval = 0, presentInterval = 0, wake = 0, lastStartUs;
+    int sampled;
+
+    if (vkPacingSwapchain != vkr.swapchain) {
+        rendererVkPacingReset();
+        vkPacingSwapchain = vkr.swapchain;
+    }
+    lastStartUs = vkPacingLastStartUs;
+    sampled = rendererVkInterval(&d->vkFrameStart, &vkPacingLastStartUs, t->startUs, &interval);
+    if (sampled == LORIE_VK_INTERVAL_INVALID)
+        LORIE_DIAG_ADD(state, vkFrameStampsInvalid, 1);
+    else if (sampled == LORIE_VK_INTERVAL_IDLE)
+        LORIE_DIAG_ADD(state, vkFrameIdleGaps, 1);
+    if (t->presentStartUs)
+        rendererVkInterval(&d->vkPresentDelta, &vkPacingLastPresentUs, t->presentStartUs, &presentInterval);
+    if (t->wantedUs && t->wantedUs > lastStartUs && t->wantedUs <= t->startUs && t->startUs - t->wantedUs < 1000000)
+        lorieHistAdd(&d->vkFrameWake, wake = t->startUs - t->wantedUs);
+    lorieHistAdd(&d->vkFrameCpu, t->endUs - t->startUs);
+    lorieHistAdd(&d->vkFrameAcquire, t->acquireUs);
+    lorieHistAdd(&d->vkFrameLock, t->lockedUs - t->lockStartUs);
+    lorieHistAdd(&d->vkFrameRecord, t->submitStartUs - t->lockedUs - t->inflightUs);
+    lorieHistAdd(&d->vkFrameSubmit, t->submittedUs - t->submitStartUs);
+    lorieHistAdd(&d->vkFrameFence, t->fenceUs);
+    if (t->presentStartUs)
+        lorieHistAdd(&d->vkFramePresent, t->presentEndUs - t->presentStartUs);
+    if (t->afterRootUs)
+        lorieHistAdd(&d->vkFrameAfterRoot, t->afterRootUs);
+    if (sampled == LORIE_VK_INTERVAL_SAMPLED && interval > d->vkWorstStartUs) {
+        d->vkWorstStartUs = (uint32_t) interval;
+        d->vkWorstWakeUs = (uint32_t) wake;
+        d->vkWorstAcquireUs = (uint32_t) t->acquireUs;
+        d->vkWorstLockUs = (uint32_t) (t->lockedUs - t->lockStartUs);
+        d->vkWorstFenceUs = (uint32_t) t->fenceUs;
+        d->vkWorstPresentUs = (uint32_t) (t->presentStartUs ? t->presentEndUs - t->presentStartUs : 0);
+        d->vkWorstAfterRootUs = (uint32_t) t->afterRootUs;
+    }
+}
+
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
 static void rendererVkApplyPendingGpuCopies(void) {
     uint64_t serial = 0, startUs, lockedUs, inflightUs, submittedUs = 0, fencedUs = 0;
@@ -2122,6 +2213,8 @@ static void rendererVkApplyPendingGpuCopies(void) {
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (res == VK_SUCCESS && state->backend.vkFrameDiag)
+            lorieHistAdd(&state->diag.vkFenceCopy, vkr.fenceWaitUs);    // P11-C3: these copies' own fence
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -2152,6 +2245,8 @@ static bool rendererRootCopyPending(void) {
 static void rendererRootCopySettle(uint32_t seq, bool failed) {
     if (failed)
         __atomic_store_n(&state->rootCopy.failed, seq, __ATOMIC_RELAXED);
+    if (state->backend.vkFrameDiag)
+        state->rootCopy.doneUs = lorieMonotonicUs();    // P11-C3: for the X server's time to go on (rootResume)
     __atomic_store_n(&state->rootCopy.done, seq, __ATOMIC_RELEASE);
     syscall(SYS_futex, &state->rootCopy.done, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 }
@@ -2186,6 +2281,9 @@ static void rendererVkRootCopy(void) {
     uint64_t bytes = 0, queuedUs;
     uint32_t seq, n, i;
     VkResult res;
+    // P11-C3: when this pass began, took the request, and submitted it
+    bool diag = state->backend.vkFrameDiag;
+    uint64_t startUs = diag ? lorieMonotonicUs() : 0, takenUs = 0, submittedUs = 0;
 
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     seq = state->rootCopy.seq;
@@ -2195,6 +2293,8 @@ static void rendererVkRootCopy(void) {
     }
     state->rootCopy.taken = seq;
     state->rootCopy.pid = getpid();
+    if (diag)
+        takenUs = lorieMonotonicUs();
     if (!rendererVkOwnedLocked()) {
         // Without the X server's PER_ACCESS answer no buffer of it is touched; the answer asked for again.
         rendererRootCopySettle(seq, true);
@@ -2240,6 +2340,8 @@ static void rendererVkRootCopy(void) {
     if (res == VK_SUCCESS) {
         rendererVkInFlight();
         LORIE_DIAG_ADD(state, rootGpuCopySubmits, 1);
+        if (diag)
+            submittedUs = lorieMonotonicUs();
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
@@ -2256,7 +2358,23 @@ static void rendererVkRootCopy(void) {
         LORIE_DIAG_ADD(state, rootGpuCopyRects, n);
         LORIE_DIAG_ADD(state, rootGpuCopyBytes, bytes);
         LORIE_DIAG_ADD(state, rootGpuCopyCompletionUs, now > queuedUs ? now - queuedUs : 0);
+        if (diag) {
+            // P11-C3: its parts - waiting to be taken, recorded and submitted, its own fence - and the period's slowest
+            volatile struct lorie_renderer_diag *dg = &state->diag;
+            uint64_t take = takenUs > queuedUs ? takenUs - queuedUs : 0, total = now > queuedUs ? now - queuedUs : 0;
+            lorieHistAdd(&dg->rootTake, take);
+            lorieHistAdd(&dg->rootRecord, submittedUs - takenUs);
+            lorieHistAdd(&dg->vkFenceRoot, vkr.fenceWaitUs);
+            if (total > dg->rootWorstUs) {
+                dg->rootWorstUs = (uint32_t) total;
+                dg->rootWorstTakeUs = (uint32_t) take;
+                dg->rootWorstRecordUs = (uint32_t) (submittedUs - takenUs);
+                dg->rootWorstFenceUs = (uint32_t) vkr.fenceWaitUs;
+            }
+        }
     }
+    if (diag)
+        vkRootCopyBusyUs = lorieMonotonicUs() - startUs;    // ahead of the frame this loop pass may draw next
     rendererRootCopySettle(seq, res != VK_SUCCESS);
     if (res != VK_SUCCESS)
         rendererVkFail();
@@ -2300,7 +2418,16 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     uint32_t readIndex = 0, index;
     int status, presented = LORIE_VK_FRAME_OK, filter = filtering == GL_LINEAR;
     VkResult res = VK_SUCCESS;
+    // P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG): this frame's stamps, sampled once it is presented
+    bool diag = state->backend.vkFrameDiag;
+    struct rendererVkFrameTimes ft = { 0 };
 
+    if (diag) {
+        ft.startUs = lorieMonotonicUs();
+        ft.wantedUs = state->frameWantedUs;
+        ft.afterRootUs = vkRootCopyBusyUs;
+        vkRootCopyBusyUs = 0;
+    }
     pthread_spin_lock(&bufferLock);
     buffer = LorieBufferList_findById(&buffers, state->rootWindowTextureID);
     if (!buffer)
@@ -2349,8 +2476,12 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         index = vkr.heldIndex;      // acquired by a frame that drew nothing, and still ours
         vkr.held = false;
         status = LORIE_VK_FRAME_OK;
-    } else
+    } else {
+        uint64_t acquireStartUs = diag ? lorieMonotonicUs() : 0;
         status = lorieVkAcquire(&vk, &vkr, &index, state);
+        if (diag)
+            ft.acquireUs = lorieMonotonicUs() - acquireStartUs;
+    }
     if (status == LORIE_VK_FRAME_SKIP)
         return;     // drawRequested stays: tried again
     if (status == LORIE_VK_FRAME_RECREATE) {
@@ -2431,6 +2562,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     }
     lorieVkFrameScreen(&vk, &vkr, index, root, &(VkRect2D) { { viewportX, viewportY }, { (uint32_t) viewportW, (uint32_t) viewportH } },
                        &rootQuad, cursor ? &cursorQuad : NULL, filter);
+    if (diag)
+        ft.submitStartUs = lorieMonotonicUs();
     res = lorieVkFrameQueue(&vk, &vkr, index, true, state);
     submittedUs = lorieMonotonicUs();
     if (res == VK_SUCCESS)
@@ -2441,7 +2574,11 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
     // once the fence was waited for, as the present below.
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        if (diag)
+            ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
     }
     if (res == VK_SUCCESS) {
@@ -2451,6 +2588,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
+        if (diag)
+            ft.fenceUs = vkr.fenceWaitUs;   // this frame's own fence (P11-C3)
     }
     if (res == VK_SUCCESS) {
         // Only now that the device finished (and gave the buffers back) may the X server reuse the source.
@@ -2473,11 +2612,24 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     }
     if (res != VK_SUCCESS)
         return rendererVkFail();
-    if (!early)
+    if (!early) {
+        if (diag)
+            ft.presentStartUs = lorieMonotonicUs();
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        if (diag)
+            ft.presentEndUs = lorieMonotonicUs();
+    }
     if (presented == LORIE_VK_FRAME_FATAL)
         return rendererVkFail();
     state->renderedFrames++;
+    if (diag) {
+        ft.lockStartUs = startUs;
+        ft.lockedUs = lockedUs;
+        ft.inflightUs = inflightUs;
+        ft.submittedUs = submittedUs;
+        ft.endUs = lorieMonotonicUs();
+        rendererVkFrameTimed(&ft);
+    }
 }
 
 static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
@@ -2595,6 +2747,7 @@ __noreturn static void* rendererThread(void) {
                 lorieVkImagesClear(&vk, &vkImages);
             }
             vkOwned = false;
+            rendererVkPacingReset();
 
             if (state) {
                 // A new X server session: Vulkan may be tried again, the X server's ownership asked for again.
@@ -2633,6 +2786,7 @@ __noreturn static void* rendererThread(void) {
         pthread_mutex_unlock(&stateLock);
 
         // P11-C2: a root copy the X server asked for, first - it may be waiting for it before it can draw again.
+        vkRootCopyBusyUs = 0;      // P11-C3: only one made in this pass counts as ahead of its frame
         if (state && rendererRootCopyPending()) {
             if (vkActive)
                 rendererVkRootCopy();

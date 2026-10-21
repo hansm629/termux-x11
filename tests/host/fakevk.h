@@ -180,9 +180,11 @@ struct lorie_shared_server_state {
         uint64_t srcId, dstId, queuedUs;
         uint32_t numRects;
         LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+        volatile uint64_t doneUs;   /* P11-C3 */
     } rootCopy;
     uint64_t rootWindowTextureID;
     volatile uint8_t drawRequested, surfaceAvailable, waitForNextFrame;
+    volatile uint64_t frameWantedUs;    /* P11-C3 */
     volatile int renderedFrames;
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
