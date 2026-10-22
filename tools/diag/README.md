@@ -18,6 +18,7 @@ XlorieVkTiming: acquire results, acquire/submit/fence/present times, copies_ahea
 XlorieRootCopy: root_gpu_copy=off|on|fallback, the root double buffering copies by the renderer's GPU (P11-C2)
 XlorieSchedule: exa_lock_opt=on|off x_access_reserved x_access_reserve_full copies_deferred copies_deferred_wakes
                 vk_schedule_opt=on|off root_ahead root_ahead_x_waiting root_chain_consumed root_ahead_unavailable (P11-C3-B)
+                buffers_awaited buffer_await_us buffers_given_up copies_left_for_buffers (P11-C3-C, always)
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -274,6 +275,17 @@ only when the X server is started with `TERMUX_X11_RENDERER_VK_SELFTEST=full`. `
 `formats_passed` / `formats_unavailable` are bit masks (1 RGBA, 2 RGBX, 4 BGRA - only BGRA may be
 unavailable). On a failure the `fail_*` fields say where: the step, the AHB format, the direction (1 or 2),
 the iteration, the byte and its expected and actual value, and the VkResult.
+
+### Buffers waited for before the shared lock (P11-C3-C, always)
+
+A copy's buffers come to the renderer over the X server's connection, on the activity's main thread; a copy queued
+right after its buffer was sent may reach the renderer first. The renderer used to wait for such a buffer under the
+shared lock - up to 100 ms per lookup, two lookups per copy - while the X server, which takes that lock for its own
+drawing, stood still. Now each pass waits for the buffers its copies use before it takes the lock (woken when the
+buffer comes), up to 100 ms; under the lock nothing waits. `XlorieSchedule`: `buffers_awaited` - passes that waited
+for a buffer; `buffer_await_us` - how long, in all; `buffers_given_up` - buffers not come within 100 ms (their copies
+skipped, as before); `copies_left_for_buffers` - passes that found a buffer missing only under the lock (queued after
+the wait) and left the copies queued for the next pass.
 
 ## Scripts
 

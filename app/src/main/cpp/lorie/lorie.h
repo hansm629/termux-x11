@@ -539,6 +539,11 @@ struct lorie_renderer_diag {
      * reservation instead of `lock`, and those that held `lock` because no reservation was free; the renderer's
      * passes that left a copy queued for a reserved AHB, and the X server's wakes of a renderer that did. */
     volatile uint32_t xAccessReserved, xAccessReserveFull, copiesDeferred, copiesDeferredWakes;
+    /* P11-C3-C, always counted: the renderer's passes that waited, before taking `lock`, for a buffer their copies use
+     * not come yet from the connection, and how long; buffers given up on (not come within 100 ms: their copies
+     * skipped); passes that left copies queued for a buffer that may still come (for the next pass to wait for). */
+    volatile uint32_t buffersAwaited, buffersGivenUp, copiesLeftForBuffers;
+    volatile uint64_t bufferAwaitUs;
     /* P11-C3-B2 (TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1), always counted: root copies submitted ahead of the frame (the
      * frame chained after them on the device); of those, waited for first because the X server already waited for
      * them; chain semaphores no frame waited for (an empty submission did); and root copies made the old way because

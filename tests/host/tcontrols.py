@@ -1502,6 +1502,75 @@ CONTROLS += [
      "tsharedlock"),
 ]
 
+# P11-C3-C: the buffers a pass's copies use waited for before the shared lock, not under it
+CONTROLS += [
+    ("buffers: the pass does not wait for them before the lock", "renderer.c",
+     """    // P11-C3-C: the buffers its copies use, waited for now if they have not come - not under the X server's lock
+    rendererAwaitBuffers();
+""",
+     """    // P11-C3-C: the buffers its copies use, waited for now if they have not come - not under the X server's lock
+""",
+     "tpresentcopy"),
+    ("buffers: waited for under the lock again (the old 5 ms retries)", "renderer.c",
+     """    pthread_spin_lock(&bufferLock);
+    buf = LorieBufferList_findById(&buffers, id);
+    if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
+        LorieBuffer_addToList(buf, &buffers);     // its GLES texture, if GLES uses it: rendererGlBuffer
+    pthread_spin_unlock(&bufferLock);
+    if (!buf && later) {""",
+     """    for (int attempt = 0; attempt < 20; attempt++) {
+        pthread_spin_lock(&bufferLock);
+        buf = LorieBufferList_findById(&buffers, id);
+        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
+            LorieBuffer_addToList(buf, &buffers);     // its GLES texture, if GLES uses it: rendererGlBuffer
+        pthread_spin_unlock(&bufferLock);
+        if (buf) break;
+        usleep(5000);
+    }
+    if (!buf && later) {""",
+     "tpresentcopy"),
+    ("buffers: a Vulkan copy whose buffer may still come skipped at once", "renderer.c",
+     """        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
+        if (!src || !dst)""",
+     """        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later && 0) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
+        if (!src || !dst)""",
+     "tpresentcopy"),
+    ("buffers: a GLES copy whose buffer may still come skipped at once", "renderer.c",
+     """        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
+        if (!src)""",
+     """        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later && 0) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
+        if (!src)""",
+     "tpresentcopy"),
+    ("buffers: one given up on still waited for (never skipped)", "renderer.c",
+     """        for (i = 0; i < buffersGivenUpCount; i++)
+            if (buffersGivenUp[i] == id)
+                *later = false;""",
+     """        for (i = 0; i < buffersGivenUpCount; i++)
+            if (buffersGivenUp[i] == id)
+                *later = true;""",
+     "tpresentcopy"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

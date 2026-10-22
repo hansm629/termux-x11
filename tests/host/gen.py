@@ -205,6 +205,11 @@ recipes = {
         + func(I, "void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {")
         + func(R, "static void rendererGlBuffer(LorieBuffer *buf) {")
         + func(R, "static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {")
+        # P11-C3-C: the buffers a pass's copies use, waited for before the shared lock; looked up under it without waiting
+        + span(R, "#define LORIE_BUFFER_AWAIT_US 100000", "static uint32_t buffersGivenUpCount;")
+        + func(R, "static bool rendererHasBuffer(uint64_t id) {") + "static bool rendererRootCopyPending(void);\n"
+        + func(R, "static void rendererAwaitBuffers(void) {")
+        + func(R, "static LorieBuffer *rendererFindBuffer(uint64_t id, bool *later) {")
         + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {")
         + func(R, "static void rendererVkInFlight(void) {")

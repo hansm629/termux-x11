@@ -1199,33 +1199,104 @@ rendererUpdateHighRefreshPlateauLimiter(enabled, swapUs, totalUs);
 
 
 
-// Drains the deferred GPU copy queue (filled by present_execute_copy) into the root texture via
-// an FBO. Assumes the caller holds state->lock and will flush/fence before unlocking - returns
-// the highest drained serial WITHOUT publishing it to completedSerial, since the caller must only
-// do that after the fence confirms the GPU actually finished (not just submitted) the draws;
-// publishing early would let the client's next write race our still-in-flight read.
-// Looks up a registered buffer by id, waiting briefly (bounded) if it hasn't arrived over the
-// async registration socket yet instead of busy-spinning the outer loop.
-static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
+/*
+ * P11-C3-C: the buffers the copies about to be made use - those queued, and the root copy's - waited for while they
+ * have not come yet from the X server's connection (activity.c EVENT_ADD_BUFFER, on the activity's main thread;
+ * rendererAddBuffer wakes the renderer), before the X server's lock is taken and not under it. There each lookup used
+ * to sleep up to 100 ms (5 ms at a time) while the X server, which takes that lock for its own drawing, its swaps and
+ * its EXA accesses, stood still - buffer after buffer. Up to LORIE_BUFFER_AWAIT_US from the first one found missing;
+ * those still missing then are given up on: a copy using one is skipped, as it was after its 100 ms. A copy queued
+ * after this look whose buffer has not come is left queued, with those after it, for the next pass to wait for here
+ * (rendererFindBuffer).
+ */
+#define LORIE_BUFFER_AWAIT_US 100000
+#define LORIE_BUFFER_AWAIT_IDS (2 * LORIE_GPU_COPY_QUEUE_CAPACITY + 2)
+static uint64_t buffersGivenUp[LORIE_BUFFER_AWAIT_IDS];
+static uint32_t buffersGivenUpCount;
+
+static bool rendererHasBuffer(uint64_t id) {
+    bool found;
+    pthread_spin_lock(&bufferLock);
+    found = LorieBufferList_findById(&buffers, id) || LorieBufferList_findById(&addedBuffers, id);
+    pthread_spin_unlock(&bufferLock);
+    return found;
+}
+
+static bool rendererRootCopyPending(void);
+
+static void rendererAwaitBuffers(void) {
+    uint64_t ids[LORIE_BUFFER_AWAIT_IDS], startUs = 0, deadlineUs = 0;
+    uint32_t n = 0, i, end;
+
+    buffersGivenUpCount = 0;
+    if (!state)
+        return;
+    // The root copy asked for (its ids written before its seq was published), and the copies queued - those up to
+    // writeIndex written before it was: only the renderer moves readIndex, so they stay until it does.
+    if (rendererRootCopyPending()) {
+        ids[n++] = state->rootCopy.srcId;
+        ids[n++] = state->rootCopy.dstId;
+    }
+    end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+    for (i = state->gpuCopyQueue.readIndex; i != end && n + 2 <= LORIE_BUFFER_AWAIT_IDS; i++) {
+        const volatile LorieGpuCopyEntry *e = &state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        if (!e->cancelled) {
+            ids[n++] = e->srcBufferId;
+            ids[n++] = e->dstBufferId;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        while (!rendererHasBuffer(ids[i])) {
+            // the wake count before the look: a buffer added after it moved it (rendererSleep's rule, stateLock not held)
+            uint32_t seen = lorieWakeSeen(rendererWake);
+            uint64_t now = lorieMonotonicUs();
+            struct timespec rel;
+            if (!deadlineUs)
+                deadlineUs = (startUs = now) + LORIE_BUFFER_AWAIT_US;
+            if (rendererHasBuffer(ids[i]))
+                break;
+            if (now >= deadlineUs) {
+                buffersGivenUp[buffersGivenUpCount++] = ids[i];
+                LORIE_DIAG_ADD(state, buffersGivenUp, 1);
+                break;
+            }
+            rel = (struct timespec) { (time_t) ((deadlineUs - now) / 1000000), (long) ((deadlineUs - now) % 1000000) * 1000 };
+            syscall(SYS_futex, &rendererWake->seq, FUTEX_WAIT, seen, &rel, NULL, 0);
+        }
+    }
+    if (startUs) {
+        LORIE_DIAG_ADD(state, buffersAwaited, 1);
+        LORIE_DIAG_ADD(state, bufferAwaitUs, lorieMonotonicUs() - startUs);
+    }
+}
+
+/*
+ * A copy's buffer, under the X server's lock, without waiting (rendererAwaitBuffers waited before the lock). Not there:
+ * NULL, and *later set unless this pass's wait gave it up - the copy then stays queued for the next pass.
+ */
+static LorieBuffer *rendererFindBuffer(uint64_t id, bool *later) {
     LorieBuffer *buf;
-    int attempt;
+    uint32_t i;
 
     pthread_spin_lock(&bufferLock);
     buf = LorieBufferList_findById(&buffers, id);
     if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
         LorieBuffer_addToList(buf, &buffers);     // its GLES texture, if GLES uses it: rendererGlBuffer
     pthread_spin_unlock(&bufferLock);
-
-    for (attempt = 0; attempt < 20 && !buf; attempt++) {
-        usleep(5000);
-        pthread_spin_lock(&bufferLock);
-        buf = LorieBufferList_findById(&buffers, id);
-        if (!buf && (buf = LorieBufferList_findById(&addedBuffers, id)))
-            LorieBuffer_addToList(buf, &buffers);
-        pthread_spin_unlock(&bufferLock);
+    if (!buf && later) {
+        *later = true;
+        for (i = 0; i < buffersGivenUpCount; i++)
+            if (buffersGivenUp[i] == id)
+                *later = false;
     }
     return buf;
 }
+
+// Drains the deferred GPU copy queue (filled by present_execute_copy) into the root texture via
+// an FBO. Assumes the caller holds state->lock and will flush/fence before unlocking - returns
+// the highest drained serial WITHOUT publishing it to completedSerial, since the caller must only
+// do that after the fence confirms the GPU actually finished (not just submitted) the draws;
+// publishing early would let the client's next write race our still-in-flight read.
 
 /*
  * P11-C3-B1 (lorie.h cpuAccess): a queued copy using a buffer the X server holds reserved for a CPU access is not
@@ -1267,6 +1338,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     while (state->gpuCopyQueue.readIndex != __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE)) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
         LorieBuffer *src, *dst;
+        bool later = false;
 
         if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
@@ -1276,8 +1348,12 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
         }
         if (rendererCopyDeferred(&entry, state->gpuCopyQueue.readIndex))
             break;      // P11-C3-B1: left queued, with the copies after it
-        src = rendererFindBufferWithRetry(entry.srcBufferId);
-        dst = rendererFindBufferWithRetry(entry.dstBufferId);
+        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
         if (!src)
             log("rendererApplyPendingGpuCopies: source buffer %llu not found after waiting, skipping\n", (unsigned long long) entry.srcBufferId);
         if (!dst)
@@ -2093,6 +2169,7 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
     for (; i != end; i++) {
         LorieGpuCopyEntry entry = state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
         LorieBuffer *src, *dst;
+        bool later = false;
 
         if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
@@ -2105,8 +2182,12 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
         if (vkAux.pending && (entry.srcBufferId == vkAux.work.srcId || entry.srcBufferId == vkAux.work.dstId ||
                               entry.dstBufferId == vkAux.work.srcId || entry.dstBufferId == vkAux.work.dstId))
             break;
-        src = rendererFindBufferWithRetry(entry.srcBufferId);
-        dst = rendererFindBufferWithRetry(entry.dstBufferId);
+        src = rendererFindBuffer(entry.srcBufferId, &later);
+        dst = rendererFindBuffer(entry.dstBufferId, &later);
+        if ((!src || !dst) && later) {
+            LORIE_DIAG_ADD(state, copiesLeftForBuffers, 1);
+            break;      // P11-C3-C: a buffer that may still come - left queued, with the copies after it, for the next pass
+        }
         if (!src || !dst)
             log("rendererVkCopies: buffer %llu not found after waiting, skipping\n",
                 (unsigned long long) (!src ? entry.srcBufferId : entry.dstBufferId));
@@ -2418,8 +2499,8 @@ static bool rendererVkRootCopySubmit(struct rendererVkRootWork *w, bool ahead) {
     w->queuedUs = state->rootCopy.queuedUs;
     w->srcId = state->rootCopy.srcId;
     w->dstId = state->rootCopy.dstId;
-    src = rendererFindBufferWithRetry(w->srcId);
-    dst = rendererFindBufferWithRetry(w->dstId);
+    src = rendererFindBuffer(w->srcId, NULL);     // P11-C3-C: waited for before the lock (rendererAwaitBuffers)
+    dst = rendererFindBuffer(w->dstId, NULL);
     // P11-C3-B1: nor a buffer the X server holds reserved for a CPU access - it reserves neither of these (it waits
     // for the copy before it accesses the one copied into; the other is the root it publishes): not copied, then
     if (!src || !dst || lorieCpuReserved(state, w->srcId) || lorieCpuReserved(state, w->dstId)) {
@@ -2990,6 +3071,9 @@ static bool rendererVkFrameWanted(void) {
  */
 static void rendererPass(bool *waitingForBuffers) {
     bool gpuCopyPending;
+
+    // P11-C3-C: the buffers its copies use, waited for now if they have not come - not under the X server's lock
+    rendererAwaitBuffers();
 
     // P11-C2: a root copy the X server asked for, first - it may be waiting for it before it can draw again.
     // P11-C3-B2: submitted ahead of the frame this pass draws, which waits for it on the device, not the CPU.

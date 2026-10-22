@@ -1308,10 +1308,12 @@ static void lorieLogRendererDiag(void) {
     // renderer left queued for one
     log(INFO, "XlorieSchedule: exa_lock_opt=%s x_access_reserved=%llu(+%llu) x_access_reserve_full=%llu(+%llu) "
               "copies_deferred=%llu(+%llu) copies_deferred_wakes=%llu(+%llu) vk_schedule_opt=%s root_ahead=%llu(+%llu) "
-              "root_ahead_x_waiting=%llu(+%llu) root_chain_consumed=%llu(+%llu) root_ahead_unavailable=%llu(+%llu)",
+              "root_ahead_x_waiting=%llu(+%llu) root_chain_consumed=%llu(+%llu) root_ahead_unavailable=%llu(+%llu) "
+              "buffers_awaited=%llu(+%llu) buffer_await_us=%llu(+%llu) buffers_given_up=%llu(+%llu) "
+              "copies_left_for_buffers=%llu(+%llu)",
         pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes),
         pvfb->state->backend.vkScheduleOpt ? "on" : "off", TD(rootAhead), TD(rootAheadXWaiting), TD(rootChainConsumed),
-        TD(rootAheadUnavailable));
+        TD(rootAheadUnavailable), TD(buffersAwaited), TD(bufferAwaitUs), TD(buffersGivenUp), TD(copiesLeftForBuffers));
     // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
     log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
               "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "

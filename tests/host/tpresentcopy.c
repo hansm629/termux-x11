@@ -113,9 +113,14 @@ static void LorieBuffer_gpuCopyPendingDec(LorieBuffer *b) { b->gpuCopyPending--;
 static int LorieBuffer_lock(LorieBuffer *b, void **out) { *out = b; return 0; }
 static void LorieBuffer_unlock(LorieBuffer *b) { (void) b; }
 static void FatalError(const char *f, ...) { printf("FatalError %s\n", f); abort(); }
-static void *rendererWake;
+#include "wake_src.inc"
+static struct lorie_renderer_wake wakeRegion, *rendererWake = &wakeRegion;
 static int wakeups;
-#define lorieWakeRenderer(w) ((void) (w), wakeups++)
+static void countedWake(volatile struct lorie_renderer_wake *w) {
+    wakeups++;
+    lorieWakeRenderer(w);
+}
+#define lorieWakeRenderer(w) countedWake(w)
 
 /* ---- GL, as far as GLES's copies use it: each draw's corners, program, texture and framebuffer texture ---- */
 typedef unsigned GLuint, GLenum;
@@ -173,7 +178,8 @@ static pthread_spinlock_t bufferLock;
 static LorieBuffer bufs[96];
 static int nbufs, vkFailures;
 #define buffers rendererBuffers     /* fakevk.h has its own `buffers` */
-static int buffers, removedBuffers;
+static int buffers, removedBuffers, addedBuffers;
+#define LorieBuffer_addToList(buf, list) ((void) (buf), (void) (list))
 /* the renderer's lists: what the X server registered */
 static LorieBuffer *LorieBufferList_findById(volatile void *list, uint64_t id) {
     for (int i = 0; list == &buffers && i < nbufs; i++)
@@ -181,7 +187,6 @@ static LorieBuffer *LorieBufferList_findById(volatile void *list, uint64_t id) {
             return &bufs[i];
     return NULL;
 }
-static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) { return LorieBufferList_findById(&buffers, id); }
 static uint64_t rootAtLock;     /* non-zero: the root id the X server publishes as the renderer takes the lock */
 static void lorie_mutex_lock(volatile int *m, volatile int *pid);
 static void lorie_mutex_unlock(volatile int *m, volatile int *pid) { (*m)--; *pid = 0; }
@@ -229,11 +234,17 @@ static void notifyGpuCopyPublished(uint64_t publishedUs) {
     notifiedPublishedUs = publishedUs;
     notifyGpuCopyDone();
 }
+static void (*atLock)(void);     /* P11-C3-C: run once, as the renderer takes the shared lock */
 static void lorie_mutex_lock(volatile int *m, volatile int *pid) {
     (*m)++;
     *pid = 1;
     if (rootAtLock && m == &state->lock)
         state->rootWindowTextureID = rootAtLock;
+    if (atLock && m == &state->lock) {
+        void (*f)(void) = atLock;
+        atLock = NULL;
+        f();
+    }
 }
 /* the shared lock if no one holds it (lorieGpuCopySettle): a case makes a renderer process hold it (lockHolder) */
 static pid_t lockHolder;
@@ -619,6 +630,22 @@ static void queueDuringAcquire(void) {
                                                        &duringAcquire.dstBuffer);
 }
 
+/* P11-C3-C: a buffer coming from the connection `ms` later (rendererAddBuffer's part: in the list, then the wake) - or
+ * none, only a look then at the shared lock: whether the renderer held it while it waited */
+static struct arrival { LorieBuffer *buf; int ms, lockHeld; } arrival;
+static void *arrive(void *arg) {
+    struct arrival *a = arg;
+    usleep((useconds_t) a->ms * 1000);
+    a->lockHeld = st.lock;
+    if (a->buf) {
+        __atomic_store_n(&a->buf->registered, true, __ATOMIC_RELEASE);
+        lorieWakeRenderer(rendererWake);
+    }
+    return NULL;
+}
+static LorieBuffer *gone;
+static void bufferGone(void) { gone->registered = false; }
+
 int main(void) {
     LorieBuffer *root, *src, *bgra, *redirected, *fresh, *fd;
     LoriePixmapPriv rootP, srcP, bgraP, redirectedP, freshP, fdP, memP;
@@ -940,13 +967,15 @@ int main(void) {
         lorieGpuCopyAck(&srcPix, dstBuffer);
     }
 
-    /* an entry whose source the renderer never got: skipped and completed, as GLES does */
+    /* an entry whose source the renderer never got: skipped and completed, as GLES does - once the pass's wait for it
+     * (rendererAwaitBuffers, before the copies, as rendererPass has it) gave it up */
     {
         RegionRec one = { 1, boxes };
         uint32_t dests = st.diag.vkImportedDestinationDraws;
         CHECK(lorieTryScheduleGpuCopy(&freshPix, &rootPix, &one, 0, 0, &serial, &dstBuffer), "never got: not queued");
         fresh->registered = false;
         memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
+        rendererAwaitBuffers();
         rendererVkApplyPendingGpuCopies();
         CHECK(lorieGpuCopyIsDone(serial) && st.diag.vkImportedDestinationDraws == dests && vkFailures == 0 &&
               gles(&saved) == serial && glDrawCount == 0 && !fresh->glTexture, "never got: not skipped as GLES skips it");
@@ -1528,6 +1557,91 @@ int main(void) {
                   "B1 published root let go: held %d, %u presented", vkr.held, st.diag.vkFramesPresented - presented);
         }
         st.cpuAccess.waiter = 0;
+    }
+
+    /* P11-C3-C: a buffer a queued copy uses that has not come yet from the connection - waited for before the shared
+     * lock, not under it (the X server may take the lock meanwhile): it comes, its wake ends the wait, the copy is made
+     * in that same pass. Never coming: given up after 100 ms, the copy skipped - completed - the lock free all along.
+     * Missing only once the frame has the lock (queued after the wait): left queued, not skipped, and made by the next
+     * pass. GLES's copies likewise: left queued, or, given up on, skipped. */
+    {
+        uint64_t s1 = 0, s2 = 0, s3 = 0;
+        void *db1 = NULL, *db2 = NULL, *db3 = NULL;
+        uint32_t awaited = st.diag.buffersAwaited, givenUp = st.diag.buffersGivenUp, left = st.diag.copiesLeftForBuffers;
+        int fails0 = vkFailures;
+        struct timespec t0;
+        pthread_t t;
+        long ms;
+
+        own(46);
+        st.gpuInFlight.busy = 0;
+        CHECK(st.gpuCopyQueue.readIndex == st.gpuCopyQueue.writeIndex, "buffers: copies still queued from before");
+        /* comes 40 ms later */
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 1, 1, &s1, &db1), "buffers: not queued");
+        src->registered = false;
+        arrival = (struct arrival) { src, 40, -1 };
+        pthread_create(&t, NULL, arrive, &arrival);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        st.drawRequested = 1;
+        rendererPass(&waiting);
+        ms = msSince(&t0);
+        pthread_join(t, NULL);
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieGpuCopyIsDone(s1) && ms >= 30 && arrival.lockHeld == 0 && st.diag.buffersAwaited == awaited + 1 &&
+              st.diag.buffersGivenUp == givenUp && vkFailures == fails0 && emu.violations == 0,
+              "buffers, come after 40 ms: done %d after %ld ms, the shared lock %s while waited for, %u awaited, %u given up",
+              lorieGpuCopyIsDone(s1), ms, arrival.lockHeld ? "held" : "free", st.diag.buffersAwaited - awaited,
+              st.diag.buffersGivenUp - givenUp);
+        lorieGpuCopyAck(&srcPix, db1);
+        /* never coming */
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 2, 2, &s2, &db2), "buffers: not queued");
+        src->registered = false;
+        arrival = (struct arrival) { NULL, 50, -1 };
+        pthread_create(&t, NULL, arrive, &arrival);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        st.drawRequested = 1;
+        rendererPass(&waiting);
+        ms = msSince(&t0);
+        pthread_join(t, NULL);
+        st.gpuInFlight.busy = 0;
+        src->registered = true;
+        CHECK(lorieGpuCopyIsDone(s2) && ms >= 90 && ms < 500 && arrival.lockHeld == 0 && st.diag.buffersGivenUp == givenUp + 1 &&
+              vkFailures == fails0, "buffers, never come: done %d after %ld ms, the lock %s meanwhile, %u given up",
+              lorieGpuCopyIsDone(s2), ms, arrival.lockHeld ? "held" : "free", st.diag.buffersGivenUp - givenUp);
+        lorieGpuCopyAck(&srcPix, db2);
+        /* missing only once the frame has the lock: left for the next pass */
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &two, 3, 3, &s3, &db3), "buffers: not queued");
+        gone = src;
+        atLock = bufferGone;
+        arrival = (struct arrival) { NULL, 30, -1 };    /* the lock looked at meanwhile: not slept on under it */
+        pthread_create(&t, NULL, arrive, &arrival);
+        st.drawRequested = 1;
+        rendererPass(&waiting);
+        pthread_join(t, NULL);
+        atLock = NULL;
+        st.gpuInFlight.busy = 0;
+        CHECK(!lorieGpuCopyIsDone(s3) && st.diag.copiesLeftForBuffers == left + 1 && vkFailures == fails0 && arrival.lockHeld == 0,
+              "buffers, missing under the lock: done %d (want left queued), %u left, the lock %s 30 ms on", lorieGpuCopyIsDone(s3),
+              st.diag.copiesLeftForBuffers - left, arrival.lockHeld ? "held" : "free");
+        /* GLES, the same entry: left queued; given up on: skipped */
+        {
+            Queue saved;
+            memcpy(&saved, (const void *) &st.gpuCopyQueue, sizeof saved);
+            buffersGivenUpCount = 0;
+            CHECK(gles(&saved) == 0 && glesState.gpuCopyQueue.readIndex == saved.readIndex && glDrawCount == 0,
+                  "buffers, GLES: a copy whose buffer may still come not left queued");
+            buffersGivenUp[0] = src->desc.id, buffersGivenUpCount = 1;
+            CHECK(gles(&saved) == s3 && glesState.gpuCopyQueue.readIndex == saved.writeIndex && glDrawCount == 0,
+                  "buffers, GLES: a copy whose buffer was given up on not skipped");
+            buffersGivenUpCount = 0;
+        }
+        src->registered = true;
+        st.drawRequested = 1;
+        rendererPass(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(lorieGpuCopyIsDone(s3) && vkFailures == fails0 && emu.violations == 0,
+              "buffers: the copy left queued not made by the next pass");
+        lorieGpuCopyAck(&srcPix, db3);
     }
 
     /* P11-C3-B2, TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1: the root copy submitted ahead of the frame, in the second

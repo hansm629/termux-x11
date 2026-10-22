@@ -142,8 +142,19 @@ in_order("Vulkan teardown", func(R, "static void rendererVkTeardown(void) {"), "
 
 check("            if (rendererGlesEager())\n                rendererAttachToGL(buf);" in loop,
       "a buffer that comes gets a GLES texture whoever draws")
-check("rendererAttachToGL" not in func(R, "static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {"),
-      "a buffer found for a copy gets a GLES texture whoever copies")
+find = func(R, "static LorieBuffer *rendererFindBuffer(uint64_t id, bool *later) {")
+check("rendererAttachToGL" not in find, "a buffer found for a copy gets a GLES texture whoever copies")
+# P11-C3-C: the buffers a pass's copies use are waited for before the shared lock (rendererAwaitBuffers, first in the
+# pass), never under it: the lookups under it neither sleep nor wait, and every copy path looks up that way
+check("usleep" not in find and "futex" not in find and "rendererFindBufferWithRetry" not in open(R, encoding="utf-8").read(),
+      "a copy's buffer is still waited for under the shared lock")
+in_order("the pass waits for its buffers first", rpass, "rendererAwaitBuffers();", "if (state && rendererRootCopyPending()) {",
+         "rendererVkRedraw(waitingForBuffers);", "rendererRedrawLocked(waitingForBuffers);")
+check("lorie_mutex_lock" not in func(R, "static void rendererAwaitBuffers(void) {"), "the buffers waited for under the shared lock")
+for what, sig in (("GLES copies", "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {"),
+                  ("Vulkan copies", "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")):
+    in_order("a buffer that may still come leaves the copies queued: " + what, func(R, sig), "rendererFindBuffer(entry.srcBufferId, &later);",
+             "rendererFindBuffer(entry.dstBufferId, &later);", "if ((!src || !dst) && later) {", "break;")
 in_order("GLES frame", func(R, "void rendererRedrawLocked(bool* waitingForBuffers) {"), "rendererGlBuffer(buffer);",
          "LorieBuffer_bindTexture(buffer);")
 

@@ -406,7 +406,8 @@ int main(void) {
               "%u waits (want 1: none over 10 s)", (unsigned long long) (dg->xTickDelay.sumUs - sum), dg->xTickDelay.count - delays);
     }
 
-    /* P11-C3-B1: XlorieSchedule in every report - TERMUX_X11_EXA_LOCK_OPT off, its counters as they moved; on */
+    /* P11-C3-B1: XlorieSchedule in every report - TERMUX_X11_EXA_LOCK_OPT off, its counters as they moved; on. P11-C3-C:
+     * the buffers waited for, given up, and the copies left for them, always */
     {
         int lines = 0, offOk = 0, onOk = 0;
         snprintf(path, sizeof path, "%s/diag-schedule.log", out ? out : ".");
@@ -418,6 +419,8 @@ int main(void) {
         fakeState.diag.copiesDeferred += 7, fakeState.diag.copiesDeferredWakes += 6;
         fakeState.diag.rootAhead += 596, fakeState.diag.rootAheadXWaiting += 5, fakeState.diag.rootChainConsumed += 3;
         fakeState.diag.rootAheadUnavailable += 1;
+        fakeState.diag.buffersAwaited += 4, fakeState.diag.bufferAwaitUs += 123456, fakeState.diag.buffersGivenUp += 1;
+        fakeState.diag.copiesLeftForBuffers += 2;      /* P11-C3-C */
         lorieLogRendererDiag();
         fakePvfb.exaLockOpt = FALSE;
         fakeState.backend.vkScheduleOpt = 0;
@@ -429,11 +432,14 @@ int main(void) {
             lines++;
             offOk += lines == 1 && strstr(line, "XlorieSchedule: exa_lock_opt=off x_access_reserved=0(+0) x_access_reserve_full=0(+0) "
                                                 "copies_deferred=0(+0) copies_deferred_wakes=0(+0) vk_schedule_opt=off root_ahead=0(+0) "
-                                                "root_ahead_x_waiting=0(+0) root_chain_consumed=0(+0) root_ahead_unavailable=0(+0)\n") != NULL;
+                                                "root_ahead_x_waiting=0(+0) root_chain_consumed=0(+0) root_ahead_unavailable=0(+0) "
+                                                "buffers_awaited=0(+0) buffer_await_us=0(+0) buffers_given_up=0(+0) "
+                                                "copies_left_for_buffers=0(+0)\n") != NULL;
             onOk += lines == 2 && strstr(line, "XlorieSchedule: exa_lock_opt=on x_access_reserved=1201(+1201) "
                                                "x_access_reserve_full=2(+2) copies_deferred=7(+7) copies_deferred_wakes=6(+6) "
                                                "vk_schedule_opt=on root_ahead=596(+596) root_ahead_x_waiting=5(+5) "
-                                               "root_chain_consumed=3(+3) root_ahead_unavailable=1(+1)\n") != NULL;
+                                               "root_chain_consumed=3(+3) root_ahead_unavailable=1(+1) buffers_awaited=4(+4) "
+                                               "buffer_await_us=123456(+123456) buffers_given_up=1(+1) copies_left_for_buffers=2(+2)\n") != NULL;
         }
         fclose(logf);
         CHECK(lines == 2 && offOk && onOk, "schedule log: %d lines (want 2), off %s, on %s", lines, offOk ? "right" : "wrong",
