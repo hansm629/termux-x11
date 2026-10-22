@@ -165,6 +165,9 @@ recipes = {
         + func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
+    # P11-C3-C: the shared lock's wait (lorie.h) - tsharedlock.c
+    "sharedlock": lambda: func(H, "static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {")
+        + func(H, "static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex, pid_t* lockingPid) {"),
     # P11-C3-C: the renderer's wake, both ends (lorie.h) - tvkrenderer.c, twake.c
     "wake": lambda: span(H, "struct lorie_renderer_wake {", "    return __atomic_load_n(&w->seq, __ATOMIC_ACQUIRE);\n}"),
     # ... and the renderer's wait for work: its look (rendererShouldWait, with the pending root copy and the copies left

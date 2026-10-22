@@ -76,7 +76,12 @@ static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_
     // we will simply reinitialize it.
     struct timespec ts = {0};
     while(true) {
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        // P11-C3-C: pthread_mutex_timedlock's deadline is on CLOCK_REALTIME (POSIX; bionic's pthread.h says so too: only
+        // pthread_mutex_timedlock_monotonic_np, API 28, takes CLOCK_MONOTONIC). A CLOCK_MONOTONIC one is long past on
+        // that clock, so each wait ended at once - a busy loop of timed-out locks instead of a sleep until the unlock,
+        // and a lock left by a dead process reinitialised without the 33 msec. A jump of the clock only moves when the
+        // next of those checks is made: an unlock ends the wait whatever the clock says.
+        clock_gettime(CLOCK_REALTIME, &ts);
 
         // 33 msec is enough to complete any drawing operation on both X server and renderer side
         // In the case if mutex is locked most likely other thread died with the mutex locked

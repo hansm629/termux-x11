@@ -1494,6 +1494,14 @@ CONTROLS += [
      "twiring"),
 ]
 
+# P11-C3-C: the shared lock's 33 ms wait on the clock pthread_mutex_timedlock uses
+CONTROLS += [
+    ("shared lock: its deadline on CLOCK_MONOTONIC again", "lorie.h",
+     """        clock_gettime(CLOCK_REALTIME, &ts);""",
+     """        clock_gettime(CLOCK_MONOTONIC, &ts);""",
+     "tsharedlock"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):
