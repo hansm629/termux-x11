@@ -41,6 +41,7 @@ static struct {
     struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
+    Bool exaCompositeOpt;
     Bool freezeDiag;
     Bool contentDiag;
     struct {
@@ -466,9 +467,10 @@ int main(void) {
     }
 
     /* P11-C3-B1: XlorieSchedule in every report - TERMUX_X11_EXA_LOCK_OPT off, its counters as they moved; on. P11-C3-C:
-     * the buffers waited for, given up, and the copies left for them, always */
+     * the buffers waited for, given up, and the copies left for them, always. P11-C3-D1-A: XlorieCopyDamage likewise -
+     * TERMUX_X11_EXA_COMPOSITE_OPT off, on, the damage put off and how it went, those still running */
     {
-        int lines = 0, offOk = 0, onOk = 0;
+        int lines = 0, offOk = 0, onOk = 0, damageLines = 0, damageOk = 0;
         snprintf(path, sizeof path, "%s/diag-schedule.log", out ? out : ".");
         logf = fopen(path, "w");
         lorieLogRendererDiag();
@@ -480,12 +482,23 @@ int main(void) {
         fakeState.diag.rootAheadUnavailable += 1;
         fakeState.diag.buffersAwaited += 4, fakeState.diag.bufferAwaitUs += 123456, fakeState.diag.buffersGivenUp += 1;
         fakeState.diag.copiesLeftForBuffers += 2;      /* P11-C3-C */
+        fakePvfb.exaCompositeOpt = TRUE;                /* P11-C3-D1-A */
+        fakeState.diag.copyDamageDeferred += 1000, fakeState.diag.copyDamageDone += 990, fakeState.diag.copyDamageEarly += 4;
+        fakeState.diag.copyDamageDropped += 3;
         lorieLogRendererDiag();
         fakePvfb.exaLockOpt = FALSE;
+        fakePvfb.exaCompositeOpt = FALSE;
         fakeState.backend.vkScheduleOpt = 0;
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
+            if (strstr(line, "XlorieCopyDamage:")) {
+                damageLines++;
+                damageOk += damageLines == 1 && strstr(line, "XlorieCopyDamage: exa_composite_opt=off deferred=0(+0) done=0(+0) "
+                                                             "early=0(+0) dropped=0(+0) pending=0\n") != NULL;
+                damageOk += damageLines == 2 && strstr(line, "XlorieCopyDamage: exa_composite_opt=on deferred=1000(+1000) "
+                                                             "done=990(+990) early=4(+4) dropped=3(+3) pending=3\n") != NULL;
+            }
             if (!strstr(line, "XlorieSchedule:"))
                 continue;
             lines++;
@@ -503,6 +516,7 @@ int main(void) {
         fclose(logf);
         CHECK(lines == 2 && offOk && onOk, "schedule log: %d lines (want 2), off %s, on %s", lines, offOk ? "right" : "wrong",
               onOk ? "right" : "wrong");
+        CHECK(damageLines == 2 && damageOk == 2, "copy damage: %d lines (want 2), %d right", damageLines, damageOk);
     }
 
     /* P11-C3-D0: the content lines, only with TERMUX_X11_CONTENT_FRAME_DIAG - the counts as they moved, each wait (its
@@ -663,6 +677,9 @@ int main(void) {
         fakeState.diag.copiesDeferred += 999999999, fakeState.diag.copiesDeferredWakes += 999999999;
         fakeState.diag.rootAhead += 999999999, fakeState.diag.rootAheadXWaiting += 999999999;
         fakeState.diag.rootChainConsumed += 999999999, fakeState.diag.rootAheadUnavailable += 999999999;
+        fakeState.diag.copyDamageDeferred += 4294967295u, fakeState.diag.copyDamageDone += 999999999;      /* P11-C3-D1-A */
+        fakeState.diag.copyDamageEarly += 999999999, fakeState.diag.copyDamageDropped += 999999999;
+        fakePvfb.exaCompositeOpt = TRUE;
         /* P11-C3-D1: every composite class at its widest - the longest names, every count and time at its type's
          * widest (the sums at 2^64 - 1: they do not wrap in a period, so never wider) - and the slowest */
         for (i = 0; i <= LORIE_COMPOSITE_CLASSES; i++)
@@ -673,6 +690,7 @@ int main(void) {
                                                                       1000000000, 1000000000, 1000000000, 65535, 65535 };
         lorieLogRendererDiag();
         fakePvfb.contentDiag = FALSE;
+        fakePvfb.exaCompositeOpt = FALSE;
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {
             snprintf(path, sizeof path, "%s/%s", out ? out : ".", logs[k]);

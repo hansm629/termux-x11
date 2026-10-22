@@ -148,6 +148,10 @@ typedef struct {
      * holding the shared lock through the access */
     Bool exaLockOpt;
 
+    /* P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1, lorieDeferCopyDamage): a Present GPU copy's damage reported once the
+     * copy is done */
+    Bool exaCompositeOpt;
+
     /* P11-C3-C (TERMUX_X11_FRAME_FREEZE_DIAG=1, the freeze watchdog: lorieFreezeWatch): asked for; where this thread is
      * (LORIE_X_*, since when), the request it is in and the stage it came from, the requests run; the 5 second
      * report's own time (the last, and the most since the watchdog last logged the threads); the last GPU copy
@@ -522,6 +526,10 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_EXA_LOCK_OPT=1 has a PER_ACCESS AHB access reserve the AHB for itself instead of holding
     // the shared lock - and so the renderer's frames - through the CPU drawing (loriePrepareAccess, lorie.h cpuAccess).
     lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");
+    // Experimental: TERMUX_X11_EXA_COMPOSITE_OPT=1 reports a Present GPU copy's damage once the copy is done, not as it is
+    // queued - a compositor then reads (composites) the window's content with the copy in it, without waiting for the
+    // frame that runs it (lorieDeferCopyDamage, patches/xserver.patch present_damage_gpu_copy).
+    lorieScreen.exaCompositeOpt = getenv("TERMUX_X11_EXA_COMPOSITE_OPT") && !strcmp(getenv("TERMUX_X11_EXA_COMPOSITE_OPT"), "1");
     // Experimental: TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1 has the renderer submit root double buffering's GPU copy
     // ahead of the frame, which waits for it on the device instead of the renderer waiting for its fence (renderer.c).
     lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&
@@ -1449,6 +1457,11 @@ static void lorieLogRendererDiag(void) {
         pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes),
         pvfb->state->backend.vkScheduleOpt ? "on" : "off", TD(rootAhead), TD(rootAheadXWaiting), TD(rootChainConsumed),
         TD(rootAheadUnavailable), TD(buffersAwaited), TD(bufferAwaitUs), TD(buffersGivenUp), TD(copiesLeftForBuffers));
+    // P11-C3-D1-A: the Present GPU copies' damage put off until the copy was done, and how each went; those still running
+    log(INFO, "XlorieCopyDamage: exa_composite_opt=%s deferred=%llu(+%llu) done=%llu(+%llu) early=%llu(+%llu) dropped=%llu(+%llu) "
+              "pending=%u",
+        pvfb->exaCompositeOpt ? "on" : "off", TD(copyDamageDeferred), TD(copyDamageDone), TD(copyDamageEarly), TD(copyDamageDropped),
+        d.copyDamageDeferred - d.copyDamageDone - d.copyDamageEarly - d.copyDamageDropped);
     // P11-C2: the root's copies by the renderer's GPU; "fallback" when, this period, only the CPU settled them
     log(INFO, "XlorieRootCopy: root_gpu_copy=%s root_gpu_copy_requests=%llu(+%llu) root_gpu_copy_submits=%llu(+%llu) "
               "root_gpu_copy_completions=%llu(+%llu) root_gpu_copy_rects=%llu(+%llu) root_gpu_copy_bytes=%llu(+%llu) "
@@ -2798,6 +2811,21 @@ void lorieCountGpuCopyEarly(int how) {
         __atomic_fetch_add(&pvfb->state->diag.xCopyEarly[how], 1, __ATOMIC_RELAXED);
 }
 
+// P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1): a Present GPU copy's damage put off until the copy is done
+// (patches/xserver.patch present_damage_gpu_copy), counted; and how each one put off went (LORIE_COPY_DAMAGE_*).
+Bool lorieDeferCopyDamage(void) {
+    if (!pvfb->exaCompositeOpt)
+        return FALSE;
+    __atomic_fetch_add(&pvfb->state->diag.copyDamageDeferred, 1, __ATOMIC_RELAXED);
+    return TRUE;
+}
+
+void lorieCountCopyDamage(int how) {
+    __atomic_fetch_add(how == LORIE_COPY_DAMAGE_DONE ? &pvfb->state->diag.copyDamageDone
+                       : how == LORIE_COPY_DAMAGE_EARLY ? &pvfb->state->diag.copyDamageEarly : &pvfb->state->diag.copyDamageDropped,
+                       1, __ATOMIC_RELAXED);
+}
+
 // P9-B0: from the Vulkan renderer's latest completedSerial publish to here (cmdentrypoint.c, after the X server
 // re-executed what it completed: lorieRecheckGpuCopies), once per publish.
 void lorieCountCopyAck(void) {
@@ -2907,7 +2935,8 @@ static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c
 
 /*
  * Its copy queued for the GPU (`gpu`, present_execute_copy: when, for its completion's wait; the copy's serial kept on
- * `dst` for stale reads) or made by the CPU (its content in `dst` now). The wait from the request.
+ * `dst` for stale reads - its damage reported as it is queued, before the copy: not with TERMUX_X11_EXA_COMPOSITE_OPT=1,
+ * which reports it once the copy is done) or made by the CPU (its content in `dst` now). The wait from the request.
  */
 uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
     LoriePixmapPriv *priv = dst ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
@@ -2917,7 +2946,7 @@ uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bo
     now = lorieMonotonicUs();
     __atomic_fetch_add(gpu ? &pvfb->state->diag.contentGpuCopies : &pvfb->state->diag.contentCpuCopies, 1, __ATOMIC_RELAXED);
     lorieHistAdd(&pvfb->state->diag.contentPresentToCopy, now >= request_us ? now - request_us : 0);
-    if (gpu && priv)
+    if (gpu && priv && !pvfb->exaCompositeOpt)
         priv->contentCopySerial = pvfb->gpuCopySerialCounter;  // the one lorieTryScheduleGpuCopy just queued
     else if (!gpu)
         lorieContentStore(dst, &(struct lorie_content_stamp) { seq, request_us, now, now }, now, FALSE);

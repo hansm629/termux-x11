@@ -404,7 +404,38 @@
  
      screen_priv->re_execute(vblank);
  }
-@@ -67,6 +69,14 @@
+@@ -61,12 +63,45 @@
+     return FALSE;
+ }
+ 
++/* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - a GPU copy's damage, put off as it was queued, reported now (`how`:
++ * its copy done, or still possibly running) or dropped (the copy never runs, or the window goes): the update region - in
++ * the pixmap's coordinates, x_off/y_off into the window, the window where it is now - or the window's whole clip, as
++ * present_copy_region draws them. Dropped, the update region goes with the vblank. */
++void
++present_damage_gpu_copy(present_vblank_ptr vblank, int how)
++{
++    WindowPtr                   window = vblank->window;
++
++    if (!vblank->lorie_damage_deferred)
++        return;
++    vblank->lorie_damage_deferred = FALSE;
++    lorieCountCopyDamage(how);
++    if (how == LORIE_COPY_DAMAGE_DROPPED || !window)
++        return;
++    if (vblank->update) {
++        RegionTranslate(vblank->update, vblank->x_off + window->drawable.x, vblank->y_off + window->drawable.y);
++        RegionIntersect(vblank->update, vblank->update, &window->clipList);
++        DamageDamageRegion(&window->drawable, vblank->update);
++        RegionDestroy(vblank->update);
++        vblank->update = NULL;
++    } else
++        DamageDamageRegion(&window->drawable, &window->clipList);
++}
++
+ void
+ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ {
      WindowPtr                   window = vblank->window;
      ScreenPtr                   screen = window->drawable.pScreen;
      present_screen_priv_ptr screen_priv = present_screen_priv(screen);
@@ -419,7 +450,7 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +89,79 @@
+@@ -79,12 +114,85 @@
          return;
      }
  
@@ -450,6 +481,7 @@
 +        if (settled == LORIE_GPU_COPY_CANCELLED) {
 +            lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
 +            vblank->gpu_copy_pending = FALSE;
++            present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DROPPED);     /* lorie: P11-C3-D1-A - nothing copied */
 +            present_vblank_scrap(vblank);
 +            screen_priv->flush(window);
 +            return;
@@ -459,6 +491,7 @@
 +    if (vblank->gpu_copy_pending) {
 +        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
 +        vblank->gpu_copy_pending = FALSE;
++        present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DONE);    /* lorie: P11-C3-D1-A - the content there now */
 +        lorieContentCopyDone(vblank->lorie_content_seq, vblank->lorie_content_us, vblank->lorie_copy_us, gpuCopyDst);
 +    } else if (present_retired_copy_reserve(vblank) &&
 +               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
@@ -466,16 +499,20 @@
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
 +         * ops that Damage tracking hooks into, so report it manually - same drawable and region
 +         * present_scmd.c's flip success path already uses, so this also reaches Composite's
-+         * per-window damage for redirected windows, not just lorie's own root damage. */
-+        RegionPtr damage = vblank->update ? vblank->update : &window->clipList;
-+        if (vblank->update)
-+            RegionIntersect(damage, damage, &window->clipList);
-+        DamageDamageRegion(&window->drawable, damage);
++         * per-window damage for redirected windows, not just lorie's own root damage.
++         * P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1): reported once the copy is done instead
++         * (present_damage_gpu_copy), the update region kept for it. */
++        if (!(vblank->lorie_damage_deferred = lorieDeferCopyDamage())) {
++            RegionPtr damage = vblank->update ? vblank->update : &window->clipList;
++            if (vblank->update)
++                RegionIntersect(damage, damage, &window->clipList);
++            DamageDamageRegion(&window->drawable, damage);
++        }
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
 +         * consumed (copied into the shared command queue), so free it like
 +         * present_copy_region would have. */
-+        if (vblank->update) {
++        if (vblank->update && !vblank->lorie_damage_deferred) {
 +            RegionDestroy(vblank->update);
 +            vblank->update = NULL;
 +        }
@@ -504,7 +541,7 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
-@@ -110,6 +187,7 @@
+@@ -110,6 +218,7 @@
      else
          mode = PresentCompleteModeCopy;
  
@@ -521,7 +558,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,75 @@
+@@ -90,8 +91,90 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -542,6 +579,9 @@
 +     * for, and when its copy was queued for the GPU (lorieContent*) */
 +    uint32_t            lorie_content_seq;
 +    uint64_t            lorie_content_us, lorie_copy_us;
++    /* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - its GPU copy's damage put off until the copy is done
++     * (present_damage_gpu_copy), its update region kept for it until then */
++    Bool                lorie_damage_deferred;
  };
  
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
@@ -593,6 +633,18 @@
 +extern uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu);
 +extern void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst);
 +extern void lorieContentComplete(uint32_t seq, CARD8 mode);
++
++/* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - a GPU-copied presentation's damage reported once its copy is
++ * done, not as it is queued: a compositor told then reads the window's pixmap before the copy wrote it, or waits for
++ * the frame that runs it. lorieDeferCopyDamage (lorie/InitOutput.c) says whether, counting it; present_damage_gpu_copy
++ * (present_execute.c) reports it - the copy done; at once, the presentation scrapped while its copy may still run (as
++ * without the option); never, the copy never to run or the window destroyed - and lorieCountCopyDamage counts which. */
++extern Bool lorieDeferCopyDamage(void);
++extern void lorieCountCopyDamage(int how);
++extern void present_damage_gpu_copy(present_vblank_ptr vblank, int how);
++#define LORIE_COPY_DAMAGE_DONE 0
++#define LORIE_COPY_DAMAGE_EARLY 1
++#define LORIE_COPY_DAMAGE_DROPPED 2
 +
  typedef struct present_screen_priv present_screen_priv_rec, *present_screen_priv_ptr;
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
@@ -678,7 +730,7 @@
          present_clear_window_notifies(window);
          present_free_events(window);
 +++ ./present/present_vblank.c
-@@ -180,14 +180,140 @@
+@@ -180,14 +180,147 @@
      return NULL;
  }
  
@@ -805,9 +857,16 @@
 +     * idle notification it owes stay with a retired copy until it settles, and this presentation goes on without
 +     * them. Settled (done, or cancelled before any renderer recorded it), they go here as without a copy. */
 +    if (vblank->gpu_copy_pending) {
++        int settled;
++
 +        if (!lorieGpuCopyIsDone(vblank->gpu_copy_serial))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_SCRAP);
-+        if (lorieGpuCopySettle(vblank->gpu_copy_serial) == LORIE_GPU_COPY_RUNNING) {
++        settled = lorieGpuCopySettle(vblank->gpu_copy_serial);
++        /* lorie: P11-C3-D1-A - its damage put off: reported now, the copy done or - as without the option - while it may
++         * still run; dropped, never to run */
++        present_damage_gpu_copy(vblank, settled == LORIE_GPU_COPY_DONE ? LORIE_COPY_DAMAGE_DONE
++                                        : settled == LORIE_GPU_COPY_RUNNING ? LORIE_COPY_DAMAGE_EARLY : LORIE_COPY_DAMAGE_DROPPED);
++        if (settled == LORIE_GPU_COPY_RUNNING) {
 +            present_retire_copy(vblank, TRUE);
 +            vblank->flip = FALSE;
 +            return;
@@ -819,7 +878,7 @@
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +326,20 @@
+@@ -200,6 +333,21 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
@@ -836,11 +895,12 @@
 +            vblank->gpu_copy_pending = FALSE;
 +        }
 +    }
++    present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DROPPED);     /* lorie: P11-C3-D1-A - its window goes */
 +
      /* Remove vblank from window and screen lists */
      xorg_list_del(&vblank->window_list);
      /* Also make sure vblank is removed from event queue (wnmd) */
-@@ -229,5 +369,8 @@
+@@ -229,5 +377,8 @@
      if (vblank->notifies)
          present_destroy_notifies(vblank->notifies, vblank->num_notifies);
  

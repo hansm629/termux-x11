@@ -309,10 +309,12 @@ recipes = {
     # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that
     # scraps a queued presentation a new one overwrites in the same frame
     "presentsafety_struct": lambda: span(present("present_priv.h"), "struct present_vblank {",
-                                         "    uint64_t            lorie_content_us, lorie_copy_us;\n};")
-        + span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
+                                         "    Bool                lorie_damage_deferred;\n};")
+        + span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_CANCELLED 2")
+        + span(present("present_priv.h"), "#define LORIE_COPY_DAMAGE_DONE 0", "#define LORIE_COPY_DAMAGE_DROPPED 2"),
     "presentsafety": lambda: "static void\n" + func(present("present_scmd.c"), "present_re_execute(present_vblank_ptr vblank)\n{")
         + "static void\n" + func(present("present_scmd.c"), "present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
+        + "void\n" + func(present("present_execute.c"), "present_damage_gpu_copy(present_vblank_ptr vblank, int how)\n{")
         + "void\n" + func(present("present_execute.c"), "present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)\n{")
         + "void\n" + func(present("present_execute.c"), "present_execute_post(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")
         + span(present("present_vblank.c"), "struct present_retired_copy {",

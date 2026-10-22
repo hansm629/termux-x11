@@ -587,6 +587,11 @@ struct lorie_renderer_diag {
      * them; chain semaphores no frame waited for (an empty submission did); and root copies made the old way because
      * the second submission's objects could not be made. */
     volatile uint32_t rootAhead, rootAheadXWaiting, rootChainConsumed, rootAheadUnavailable;
+    /* P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1), always counted: Present GPU copies whose damage was put off until
+     * the copy was done (patches/xserver.patch present_damage_gpu_copy), and how each went - reported with its copy
+     * done; reported before, its presentation scrapped while the copy may still run (as without the option); dropped,
+     * the copy never to run or its window destroyed. Put off less those: copies still running. */
+    volatile uint32_t copyDamageDeferred, copyDamageDone, copyDamageEarly, copyDamageDropped;
 
     /* TERMUX_X11_RENDERER_VK_TRANSFER_COPY, while it is on: queued copies checked; for each condition, the copies it
      * kept from vkCmdCopyImage (one copy may count under several); for each image of a copy without the transfer

@@ -298,6 +298,13 @@ check(sinit.count("lorieCompositeTimed") == 1, "the composites timed other than 
 check("    if (pvfb->frameDiag)\n        pvfb->xAccessesOpened++;" in prep and open(I, encoding="utf-8").read().count("xAccessesOpened++") == 1,
       "the EXA accesses counted for the composites without the frame diagnostics, or not counted")
 
+# P11-C3-D1-A: TERMUX_X11_EXA_COMPOSITE_OPT read when the server state is made, "1" only; the copies' damage put off only
+# with it (tpresentsafety.c runs the patch's present_damage_gpu_copy and its callers)
+check('lorieScreen.exaCompositeOpt = getenv("TERMUX_X11_EXA_COMPOSITE_OPT") && !strcmp(getenv("TERMUX_X11_EXA_COMPOSITE_OPT"), "1");'
+      in init, "OsVendorInit does not read TERMUX_X11_EXA_COMPOSITE_OPT=1")
+check("    if (!pvfb->exaCompositeOpt)\n        return FALSE;" in func(I, "Bool lorieDeferCopyDamage(void) {"),
+      "a copy's damage put off with TERMUX_X11_EXA_COMPOSITE_OPT off")
+
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
 # publishes its work before it moves the count.

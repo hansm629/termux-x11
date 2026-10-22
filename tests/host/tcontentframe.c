@@ -11,7 +11,9 @@
  *   older content never over a newer one. Numbers past their wrap. A publish with nothing new changes nothing. Frames
  *   with new content 22 ms apart, then 101 ms apart (asked for in the first half: pending), then 99 ms apart (asked for
  *   late: client): their intervals, the longest, the slowest content with its stages. Clients: named once, counted
- *   apart, a ninth taking the least-used slot, a reused index with another client a new slot.
+ *   apart, a ninth taking the least-used slot, a reused index with another client a new slot. With
+ *   TERMUX_X11_EXA_COMPOSITE_OPT=1 (P11-C3-D1-A: a copy's damage reported once it is done) no read is stale: the
+ *   compositor is told of the copy only once it is there - a read while it is queued sees what it was told of.
  */
 #include <errno.h>
 #include <limits.h>
@@ -77,6 +79,7 @@ static struct {
     struct lorie_shared_server_state *state;
     uint64_t gpuCopySerialCounter;
     Bool contentDiag;
+    Bool exaCompositeOpt;           /* P11-C3-D1-A: the copies' damage once they are done */
     uint32_t contentSeq, contentGen, contentPublishedSeq;
     int contentOpen;
     struct lorie_content_stamp contentIn;
@@ -334,6 +337,19 @@ int main(void) {
     n = d->contentRequests;
     lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
     CHECK(d->contentRequests == n + 1, "a presentation with no current client not counted");
+
+    /* P11-C3-D1-A: the copy's damage reported once it is done - a read while it is queued sees what the compositor was
+     * told of, not stale */
+    world();
+    fakePvfb.exaCompositeOpt = TRUE;
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    fakePvfb.gpuCopySerialCounter = 90;
+    st.gpuCopyQueue.completedSerial = 89;
+    lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
+    lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_SRC);
+    CHECK(!privs[WINDOW].contentCopySerial && d->contentStaleReads == 0 && d->contentGpuCopies == 1, "with the damage put off: "
+          "serial %llu kept, %u stale reads (want none)", (unsigned long long) privs[WINDOW].contentCopySerial, d->contentStaleReads);
+    fakePvfb.exaCompositeOpt = FALSE;
 
     printf("TCONTENTFRAME client content from its presentation to the screen (TERMUX_X11_CONTENT_FRAME_DIAG): %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);

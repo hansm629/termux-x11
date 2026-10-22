@@ -20,7 +20,15 @@
  * references, not these, keep the buffers its GPU may still use - present_retired_copies_drain); a copy that
  * never ran completes as skipped; each reference, idle fence and notification goes exactly once; nothing is left
  * behind - every vblank and retired copy freed once (their allocations counted, and failed at will: out of memory, no
- * GPU copy is scheduled without its retired copy, and retiring one never allocates). */
+ * GPU copy is scheduled without its retired copy, and retiring one never allocates).
+ *
+ * P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1): the copy's damage, logged apart ("+"/"!" as above: the GPU may no longer
+ * or may still write the window's pixmap then) with its region (regions here are one box): off, reported as the copy
+ * is queued; on, once it is done - the window's clip, or the update region moved into the window (x_off/y_off, the
+ * window where it is then) and clipped - before the client is told the pixmap is idle; a presentation scrapped meanwhile
+ * reports it then (copy done: "+"; still running, as off: "!"), never when its copy never runs (cancelled, or its
+ * renderer stalled) or its window goes; the update region destroyed once whatever happens; a CPU copy never puts it
+ * off. Each counted by how it went. */
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,7 +45,7 @@ typedef uint16_t CARD16;
 #define Success 0
 #define DebugPresent(x)
 #include "xorglist_src.inc"
-typedef struct { int n; } RegionRec, *RegionPtr;
+typedef struct { int n; int x1, y1, x2, y2; } RegionRec, *RegionPtr;     /* one box: n 0 (empty) or 1 */
 typedef struct _Screen *ScreenPtr;
 typedef struct { ScreenPtr pScreen; int16_t x, y; XID id; } DrawableRec;
 typedef struct _Window { DrawableRec drawable; RegionRec clipList; struct present_window_priv *priv; } WindowRec, *WindowPtr;
@@ -161,9 +169,29 @@ static void present_vblank_notify(struct present_vblank *v, CARD16 kind, CARD16 
     (void) v; (void) kind; (void) ust; (void) msc;
     step(mode == PresentCompleteModeSkip ? "complete(skip)" : "complete(copy)", current);
 }
-static void RegionDestroy(RegionPtr r) { (void) r; }
-static void RegionIntersect(RegionPtr d, RegionPtr a, RegionPtr b) { (void) d; (void) a; (void) b; }
-static void DamageDamageRegion(DrawableRec *d, RegionPtr r) { (void) d; (void) r; }
+static int regionsDestroyed;
+static void RegionDestroy(RegionPtr r) { if (r) regionsDestroyed++; }
+static void RegionTranslate(RegionPtr r, int dx, int dy) { r->x1 += dx, r->y1 += dy, r->x2 += dx, r->y2 += dy; }
+static void RegionIntersect(RegionPtr d, RegionPtr a, RegionPtr b) {
+    RegionRec r = { 1, a->x1 > b->x1 ? a->x1 : b->x1, a->y1 > b->y1 ? a->y1 : b->y1, a->x2 < b->x2 ? a->x2 : b->x2,
+                    a->y2 < b->y2 ? a->y2 : b->y2 };
+    if (!a->n || !b->n || r.x1 >= r.x2 || r.y1 >= r.y2)
+        r = (RegionRec) { 0 };
+    *d = r;
+}
+/* P11-C3-D1-A: the damage reported, logged apart (dtrail) - its box, and whether the GPU may still write then */
+static char dtrail[256];
+static bool damageBeforeIdle;
+static void DamageDamageRegion(DrawableRec *d, RegionPtr r) {
+    (void) d;
+    snprintf(dtrail + strlen(dtrail), sizeof dtrail - strlen(dtrail), "%sdamage(%d,%d,%d,%d)%s", dtrail[0] ? " " : "",
+             r->n ? r->x1 : 0, r->n ? r->y1 : 0, r->n ? r->x2 : 0, r->n ? r->y2 : 0, gpuMay(current ? current->copySerial : 0) ? "!" : "+");
+    damageBeforeIdle = !strstr(trail, "idle");
+}
+static bool deferDamage;            /* TERMUX_X11_EXA_COMPOSITE_OPT */
+static int damageDeferred, damageHow[3];
+static Bool lorieDeferCopyDamage(void) { damageDeferred += deferDamage; return deferDamage; }
+static void lorieCountCopyDamage(int how) { damageHow[how]++; }
 static int queued;                  /* polls queued (the lorie vblank events), minus those aborted */
 static int queueVblank(ScreenPtr s, WindowPtr w, RRCrtcPtr c, uint64_t id, uint64_t msc) {
     (void) s; (void) w; (void) c; (void) id; (void) msc;
@@ -218,6 +246,7 @@ static void lorieContentComplete(uint32_t seq, uint8_t mode) {
     if (seq)
         cstep("complete", seq, mode == PresentCompleteModeSkip ? "skip" : "copy");
 }
+void present_damage_gpu_copy(struct present_vblank *vblank, int how);
 void present_execute_copy(struct present_vblank *vblank, uint64_t crtc_msc);
 void present_execute_post(struct present_vblank *vblank, uint64_t ust, uint64_t crtc_msc);
 void present_vblank_scrap(struct present_vblank *vblank);
@@ -232,6 +261,10 @@ static void present_execute(struct present_vblank *vblank, uint64_t ust, uint64_
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("  FAIL " __VA_ARGS__); printf("\n"); } } while (0)
+
+/* P11-C3-D1-A: the next presentation's update region (none: n 0) and offset into the window */
+static RegionRec nextUpdate;
+static int16_t nextXOff, nextYOff;
 
 /* a client's presentation of `pixmap` to the window at msc 10, as present_scmd_pixmap queues and executes it */
 static struct present_vblank *presentation(PixmapPtr pixmap) {
@@ -251,9 +284,21 @@ static struct present_vblank *presentation(PixmapPtr pixmap) {
     xorg_list_append(&v->event_queue, &present_exec_queue);
     v->queued = TRUE;
     v->lorie_content_seq = contentSeqNext;
+    if (nextUpdate.n) {
+        v->update = &nextUpdate;
+        v->x_off = nextXOff, v->y_off = nextYOff;
+    }
     current = pixmap;
     present_execute(v, 0, 10);
     return v;
+}
+
+/* P11-C3-D1-A: the damage logged and counted, and no update region for the next presentation */
+static void dreset(void) {
+    dtrail[0] = 0;
+    damageDeferred = regionsDestroyed = 0;
+    memset(damageHow, 0, sizeof damageHow);
+    nextUpdate = (RegionRec) { 0 }, nextXOff = nextYOff = 0;
 }
 
 static void reset(void) {
@@ -657,6 +702,122 @@ int main(void) {
     lorieRecheckGpuCopies();
     expect("renderer without a surface, the shared lock busy, then free", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
     clean("lock busy", &a, 0);
+
+    /* P11-C3-D1-A: the copy's damage. Off: reported as the copy is queued (the GPU may still write), once */
+    window.drawable.x = 100, window.drawable.y = 50;
+    window.clipList = (RegionRec) { 1, 100, 50, 900, 650 };
+    reset();
+    dreset();
+    v = presentation(&a);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !v->lorie_damage_deferred, "off: not damaged as the copy is queued: %s", dtrail);
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !damageDeferred && !damageHow[0] && !damageHow[1] && !damageHow[2],
+          "off: damaged again, or counted: %s", dtrail);
+    expect("damage, off: as the copy is queued", "ack+ idle+ complete(copy)+", -1);
+    clean("damage, off", &a, 0);
+
+    /* on: none as it is queued, nor while it runs; once it is done, before the client is told its pixmap is idle */
+    deferDamage = true;
+    reset();
+    dreset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    lorieRecheckGpuCopies();                /* a tick, still copying */
+    present_execute(v, 0, 11);              /* its poll, still copying */
+    CHECK(!dtrail[0] && v->lorie_damage_deferred && damageDeferred == 1, "on: damaged before the copy is done: %s", dtrail);
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)+") && damageBeforeIdle && damageHow[LORIE_COPY_DAMAGE_DONE] == 1 &&
+          !damageHow[LORIE_COPY_DAMAGE_EARLY] && !damageHow[LORIE_COPY_DAMAGE_DROPPED], "on: not damaged once the copy is done, "
+          "before idle (%d): %s", damageBeforeIdle, dtrail);
+    expect("damage, on: once the copy is done", "ack+ idle+ complete(copy)+", -1);
+    clean("damage, on", &a, 0);
+
+    /* on, an update region: moved into the window by x_off/y_off and the window where it is once the copy is done (it
+     * moved meanwhile), clipped; destroyed once */
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 700 }, nextXOff = 5, nextYOff = 6;
+    v = presentation(&a);
+    CHECK(!dtrail[0] && v->update == &nextUpdate && !regionsDestroyed, "on, update: damaged, or its region gone, as it is queued: %s",
+          dtrail);
+    window.drawable.x = 200, window.clipList = (RegionRec) { 1, 200, 50, 1000, 650 };
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(205,56,215,650)+") && regionsDestroyed == 1, "on, update: %s, its region destroyed %d times "
+          "(want damage(205,56,215,650)+, once)", dtrail, regionsDestroyed);
+    expect("damage, on, an update region: moved into the window, clipped", "ack+ idle+ complete(copy)+", -1);
+    clean("damage, on, update", &a, 0);
+    window.drawable.x = 100, window.clipList = (RegionRec) { 1, 100, 50, 900, 650 };
+
+    /* on, overwritten in its frame while the copy runs: damaged then, as off (the GPU may still write), not again */
+    reset();
+    dreset();
+    v = presentation(&a);
+    recorded = a.copySerial;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && damageHow[LORIE_COPY_DAMAGE_EARLY] == 1, "on, overwritten while copying: %s",
+          dtrail);
+    present_execute(v, 0, 11);
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && damageHow[LORIE_COPY_DAMAGE_EARLY] == 1 && !damageHow[LORIE_COPY_DAMAGE_DONE],
+          "on, overwritten while copying: damaged again: %s", dtrail);
+    expect("damage, on, overwritten while copying: then (scrap)", "complete(skip)! ack+ idle+", LORIE_X_EARLY_SCRAP);
+    clean("damage, on, overwritten while copying", &a, 0);
+
+    /* on, overwritten once the copy is done, not taken up yet: damaged then, done */
+    reset();
+    dreset();
+    v = presentation(&a);
+    recorded = completed = a.copySerial;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)+") && damageHow[LORIE_COPY_DAMAGE_DONE] == 1, "on, overwritten, copy done: %s", dtrail);
+    expect("damage, on, overwritten once the copy is done", "ack+ idle+ complete(skip)+", -1);
+    clean("damage, on, overwritten, done", &a, 0);
+
+    /* on, overwritten before the renderer recorded it (cancelled), or its renderer stalled before it did: never damaged */
+    reset();
+    dreset();
+    v = presentation(&a);
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    CHECK(!dtrail[0] && damageHow[LORIE_COPY_DAMAGE_DROPPED] == 1, "on, cancelled: %s", dtrail);
+    expect("damage, on, overwritten before it was recorded: none (scrap)", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_SCRAP);
+    clean("damage, on, cancelled", &a, 0);
+    reset();
+    dreset();
+    v = presentation(&a);
+    rendererAvailable = false;
+    lorieRecheckGpuCopies();
+    gpuDone(a.copySerial);
+    CHECK(!dtrail[0] && damageHow[LORIE_COPY_DAMAGE_DROPPED] == 1 && !v->lorie_damage_deferred, "on, stalled, not recorded: %s", dtrail);
+    expect("damage, on, its renderer stalled before recording it: none", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
+    clean("damage, on, stalled", &a, 0);
+
+    /* on, its window destroyed while the copy runs: never damaged, its update region destroyed once */
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 10 };
+    v = presentation(&a);
+    recorded = a.copySerial;
+    present_free_window_vblank(&window);
+    gpuDone(a.copySerial);
+    CHECK(!dtrail[0] && damageHow[LORIE_COPY_DAMAGE_DROPPED] == 1 && regionsDestroyed == 1, "on, window destroyed: %s, its region "
+          "destroyed %d times", dtrail, regionsDestroyed);
+    expect("damage, on, its window destroyed while copying: none (destroy)", "ack+", LORIE_X_EARLY_DESTROY);
+    clean("damage, on, window destroyed", &a, 0);
+
+    /* on, copied by the CPU (out of memory reserving the retired copy): nothing put off */
+    reset();
+    dreset();
+    outOfMemory = true;
+    v = presentation(&a);
+    outOfMemory = false;
+    CHECK(!dtrail[0] && !damageDeferred, "on, CPU copy: %s, %d put off", dtrail, damageDeferred);
+    expect("damage, on, copied by the CPU: nothing put off", "cpu-copy+ idle+ complete(copy)+", -1);
+    clean("damage, on, CPU copy", &a, 0);
+    deferDamage = false;
+    window.drawable.x = window.drawable.y = 0;
+    window.clipList = (RegionRec) { 0 };
 
     /* P11-C3-D0: a followed presentation's content - its GPU copy queued, done, then its CompleteNotify; copied by the CPU;
      * overwritten in its frame by the next one, which is then copied; nothing for one not followed */

@@ -1771,6 +1771,50 @@ CONTROLS += [
      "twiring"),
 ]
 
+# P11-C3-D1-A: a Present GPU copy's damage once the copy is done (TERMUX_X11_EXA_COMPOSITE_OPT)
+CONTROLS += [
+    ("copy damage: reported as the copy is queued with the option on", "xserver.patch",
+     """+        if (!(vblank->lorie_damage_deferred = lorieDeferCopyDamage())) {""",
+     """+        if (!(vblank->lorie_damage_deferred = lorieDeferCopyDamage()) || 1) {""",
+     "tpresentsafety"),
+    ("copy damage: not reported once the copy is done", "xserver.patch",
+     """+        present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DONE);    /* lorie: P11-C3-D1-A - the content there now */""",
+     """+        (void) 0;""",
+     "tpresentsafety"),
+    ("copy damage: the update region not moved by the offset into the window", "xserver.patch",
+     """+        RegionTranslate(vblank->update, vblank->x_off + window->drawable.x, vblank->y_off + window->drawable.y);""",
+     """+        RegionTranslate(vblank->update, window->drawable.x, window->drawable.y);""",
+     "tpresentsafety"),
+    ("copy damage: a scrapped presentation's copy still running never damaged", "xserver.patch",
+     """settled == LORIE_GPU_COPY_RUNNING ? LORIE_COPY_DAMAGE_EARLY : LORIE_COPY_DAMAGE_DROPPED);""",
+     """LORIE_COPY_DAMAGE_DROPPED);""",
+     "tpresentsafety"),
+    ("copy damage: a copy cancelled by a stalled renderer damaged", "xserver.patch",
+     """+            present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DROPPED);     /* lorie: P11-C3-D1-A - nothing copied */""",
+     """+            present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DONE);     /* lorie: P11-C3-D1-A - nothing copied */""",
+     "tpresentsafety"),
+    ("copy damage: reported for a window being destroyed", "xserver.patch",
+     """+    present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DROPPED);     /* lorie: P11-C3-D1-A - its window goes */""",
+     """+    present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DONE);     /* lorie: P11-C3-D1-A - its window goes */""",
+     "tpresentsafety"),
+    ("copy damage: the update region let go as the copy is queued", "xserver.patch",
+     """+        if (vblank->update && !vblank->lorie_damage_deferred) {""",
+     """+        if (vblank->update) {""",
+     "tpresentsafety"),
+    ("copy damage: stale reads counted with the damage put off", "InitOutput.c",
+     """    if (gpu && priv && !pvfb->exaCompositeOpt)""",
+     """    if (gpu && priv)""",
+     "tcontentframe"),
+    ("copy damage: put off with the option off", "InitOutput.c",
+     """    if (!pvfb->exaCompositeOpt)
+        return FALSE;
+    __atomic_fetch_add(&pvfb->state->diag.copyDamageDeferred, 1, __ATOMIC_RELAXED);""",
+     """    if (0)
+        return FALSE;
+    __atomic_fetch_add(&pvfb->state->diag.copyDamageDeferred, 1, __ATOMIC_RELAXED);""",
+     "twiring"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):
