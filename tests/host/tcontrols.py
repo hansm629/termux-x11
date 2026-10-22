@@ -1620,6 +1620,28 @@ CONTROLS += [
      "tdispatchyield"),
 ]
 
+# P11-C3-C: the frame gaps (TERMUX_X11_RENDERER_VK_FRAME_DIAG)
+CONTROLS += [
+    ("gaps: a long gap with a frame waiting taken as idle (the 250 ms rule back)", "renderer.c",
+     """    if (wait >= LORIE_VK_GAP_US) {
+        bool asleep""",
+     """    if (0) {
+        bool asleep""",
+     "tpresentcopy"),
+    ("gaps: a renderer asleep through the ask not told from a late one", "renderer.c",
+     """        cause = asleep && wake * 2 >= wait ? LORIE_GAP_UNWOKEN : LORIE_GAP_LATE;""",
+     """        cause = asleep && 0 ? LORIE_GAP_UNWOKEN : LORIE_GAP_LATE;""",
+     "tpresentcopy"),
+    ("gaps: the ask's wait from the last ask, not the first still waiting", "renderer.c",
+     """        ft.firstAskUs = askSeq != ft.takenSeq ? lorieAskUs(&state->progress, ft.takenSeq + 1, askSeq) : 0;""",
+     """        ft.firstAskUs = askSeq != ft.takenSeq ? lorieAskUs(&state->progress, askSeq, askSeq) : 0;""",
+     "tpresentcopy"),
+    ("gaps: the X server's ticks not looked at", "renderer.c",
+     """        cause = (uint64_t) ticks * 50000 < gap ? LORIE_GAP_X_STALLED : LORIE_GAP_NONE;""",
+     """        cause = (uint64_t) ticks * 0 > gap ? LORIE_GAP_X_STALLED : LORIE_GAP_NONE;""",
+     "tpresentcopy"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

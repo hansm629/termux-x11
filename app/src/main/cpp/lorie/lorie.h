@@ -523,6 +523,19 @@ struct lorie_renderer_diag {
      * lock, its fence, the root copy before it - then the gap from its end to the next start, and of that gap how long
      * no tick asked for a frame (the X server had nothing new to show) */
     volatile uint32_t vkWorstPrevCpuUs, vkWorstPrevLockUs, vkWorstPrevFenceUs, vkWorstPrevAfterRootUs, vkWorstGapUs, vkWorstUnaskedUs;
+    /* P11-C3-C: a frame's start 100 ms or more after the last one's (renderer.c rendererVkFrameGap), by what waited in
+     * that gap (struct lorie_progress): a tick's ask had waited 100 ms or more as the frame began - the renderer asleep
+     * when it was asked and not woken for most of the wait (unwoken), or awake and late (late) - or else nothing was
+     * asked for most of it: the X server's ticks not run in it (x_stalled), or run with nothing to show (idle). Each by
+     * its length - a stall's the ask's wait (X stalled: the gap), idle's the gap - at 100, 250, 500 ms and 1, 2, 3 s
+     * (LORIE_GAP_GE); the first waiting ask's wait at every frame's start (vkAskWait); the period's longest stall:
+     * its length, cause (LORIE_GAP_*), the ask's wait, the wake (the ask to the renderer back to look for work), the
+     * gap and the ticks run in it. */
+#define LORIE_GAP_GE 6
+    struct lorie_hist vkAskWait;
+    volatile uint32_t vkGapIdle, vkGapXStalled, vkGapUnwoken, vkGapLate;
+    volatile uint32_t vkGapStallGe[LORIE_GAP_GE], vkGapIdleGe[LORIE_GAP_GE];
+    volatile uint32_t vkGapWorstStallUs, vkGapWorstCause, vkGapWorstAskWaitUs, vkGapWorstWakeUs, vkGapWorstGapUs, vkGapWorstTicks;
     /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the
      * X server had to wait for one (lorieRootCopyWait), that wait, and from the renderer settling the copy to the X
      * server going on. The period's slowest request to completion and its parts (its fence: vkFenceRoot's). */
@@ -613,6 +626,7 @@ struct lorie_renderer_diag {
  *                        of them were asked for (lorieAskUs)
  *   takenSeq, takenUs    renderer: the asks its last frame presented took up (askSeq as it began), and its start
  *   seenSeq, seenUs      renderer: the asks it saw when it last woke to work (rendererWaitForWork), and when
+ *   sleepUs              renderer: when it last went to sleep there
  *   rStage, rStageUs     renderer, the watchdog only: what it is doing (LORIE_R_*), and since when
  */
 enum {
@@ -634,7 +648,7 @@ enum {
 #define LORIE_ASK_RING 32
 struct lorie_progress {
     volatile uint32_t askSeq, takenSeq, seenSeq, rStage;
-    volatile uint64_t askUs[LORIE_ASK_RING], takenUs, seenUs, rStageUs;
+    volatile uint64_t askUs[LORIE_ASK_RING], takenUs, seenUs, sleepUs, rStageUs;
 };
 
 // When ask `seq` was made, `last` being the last one made: kept for the last LORIE_ASK_RING; for an older one, the

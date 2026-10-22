@@ -268,13 +268,14 @@ int main(void) {
      * frame, root copy and request. The next report: "0" for each, the maxima and the worst taken back. */
     {
         static const char *const offLogs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log" };
-        int offLines = 0, offBackend = 0, backendLines = 0, onBackend = 0, n[4] = { 0 }, pacingOk = 0, pipelineOk = 0, rootOk = 0, xOk = 0, emptyOk = 0;
+        int offLines = 0, offBackend = 0, backendLines = 0, onBackend = 0, n[5] = { 0 }, pacingOk = 0, pipelineOk = 0, rootOk = 0, xOk = 0, emptyOk = 0;
+        int gapsOk = 0;
         for (unsigned k = 0; k < sizeof offLogs / sizeof *offLogs; k++) {
             snprintf(path, sizeof path, "%s/%s", out ? out : ".", offLogs[k]);
             logf = fopen(path, "r");
             while (logf && fgets(line, sizeof line, logf)) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
-                            strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:");
+                            strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:") || strstr(line, "XlorieFrameGaps:");
                 offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
@@ -317,6 +318,13 @@ int main(void) {
         fakePvfb.worstAccess.index = EXA_PREPARE_SRC, fakePvfb.worstAccess.reserved = TRUE;
         lorieHistAdd(&fakeState.diag.xAccessGpu, 6000), lorieHistAdd(&fakeState.diag.xTickDelay, 700);
         lorieHistAdd(&fakeState.diag.xTickWork, 300);
+        /* P11-C3-C: the frame gaps - two waits for a first ask, a stall and an idle gap at their lengths, the worst */
+        lorieHistAdd(&fakeState.diag.vkAskWait, 3000), lorieHistAdd(&fakeState.diag.vkAskWait, 3100000);
+        fakeState.diag.vkGapIdle += 4, fakeState.diag.vkGapXStalled += 1, fakeState.diag.vkGapUnwoken += 2, fakeState.diag.vkGapLate += 3;
+        for (i = 0; i < LORIE_GAP_GE; i++)
+            fakeState.diag.vkGapStallGe[i] += (uint32_t) (6 - i), fakeState.diag.vkGapIdleGe[i] += (uint32_t) (i < 2 ? 4 : 0);
+        fakeState.diag.vkGapWorstStallUs = 3000000, fakeState.diag.vkGapWorstCause = 2, fakeState.diag.vkGapWorstAskWaitUs = 3000000;
+        fakeState.diag.vkGapWorstWakeUs = 2999000, fakeState.diag.vkGapWorstGapUs = 3100000, fakeState.diag.vkGapWorstTicks = 370;
         lorieLogRendererDiag();
         lorieLogRendererDiag();
         fclose(logf);
@@ -352,19 +360,30 @@ int main(void) {
                                    "tick_delay_us=1/700/750/750/700/0/0 tick_work_us=1/300/300/300/300/0/0 "
                                    "worst_request_us=25000 worst_request=7:glmark2-es2:MIT-SHM:130.3 access_hold_us=1/120/200/200/120/0/0 "
                                    "worst_access_us=19379 worst_access=800x600:src:reserved\n") != NULL;
+            if (strstr(line, "XlorieFrameGaps:") && ++n[4] == 2)
+                gapsOk = strstr(line, "XlorieFrameGaps: ask_wait_us=2/1551500/>100000/>100000/3100000/1/1 gaps_idle=4(+4) "
+                                      "gaps_x_stalled=1(+1) gaps_unwoken=2(+2) gaps_late=3(+3) stall_ge_ms=100:6(+6),250:5(+5),"
+                                      "500:4(+4),1000:3(+3),2000:2(+2),3000:1(+1) idle_ge_ms=100:4(+4),250:4(+4),500:0(+0),"
+                                      "1000:0(+0),2000:0(+0),3000:0(+0) worst_stall_us=3000000 worst_stall_cause=unwoken "
+                                      "worst_stall_ask_wait_us=3000000 worst_stall_wake_us=2999000 worst_stall_gap_us=3100000 "
+                                      "worst_stall_ticks=370\n") != NULL;
+            if (strstr(line, "XlorieFrameGaps:") && n[4] == 3)
+                emptyOk += strstr(line, "XlorieFrameGaps: ask_wait_us=0 gaps_idle=4(+0) ") != NULL &&
+                           strstr(line, " worst_stall_us=0 worst_stall_cause=none worst_stall_ask_wait_us=0 ") != NULL;
             if (strstr(line, "XlorieXLatency:") && n[3] == 3)
                 emptyOk += strstr(line, "request_us=0 access_us=0 access_lock_us=0 access_gpu_us=0 tick_delay_us=0 tick_work_us=0 "
                                         "worst_request_us=0 worst_request=-1:none:none:0.0 access_hold_us=0 worst_access_us=0 "
                                         "worst_access=0x0:none:none\n") != NULL;
         }
         fclose(logf);
-        CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3, "frame diag on: %d backend lines saying on, "
-              "lines %d/%d/%d/%d (want 3 each)", onBackend, n[0], n[1], n[2], n[3]);
+        CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3 && n[4] == 3, "frame diag on: %d backend lines "
+              "saying on, lines %d/%d/%d/%d/%d (want 3 each)", onBackend, n[0], n[1], n[2], n[3], n[4]);
+        CHECK(gapsOk, "frame diag: the frame gaps line wrong");
         CHECK(pacingOk, "frame diag: the pacing line's timings or worst frame wrong");
         CHECK(pipelineOk, "frame diag: the pipeline line's fences not each their own");
         CHECK(rootOk, "frame diag: the root copy timing line wrong");
         CHECK(xOk, "frame diag: the X latency line wrong");
-        CHECK(emptyOk == 4, "frame diag: %d of 4 lines without samples say so and took the worst back", emptyOk);
+        CHECK(emptyOk == 5, "frame diag: %d of 5 lines without samples say so and took the worst back", emptyOk);
         CHECK(!fakeState.diag.vkFrameStart.maxUs && !fakeState.diag.vkPresentDelta.maxUs && !fakeState.diag.xRequest.maxUs &&
               !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us && !fakePvfb.worstAccess.us,
               "frame diag: a maximum or worst not taken back by its report");
@@ -460,7 +479,8 @@ int main(void) {
             &fakeState.diag.vkFrameFence, &fakeState.diag.vkFramePresent, &fakeState.diag.vkFrameAfterRoot, &fakeState.diag.vkFenceRoot,
             &fakeState.diag.vkFenceCopy, &fakeState.diag.rootTake, &fakeState.diag.rootRecord, &fakeState.diag.rootResume,
             &fakeState.diag.rootBlock, &fakeState.diag.xRequest, &fakeState.diag.xAccess, &fakeState.diag.xAccessLock,
-            &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork, &fakeState.diag.xAccessHold };
+            &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork, &fakeState.diag.xAccessHold,
+            &fakeState.diag.vkAskWait };
         volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
                                                    &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
                                                    &fakeState.diag.copyTotal, &fakeState.diag.copyAck, &fakeState.diag.xVsyncToCallback,
@@ -490,6 +510,12 @@ int main(void) {
         fakeState.diag.rootWorstRecordUs = fakeState.diag.rootWorstFenceUs = 4294967295u;
         fakeState.diag.vkWorstPrevCpuUs = fakeState.diag.vkWorstPrevLockUs = fakeState.diag.vkWorstPrevFenceUs = 4294967295u;
         fakeState.diag.vkWorstPrevAfterRootUs = fakeState.diag.vkWorstGapUs = fakeState.diag.vkWorstUnaskedUs = 4294967295u;
+        fakeState.diag.vkGapIdle += 999999999, fakeState.diag.vkGapXStalled += 999999999;      /* P11-C3-C */
+        fakeState.diag.vkGapUnwoken += 999999999, fakeState.diag.vkGapLate += 999999999;
+        for (i = 0; i < LORIE_GAP_GE; i++)
+            fakeState.diag.vkGapStallGe[i] += 999999999, fakeState.diag.vkGapIdleGe[i] += 999999999;
+        fakeState.diag.vkGapWorstStallUs = fakeState.diag.vkGapWorstAskWaitUs = fakeState.diag.vkGapWorstWakeUs = 4294967295u;
+        fakeState.diag.vkGapWorstGapUs = fakeState.diag.vkGapWorstTicks = 4294967295u, fakeState.diag.vkGapWorstCause = 3;
         fakePvfb.worstRequest.us = 4294967295u, fakePvfb.worstRequest.client = 2047, fakePvfb.worstRequest.major = 255;
         fakePvfb.worstRequest.minor = 255;
         memset(fakePvfb.worstRequest.cmd, 'c', 23), memset(fakePvfb.worstRequest.ext, 'e', 23);

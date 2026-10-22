@@ -383,7 +383,7 @@ static uint32_t vkOwnershipSeq;
 static uint64_t vkPacingLastStartUs, vkPacingLastPresentUs;
 static VkSwapchainKHR vkPacingSwapchain;
 // ... and what that last frame spent, and when it ended
-static struct { uint64_t endUs, cpuUs, lockUs, fenceUs, afterRootUs; } vkPacingLast;
+static struct { uint64_t endUs, cpuUs, lockUs, fenceUs, afterRootUs; uint32_t ticksRun; } vkPacingLast;
 static void rendererVkPacingReset(void) {
     vkPacingLastStartUs = vkPacingLastPresentUs = 0;
     vkPacingSwapchain = VK_NULL_HANDLE;
@@ -2321,7 +2321,67 @@ static int rendererVkInterval(volatile struct lorie_hist *h, uint64_t *last, uin
 struct rendererVkFrameTimes {
     uint64_t startUs, wantedUs, acquireUs, lockStartUs, lockedUs, inflightUs, submitStartUs, submittedUs, fenceUs,
              presentStartUs, presentEndUs, endUs, afterRootUs;
+    // P11-C3-C: the asks as it began (lorie.h struct lorie_progress) - made, taken up by the last frame presented, the
+    // first still waiting; the renderer's last sleep and its last wake to work (the asks it saw then); the ticks run
+    uint32_t askSeq, takenSeq, seenSeq, ticksRun;
+    uint64_t firstAskUs, sleepUs, seenUs;
 };
+
+/*
+ * P11-C3-C: a frame whose start came LORIE_VK_GAP_US or more after the last one's (`lastStartUs`, the X server's ticks
+ * run then `lastTicks`): what waited in that gap, by the asks as it began (lorie.h struct lorie_progress). The first
+ * ask still waiting had waited LORIE_VK_GAP_US or more: the renderer's stall - unwoken if it was asleep when asked
+ * (asleep since before the ask, and since the last frame began) and back to look for work only after half the wait or
+ * more, else late (awake, other work first). Otherwise nothing was asked for most of the gap: the X server's ticks
+ * not run in it - fewer than one per 50 ms, so it could not ask - or run with nothing to show (idle). Never dropped as
+ * idle by its length alone, as the frame starts' samples drop those over LORIE_VK_IDLE_GAP_US. Every frame: the first
+ * waiting ask's wait (vkAskWait).
+ */
+#define LORIE_VK_GAP_US 100000
+enum { LORIE_GAP_NONE, LORIE_GAP_X_STALLED, LORIE_GAP_UNWOKEN, LORIE_GAP_LATE };
+static void rendererVkFrameGap(const struct rendererVkFrameTimes *t, uint64_t lastStartUs, uint32_t lastTicks) {
+    static const uint32_t ge[LORIE_GAP_GE] = { 100000, 250000, 500000, 1000000, 2000000, 3000000 };
+    volatile struct lorie_renderer_diag *d = &state->diag;
+    uint64_t gap, wait = 0, wake = 0, len;
+    uint32_t ticks = t->ticksRun - lastTicks, cause, i;
+
+    if (t->firstAskUs && t->firstAskUs <= t->startUs)
+        lorieHistAdd(&d->vkAskWait, wait = t->startUs - t->firstAskUs);
+    if (!lastStartUs || t->startUs < lastStartUs || (gap = t->startUs - lastStartUs) < LORIE_VK_GAP_US)
+        return;
+    if (wait >= LORIE_VK_GAP_US) {
+        bool asleep = t->sleepUs && t->sleepUs <= t->firstAskUs && t->sleepUs >= lastStartUs &&
+                      (int32_t) (t->seenSeq - t->takenSeq) > 0 && t->seenUs >= t->firstAskUs;
+        wake = (int32_t) (t->seenSeq - t->takenSeq) > 0 && t->seenUs >= t->firstAskUs ? t->seenUs - t->firstAskUs : wait;
+        cause = asleep && wake * 2 >= wait ? LORIE_GAP_UNWOKEN : LORIE_GAP_LATE;
+        len = wait;
+    } else {
+        cause = (uint64_t) ticks * 50000 < gap ? LORIE_GAP_X_STALLED : LORIE_GAP_NONE;
+        len = gap;
+    }
+    if (cause == LORIE_GAP_UNWOKEN)
+        LORIE_DIAG_ADD(state, vkGapUnwoken, 1);
+    else if (cause == LORIE_GAP_LATE)
+        LORIE_DIAG_ADD(state, vkGapLate, 1);
+    else if (cause == LORIE_GAP_X_STALLED)
+        LORIE_DIAG_ADD(state, vkGapXStalled, 1);
+    else
+        LORIE_DIAG_ADD(state, vkGapIdle, 1);
+    for (i = 0; i < LORIE_GAP_GE && len >= ge[i]; i++) {
+        if (cause)
+            LORIE_DIAG_ADD(state, vkGapStallGe[i], 1);
+        else
+            LORIE_DIAG_ADD(state, vkGapIdleGe[i], 1);
+    }
+    if (cause && len > d->vkGapWorstStallUs) {
+        d->vkGapWorstStallUs = (uint32_t) (len > UINT32_MAX ? UINT32_MAX : len);
+        d->vkGapWorstCause = cause;
+        d->vkGapWorstAskWaitUs = (uint32_t) (wait > UINT32_MAX ? UINT32_MAX : wait);
+        d->vkGapWorstWakeUs = (uint32_t) (wake > UINT32_MAX ? UINT32_MAX : wake);
+        d->vkGapWorstGapUs = (uint32_t) (gap > UINT32_MAX ? UINT32_MAX : gap);
+        d->vkGapWorstTicks = ticks;
+    }
+}
 
 /*
  * A frame presented: its samples, and, should its start make the period's largest interval, what it spent; a start
@@ -2339,6 +2399,7 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
         vkPacingSwapchain = vkr.swapchain;
     }
     lastStartUs = vkPacingLastStartUs;
+    rendererVkFrameGap(t, lastStartUs, vkPacingLast.ticksRun);     // P11-C3-C: before the interval drops a long one
     sampled = rendererVkInterval(&d->vkFrameStart, &vkPacingLastStartUs, t->startUs, &interval);
     if (sampled == LORIE_VK_INTERVAL_INVALID)
         LORIE_DIAG_ADD(state, vkFrameStampsInvalid, 1);
@@ -2380,6 +2441,7 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
     vkPacingLast.lockUs = t->lockedUs - t->lockStartUs;
     vkPacingLast.fenceUs = t->fenceUs;
     vkPacingLast.afterRootUs = t->afterRootUs;
+    vkPacingLast.ticksRun = t->ticksRun;
 }
 
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
@@ -2750,6 +2812,14 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     if (diag) {
         ft.startUs = lorieMonotonicUs();
         ft.wantedUs = state->frameWantedUs;
+        // P11-C3-C: what was asked for as it began, and the renderer's last sleep and wake (rendererVkFrameGap)
+        ft.askSeq = askSeq;
+        ft.takenSeq = state->progress.takenSeq;
+        ft.firstAskUs = askSeq != ft.takenSeq ? lorieAskUs(&state->progress, ft.takenSeq + 1, askSeq) : 0;
+        ft.seenSeq = state->progress.seenSeq;
+        ft.seenUs = state->progress.seenUs;
+        ft.sleepUs = state->progress.sleepUs;
+        ft.ticksRun = __atomic_load_n(&state->diag.xTicksRun, __ATOMIC_RELAXED);
         ft.afterRootUs = vkRootCopyBusyUs;
         vkRootCopyBusyUs = 0;
     }
@@ -3100,6 +3170,8 @@ static void rendererWaitForWork(bool *waitingForBuffers) {
         if (!rendererShouldWait(waitingForBuffers))
             break;
         rendererStage(LORIE_R_SLEEP);
+        if (rendererProgressOn())
+            state->progress.sleepUs = lorieMonotonicUs();
         rendererSleep(seen, -1);
     }
     // P11-C3-C: the asks it woke to (the frame gaps' "seen"), and its stage

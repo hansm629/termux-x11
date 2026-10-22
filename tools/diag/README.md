@@ -38,6 +38,9 @@ XlorieVkFramePacing: frame_start_us present_delta_us wake_us idle_gaps stamps_in
 XlorieVkPipeline: cpu_us acquire_us lock_us record_us submit_us fence_frame_us fence_root_us fence_copy_us present_us
                 after_root_us
 XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us worst_take_us worst_record_us worst_fence_us
+XlorieFrameGaps: ask_wait_us gaps_idle gaps_x_stalled gaps_unwoken gaps_late stall_ge_ms=100:N(+d),...,3000:N(+d)
+                idle_ge_ms=... worst_stall_us worst_stall_cause worst_stall_ask_wait_us worst_stall_wake_us
+                worst_stall_gap_us worst_stall_ticks (P11-C3-C)
 XlorieXLatency: request_us access_us access_lock_us access_gpu_us tick_delay_us tick_work_us worst_request_us
                 worst_request=client:command:extension:major.minor access_hold_us worst_access_us
                 worst_access=WxH:dest|src|mask:reserved|locked
@@ -199,6 +202,19 @@ is `fence_root_us` above. Where the X server had to wait for one (its next acces
 `x_block_us` that wait, `resume_us` from the renderer settling the copy to the X server going on. A copy settled
 before the X server needed it costs no wait and is in neither. `worst_*`: the period's slowest copy, from its request
 to its completion, and its parts.
+
+`XlorieFrameGaps` (P11-C3-C): `idle_gaps` above drops every interval over 250 ms as an idle desktop - a 3 second
+freeze with a frame waiting the whole time included. Here every frame start 100 ms or more after the last one's is
+classified by what waited in that gap, from the X server's numbered asks (the time of the last 32 kept):
+`gaps_unwoken` - a tick's ask had waited 100 ms or more as the frame began, and the renderer was asleep when it was
+asked and came back to look for work only after half the wait or more; `gaps_late` - the same wait, the renderer awake
+(or woken at once) but busy with something else first; `gaps_x_stalled` - nothing asked for most of the gap, and the
+X server's ticks did not run in it (fewer than one per 50 ms); `gaps_idle` - nothing asked for, ticks run: nothing to
+show (a client drawing nothing, a scene change). `stall_ge_ms` counts the stalls (the first three) by length - the
+ask's wait, or for `x_stalled` the gap - at 100, 250, 500 ms and 1, 2, 3 s and over; `idle_ge_ms` the idle gaps by
+theirs. `ask_wait_us` is every frame's first waiting ask's wait (not the last ask's, as `wake_us`). `worst_stall_*`:
+the period's longest stall - its length, cause, the ask's wait, the wake (from the ask to the renderer back to look),
+the gap, the ticks run in it.
 
 `XlorieXLatency`, the X server's side: `request_us` each client request's handling in Dispatch, and the period's
 slowest as `worst_request=client:command:extension:major.minor` (the client's index and command name, `core` for a

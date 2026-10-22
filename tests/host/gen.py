@@ -244,6 +244,9 @@ recipes = {
         + span(R, "// Gaps between frames longer than this", "static uint64_t vkRootCopyBusyUs;")
         + span(R, "enum { LORIE_VK_INTERVAL_SAMPLED,", "};") + func(R, "static int rendererVkInterval(")
         + span(R, "struct rendererVkFrameTimes {", "};")
+        # P11-C3-C: the frame gaps by what waited in them
+        + span(R, "#define LORIE_VK_GAP_US 100000", "enum { LORIE_GAP_NONE, LORIE_GAP_X_STALLED, LORIE_GAP_UNWOKEN, LORIE_GAP_LATE };")
+        + func(R, "static void rendererVkFrameGap(const struct rendererVkFrameTimes *t, uint64_t lastStartUs, uint32_t lastTicks) {")
         + func(R, "static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static bool rendererRootCopyPending(void) {")

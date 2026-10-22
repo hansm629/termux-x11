@@ -231,6 +231,16 @@ in_order("the Vulkan frame's stages", redraw, "rendererStage(LORIE_R_FRAME);", "
          "rendererStage(LORIE_R_LOCK_WAIT);", "lorie_mutex_lock(&state->lock", "rendererStage(LORIE_R_FENCE_WAIT);", "lorieVkFrameWait(",
          "rendererStage(LORIE_R_PRESENT);", "lorieVkPresent(", "state->progress.takenSeq = askSeq;")
 
+# P11-C3-C: the frame gaps (TERMUX_X11_RENDERER_VK_FRAME_DIAG): each frame's gap classified before the frame starts'
+# samples drop a long one as idle; the asks read at the frame's start, under the option
+in_order("the gap classified before the long interval is dropped", func(R, "static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {"),
+         "lastStartUs = vkPacingLastStartUs;", "rendererVkFrameGap(t, lastStartUs, vkPacingLast.ticksRun);",
+         "rendererVkInterval(&d->vkFrameStart, &vkPacingLastStartUs, t->startUs, &interval);", "vkPacingLast.ticksRun = t->ticksRun;")
+in_order("the asks read as the frame begins", redraw, "if (diag) {", "ft.startUs = lorieMonotonicUs();",
+         "ft.firstAskUs = askSeq != ft.takenSeq ? lorieAskUs(&state->progress, ft.takenSeq + 1, askSeq) : 0;", "lorieVkAcquire(")
+in_order("the renderer's sleep stamped for the gaps", func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {"),
+         "if (rendererProgressOn())", "state->progress.sleepUs = lorieMonotonicUs();", "rendererSleep(seen, -1);")
+
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
 # publishes its work before it moves the count.

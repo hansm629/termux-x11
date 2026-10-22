@@ -1514,6 +1514,21 @@ static void lorieLogRendererDiag(void) {
             TD32(xTicksFrameMissed), worst, d.vkWorstWakeUs, d.vkWorstAcquireUs, d.vkWorstLockUs, d.vkWorstFenceUs,
             d.vkWorstPresentUs, d.vkWorstAfterRootUs, d.vkWorstPrevCpuUs, d.vkWorstPrevLockUs, d.vkWorstPrevFenceUs,
             d.vkWorstPrevAfterRootUs, d.vkWorstGapUs, d.vkWorstUnaskedUs);
+        // P11-C3-C: the frame gaps of 100 ms or more, by what waited in them (renderer.c rendererVkFrameGap)
+        worst = __atomic_exchange_n(&live->vkGapWorstStallUs, 0, __ATOMIC_RELAXED);
+        HT(0, vkAskWait);
+        log(INFO, "XlorieFrameGaps: ask_wait_us=%s gaps_idle=%u(+%u) gaps_x_stalled=%u(+%u) gaps_unwoken=%u(+%u) "
+                  "gaps_late=%u(+%u) stall_ge_ms=100:%u(+%u),250:%u(+%u),500:%u(+%u),1000:%u(+%u),2000:%u(+%u),3000:%u(+%u) "
+                  "idle_ge_ms=100:%u(+%u),250:%u(+%u),500:%u(+%u),1000:%u(+%u),2000:%u(+%u),3000:%u(+%u) worst_stall_us=%u "
+                  "worst_stall_cause=%s worst_stall_ask_wait_us=%u worst_stall_wake_us=%u worst_stall_gap_us=%u "
+                  "worst_stall_ticks=%u",
+            h[0], TD32(vkGapIdle), TD32(vkGapXStalled), TD32(vkGapUnwoken), TD32(vkGapLate), TD32(vkGapStallGe[0]),
+            TD32(vkGapStallGe[1]), TD32(vkGapStallGe[2]), TD32(vkGapStallGe[3]), TD32(vkGapStallGe[4]), TD32(vkGapStallGe[5]),
+            TD32(vkGapIdleGe[0]), TD32(vkGapIdleGe[1]), TD32(vkGapIdleGe[2]), TD32(vkGapIdleGe[3]), TD32(vkGapIdleGe[4]),
+            TD32(vkGapIdleGe[5]), worst,
+            !worst ? "none" : d.vkGapWorstCause == 1 ? "x_stalled" : d.vkGapWorstCause == 2 ? "unwoken" : "late",
+            worst ? d.vkGapWorstAskWaitUs : 0, worst ? d.vkGapWorstWakeUs : 0, worst ? d.vkGapWorstGapUs : 0,
+            worst ? d.vkGapWorstTicks : 0);
         HT(0, vkFrameCpu), HT(1, vkFrameAcquire), HT(2, vkFrameLock), HT(3, vkFrameRecord), HT(4, vkFrameSubmit);
         HT(5, vkFrameFence), HT(6, vkFenceRoot), HT(7, vkFenceCopy), HT(8, vkFramePresent), HT(9, vkFrameAfterRoot);
         log(INFO, "XlorieVkPipeline: cpu_us=%s acquire_us=%s lock_us=%s record_us=%s submit_us=%s fence_frame_us=%s "

@@ -1587,6 +1587,73 @@ int main(void) {
               "freeze diag off: stage %u, taken %u - kept", st.progress.rStage, st.progress.takenSeq);
     }
 
+    /* P11-C3-C, TERMUX_X11_RENDERER_VK_FRAME_DIAG: a frame's start 100 ms or more after the last one's, by what waited in
+     * that gap (rendererVkFrameGap, the real one) - asleep through a frame's 3 s wait: unwoken, at every length up to 3 s,
+     * the period's worst with its wake and gap; woken at once but the frame 150 ms late: late; awake when asked and
+     * back to look 120 ms later: late; nothing asked for 1 s, ticks run: idle, not a stall; ticks not run: the X server
+     * stalled; 60 ms: no gap. The frame's start takes the first ask still waiting from the ring, not the last. */
+    {
+        volatile struct lorie_renderer_diag *dg = &st.diag;
+        struct rendererVkFrameTimes t;
+        uint32_t idle = dg->vkGapIdle, xs = dg->vkGapXStalled, unw = dg->vkGapUnwoken, late = dg->vkGapLate;
+        uint32_t ge[LORIE_GAP_GE], ige[LORIE_GAP_GE], k, waits;
+        uint64_t T = 50000000;
+        for (k = 0; k < LORIE_GAP_GE; k++)
+            ge[k] = dg->vkGapStallGe[k], ige[k] = dg->vkGapIdleGe[k];
+        dg->vkGapWorstStallUs = 0;
+        t = (struct rendererVkFrameTimes) { .startUs = T + 3100000, .firstAskUs = T + 100000, .askSeq = 9, .takenSeq = 8,
+                                            .seenSeq = 9, .seenUs = T + 3099000, .sleepUs = T + 50000, .ticksRun = 400 };
+        rendererVkFrameGap(&t, T, 30);
+        CHECK(dg->vkGapUnwoken == unw + 1 && dg->vkGapStallGe[0] == ge[0] + 1 && dg->vkGapStallGe[5] == ge[5] + 1 &&
+              dg->vkGapWorstStallUs == 3000000 && dg->vkGapWorstCause == LORIE_GAP_UNWOKEN && dg->vkGapWorstWakeUs == 2999000 &&
+              dg->vkGapWorstGapUs == 3100000 && dg->vkGapWorstTicks == 370,
+              "gaps, asleep through a 3 s wait: unwoken +%u, >=3 s +%u, worst %u us cause %u wake %u gap %u ticks %u",
+              dg->vkGapUnwoken - unw, dg->vkGapStallGe[5] - ge[5], dg->vkGapWorstStallUs, dg->vkGapWorstCause,
+              dg->vkGapWorstWakeUs, dg->vkGapWorstGapUs, dg->vkGapWorstTicks);
+        t = (struct rendererVkFrameTimes) { .startUs = T + 400000, .firstAskUs = T + 250000, .askSeq = 5, .takenSeq = 4,
+                                            .seenSeq = 5, .seenUs = T + 251000, .sleepUs = T + 100000, .ticksRun = 80 };
+        rendererVkFrameGap(&t, T, 30);
+        t = (struct rendererVkFrameTimes) { .startUs = T + 500000, .firstAskUs = T + 300000, .askSeq = 6, .takenSeq = 5,
+                                            .seenSeq = 6, .seenUs = T + 420000, .sleepUs = T - 5000, .ticksRun = 90 };
+        rendererVkFrameGap(&t, T, 30);
+        CHECK(dg->vkGapLate == late + 2 && dg->vkGapUnwoken == unw + 1 && dg->vkGapStallGe[0] == ge[0] + 3 &&
+              dg->vkGapStallGe[1] == ge[1] + 1 && dg->vkGapWorstStallUs == 3000000,
+              "gaps, woken but late: late +%u (want 2), >=100 ms +%u (want 3), >=250 ms +%u (want 1)", dg->vkGapLate - late,
+              dg->vkGapStallGe[0] - ge[0], dg->vkGapStallGe[1] - ge[1]);
+        t = (struct rendererVkFrameTimes) { .startUs = T + 1000000, .firstAskUs = T + 999000, .askSeq = 3, .takenSeq = 2,
+                                            .ticksRun = 150 };
+        rendererVkFrameGap(&t, T, 30);
+        CHECK(dg->vkGapIdle == idle + 1 && dg->vkGapIdleGe[3] == ige[3] + 1 && dg->vkGapIdleGe[4] == ige[4] &&
+              dg->vkGapXStalled == xs, "gaps, nothing asked for 1 s: idle +%u, >=1 s +%u, >=2 s +%u, X stalled +%u",
+              dg->vkGapIdle - idle, dg->vkGapIdleGe[3] - ige[3], dg->vkGapIdleGe[4] - ige[4], dg->vkGapXStalled - xs);
+        t = (struct rendererVkFrameTimes) { .startUs = T + 1000000, .askSeq = 3, .takenSeq = 3, .ticksRun = 31 };
+        rendererVkFrameGap(&t, T, 30);
+        t = (struct rendererVkFrameTimes) { .startUs = T + 60000, .firstAskUs = T + 30000, .askSeq = 4, .takenSeq = 3, .ticksRun = 40 };
+        waits = dg->vkAskWait.count;
+        rendererVkFrameGap(&t, T, 30);
+        CHECK(dg->vkGapXStalled == xs + 1 && dg->vkGapIdle == idle + 1 && dg->vkGapLate == late + 2 && dg->vkAskWait.count == waits + 1,
+              "gaps, ticks not run 1 s: X stalled +%u; 60 ms: counted as a gap, or its ask's wait not sampled",
+              dg->vkGapXStalled - xs);
+        /* the frame's start: the first ask still waiting (11, 5 ms ago), not the last (12, now) */
+        {
+            uint32_t presented = st.diag.vkFramesPresented, maxBefore;
+            own(48);
+            st.backend.vkFrameDiag = 1;
+            st.progress.takenSeq = 10, st.progress.askSeq = 12;
+            st.progress.askUs[11 % LORIE_ASK_RING] = lorieMonotonicUs() - 5000;
+            st.progress.askUs[12 % LORIE_ASK_RING] = lorieMonotonicUs();
+            dg->vkAskWait.maxUs = 0;
+            maxBefore = dg->vkAskWait.count;
+            st.drawRequested = 1, st.waitForNextFrame = 0;
+            rendererVkRedraw(&waiting);
+            st.gpuInFlight.busy = 0;
+            CHECK(st.diag.vkFramesPresented == presented + 1 && dg->vkAskWait.count == maxBefore + 1 && dg->vkAskWait.maxUs >= 5000 &&
+                  st.progress.takenSeq == 12, "gaps: the frame's first waiting ask - wait %u us (want 5000 or more), taken %u",
+                  dg->vkAskWait.maxUs, st.progress.takenSeq);
+            st.backend.vkFrameDiag = 0;
+        }
+    }
+
     /* P11-C3-C: a buffer a queued copy uses that has not come yet from the connection - waited for before the shared
      * lock, not under it (the X server may take the lock meanwhile): it comes, its wake ends the wait, the copy is made
      * in that same pass. Never coming: given up after 100 ms, the copy skipped - completed - the lock free all along.
