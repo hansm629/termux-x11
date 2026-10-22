@@ -28,6 +28,8 @@ typedef int Bool;
 #define TRUE 1
 #define FALSE 0
 #include "contentconsts_src.inc"
+#include "compositeconsts_src.inc"
+typedef void *CompositeProcPtr;
 static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint64_t frameWantedUs;
                 struct lorie_progress progress; } fakeState;
 static struct {
@@ -48,7 +50,9 @@ static struct {
         uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
         uint64_t lastUs;
     } contentClients[LORIE_CONTENT_CLIENTS];
+#include "compositefields_src.inc"
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
+#include "compositereport_src.inc"
 #include "diaglog_src.inc"
 
 static int fails;
@@ -277,14 +281,15 @@ int main(void) {
      * frame, root copy and request. The next report: "0" for each, the maxima and the worst taken back. */
     {
         static const char *const offLogs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log" };
-        int offLines = 0, offBackend = 0, backendLines = 0, onBackend = 0, n[5] = { 0 }, pacingOk = 0, pipelineOk = 0, rootOk = 0, xOk = 0, emptyOk = 0;
-        int gapsOk = 0;
+        int offLines = 0, offBackend = 0, backendLines = 0, onBackend = 0, n[7] = { 0 }, pacingOk = 0, pipelineOk = 0, rootOk = 0, xOk = 0, emptyOk = 0;
+        int gapsOk = 0, compositeOk = 0;
         for (unsigned k = 0; k < sizeof offLogs / sizeof *offLogs; k++) {
             snprintf(path, sizeof path, "%s/%s", out ? out : ".", offLogs[k]);
             logf = fopen(path, "r");
             while (logf && fgets(line, sizeof line, logf)) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
-                            strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:") || strstr(line, "XlorieFrameGaps:");
+                            strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:") || strstr(line, "XlorieFrameGaps:") ||
+                            strstr(line, "XlorieComposite:") || strstr(line, "XlorieCompositeClasses:");
                 offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
@@ -334,6 +339,15 @@ int main(void) {
             fakeState.diag.vkGapStallGe[i] += (uint32_t) (6 - i), fakeState.diag.vkGapIdleGe[i] += (uint32_t) (i < 2 ? 4 : 0);
         fakeState.diag.vkGapWorstStallUs = 3000000, fakeState.diag.vkGapWorstCause = 2, fakeState.diag.vkGapWorstAskWaitUs = 3000000;
         fakeState.diag.vkGapWorstWakeUs = 2999000, fakeState.diag.vkGapWorstGapUs = 3100000, fakeState.diag.vkGapWorstTicks = 370;
+        /* P11-C3-D1: two classes of composites (lorieCompositeTimed's slots: over:ahb_a>mem+mask_a, src:mem_x>root), the slowest */
+        fakePvfb.compositeClasses[0] = (struct lorie_composite_class) { 3 | 2 << 8 | 1 << 10 | 1 << 11 | 1 << 13, 120, 360, 120, 9000,
+                                                                        57600000, 360000, 60000, 0, 6000, 12000 };
+        fakePvfb.compositeClasses[1] = (struct lorie_composite_class) { 1 | 1 << 8 | 3 << 11, 120, 240, 120, 6000, 248832000, 240000, 0,
+                                                                        150000, 1000, 10000 };
+        fakePvfb.composites = 240;
+        fakePvfb.worstComposite.key = fakePvfb.compositeClasses[0].key, fakePvfb.worstComposite.us = 9000;
+        fakePvfb.worstComposite.gpuUs = 5500, fakePvfb.worstComposite.lockUs = 100, fakePvfb.worstComposite.ahbUs = 200;
+        fakePvfb.worstComposite.width = 800, fakePvfb.worstComposite.height = 600;
         lorieLogRendererDiag();
         lorieLogRendererDiag();
         fclose(logf);
@@ -379,22 +393,37 @@ int main(void) {
             if (strstr(line, "XlorieFrameGaps:") && n[4] == 3)
                 emptyOk += strstr(line, "XlorieFrameGaps: ask_wait_us=0 gaps_idle=4(+0) ") != NULL &&
                            strstr(line, " worst_stall_us=0 worst_stall_cause=none worst_stall_ask_wait_us=0 ") != NULL;
+            if (strstr(line, "XlorieComposite:") && ++n[5] == 2)
+                compositeOk += strstr(line, "XlorieComposite: composites=240(+240) px=306432000 us=600000 cpu_us=361000 gpu_us=60000 "
+                                            "root_us=150000 lock_us=7000 ahb_us=22000 accesses=600 ahb_locks=240 worst_us=9000 "
+                                            "worst=over:ahb_a>mem+mask_a:800x600:cpu=3200,gpu=5500,root=0,lock=100,ahb=200\n") != NULL;
+            if (strstr(line, "XlorieCompositeClasses:") && ++n[6] == 2)
+                compositeOk += strstr(line, "XlorieCompositeClasses: over:ahb_a>mem+mask_a=120/57600/360000/282000/60000/0/360/9000,"
+                                            "src:mem_x>root=120/248832/240000/79000/0/150000/240/6000 classes_more=0\n") != NULL;
+            if (strstr(line, "XlorieComposite:") && n[5] == 3)
+                emptyOk += strstr(line, "XlorieComposite: composites=240(+0) px=0 us=0 cpu_us=0 gpu_us=0 root_us=0 lock_us=0 ahb_us=0 "
+                                        "accesses=0 ahb_locks=0 worst_us=0 worst=none:0x0:cpu=0,gpu=0,root=0,lock=0,ahb=0\n") != NULL;
+            if (strstr(line, "XlorieCompositeClasses:") && n[6] == 3)
+                emptyOk += !strcmp(strstr(line, "XlorieCompositeClasses:"), "XlorieCompositeClasses: none classes_more=0\n");
             if (strstr(line, "XlorieXLatency:") && n[3] == 3)
                 emptyOk += strstr(line, "request_us=0 access_us=0 access_lock_us=0 access_gpu_us=0 tick_delay_us=0 tick_work_us=0 "
                                         "worst_request_us=0 worst_request=-1:none:none:0.0 access_hold_us=0 worst_access_us=0 "
                                         "worst_access=0x0:none:none\n") != NULL;
         }
         fclose(logf);
-        CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3 && n[4] == 3, "frame diag on: %d backend lines "
-              "saying on, lines %d/%d/%d/%d/%d (want 3 each)", onBackend, n[0], n[1], n[2], n[3], n[4]);
+        CHECK(onBackend == 3 && n[0] == 3 && n[1] == 3 && n[2] == 3 && n[3] == 3 && n[4] == 3 && n[5] == 3 && n[6] == 3,
+              "frame diag on: %d backend lines saying on, lines %d/%d/%d/%d/%d/%d/%d (want 3 each)", onBackend, n[0], n[1], n[2], n[3],
+              n[4], n[5], n[6]);
+        CHECK(compositeOk == 2, "frame diag: %d of the 2 composite lines right", compositeOk);
         CHECK(gapsOk, "frame diag: the frame gaps line wrong");
         CHECK(pacingOk, "frame diag: the pacing line's timings or worst frame wrong");
         CHECK(pipelineOk, "frame diag: the pipeline line's fences not each their own");
         CHECK(rootOk, "frame diag: the root copy timing line wrong");
         CHECK(xOk, "frame diag: the X latency line wrong");
-        CHECK(emptyOk == 5, "frame diag: %d of 5 lines without samples say so and took the worst back", emptyOk);
+        CHECK(emptyOk == 7, "frame diag: %d of 7 lines without samples say so and took the worst back", emptyOk);
         CHECK(!fakeState.diag.vkFrameStart.maxUs && !fakeState.diag.vkPresentDelta.maxUs && !fakeState.diag.xRequest.maxUs &&
-              !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us && !fakePvfb.worstAccess.us,
+              !fakeState.diag.vkWorstStartUs && !fakeState.diag.rootWorstUs && !fakePvfb.worstRequest.us && !fakePvfb.worstAccess.us &&
+              !fakePvfb.worstComposite.us && !fakePvfb.compositeClasses[0].n,
               "frame diag: a maximum or worst not taken back by its report");
     }
 
@@ -634,6 +663,14 @@ int main(void) {
         fakeState.diag.copiesDeferred += 999999999, fakeState.diag.copiesDeferredWakes += 999999999;
         fakeState.diag.rootAhead += 999999999, fakeState.diag.rootAheadXWaiting += 999999999;
         fakeState.diag.rootChainConsumed += 999999999, fakeState.diag.rootAheadUnavailable += 999999999;
+        /* P11-C3-D1: every composite class at its widest - the longest names, every count and time at its type's
+         * widest (the sums at 2^64 - 1: they do not wrap in a period, so never wider) - and the slowest */
+        for (i = 0; i <= LORIE_COMPOSITE_CLASSES; i++)
+            fakePvfb.compositeClasses[i] = (struct lorie_composite_class) { 13 | 1 << 10 | 3 << 13 | 1 << 15, 4294967295u, 4294967295u,
+                4294967295u, 4294967295u, UINT64_MAX, UINT64_MAX, UINT64_MAX >> 2, UINT64_MAX >> 2, 0, 0 };
+        fakePvfb.composites = UINT64_MAX;
+        fakePvfb.worstComposite = (typeof(fakePvfb.worstComposite)) { 13 | 1 << 10 | 3 << 13 | 1 << 15, 4294967295u, 1000000000,
+                                                                      1000000000, 1000000000, 1000000000, 65535, 65535 };
         lorieLogRendererDiag();
         fakePvfb.contentDiag = FALSE;
         fclose(logf);

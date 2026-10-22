@@ -140,6 +140,7 @@ struct fake_pvfb {
     } rootCopy;
     int accessLocks;
     Bool frameDiag;             /* P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG */
+    uint32_t xAccessesOpened;   /* P11-C3-D1: the accesses counted for the composites (texacomposite.c times them) */
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
     Bool freezeDiag;            /* P11-C3-C: TERMUX_X11_FRAME_FREEZE_DIAG - the stage this thread is in */

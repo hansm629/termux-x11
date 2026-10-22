@@ -1715,6 +1715,62 @@ CONTROLS += [
      "twiring"),
 ]
 
+# P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG)
+CONTROLS += [
+    ("composite: the lock's wait counted with the GPU's in it", "InitOutput.c",
+     """    lock = lock > gpu ? lock - gpu : 0;
+""",
+     "",
+     "texacomposite"),
+    ("composite: the wrap not put back after the call", "InitOutput.c",
+     """    pvfb->composite = ps->Composite;
+    ps->Composite = lorieCompositeTimed;
+""",
+     """    pvfb->composite = ps->Composite;
+""",
+     "texacomposite"),
+    ("composite: a Composite changed below the wrap lost", "InitOutput.c",
+     """    pvfb->composite = ps->Composite;
+    ps->Composite = lorieCompositeTimed;
+""",
+     """    ps->Composite = lorieCompositeTimed;
+""",
+     "texacomposite"),
+    ("composite: a class seen again given a slot of its own", "InitOutput.c",
+     """        if (!pvfb->compositeClasses[i].n || pvfb->compositeClasses[i].key == key) {""",
+     """        if (!pvfb->compositeClasses[i].n) {""",
+     "texacomposite"),
+    ("composite: the classes shown fastest first", "InitOutput.c",
+     """        for (k = 0; k < LORIE_COMPOSITE_SHOWN && shown[k] && shown[k]->us >= e->us; k++)""",
+     """        for (k = 0; k < LORIE_COMPOSITE_SHOWN && shown[k] && shown[k]->us <= e->us; k++)""",
+     "texacomposite"),
+    ("composite: the last slot named as its last class", "InitOutput.c",
+     """        if (e == &c[LORIE_COMPOSITE_CLASSES])
+            snprintf(name, sizeof(name), "other");""",
+     """        if (0)
+            snprintf(name, sizeof(name), "other");""",
+     "texacomposite"),
+    ("composite: the classes kept past the report", "InitOutput.c",
+     """    memset(c, 0, sizeof(pvfb->compositeClasses));
+""",
+     "",
+     "texacomposite"),
+    ("composite: the own time the whole time", "InitOutput.c",
+     """    return us > other ? us - other : 0;""",
+     """    return us + 0 * other;""",
+     "tdiaglog"),
+    ("composite: timed with the frame diagnostics off", "InitOutput.c",
+     """    if (pvfb->frameDiag) {
+        PictureScreenPtr ps = GetPictureScreen(pScreen);""",
+     """    if (1) {
+        PictureScreenPtr ps = GetPictureScreen(pScreen);""",
+     "twiring"),
+    ("composite: the EXA accesses not counted", "InitOutput.c",
+     """        pvfb->xAccessesOpened++;    // P11-C3-D1: for each composite's (lorieCompositeTimed)""",
+     """        (void) 0;""",
+     "twiring"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

@@ -68,6 +68,7 @@ static ExaDriverRec lorieExa;
 // (lorieMonotonicUs): the stage to go back to once it is over (lorieXEnter, lorieXLeave).
 enum { LORIE_X_LOOP, LORIE_X_TICK, LORIE_X_REQUEST, LORIE_X_ROOT_COPY_WAIT, LORIE_X_REPORT, LORIE_X_STAGES };
 #define LORIE_CONTENT_CLIENTS 8     /* P11-C3-D0: the presenting clients counted apart */
+#define LORIE_COMPOSITE_CLASSES 8   /* P11-C3-D1: the RENDER composites' classes counted apart */
 struct lorieXMark { uint32_t stage; uint64_t us; };
 
 typedef struct {
@@ -177,6 +178,20 @@ typedef struct {
         uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
         uint64_t lastUs;
     } contentClients[LORIE_CONTENT_CLIENTS];
+
+    /* P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, lorieCompositeTimed): the RENDER composites, by class (operator,
+     * source, destination, mask, transform: lorieCompositeKey) - LORIE_COMPOSITE_CLASSES of them this period, the rest
+     * counted together in the last slot - each with its time split into what it waited for (the GPU, the root copy,
+     * the shared lock), its AHB CPU locks and what is left (pixman's and EXA's own); the EXA accesses opened
+     * (loriePrepareAccess) and the AHBs CPU-locked; the period's slowest */
+    CompositeProcPtr composite;
+    uint32_t xAccessesOpened;
+    uint64_t composites;
+    struct lorie_composite_class {
+        uint32_t key, n, accesses, locks, maxUs;
+        uint64_t px, us, gpuUs, rootUs, lockUs, ahbUs;
+    } compositeClasses[LORIE_COMPOSITE_CLASSES + 1];
+    struct { uint32_t key, us, gpuUs, rootUs, lockUs, ahbUs, width, height; } worstComposite;
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -184,6 +199,9 @@ typedef struct {
 // renderer's GPU and back.
 #define LORIE_ROOT_GPU_COPY_MIN_BYTES (1u << 20)
 static void lorieRootCopyWait(Bool takeBack);
+static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
+                                INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height);
+static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize);
 
 ScreenPtr pScreenPtr;
 static lorieScreenInfo lorieScreen = {
@@ -1582,6 +1600,13 @@ static void lorieLogRendererDiag(void) {
             !pvfb->worstAccess.us ? "none" : pvfb->worstAccess.reserved ? "reserved" : "locked");
         pvfb->worstRequest.us = 0;
         pvfb->worstAccess.us = 0;
+        // P11-C3-D1: the RENDER composites - their time apart from their waits, by class (lorieCompositeTimed)
+        {
+            char composites[512], classes[1024];
+            lorieCompositeReport(composites, sizeof(composites), classes, sizeof(classes));
+            log(INFO, "XlorieComposite: %s", composites);
+            log(INFO, "XlorieCompositeClasses: %s", classes);
+        }
 #undef TD32
 #undef HT
     }
@@ -2387,6 +2412,12 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
     pScreen->CloseScreen = lorieCloseScreen;
     pScreen->SetWindowPixmap = lorieSetWindowPixmap;
+    // P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): the RENDER composites timed, over EXA's
+    if (pvfb->frameDiag) {
+        PictureScreenPtr ps = GetPictureScreen(pScreen);
+        pvfb->composite = ps->Composite;
+        ps->Composite = lorieCompositeTimed;
+    }
 
     ShmRegisterFbFuncs(pScreen);
     miSyncShmScreenInit(pScreen);
@@ -2963,6 +2994,172 @@ static void lorieContentPublish(LoriePixmapPriv *priv) {
     lorieHistAdd(&pvfb->state->diag.contentRootToPublish, now >= priv->content.readyUs ? now - priv->content.readyUs : 0);
 }
 
+/*
+ * P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): what a RENDER picture's pixels are - none of a drawable's (a solid
+ * fill or a gradient), the screen pixmap's (the root's, or a window's drawn into it), an AHB's, or this process's own
+ * memory - and a composite's class from its operator, its source's and destination's, its source's alpha, its mask's
+ * kind (alpha only, colour, component alpha) and whether a transform is set.
+ */
+enum { LORIE_PICT_SOLID, LORIE_PICT_MEM, LORIE_PICT_AHB, LORIE_PICT_ROOT };
+static uint32_t lorieCompositePict(PicturePtr pict) {
+    DrawablePtr d = pict->pDrawable;
+    PixmapPtr pix;
+    if (!d)
+        return LORIE_PICT_SOLID;
+    pix = d->type == DRAWABLE_WINDOW ? d->pScreen->GetWindowPixmap((WindowPtr) d) : (PixmapPtr) d;
+    if (pix == pScreenPtr->devPrivate)
+        return LORIE_PICT_ROOT;
+    return lorieIsAhb(exaGetPixmapDriverPrivate(pix)) ? LORIE_PICT_AHB : LORIE_PICT_MEM;
+}
+
+static uint32_t lorieCompositeKey(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst) {
+    uint32_t m = !mask ? 0 : mask->componentAlpha ? 3 : PICT_FORMAT_RGB(mask->format) ? 2 : 1;
+    return op | lorieCompositePict(src) << 8 | (uint32_t) (PICT_FORMAT_A(src->format) > 0) << 10 | lorieCompositePict(dst) << 11 |
+           m << 13 | (uint32_t) (src->transform || (mask && mask->transform)) << 15;
+}
+
+static void lorieCompositeName(char *out, size_t size, uint32_t key) {
+    static const char *const ops[] = { "clear", "src", "dst", "over", "overrev", "in", "inrev", "out", "outrev", "atop",
+                                       "atoprev", "xor", "add", "saturate" };
+    static const char *const kinds[] = { "solid", "mem", "ahb", "root" }, *const masks[] = { "", "+mask_a", "+mask_rgb", "+mask_ca" };
+    uint32_t op = key & 0xff;
+    if (op < sizeof(ops) / sizeof(ops[0]))
+        snprintf(out, size, "%s:%s_%s>%s%s%s", ops[op], kinds[key >> 8 & 3], key >> 10 & 1 ? "a" : "x", kinds[key >> 11 & 3],
+                 masks[key >> 13 & 3], key >> 15 & 1 ? "+xf" : "");
+    else
+        snprintf(out, size, "op%u:%s_%s>%s%s%s", op, kinds[key >> 8 & 3], key >> 10 & 1 ? "a" : "x", kinds[key >> 11 & 3],
+                 masks[key >> 13 & 3], key >> 15 & 1 ? "+xf" : "");
+}
+
+/*
+ * ... and a composite timed (wrapping PictureScreen's Composite, EXA's and what it calls below it): what it waited for
+ * read from this thread's own counters - the GPU before a CPU access (xGpuWaitUs), the shared lock besides
+ * (xStateLockWaitUs, which holds both), the root copy (rootCopyCpuBlockUs) - and its AHB CPU locks (xAhbCpuLockUs);
+ * what is left is the composite's own work on the CPU (pixman's, EXA's). Counted in its class's slot, the period's
+ * first LORIE_COMPOSITE_CLASSES classes each in one, any other in the last.
+ */
+static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
+                                INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {
+    PictureScreenPtr ps = GetPictureScreen(dst->pDrawable->pScreen);
+    volatile struct lorie_renderer_diag *dg = &pvfb->state->diag;
+    struct lorie_composite_class *c = &pvfb->compositeClasses[LORIE_COMPOSITE_CLASSES];
+    uint32_t key = lorieCompositeKey(op, src, mask, dst), accesses = pvfb->xAccessesOpened, i;
+    uint64_t gpu = dg->xGpuWaitUs, lock = dg->xStateLockWaitUs, root = dg->rootCopyCpuBlockUs, ahb = dg->xAhbCpuLockUs;
+    uint64_t locks = dg->xAhbCpuAcquires, startUs = GetTimeInMicros(), us;
+
+    ps->Composite = pvfb->composite;
+    (*ps->Composite) (op, src, mask, dst, xSrc, ySrc, xMask, yMask, xDst, yDst, width, height);
+    pvfb->composite = ps->Composite;
+    ps->Composite = lorieCompositeTimed;
+
+    us = GetTimeInMicros() - startUs;
+    gpu = dg->xGpuWaitUs - gpu;
+    lock = dg->xStateLockWaitUs - lock;
+    lock = lock > gpu ? lock - gpu : 0;
+    root = dg->rootCopyCpuBlockUs - root;
+    ahb = dg->xAhbCpuLockUs - ahb;
+    for (i = 0; i < LORIE_COMPOSITE_CLASSES; i++)
+        if (!pvfb->compositeClasses[i].n || pvfb->compositeClasses[i].key == key) {
+            c = &pvfb->compositeClasses[i];
+            break;
+        }
+    c->key = key;   // the last slot's: its last one's
+    c->n++;
+    c->accesses += pvfb->xAccessesOpened - accesses;
+    c->locks += (uint32_t) (dg->xAhbCpuAcquires - locks);
+    c->px += (uint64_t) width * height;
+    c->us += us;
+    c->gpuUs += gpu;
+    c->rootUs += root;
+    c->lockUs += lock;
+    c->ahbUs += ahb;
+    if (us > c->maxUs)
+        c->maxUs = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+    pvfb->composites++;
+    if (us > pvfb->worstComposite.us) {
+        pvfb->worstComposite.key = key;
+        pvfb->worstComposite.us = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+        pvfb->worstComposite.gpuUs = (uint32_t) gpu;
+        pvfb->worstComposite.rootUs = (uint32_t) root;
+        pvfb->worstComposite.lockUs = (uint32_t) lock;
+        pvfb->worstComposite.ahbUs = (uint32_t) ahb;
+        pvfb->worstComposite.width = width;
+        pvfb->worstComposite.height = height;
+    }
+}
+
+// ... what is left of a composite's time for its own work, its waits and AHB CPU locks taken away.
+static uint64_t lorieCompositeCpuUs(uint64_t us, uint64_t gpu, uint64_t root, uint64_t lock, uint64_t ahb) {
+    uint64_t other = gpu + root + lock + ahb;
+    return us > other ? us - other : 0;
+}
+
+/*
+ * The period's composites as XlorieComposite reports them (into `totals`): their totals and the slowest; and, as
+ * XlorieCompositeClasses does (into `classes`), the classes that took longest - LORIE_COMPOSITE_SHOWN of them,
+ * "name=n/kpx/us/cpu_us/gpu_us/root_us/accesses/max_us" each (the last slot's as "other") - then how many classes more;
+ * the period over.
+ */
+#define LORIE_COMPOSITE_SHOWN 4
+static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize) {
+    struct lorie_composite_class *c = pvfb->compositeClasses, *shown[LORIE_COMPOSITE_SHOWN] = { 0 };
+    uint64_t n = 0, px = 0, us = 0, gpu = 0, root = 0, lock = 0, ahb = 0;
+    uint32_t accesses = 0, locks = 0, more = 0, i, k;
+    size_t at = 0;
+    char worst[48];
+    static uint64_t composites;
+
+    for (i = 0; i <= LORIE_COMPOSITE_CLASSES; i++) {
+        struct lorie_composite_class *e = &c[i];
+        if (!e->n)
+            continue;
+        n += e->n, px += e->px, us += e->us, gpu += e->gpuUs, root += e->rootUs, lock += e->lockUs, ahb += e->ahbUs;
+        accesses += e->accesses, locks += e->locks;
+        for (k = 0; k < LORIE_COMPOSITE_SHOWN && shown[k] && shown[k]->us >= e->us; k++)
+            ;
+        if (k == LORIE_COMPOSITE_SHOWN) {
+            more++;
+            continue;
+        }
+        if (shown[LORIE_COMPOSITE_SHOWN - 1])
+            more++;
+        memmove(&shown[k + 1], &shown[k], sizeof(shown[0]) * (LORIE_COMPOSITE_SHOWN - 1 - k));
+        shown[k] = e;
+    }
+    classes[0] = 0;
+    for (k = 0; k < LORIE_COMPOSITE_SHOWN && shown[k] && at < classesSize; k++) {
+        struct lorie_composite_class *e = shown[k];
+        char name[48];
+        int w;
+        if (e == &c[LORIE_COMPOSITE_CLASSES])
+            snprintf(name, sizeof(name), "other");
+        else
+            lorieCompositeName(name, sizeof(name), e->key);
+        w = snprintf(classes + at, classesSize - at, "%s%s=%u/%llu/%llu/%llu/%llu/%llu/%u/%u", k ? "," : "", name, e->n,
+                     (unsigned long long) (e->px / 1000), (unsigned long long) e->us,
+                     (unsigned long long) lorieCompositeCpuUs(e->us, e->gpuUs, e->rootUs, e->lockUs, e->ahbUs),
+                     (unsigned long long) e->gpuUs, (unsigned long long) e->rootUs, e->accesses, e->maxUs);
+        at += w > 0 ? (size_t) w : 0;
+    }
+    if (at < classesSize)
+        snprintf(classes + at, classesSize - at, "%s classes_more=%u", n ? "" : "none", more);
+    if (pvfb->worstComposite.us)
+        lorieCompositeName(worst, sizeof(worst), pvfb->worstComposite.key);
+    snprintf(totals, totalsSize, "composites=%llu(+%llu) px=%llu us=%llu cpu_us=%llu gpu_us=%llu root_us=%llu lock_us=%llu "
+                                 "ahb_us=%llu accesses=%u ahb_locks=%u worst_us=%u worst=%s:%ux%u:cpu=%llu,gpu=%u,root=%u,lock=%u,ahb=%u",
+             (unsigned long long) pvfb->composites, (unsigned long long) (pvfb->composites - composites), (unsigned long long) px,
+             (unsigned long long) us, (unsigned long long) lorieCompositeCpuUs(us, gpu, root, lock, ahb), (unsigned long long) gpu,
+             (unsigned long long) root, (unsigned long long) lock, (unsigned long long) ahb, accesses, locks,
+             pvfb->worstComposite.us, pvfb->worstComposite.us ? worst : "none", pvfb->worstComposite.width,
+             pvfb->worstComposite.height,
+             (unsigned long long) lorieCompositeCpuUs(pvfb->worstComposite.us, pvfb->worstComposite.gpuUs, pvfb->worstComposite.rootUs,
+                                                      pvfb->worstComposite.lockUs, pvfb->worstComposite.ahbUs),
+             pvfb->worstComposite.gpuUs, pvfb->worstComposite.rootUs, pvfb->worstComposite.lockUs, pvfb->worstComposite.ahbUs);
+    composites = pvfb->composites;
+    memset(c, 0, sizeof(pvfb->compositeClasses));
+    memset(&pvfb->worstComposite, 0, sizeof(pvfb->worstComposite));
+}
+
 Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
     LoriePixmapPriv* priv = (LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap);
     if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height)
@@ -3133,6 +3330,8 @@ static void lorieCpuReleasedWake(void) {
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
+    if (pvfb->frameDiag)
+        pvfb->xAccessesOpened++;    // P11-C3-D1: for each composite's (lorieCompositeTimed)
     if (pvfb->contentDiag && priv)
         lorieContentAccess(pPix, priv, index, FALSE);   // P11-C3-D0
     // P11-C2: the root's buffer not before the copy into it the GPU was asked for settled

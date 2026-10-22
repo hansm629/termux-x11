@@ -287,6 +287,17 @@ check(xredraw.count("lorieContentPublish(") == 1 and
 in_order("the content taken under the lock, counted once presented", redraw, "lorie_mutex_lock(&state->lock", "rendererContentRead(&content);",
          "lorie_mutex_unlock(&state->lock", "lorieVkPresent(", "if (presented == LORIE_VK_FRAME_OK)", "rendererContentFrame(&content, lorieMonotonicUs());")
 
+# P11-C3-D1: the RENDER composites timed (TERMUX_X11_RENDERER_VK_FRAME_DIAG; texacomposite.c runs the timing) - wrapped
+# over EXA's once the screen's pictures and EXA are set up, and only with the option on; the EXA accesses counted for
+# them only then
+sinit = func(I, "static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {")
+in_order("the composites timed over EXA's", sinit, "!exaDriverInit(pScreen, &lorieExa)", "!present_screen_init(pScreen, &loriePresentInfo)",
+         "    if (pvfb->frameDiag) {\n        PictureScreenPtr ps = GetPictureScreen(pScreen);\n        pvfb->composite = ps->Composite;\n"
+         "        ps->Composite = lorieCompositeTimed;\n    }")
+check(sinit.count("lorieCompositeTimed") == 1, "the composites timed other than with the frame diagnostics on")
+check("    if (pvfb->frameDiag)\n        pvfb->xAccessesOpened++;" in prep and open(I, encoding="utf-8").read().count("xAccessesOpened++") == 1,
+      "the EXA accesses counted for the composites without the frame diagnostics, or not counted")
+
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
 # publishes its work before it moves the count.

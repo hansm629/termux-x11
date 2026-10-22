@@ -192,6 +192,21 @@ recipes = {
         + span(R, "// P11-C3-D0: the content generation the last frame presented showed", "static struct { uint32_t gen; uint64_t newUs; } vkContentLast;")
         + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
         + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {"),
+    # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG) - the X server's own fields
+    # for them, their report (tdiaglog.c, texacomposite.c) and the timing itself (texacomposite.c)
+    "compositeconsts": lambda: macro(I, "LORIE_COMPOSITE_CLASSES"),
+    "compositefields": lambda: span(I, "    CompositeProcPtr composite;\n", "} worstComposite;"),
+    "compositereport": lambda: func(I, "static void lorieCompositeName(char *out, size_t size, uint32_t key) {")
+        + func(I, "static uint64_t lorieCompositeCpuUs(uint64_t us, uint64_t gpu, uint64_t root, uint64_t lock, uint64_t ahb) {")
+        + macro(I, "LORIE_COMPOSITE_SHOWN")
+        + func(I, "static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize) {"),
+    "compositetimed": lambda: span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
+        + func(I, "static Bool lorieIsAhb(LoriePixmapPriv *priv) {")
+        + span(I, "enum { LORIE_PICT_SOLID,", "LORIE_PICT_ROOT };")
+        + func(I, "static uint32_t lorieCompositePict(PicturePtr pict) {")
+        + func(I, "static uint32_t lorieCompositeKey(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst) {")
+        + func(I, "static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,\n"
+                  "                                INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {"),
     "xstage_decl": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };"),
     "xstage": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };")
         + func(I, "static struct lorieXMark lorieXEnter(uint32_t stage) {") + func(I, "static void lorieXLeave(struct lorieXMark *prev) {"),
