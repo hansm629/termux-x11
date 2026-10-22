@@ -562,6 +562,7 @@ struct lorie_renderer_diag {
     volatile uint32_t contentPendingReads, contentUnknownReads;
     volatile uint32_t contentScreenNew, contentScreenReused, contentGapsPending, contentGapsClient;
     volatile uint32_t contentScreenUnknown;     /* frames presented with no whole copy of the content taken (torn) */
+    volatile uint32_t contentSkippedUnattributed;   /* skips whose client's slot went to another since its request */
     volatile uint32_t contentMaxGapUs, contentWorstUs, contentWorstCopyUs, contentWorstCompositeUs, contentWorstPublishUs,
                       contentWorstScreenUs;
     /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the

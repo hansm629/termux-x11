@@ -185,6 +185,8 @@ typedef struct {
         char cmd[24];
         uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
         uint64_t lastUs;
+        uint32_t epoch;     /* moved on each time the slot is given to a client: its presentations' tokens' (lorieContentClient) */
+        Bool gone;          /* the client gone (lorieContentClientGone): counted on until the next report, matched by none */
     } contentClients[LORIE_CONTENT_CLIENTS];
 
     /* P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, lorieCompositeTimed): the RENDER composites, by class (operator,
@@ -210,6 +212,7 @@ static void lorieRootCopyWait(Bool takeBack);
 static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
                                 INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height);
 static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize);
+static void lorieContentClientGone(CallbackListPtr *list, void *closure, void *data);
 
 ScreenPtr pScreenPtr;
 static lorieScreenInfo lorieScreen = {
@@ -1684,13 +1687,13 @@ static void lorieLogRendererDiag(void) {
             }
             if (best < 0)
                 break;
-            at += (size_t) snprintf(clients + at, sizeof(clients) - at, "%s%s/%d:requests=%u(+%u),skipped=%u(+%u),max_gap_us=%u",
+            at += (size_t) snprintf(clients + at, sizeof(clients) - at, "%s%s/%d:requests=%u(+%u),skipped=%u(+%u),max_gap_us=%u%s",
                                     at ? " " : "", pvfb->contentClients[best].cmd, pvfb->contentClients[best].index,
                                     pvfb->contentClients[best].requests,
                                     pvfb->contentClients[best].requests - pvfb->contentClients[best].requestsAt,
                                     pvfb->contentClients[best].skipped,
                                     pvfb->contentClients[best].skipped - pvfb->contentClients[best].skippedAt,
-                                    pvfb->contentClients[best].maxGapUs);
+                                    pvfb->contentClients[best].maxGapUs, pvfb->contentClients[best].gone ? ",gone" : "");
             if (at >= sizeof(clients))
                 at = sizeof(clients) - 1;
             pvfb->contentClients[best].requestsAt = UINT32_MAX;     // shown: not again in this line
@@ -1699,8 +1702,15 @@ static void lorieLogRendererDiag(void) {
             pvfb->contentClients[k].requestsAt = pvfb->contentClients[k].requests;
             pvfb->contentClients[k].skippedAt = pvfb->contentClients[k].skipped;
             pvfb->contentClients[k].maxGapUs = 0;
+            if (pvfb->contentClients[k].gone) {
+                // reported: free - its presentations' skips counted apart from now on
+                pvfb->contentClients[k].client = NULL;
+                pvfb->contentClients[k].gone = FALSE;
+                pvfb->contentClients[k].epoch = (pvfb->contentClients[k].epoch + 1) & 0x0fffffff;
+            }
         }
-        log(INFO, "XlorieContentClients: %s", clients[0] ? clients : "none");
+        log(INFO, "XlorieContentClients: %s skips_unattributed=%u(+%u)", clients[0] ? clients : "none",
+            TD32(contentSkippedUnattributed));
 #undef TD32
 #undef HT
     }
@@ -2468,6 +2478,10 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     pvfb->SetWindowPixmap = pScreenPtr->SetWindowPixmap;
     pScreen->CloseScreen = lorieCloseScreen;
     pScreen->SetWindowPixmap = lorieSetWindowPixmap;
+    // P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): clients gone, for the content's per-client counts (this server
+    // generation's callbacks: dix main deletes them at a reset)
+    if (pvfb->contentDiag)
+        AddCallback(&ClientStateCallback, lorieContentClientGone, NULL);
     // P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): the RENDER composites timed, over EXA's
     if (pvfb->frameDiag) {
         PictureScreenPtr ps = GetPictureScreen(pScreen);
@@ -2901,33 +2915,39 @@ void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
 
 /* ---- P11-C3-D0, TERMUX_X11_CONTENT_FRAME_DIAG=1: client content from its presentation to the screen ---- */
 
-// The client presenting (the request being dispatched), counted in its slot - named once as it came.
-static void lorieContentClient(Bool skipped, uint64_t now) {
+/*
+ * The client presenting (the request being dispatched: present_scmd_pixmap runs in its PresentPixmap), counted in its
+ * slot - one not gone with its pointer and index; else a free one, a gone one or the least used, named as it came, its
+ * epoch moved on - and the token its presentation keeps (slot and epoch: LORIE_CONTENT_TOKEN), for a skip of it to be
+ * counted for it whenever and wherever that comes (lorieContentSkipped). 0: none.
+ */
+#define LORIE_CONTENT_TOKEN(slot, epoch) ((epoch) << 4 | (uint32_t) (slot))
+static uint32_t lorieContentClient(uint64_t now) {
     ClientPtr client = GetCurrentClient();
-    int i, free = -1, least = 0;
+    int i, free = -1, gone = -1, least = 0;
 
     if (!client)
-        return;
+        return 0;
     for (i = 0; i < LORIE_CONTENT_CLIENTS; i++) {
-        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index)
+        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index &&
+            !pvfb->contentClients[i].gone)
             break;
         if (!pvfb->contentClients[i].client && free < 0)
             free = i;
+        if (pvfb->contentClients[i].gone && gone < 0)
+            gone = i;
         if (pvfb->contentClients[i].requests < pvfb->contentClients[least].requests)
             least = i;
     }
     if (i == LORIE_CONTENT_CLIENTS) {
-        if (skipped)
-            return;     // counted from its first request on
-        i = free >= 0 ? free : least;
+        uint32_t epoch;
+        i = free >= 0 ? free : gone >= 0 ? gone : least;
+        epoch = (pvfb->contentClients[i].epoch + 1) & 0x0fffffff;
         memset(&pvfb->contentClients[i], 0, sizeof(pvfb->contentClients[i]));
+        pvfb->contentClients[i].epoch = epoch ? epoch : 1;
         pvfb->contentClients[i].client = client;
         pvfb->contentClients[i].index = client->index;
         lorieDiagWord(pvfb->contentClients[i].cmd, sizeof(pvfb->contentClients[i].cmd), GetClientCmdName(client));
-    }
-    if (skipped) {
-        pvfb->contentClients[i].skipped++;
-        return;
     }
     if (pvfb->contentClients[i].lastUs && now > pvfb->contentClients[i].lastUs &&
         now - pvfb->contentClients[i].lastUs > pvfb->contentClients[i].maxGapUs)
@@ -2935,28 +2955,50 @@ static void lorieContentClient(Bool skipped, uint64_t now) {
                                                                                                       : now - pvfb->contentClients[i].lastUs);
     pvfb->contentClients[i].lastUs = now;
     pvfb->contentClients[i].requests++;
+    return LORIE_CONTENT_TOKEN(i, pvfb->contentClients[i].epoch);
 }
 
-// A presentation with a pixmap asked for (patches/xserver.patch present_scmd_pixmap): its content's number, its request.
-uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us) {
+// A client gone (ClientStateCallback: its connection closed): its slot no longer matched - a client later at its
+// address and index is another - its counts kept until the next report, its presentations' skips counted for it.
+static void lorieContentClientGone(__unused CallbackListPtr *list, __unused void *closure, void *data) {
+    ClientPtr client = ((NewClientInfoRec *) data)->client;
+    int i;
+    if (client->clientState != ClientStateGone && client->clientState != ClientStateRetained)
+        return;
+    for (i = 0; i < LORIE_CONTENT_CLIENTS; i++)
+        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index)
+            pvfb->contentClients[i].gone = TRUE;
+}
+
+// A presentation with a pixmap asked for (patches/xserver.patch present_scmd_pixmap): its content's number, its request,
+// its client's token.
+uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us, uint32_t *client) {
     uint64_t now;
     *request_us = 0;
+    *client = 0;
     if (!pvfb->contentDiag || !pixmap)
         return 0;
     *request_us = now = lorieMonotonicUs();
     if (!++pvfb->contentSeq)
         ++pvfb->contentSeq;     // 0 is none
     __atomic_fetch_add(&pvfb->state->diag.contentRequests, 1, __ATOMIC_RELAXED);
-    lorieContentClient(FALSE, now);
+    *client = lorieContentClient(now);
     return pvfb->contentSeq;
 }
 
 // ... skipped: overwritten in its frame by a newer one, or its GPU copy cancelled (present_vblank_scrap).
-void lorieContentSkipped(uint32_t seq) {
+// ... counted for the client that asked for it (its token: its slot, while the slot's epoch is the token's), not the one
+// dispatching now - present_vblank_scrap also runs in another client's request (a presentation overwriting it, a window
+// destroyed) or none (a tick, a completion); its slot given to another since: counted apart.
+void lorieContentSkipped(uint32_t seq, uint32_t client) {
+    uint32_t slot = client & 0xf;
     if (!seq)
         return;
     __atomic_fetch_add(&pvfb->state->diag.contentSkipped, 1, __ATOMIC_RELAXED);
-    lorieContentClient(TRUE, 0);
+    if (client && slot < LORIE_CONTENT_CLIENTS && pvfb->contentClients[slot].epoch == client >> 4)
+        pvfb->contentClients[slot].skipped++;
+    else
+        __atomic_fetch_add(&pvfb->state->diag.contentSkippedUnattributed, 1, __ATOMIC_RELAXED);
 }
 
 /*

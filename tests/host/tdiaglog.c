@@ -50,6 +50,8 @@ static struct {
         char cmd[24];
         uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
         uint64_t lastUs;
+        uint32_t epoch;
+        Bool gone;
     } contentClients[LORIE_CONTENT_CLIENTS];
 #include "compositefields_src.inc"
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
@@ -566,9 +568,12 @@ int main(void) {
         fakeState.diag.contentWorstCompositeUs = 2000, fakeState.diag.contentWorstPublishUs = 1000, fakeState.diag.contentWorstScreenUs = 96000;
         memset(fakePvfb.contentClients, 0, sizeof fakePvfb.contentClients);
         fakePvfb.contentClients[1] = (typeof(fakePvfb.contentClients[0])) { &fakePvfb, 3, "glmark2-es2", 1000, 900, 0, 0, 4000, 0 };
-        fakePvfb.contentClients[4] = (typeof(fakePvfb.contentClients[0])) { &fakeState, 5, "xfwm4", 120, 0, 0, 0, 0, 0 };
+        fakePvfb.contentClients[4] = (typeof(fakePvfb.contentClients[0])) { &fakeState, 5, "xfwm4", 120, 0, 0, 0, 0, 0, 3, TRUE };
+        fakeState.diag.contentSkippedUnattributed += 4;
         fakePvfb.contentClients[6] = (typeof(fakePvfb.contentClients[0])) { &n, 7, "xfce4-terminal", 9, 0, 9, 0, 0, 0 };
         lorieLogRendererDiag();
+        CHECK(!fakePvfb.contentClients[4].client && !fakePvfb.contentClients[4].gone && fakePvfb.contentClients[4].epoch == 4 &&
+              fakePvfb.contentClients[1].client, "a gone client's slot not let go by its report, or a running one's");
         lorieLogRendererDiag();
         fakePvfb.contentDiag = FALSE;
         fclose(logf);
@@ -600,9 +605,9 @@ int main(void) {
                                         "worst_content_us=0 worst_stage=none ") != NULL;
             if (strstr(line, "XlorieContentClients:") && ++n[3] == 1)
                 clientsOk = strstr(line, "XlorieContentClients: glmark2-es2/3:requests=1000(+1000),skipped=900(+900),max_gap_us=4000 "
-                                         "xfwm4/5:requests=120(+120),skipped=0(+0),max_gap_us=0\n") != NULL;
+                                         "xfwm4/5:requests=120(+120),skipped=0(+0),max_gap_us=0,gone skips_unattributed=4(+4)\n") != NULL;
             if (strstr(line, "XlorieContentClients:") && n[3] == 2)
-                emptyOk += strstr(line, "XlorieContentClients: none\n") != NULL;
+                emptyOk += strstr(line, "XlorieContentClients: none skips_unattributed=4(+0)\n") != NULL;
         }
         fclose(logf);
         CHECK(offContent == 0, "content lines without TERMUX_X11_CONTENT_FRAME_DIAG: %d", offContent);

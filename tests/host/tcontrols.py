@@ -1698,7 +1698,7 @@ CONTROLS += [
     lorieContentPublish(priv);""",
      "twiring"),
     ("content: the request not numbered by the patch", "xserver.patch",
-     """+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);""",
+     """+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us, &vblank->lorie_content_client);""",
      """+    vblank->lorie_content_seq = 0;""",
      "twiring"),
     ("content: a CPU copy not handed to the hooks", "xserver.patch",
@@ -1789,6 +1789,42 @@ CONTROLS += [
         pvfb->contentGen = 2;       // 0 is none""",
      """    pvfb->contentGen += 2;""",
      "tcontentframe"),
+]
+
+# P11-C3-D0 review: a skip counted for the client that asked for the presentation
+CONTROLS += [
+    ("content: a skip counted for the client dispatching as it comes", "InitOutput.c",
+     """    if (client && slot < LORIE_CONTENT_CLIENTS && pvfb->contentClients[slot].epoch == client >> 4)
+        pvfb->contentClients[slot].skipped++;""",
+     """    for (slot = 0; slot < LORIE_CONTENT_CLIENTS && pvfb->contentClients[slot].client != GetCurrentClient(); slot++)
+        ;
+    if (GetCurrentClient() && slot < LORIE_CONTENT_CLIENTS)
+        pvfb->contentClients[slot].skipped++;""",
+     "tcontentframe"),
+    ("content: a skip counted for whoever has its client's slot now", "InitOutput.c",
+     """    if (client && slot < LORIE_CONTENT_CLIENTS && pvfb->contentClients[slot].epoch == client >> 4)""",
+     """    if (client && slot < LORIE_CONTENT_CLIENTS)""",
+     "tcontentframe"),
+    ("content: a gone client's slot matched by the next at its address", "InitOutput.c",
+     """        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index &&
+            !pvfb->contentClients[i].gone)""",
+     """        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index)""",
+     "tcontentframe"),
+    ("content: a client still running taken as gone", "InitOutput.c",
+     """    if (client->clientState != ClientStateGone && client->clientState != ClientStateRetained)
+        return;""",
+     """    if (0)
+        return;""",
+     "tcontentframe"),
+    ("content: a gone client's slot kept past its report", "InitOutput.c",
+     """                pvfb->contentClients[k].client = NULL;
+                pvfb->contentClients[k].gone = FALSE;""",
+     """                pvfb->contentClients[k].gone = FALSE;""",
+     "tdiaglog"),
+    ("content: the patch's skip without its presentation's token", "xserver.patch",
+     """+    lorieContentSkipped(vblank->lorie_content_seq, vblank->lorie_content_client);     /* lorie: P11-C3-D0 */""",
+     """+    lorieContentSkipped(vblank->lorie_content_seq, 0);     /* lorie: P11-C3-D0 */""",
+     "tpresentsafety"),
 ]
 
 # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG)

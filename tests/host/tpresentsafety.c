@@ -248,7 +248,8 @@ static void cstep(const char *what, uint32_t seq, const char *how) {
     snprintf(ctrail + strlen(ctrail), sizeof ctrail - strlen(ctrail), "%s%s(%u%s%s)", ctrail[0] ? " " : "", what, seq,
              how ? "," : "", how ? how : "");
 }
-static void lorieContentSkipped(uint32_t seq) { if (seq) cstep("skipped", seq, NULL); }
+static uint32_t skippedClient;      /* the client token its skip came with (its presentation's) */
+static void lorieContentSkipped(uint32_t seq, uint32_t client) { if (seq) cstep("skipped", seq, NULL); skippedClient = client; }
 static uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
     (void) request_us, (void) dst;
     if (seq)
@@ -302,6 +303,7 @@ static struct present_vblank *presentation(PixmapPtr pixmap) {
     xorg_list_append(&v->event_queue, &present_exec_queue);
     v->queued = TRUE;
     v->lorie_content_seq = contentSeqNext;
+    v->lorie_content_client = contentSeqNext ? 0x50 | contentSeqNext : 0;    /* the token lorieContentRequest gave it */
     if (nextUpdate.n) {
         v->update = &nextUpdate;
         v->x_off = nextXOff, v->y_off = nextYOff;
@@ -927,6 +929,7 @@ int main(void) {
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
     present_execute(v, 0, 11);
     gpuDone(a.copySerial);
+    CHECK(skippedClient == (0x50 | 7), "content, overwritten: its skip told with token %#x (want its own, 0x57)", skippedClient);
     CHECK(!strncmp(ctrail, "copied(7,gpu) skipped(7)", strlen("copied(7,gpu) skipped(7)")) && !strstr(ctrail, "done(7)") &&
           strstr(ctrail, "complete(7,skip)"), "content, overwritten while its copy runs: %s", ctrail);
     clean("content, overwritten", &a, 0);

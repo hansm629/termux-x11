@@ -589,7 +589,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,96 @@
+@@ -90,8 +91,97 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -606,9 +606,10 @@
 +    /* lorie: P10-S1 - the retired copy reserved for its GPU copy before that was scheduled (present_execute_copy), so
 +     * that retiring it never allocates: taken by present_retire_copy, otherwise freed with the vblank */
 +    struct present_retired_copy *gpu_copy_retired;
-+    /* lorie: P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1) - its content's number (0: not followed), when it was asked
-+     * for, and when its copy was queued for the GPU (lorieContent*) */
-+    uint32_t            lorie_content_seq;
++    /* lorie: P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1) - its content's number (0: not followed), its client's token
++     * (its skip counted for that client, whoever dispatches then), when it was asked for, and when its copy was queued
++     * for the GPU (lorieContent*) */
++    uint32_t            lorie_content_seq, lorie_content_client;
 +    uint64_t            lorie_content_us, lorie_copy_us;
 +    /* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - its GPU copy's damage put off until the copy is done
 +     * (present_damage_gpu_copy), its update region kept for it until then */
@@ -662,8 +663,8 @@
 + * (lorie/InitOutput.c): asked for (its number: 0 with the option off or without a pixmap), skipped (overwritten in its
 + * frame, or its copy cancelled), its copy queued for the GPU or made by the CPU (when), its GPU copy complete, its
 + * CompleteNotify sent (in that mode). Each only counts and stamps: nothing waits. */
-+extern uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us);
-+extern void lorieContentSkipped(uint32_t seq);
++extern uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us, uint32_t *client);
++extern void lorieContentSkipped(uint32_t seq, uint32_t client);
 +extern uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu);
 +extern void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst);
 +extern void lorieContentComplete(uint32_t seq, CARD8 mode);
@@ -741,7 +742,7 @@
  
      vblank->event_id = ++present_scmd_event_id;
 +    /* lorie: P11-C3-D0 - this presentation's content numbered, its request stamped */
-+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);
++    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us, &vblank->lorie_content_client);
  
      if (vblank->flip && vblank->sync_flip)
          vblank->exec_msc--;
@@ -884,7 +885,7 @@
  void
  present_vblank_scrap(present_vblank_ptr vblank)
  {
-+    lorieContentSkipped(vblank->lorie_content_seq);     /* lorie: P11-C3-D0 */
++    lorieContentSkipped(vblank->lorie_content_seq, vblank->lorie_content_client);     /* lorie: P11-C3-D0 */
      DebugPresent(("\tx %" PRIu64 " %p %" PRIu64 " %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 " (crtc %p)\n",
                    vblank->event_id, vblank, vblank->exec_msc, vblank->target_msc,
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,

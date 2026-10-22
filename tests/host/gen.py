@@ -178,12 +178,13 @@ recipes = {
             "EXA_PREPARE_AUX_MASK"))
         + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + macro(I, "LORIE_PIXMAP_PRIV_FROM_PIXMAP")
-        + func(I, "static void lorieDiagWord(char *out, size_t size, const char *in) {")
+        + func(I, "static void lorieDiagWord(char *out, size_t size, const char *in) {") + macro(I, "LORIE_CONTENT_TOKEN")
         + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
         + "".join(func(I, f) for f in (
-            "static void lorieContentClient(Bool skipped, uint64_t now) {",
-            "uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us) {",
-            "void lorieContentSkipped(uint32_t seq) {",
+            "static uint32_t lorieContentClient(uint64_t now) {",
+            "static void lorieContentClientGone(__unused CallbackListPtr *list, __unused void *closure, void *data) {",
+            "uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us, uint32_t *client) {",
+            "void lorieContentSkipped(uint32_t seq, uint32_t client) {",
             "static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c, uint64_t now, Bool carried) {",
             "uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {",
             "void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst) {",

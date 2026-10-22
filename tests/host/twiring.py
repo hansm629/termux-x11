@@ -259,7 +259,7 @@ check('lorieScreen.contentDiag = getenv("TERMUX_X11_CONTENT_FRAME_DIAG") && !str
 xp = dsp
 for what, first, then in (
         ("the request numbered", "     vblank->event_id = ++present_scmd_event_id;",
-         "+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);"),
+         "+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us, &vblank->lorie_content_client);"),
         ("its GPU copy done", "+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);\n+        vblank->gpu_copy_pending = FALSE;\n",
          "+        lorieContentCopyDone(vblank->lorie_content_seq, vblank->lorie_content_us, vblank->lorie_copy_us, gpuCopyDst);"),
         ("its GPU copy queued", "+        vblank->gpu_copy_pending = TRUE;\n",
@@ -268,10 +268,16 @@ for what, first, then in (
          "+        lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, FALSE);"),
         ("its CompleteNotify", "+    lorieContentComplete(vblank->lorie_content_seq, mode);     /* lorie: P11-C3-D0 */",
          "present_vblank_notify(vblank, vblank->kind, mode, ust, crtc_msc);"),
-        ("skipped", "present_vblank_scrap(present_vblank_ptr vblank)\n {\n", "+    lorieContentSkipped(vblank->lorie_content_seq);     /* lorie: P11-C3-D0 */")):
+        ("skipped", "present_vblank_scrap(present_vblank_ptr vblank)\n {\n",
+         "+    lorieContentSkipped(vblank->lorie_content_seq, vblank->lorie_content_client);     /* lorie: P11-C3-D0 */")):
     i, j = xp.find(first), xp.find(then)
     check(i >= 0 and j > i and j - i < 400, "patches/xserver.patch: the content hook for %s not where it happens" % what)
 prep = func(I, "Bool loriePrepareAccess(PixmapPtr pPix, int index) {")
+# ... clients gone told of only with the option on, every server generation (dix main deletes the callbacks at a reset)
+check("    if (pvfb->contentDiag)\n        AddCallback(&ClientStateCallback, lorieContentClientGone, NULL);" in
+      func(I, "static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {") and
+      open(I, encoding="utf-8").read().count("AddCallback(&ClientStateCallback, lorieContentClientGone") == 1,
+      "clients gone not told of with the content option on, or told of without it")
 check("    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_OPEN);" in prep and
       "    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_DONE);" in
       func(I, "void lorieFinishAccess(PixmapPtr pPix, int index) {"), "the accesses do not carry content only with the option on")

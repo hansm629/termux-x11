@@ -59,7 +59,8 @@ XlorieContentLatency: present_to_copy_us copy_to_complete_us complete_to_root_us
                 content_total_us
 XlorieContentStall: content_interval_us gaps_pending gaps_client max_gap_us worst_content_us worst_stage worst_copy_us
                 worst_composite_us worst_publish_us worst_screen_us
-XlorieContentClients: command/index:requests=N(+d),skipped=N(+d),max_gap_us=M ... (the 3 presenting most) | none
+XlorieContentClients: command/index:requests=N(+d),skipped=N(+d),max_gap_us=M[,gone] ... (the 3 presenting most) | none
+                skips_unattributed=N(+d)
 (only with TERMUX_X11_FRAME_FREEZE_DIAG=1, P11-C3-C - from the watchdog's thread, not every 5 seconds but as they come:)
 XlorieFreeze:   phase=armed|begin|level|end id side stall_us pending stage x_stage x_main r_stage asks taken
                 ask_wait_us copies_queued copy_wait_us copies_done notified acked root root_wait_us ... (begin, level)
@@ -391,8 +392,12 @@ fixed histograms only.
   asked for in the interval's first half (`gaps_pending`: it was there and waited) or later (`gaps_client`: no client
   asked for any - a client drawing nothing, glmark2 changing scenes); the longest interval; the period's slowest
   content and its slowest stage (`copy`, `composite` - to the screen pixmap, `publish`, `screen`) with each stage's time.
-- `XlorieContentClients`: the 3 clients presenting most this period, by command and client index (a client gone and its
-  index reused by another is a new entry), each with its requests, skips and longest gap between requests.
+- `XlorieContentClients`: the 3 clients presenting most this period, by command and client index, each with its
+  requests, skips and longest gap between requests. A skip is counted for the client that asked for the presentation
+  (a token its request gave it: its slot and the slot's epoch), not the one dispatching when it is skipped - a
+  presentation overwriting it, a window destroyed, a tick. A client gone (ClientStateCallback) is marked `,gone` and
+  kept until that report - a client later at its address and index is another entry - its slot free after;
+  `skips_unattributed` counts skips whose client's slot went to another client since (or that came with no token).
 
 ### RENDER composites by class (P11-C3-D1, with `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1`)
 

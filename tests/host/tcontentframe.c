@@ -19,6 +19,8 @@
  *   with it on, as its presentation is scrapped while it may run), pending before (on: the compositor not told yet);
  *   the queue's recorded front (both buffers in flight) not queued for the read, a copy behind it into the same window
  *   queued; cancelled copies and other pixmaps' none of it; a slot noted with another copy: unknown; across the wrap.
+ *   A skip counted for the client that asked for it (its token), whoever dispatches then; a client gone kept apart from
+ *   the next at its address and index, its skips still its own until its slot goes to another (then apart).
  *   The published content's sequence lock: read midway through its writing (torn, never old and new mixed), written
  *   midway through a read (read again: the new one whole), a frame with no whole copy (unknown), the generation's wrap.
  */
@@ -77,7 +79,13 @@ typedef struct LorieBuffer { struct { uint64_t id; } d; } LorieBuffer;
 #define LorieBuffer_description(b) (&(b)->d)
 typedef struct { void *driverPriv; } PixmapRec, *PixmapPtr;
 #define exaGetPixmapDriverPrivate(p) ((p)->driverPriv)
-typedef struct { int index; } ClientRec, *ClientPtr;
+typedef struct { int index, clientState; } ClientRec, *ClientPtr;
+enum { ClientStateInitial, ClientStateRunning, ClientStateRetained, ClientStateGone };     /* dixstruct.h's */
+typedef struct { ClientPtr client; const void *prefix, *setup; } NewClientInfoRec;
+typedef void *CallbackListPtr;
+#ifndef __unused
+#define __unused __attribute__((unused))
+#endif
 static ClientPtr curClient;
 static ClientPtr GetCurrentClient(void) { return curClient; }
 static const char *clientNames[16];
@@ -100,11 +108,14 @@ static struct {
         char cmd[24];
         uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
         uint64_t lastUs;
+        uint32_t epoch;
+        Bool gone;
     } contentClients[LORIE_CONTENT_CLIENTS];
 } fakePvfb = { &st }, *pvfb = &fakePvfb;
 static volatile struct lorie_shared_server_state *state = &st;     /* the renderer's view of it */
 
 static uint64_t fakeNow = 1000;
+static uint32_t token;      /* the client token the last presentation numbered was given */
 #define lorieMonotonicUs() (fakeNow)
 /* struct lorie_content's fields as its sequence lock reads and writes them (lorie.h's: relaxed atomics), a case's step
  * run right after the n-th write or before the n-th read - the other side meeting this one midway */
@@ -208,7 +219,7 @@ static uint32_t throughCompositor(uint64_t askAt, uint64_t doneAt, uint64_t comp
     uint64_t requestUs, copyUs;
     uint32_t seq;
     fakeNow = askAt;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     copyUs = lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
     fakeNow = doneAt;
     st.gpuCopyQueue.completedSerial = fakePvfb.gpuCopySerialCounter;
@@ -235,7 +246,7 @@ int main(void) {
     world();
     fakePvfb.contentDiag = FALSE;
     st.backend.contentDiag = 0;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     st.content.gen = 4;
     frame();
     CHECK(seq == 0 && requestUs == 0 && d->contentRequests == 0 && d->contentScreenNew == 0 && d->contentScreenReused == 0,
@@ -245,7 +256,7 @@ int main(void) {
     world();
     curClient = &glmark;
     fakeNow = 1000;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     CHECK(seq && requestUs == 1000 && d->contentRequests == 1, "request: %u at %llu", seq, (unsigned long long) requestUs);
     fakeNow = 1100;
     st.gpuCopyQueue.completedSerial = 39;
@@ -331,7 +342,7 @@ int main(void) {
     /* straight into the screen pixmap by the GPU; into a window by the CPU; skipped; completed */
     world();
     fakeNow = 1000;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     copyUs = lorieContentCopied(seq, requestUs, &pix[ROOT], TRUE);
     fakeNow = 2500;
     lorieContentCopyDone(seq, requestUs, copyUs, &pix[ROOT]);
@@ -340,16 +351,16 @@ int main(void) {
           "GPU copy straight into the screen pixmap: %u root updates, %u compositor, wait %llu", d->contentRootUpdates,
           d->contentCompositorUpdates, (unsigned long long) d->contentCompleteToRoot.sumUs);
     fakeNow = 3000;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     fakeNow = 3200;
     lorieContentCopied(seq, requestUs, &pix[WINDOW], FALSE);
     CHECK(privs[WINDOW].content.seq == seq && privs[WINDOW].content.copyUs == 3200 && d->contentCpuCopies == 1 &&
           d->contentPresentToCopy.sumUs == 200, "CPU copy into a window: stamp %u, %u CPU copies", privs[WINDOW].content.seq,
           d->contentCpuCopies);
-    lorieContentSkipped(seq);
+    lorieContentSkipped(seq, token);
     lorieContentComplete(seq, PresentCompleteModeCopy);
     lorieContentComplete(seq, PresentCompleteModeSkip);
-    lorieContentSkipped(0);
+    lorieContentSkipped(0, token);
     lorieContentComplete(0, PresentCompleteModeCopy);
     CHECK(d->contentSkipped == 1 && d->contentCompletes == 1 && d->contentCompletesSkip == 1, "skipped %u, completes %u, skip %u",
           d->contentSkipped, d->contentCompletes, d->contentCompletesSkip);
@@ -361,13 +372,13 @@ int main(void) {
     /* numbers past their wrap: 0 is none, newer stays newer */
     world();
     fakePvfb.contentSeq = UINT32_MAX - 1;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     lorieContentCopied(seq, requestUs, &pix[WINDOW], FALSE);
-    n = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    n = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     lorieContentCopied(n, requestUs, &pix[WINDOW], FALSE);
     CHECK(seq == UINT32_MAX && n == 1 && privs[WINDOW].content.seq == 1, "wrap: %u then %u, stamp %u", seq, n, privs[WINDOW].content.seq);
     /* without a pixmap (NotifyMSC): not numbered */
-    CHECK(lorieContentRequest(NULL, &requestUs) == 0, "a presentation without a pixmap numbered");
+    CHECK(lorieContentRequest(NULL, &requestUs, &token) == 0, "a presentation without a pixmap numbered");
 
     /* clients: named once, counted apart; a ninth takes the least-used slot; a reused index, another client: a new slot */
     world();
@@ -375,11 +386,11 @@ int main(void) {
     curClient = &glmark;
     for (i = 0; i < 5; i++) {
         fakeNow = 100000 + (uint64_t) i * 1000;
-        lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+        lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     }
     fakeNow = 200000;
-    lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
-    lorieContentSkipped(1);
+    lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
+    lorieContentSkipped(1, token);
     CHECK(fakePvfb.contentClients[0].client == &glmark && !strcmp(fakePvfb.contentClients[0].cmd, "glmark2-es2") &&
           fakePvfb.contentClients[0].requests == 6 && fakePvfb.contentClients[0].skipped == 1 && fakePvfb.contentClients[0].maxGapUs == 96000,
           "client: %s, %u requests, %u skipped, max gap %u", fakePvfb.contentClients[0].cmd, fakePvfb.contentClients[0].requests,
@@ -388,19 +399,69 @@ int main(void) {
         other[i].index = 6 + i;
         clientNames[6 + (i % 10)] = "client";
         curClient = &other[i];
-        lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+        lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     }
     CHECK(fakePvfb.contentClients[0].client == &glmark, "the busiest client's slot taken by a ninth");
     other[9].index = 3;     /* glmark2's index, another client */
     curClient = &other[9];
-    lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     for (i = 0, n = 0; i < LORIE_CONTENT_CLIENTS; i++)
         n += fakePvfb.contentClients[i].client == &other[9];
     CHECK(n == 1 && fakePvfb.contentClients[0].client == &glmark, "a reused index with another client: %u slots of its own", n);
     curClient = NULL;
     n = d->contentRequests;
-    lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
-    CHECK(d->contentRequests == n + 1, "a presentation with no current client not counted");
+    lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
+    CHECK(d->contentRequests == n + 1 && !token, "a presentation with no current client not counted, or given a token (%#x)", token);
+
+    /* a skip counted for the client that asked for the presentation, whoever dispatches as it is skipped (another client's
+     * request, none: a tick); a client gone - its slot matched by none, a client later at its address and index another
+     * - still counted for (its presentations' skips: its windows destroyed), until its slot goes to another: apart */
+    {
+        uint32_t tokenA, seqA, unattributed;
+        NewClientInfoRec gone = { &glmark };
+        int slotA, newSlot = -1;
+        world();
+        memset(fakePvfb.contentClients, 0, sizeof(fakePvfb.contentClients));
+        curClient = &glmark;
+        seqA = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &tokenA);
+        slotA = (int) (tokenA & 0xf);
+        curClient = &xfwm;
+        lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
+        lorieContentSkipped(seqA, tokenA);
+        curClient = NULL;
+        lorieContentSkipped(seqA, tokenA);
+        CHECK(tokenA && fakePvfb.contentClients[slotA].client == &glmark && fakePvfb.contentClients[slotA].skipped == 2 &&
+              fakePvfb.contentClients[token & 0xf].skipped == 0 && !d->contentSkippedUnattributed, "skips counted for %u (want "
+              "glmark2's 2), xfwm4 %u, apart %u", fakePvfb.contentClients[slotA].skipped, fakePvfb.contentClients[token & 0xf].skipped,
+              d->contentSkippedUnattributed);
+        glmark.clientState = ClientStateRunning;
+        lorieContentClientGone(NULL, NULL, &gone);
+        CHECK(!fakePvfb.contentClients[slotA].gone, "a client running taken as gone");
+        glmark.clientState = ClientStateGone;
+        lorieContentClientGone(NULL, NULL, &gone);
+        glmark.clientState = ClientStateRunning;        /* another client, at its address and index */
+        curClient = &glmark;
+        lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
+        newSlot = (int) (token & 0xf);
+        lorieContentSkipped(seqA, tokenA);              /* the gone one's window destroyed */
+        CHECK(fakePvfb.contentClients[slotA].gone && newSlot != slotA && fakePvfb.contentClients[newSlot].requests == 1 &&
+              fakePvfb.contentClients[slotA].skipped == 3 && !d->contentSkippedUnattributed, "a gone client: slot gone %d, the next "
+              "at its address in slot %d (its own %d), skipped %u, apart %u", fakePvfb.contentClients[slotA].gone, newSlot, slotA,
+              fakePvfb.contentClients[slotA].skipped, d->contentSkippedUnattributed);
+        for (i = 0; i < 10 && !(fakePvfb.contentClients[slotA].client != &glmark); i++) {
+            other[i].index = 6 + i;
+            clientNames[6 + i] = "client";
+            curClient = &other[i];
+            lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
+        }
+        unattributed = d->contentSkippedUnattributed;
+        lorieContentSkipped(seqA, tokenA);
+        CHECK(fakePvfb.contentClients[slotA].client != &glmark && d->contentSkippedUnattributed == unattributed + 1 &&
+              fakePvfb.contentClients[slotA].skipped == 0, "its slot given to another: the gone client's skip counted for it (%u) "
+              "rather than apart (%u)", fakePvfb.contentClients[slotA].skipped, d->contentSkippedUnattributed - unattributed);
+        lorieContentSkipped(seqA, 0);
+        CHECK(d->contentSkippedUnattributed == unattributed + 2, "a skip without a token not counted apart");
+    }
 
     /* a failed opening (loriePrepareAccess returning FALSE: EXA finishes no such access): as if never opened - its source
      * carried nowhere, its index not left open, what that index carried before kept; nested accesses each by their
@@ -513,7 +574,7 @@ int main(void) {
     memset(reads, 0, sizeof reads);
     st.gpuCopyQueue.readIndex = st.gpuCopyQueue.writeIndex = UINT32_MAX - 1;
     st.gpuCopyQueue.completedSerial = 89;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs, &token);
     queueCopy(90, CLIENT_PIX, WINDOW);
     lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
     CHECK(readAs(WINDOW, 0, 1, 0), "a read of a copy queued, its damage put off: not pending (stale %u, unknown %u)",
