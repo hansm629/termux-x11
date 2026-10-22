@@ -1865,6 +1865,36 @@ CONTROLS += [
      "tpresentcopy"),
 ]
 
+# P11-C3-D: the freeze watchdog's input thread, and the session script's summary (tools/diag/frame-diag-session.sh)
+CONTROLS += [
+    ("watchdog: the input thread looked for only as it starts", "InitOutput.c",
+     """        if (!tids[LORIE_THREAD_INPUT])
+            tids[LORIE_THREAD_INPUT] = lorieInputTid(&why);     // run since: looked at from now on""",
+     """        (void) why;""",
+     "twiring"),
+    ("watchdog: an input thread not run yet called none", "InitOutput.c",
+     """    *why = tid ? NULL : InputThreadEnable ? "starting" : "none";""",
+     """    *why = tid ? NULL : "none";""",
+     "tfreeze"),
+    ("session: the watchdog taken as off without its armed line (XlorieBackend)", "frame-diag-session.sh",
+     """    /XlorieBackend: / && / freeze_diag=on/ { armed = 1 }""",
+     """    /XlorieBackend: / && / freeze_diag=on/ { }""",
+     "tdiag"),
+    ("session: the watchdog taken as off without its armed line (XlorieXSched)", "frame-diag-session.sh",
+     """    /XlorieXSched: / { xsched = $0; armed = 1 }""",
+     """    /XlorieXSched: / { xsched = $0 }""",
+     "tdiag"),
+    ("session: a report straddling its phase's start counted in it", "frame-diag-session.sh",
+     """            if ((q in from) && t - 5 >= from[q] - 0.25 && t <= to[q] + 0.25) p = q""",
+     """            if ((q in from) && t >= from[q] - 0.25 && t <= to[q] + 0.25) p = q""",
+     "tdiag"),
+    ("session: a percentile past the last bucket read as none", "frame-diag-session.sh",
+     """            if (h[4] ~ /^>/) { tover[p] = 1; h[4] = substr(h[4], 2) }
+""",
+     "",
+     "tdiag"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):
@@ -1886,6 +1916,11 @@ for n, (what, file, old, new, test) in enumerate(CONTROLS):
         env["LORIE_XSERVER_PATCH"] = path
         if old.count("\n") != new.count("\n"):
             sys.exit("control %r: changes the patch's line count - its hunks would not apply" % what)
+    elif file.endswith(".sh"):
+        # P11-C3-D: a diagnostics script (tools/diag), changed in a copy that tdiag.py then runs
+        diag = os.path.join(work, "diag")
+        shutil.copytree(os.path.join(HERE, "..", "..", "tools", "diag"), diag)
+        path = os.path.join(diag, file)
     else:
         path = os.path.join(src, file)
     text = open(path, encoding="utf-8").read()
@@ -1895,6 +1930,8 @@ for n, (what, file, old, new, test) in enumerate(CONTROLS):
 
     if test == "twiring":
         r = subprocess.run([sys.executable, os.path.join(HERE, "twiring.py"), src], capture_output=True, text=True, env=env)
+    elif test == "tdiag":
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tdiag.py"), diag], capture_output=True, text=True, env=env)
     else:
         subprocess.run([sys.executable, os.path.join(HERE, "gen.py"), src, gen, BASE], check=True, env=env)
         exe = os.path.join(gen, test)

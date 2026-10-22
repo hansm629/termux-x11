@@ -19,6 +19,9 @@ XlorieRootCopy: root_gpu_copy=off|on|fallback, the root double buffering copies 
 XlorieSchedule: exa_lock_opt=on|off x_access_reserved x_access_reserve_full copies_deferred copies_deferred_wakes
                 vk_schedule_opt=on|off root_ahead root_ahead_x_waiting root_chain_consumed root_ahead_unavailable (P11-C3-B)
                 buffers_awaited buffer_await_us buffers_given_up copies_left_for_buffers (P11-C3-C, always)
+XlorieRootCopySched: root_copy_sched_opt=on|off vk_schedule_opt=on|off settled_acquired settled_lock_wait
+                settled_x_waiting (P11-C3-D2, always)
+XlorieCopyDamage: exa_composite_opt=on|off deferred done early dropped pending (P11-C3-D1-A, always)
 XlorieVkSelftest: result=pass|fail|none compares=N(+d) iterations formats_passed formats_unavailable us
                 fail_step fail_format fail_direction fail_iteration fail_offset fail_expected fail_actual
 XlorieFallback: total, by class (fatal_backend, resource_local, injected), last reason, VkResult, resource
@@ -38,12 +41,24 @@ XlorieVkFramePacing: frame_start_us present_delta_us wake_us idle_gaps stamps_in
 XlorieVkPipeline: cpu_us acquire_us lock_us record_us submit_us fence_frame_us fence_root_us fence_copy_us present_us
                 after_root_us
 XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us worst_take_us worst_record_us worst_fence_us
+                ahead_settle_us (P11-C3-D2)
 XlorieFrameGaps: ask_wait_us gaps_idle gaps_x_stalled gaps_unwoken gaps_late stall_ge_ms=100:N(+d),...,3000:N(+d)
                 idle_ge_ms=... worst_stall_us worst_stall_cause worst_stall_ask_wait_us worst_stall_wake_us
                 worst_stall_gap_us worst_stall_ticks (P11-C3-C)
 XlorieXLatency: request_us access_us access_lock_us access_gpu_us tick_delay_us tick_work_us worst_request_us
                 worst_request=client:command:extension:major.minor access_hold_us worst_access_us
                 worst_access=WxH:dest|src|mask:reserved|locked
+XlorieComposite: composites px us cpu_us gpu_us root_us lock_us ahb_us accesses ahb_locks worst_us
+                worst=class:WxH:cpu=,gpu=,root=,lock=,ahb= (P11-C3-D1)
+XlorieCompositeClasses: class=n/kpx/us/cpu_us/gpu_us/root_us/accesses/max_us,... classes_more (P11-C3-D1)
+(only with TERMUX_X11_CONTENT_FRAME_DIAG=1, P11-C3-D0:)
+XlorieContentFrame: requests skipped gpu_copies cpu_copies copies_done completes completes_skip stale_reads
+                compositor_updates root_updates root_publishes screen_new screen_reused
+XlorieContentLatency: present_to_copy_us copy_to_complete_us complete_to_root_us root_to_publish_us publish_to_screen_us
+                content_total_us
+XlorieContentStall: content_interval_us gaps_pending gaps_client max_gap_us worst_content_us worst_stage worst_copy_us
+                worst_composite_us worst_publish_us worst_screen_us
+XlorieContentClients: command/index:requests=N(+d),skipped=N(+d),max_gap_us=M ... (the 3 presenting most) | none
 (only with TERMUX_X11_FRAME_FREEZE_DIAG=1, P11-C3-C - from the watchdog's thread, not every 5 seconds but as they come:)
 XlorieFreeze:   phase=armed|begin|level|end id side stall_us pending stage x_stage x_main r_stage asks taken
                 ask_wait_us copies_queued copy_wait_us copies_done notified acked root root_wait_us ... (begin, level)
@@ -333,6 +348,89 @@ vsync callback) over the period - time run and time waited on a run queue - and 
 the 5 second report itself took on the X server's thread (since P11-C3-C made as work there, outside the input lock the
 timers run under). `freezes` counts the freezes so far.
 
+The input thread (this build has one: `INPUTTHREAD` in `patches/dix-config.h.in`) is started by dix main last, as
+Dispatch begins - after the X server's whole initialization, which can take longer than the watchdog's first look a
+second in. The watchdog looks for it at every look until it has run (P11-C3-D; before, it kept the 0 it first saw):
+`phase=armed` gives `input_tid=<tid>`, or `starting` (not run yet), or `none` (the server started with `-dumbSched`,
+which turns it off); `XlorieXSched` gives `input=starting` or `input=none` in place of its state until then.
+
+### Client content to the screen (P11-C3-D0, `TERMUX_X11_CONTENT_FRAME_DIAG=1`)
+
+Off by default; a diagnostic only. The renderer presenting 120 frames a second says nothing of what they show: this
+follows each client presentation's content from its PresentPixmap request to the screen. Each request is numbered
+(`present_scmd`, its own number and time: the client's serial is not used - two clients' serials are unrelated);
+the number rides the destination pixmap's private through its GPU copy (queued, completed) or CPU copy, then each EXA
+CPU access carries the newest content its sources hold into its destination as the destination's access finishes - a
+compositor's composite into its own buffer, its copy into the screen pixmap - never an older one over a newer one.
+`lorieRedraw` publishes what the screen pixmap holds from then on (where it takes its damage up: swapped to the front,
+or drawn), and the renderer, which reads it under the lock it takes anyway, counts each presented frame as showing
+new content or the last one's again. No lock, fence wait, pixel readback or per-frame line is added; counters and
+fixed histograms only.
+
+- `XlorieContentFrame` (counts): `requests` presentations asked for, `skipped` (overwritten in their frame by a newer
+  one, or their copy cancelled), `gpu_copies` / `cpu_copies`, `copies_done` (GPU copies completed and taken up by the X
+  server), `completes` / `completes_skip` (CompleteNotify sent, copy or skip), `stale_reads` (a CPU read of a pixmap
+  whose Present damage was reported while its GPU copy into it was still queued - the read sees the content before
+  it; none with `TERMUX_X11_EXA_COMPOSITE_OPT=1`, which reports the damage once the copy is done), `compositor_updates`
+  (content carried by a CPU composite or copy into another pixmap), `root_updates` (into the screen pixmap),
+  `root_publishes` (the screen pixmap published with new content), `screen_new` / `screen_reused` (Vulkan frames
+  presented with new content, with the last one's again).
+- `XlorieContentLatency` (histograms, `n/avg/p95/p99/max/h16/h33`): the request to its copy queued or made, queued to
+  completed, completed to the screen pixmap, the screen pixmap to its publishing, publishing to the frame's present,
+  and the whole (`content_total_us`).
+- `XlorieContentStall`: the interval between frames with new content; intervals of 50 ms or more whose content was
+  asked for in the interval's first half (`gaps_pending`: it was there and waited) or later (`gaps_client`: no client
+  asked for any - a client drawing nothing, glmark2 changing scenes); the longest interval; the period's slowest
+  content and its slowest stage (`copy`, `composite` - to the screen pixmap, `publish`, `screen`) with each stage's time.
+- `XlorieContentClients`: the 3 clients presenting most this period, by command and client index (a client gone and its
+  index reused by another is a new entry), each with its requests, skips and longest gap between requests.
+
+### RENDER composites by class (P11-C3-D1, with `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1`)
+
+EXA has no composite acceleration here (`PrepareComposite` refuses): every RENDER Composite - a compositor's windows,
+shadows and copies to the screen, glyphs, trapezoids - is pixman on the CPU between EXA's PrepareAccess and
+FinishAccess of its pictures. With the frame diagnostics on, PictureScreen's Composite is wrapped over EXA's and each
+composite's time split, from this thread's own counters, into what it waited for - the GPU before a CPU access
+(`gpu_us`), the shared lock besides (`lock_us`), the root copy (`root_us`) - its AHB CPU lock and unlock calls
+(`ahb_us`) and what is left (`cpu_us`: pixman's and EXA's own work). `accesses` counts the EXA accesses the composites
+opened, `ahb_locks` the AHBs they CPU-locked. A class is `op:source_alpha>destination[+mask_kind][+xf]`: the operator
+(`src`, `over`, ... or `opN`), the source and destination as `solid` (no drawable), `mem` (this process's memory),
+`ahb` or `root` (the screen pixmap, or a window drawn into it), the source's alpha (`a`/`x`), the mask (`mask_a`
+alpha only, `mask_rgb`, `mask_ca` component alpha) and `+xf` when the source or the mask is transformed. 8 classes are
+kept apart per period, the rest together (`other`).
+
+- `XlorieComposite`: the period's totals and its slowest composite with its size and split.
+- `XlorieCompositeClasses`: the 4 classes that took longest, `class=n/kpx/us/cpu_us/gpu_us/root_us/accesses/max_us`
+  (kpx: thousands of pixels asked for), then `classes_more` - the classes not shown.
+
+### A Present copy's damage once the copy is done (P11-C3-D1-A, `TERMUX_X11_EXA_COMPOSITE_OPT=1`)
+
+Experimental, off by default. A Present copy made by the renderer's GPU reported its damage as it was queued; a
+compositor told then composites the window's pixmap before the copy wrote it (the stale content - the new one waits
+for the next damage) or, the copy running in a frame, its CPU access waits for that frame. With the option the damage
+is reported when the X server takes the completed copy up, before the client is told its pixmap is idle; the update
+region is kept until then and moved into the window as `present_copy_region` draws it (by `x_off`/`y_off` and the
+window where it is then; the path without the option intersects it untranslated, unchanged here). A presentation
+scrapped meanwhile reports it at once while the copy may still run (as without the option) or is done; never when the
+copy never runs or the window is destroyed. Nothing waits more. `XlorieCopyDamage`: `deferred` copies whose damage was
+put off, then `done` (reported with the copy done), `early` (reported before: scrapped while running), `dropped`;
+`pending` the ones still running.
+
+### The root copy ahead settled as soon as it may be (P11-C3-D2, `TERMUX_X11_ROOT_COPY_SCHED_OPT=1`)
+
+Experimental, off by default; acts on B2's root copy ahead only (`TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1` - without it
+the root copy is settled before the frame begins, and this does nothing). B2 settles the copy - and lets the X server,
+waiting for it to draw into its new back buffer, go on - once the frame is submitted, or at the frame's start if the
+X server already waits: the image's acquire, the wait for the X server's lock, the recording and the submission stand
+in between. With the option the renderer settles it, its fence waited for as before (at once then), as soon as the
+frame finds it may: once the image is acquired, and while the X server's lock is not free (tried every 0.5 ms while a
+root copy ahead is pending) - when the X server is found waiting for it, or its fence is signalled already (asked
+without waiting: `vkGetFenceStatus`). The lock path also ends a wait that would otherwise never end: the X server
+holding the shared lock (an EXA access open without a reservation - B1 off, or its 8 taken) while it waits for that
+copy. `XlorieRootCopySched`: `settled_acquired` (its fence signalled once the image was acquired),
+`settled_lock_wait` (signalled while the frame tried for the lock), `settled_x_waiting` (the X server found waiting).
+`XlorieRootCopyTiming` `ahead_settle_us` (frame diagnostics): a root copy ahead, from its submission to its settling.
+
 ### Buffers waited for before the shared lock (P11-C3-C, always)
 
 A copy's buffers come to the renderer over the X server's connection, on the activity's main thread; a copy queued
@@ -356,7 +454,16 @@ glmark2 while XFCE windows are moved for 60 s (`--move`) - each started when you
 `~/frame-diag-<date>-<time>.log`), and a summary of them: each freeze the watchdog logged - its length, side, where it
 stood, what waited and what ended it, and at its begin the X server's thread, request, asks, copies, root copy and
 lock - nothing to do when one happens, it logs itself; the frame gaps by cause and length, summed over the session;
-the X server's threads' last `XlorieXSched` line. The summary only picks keys out of the lines; it judges nothing.
+the X server's threads' last `XlorieXSched` line. The watchdog is taken as on from its `phase=armed` line or - that line
+logged before the session began - from `XlorieBackend` `freeze_diag=on` or an `XlorieXSched` line (P11-C3-D). Then
+(P11-C3-D) each phase, in the order they began, from the 5-second reports made wholly within it (by the marks as the
+log has them, on its clock; a report whose 5 seconds straddle a phase's start or end counts in none): the screen's
+frames and, with the content diagnostics, those with new client content and the content's path (asked, skipped,
+copied, stale reads, into the compositor, the screen pixmap, published), its wait to the screen (mean, the largest
+p99 and max) and its gaps (pending, client - glmark2's scene changes are client gaps); the X server's GPU, lock and
+root copy waits and, with the watchdog, its main thread's time runnable; the composites (frame diagnostics); the root
+copies, and what `TERMUX_X11_EXA_COMPOSITE_OPT` and `TERMUX_X11_ROOT_COPY_SCHED_OPT` did - per second. The summary
+only picks keys out of the lines and sums them; it judges nothing.
 
 `renderer-proof.sh --expect vulkan|gles [--reports N] [--file LOG]` - judges the last N reports (default 3,
 15 seconds) and prints every check with its numbers; exit 0 PASS, 1 FAIL, 2 not enough reports.

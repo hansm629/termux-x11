@@ -69,7 +69,11 @@ static struct {
     int xRequestClient, xRequestMajor, xRequestMinor;
     uint64_t reportUs, reportMaxUs;
     uint64_t copyNotifiedSerial, copyNotifiedUs, copyAckedSerial, copyAckedUs;
+    pid_t inputTid;
 } fakePvfb = { &st, TRUE }, *pvfb = &fakePvfb;
+/* the input thread: this build's (dix-config.h.in) and this server's (-dumbSched: off) */
+#define INPUTTHREAD 1
+static Bool InputThreadEnable = TRUE;
 static bool connected = true;
 static bool lorieConnectionAlive(void) { return connected; }
 /* the clock the sample reads: the case's */
@@ -351,10 +355,26 @@ int main(void) {
             at[i] = (struct lorie_thread_info) { 'S', 100, 50, -1, 0, FALSE };
         fakePvfb.reportUs = 1234, fakePvfb.reportMaxUs = 2345;
         th[LORIE_THREAD_MAIN].runUs = 400, th[LORIE_THREAD_MAIN].waitUs = 350;
+        fakePvfb.inputTid = 4321;
         lorieXSchedLine(line, sizeof(line), th, at, 2);
         CHECK(strstr(line, "XlorieXSched: main=S,futex:lock,run_us=300,runq_us=300 input=S,run_us=900,runq_us=450 ") &&
               strstr(line, " report_us=1234 report_max_us=2345 freezes=2") && fakePvfb.reportMaxUs == 0,
               "threads line: %s", line);
+        /* P11-C3-D: the input thread not run yet - dix main starts it as Dispatch begins - or none in this server */
+        {
+            const char *why = "?";
+            fakePvfb.inputTid = 0;
+            lorieXSchedLine(line, sizeof(line), th, at, 2);
+            CHECK(strstr(line, " input=starting,run_us=") && !lorieInputTid(&why) && why && !strcmp(why, "starting"),
+                  "threads line, the input thread not run yet: %s", line);
+            InputThreadEnable = FALSE;
+            lorieXSchedLine(line, sizeof(line), th, at, 2);
+            CHECK(strstr(line, " input=none,run_us=") && !lorieInputTid(&why) && why && !strcmp(why, "none"),
+                  "threads line, no input thread: %s", line);
+            InputThreadEnable = TRUE;
+            fakePvfb.inputTid = 4321;
+            CHECK(lorieInputTid(&why) == 4321 && !why, "the input thread's tid once it ran: not given");
+        }
     }
 
     printf("TFREEZE the freeze watchdog (TERMUX_X11_FRAME_FREEZE_DIAG): %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

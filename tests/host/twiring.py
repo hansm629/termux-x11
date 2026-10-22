@@ -305,6 +305,12 @@ check('lorieScreen.exaCompositeOpt = getenv("TERMUX_X11_EXA_COMPOSITE_OPT") && !
 check("    if (!pvfb->exaCompositeOpt)\n        return FALSE;" in func(I, "Bool lorieDeferCopyDamage(void) {"),
       "a copy's damage put off with TERMUX_X11_EXA_COMPOSITE_OPT off")
 
+# P11-C3-D: the freeze watchdog looks for the input thread at each look until it has run (dix main starts it as
+# Dispatch begins, which can be after the watchdog's first look); tfreeze.c runs lorieInputTid
+watch = func(I, "static void *lorieFreezeWatch(__unused void *arg) {")
+in_order("the watchdog looks for the input thread until it has run", watch, "for (;;) {",
+         "if (!tids[LORIE_THREAD_INPUT])\n            tids[LORIE_THREAD_INPUT] = lorieInputTid(&why);", "lorieFreezeSample(&s);")
+
 # P11-C3-D2: TERMUX_X11_ROOT_COPY_SCHED_OPT read when the server state is made, "1" only, into the renderer's flag; the
 # frame and the copies alone take the X server's lock through rendererVkLock (which tpresentcopy.c runs) - tries while
 # a root copy submitted ahead is pending, then as always; the frame's root copy settled early once its image is

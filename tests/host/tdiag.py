@@ -11,7 +11,10 @@ latest of P11-C3's TERMUX_X11_RENDERER_VK_FRAME_DIAG lines there are, none where
 
 And frame-diag-session.sh (P11-C3) as it runs on a device, its waits and Android's tools faked: the three phases'
 marks in order, each in the log (as LorieNative) and in the file, the X server's lines from the session's start after
-them, nothing else left behind; a warning when the session has no pacing report.
+them, nothing else left behind; a warning when the session has no pacing report. P11-C3-D: the watchdog taken as on from
+its armed line, or - that line older than the session - from XlorieBackend's freeze_diag=on or an XlorieXSched line; each
+phase summed from the 5-second reports made wholly within it (by the log's marks), none from one that straddles its
+start or end.
 
 usage: tdiag.py <tools/diag> [<host test output dir>]
 """
@@ -124,8 +127,14 @@ if len(sys.argv) > 2:
     p = os.path.join(sys.argv[2], "diag-frame.log")
     r = subprocess.run(["sh", os.path.join(D, "renderer-status.sh"), "--file", p], capture_output=True, text=True)
     check(r.returncode == 0 and all(r.stdout.count(k) == 1 for k in ("XlorieVkFramePacing:", "XlorieVkPipeline:",
-          "XlorieRootCopyTiming:", "XlorieXLatency:", "XlorieFrameGaps:")) and "XlorieVkFramePacing: frame_start_us=0 " in r.stdout,
-          "renderer-status on the real frame diagnostics log: %d\n%s" % (r.returncode, r.stdout))
+          "XlorieRootCopyTiming:", "XlorieXLatency:", "XlorieFrameGaps:", "XlorieComposite:", "XlorieCompositeClasses:",
+          "XlorieRootCopySched:", "XlorieCopyDamage:")) and "XlorieVkFramePacing: frame_start_us=0 " in r.stdout and
+          "XlorieContent" not in r.stdout, "renderer-status on the real frame diagnostics log: %d\n%s" % (r.returncode, r.stdout))
+    # P11-C3-D0: the content lines, the latest of each, where the X server wrote them
+    r = subprocess.run(["sh", os.path.join(D, "renderer-status.sh"), "--file", os.path.join(sys.argv[2], "diag-content.log")],
+                       capture_output=True, text=True)
+    check(r.returncode == 0 and all(r.stdout.count(k) == 1 for k in ("XlorieContentFrame:", "XlorieContentLatency:",
+          "XlorieContentStall:", "XlorieContentClients:")), "renderer-status on the real content log: %d\n%s" % (r.returncode, r.stdout))
 
 # frame-diag-session.sh, with Android's logcat and log and the waits faked; `lines`: more the fake logcat says
 P = "10-21 10:00:%02d.000  9  9 I LorieNative: "
@@ -186,7 +195,7 @@ check("logcat -d -v threadtime -T " in made and " -s LorieNative:I" in made and
       saved.index("XlorieVkFramePacing:") < saved.index("XlorieMark: "), "frame-diag-session: the X server's lines not saved first\n" + saved)
 check(left == ["bin", "calls", "session.log"] and "1 pacing reports" in r.stdout and "no XlorieVkFramePacing" not in r.stderr,
       "frame-diag-session: left %s, said %s" % (left, r.stdout + r.stderr))
-check("freezes: no XlorieFreeze armed line" in r.stdout and "frame gaps" not in r.stdout, "frame-diag-session without the "
+check("freezes: the watchdog not on" in r.stdout and "frame gaps" not in r.stdout, "frame-diag-session without the "
       "watchdog: said %s" % r.stdout)
 r, saved, made, left = session(False)
 check(r.returncode == 0 and "no XlorieVkFramePacing line" in r.stderr, "frame-diag-session without a pacing report: no warning\n" +
@@ -209,6 +218,66 @@ check("1 begun, 0 ended" in r.stdout and "(a freeze begun and not ended in the l
       "ended: said %s" % r.stdout)
 r, saved, made, left = session(True, (), ["--move", "x"])
 check(r.returncode == 2, "frame-diag-session --move x: exit %d" % r.returncode)
+
+# P11-C3-D: the watchdog on, its armed line before the session (not in it); each phase from its whole reports
+Q = "10-21 10:%s  9  9 I LorieNative: "
+def phaseReport(at, scale=1):
+    d = lambda n: "%d(+%d)" % (n * 10 * scale, n * scale)
+    return [Q % at + l for l in (
+        "XlorieBackend: requested=vulkan active=VULKAN x_gpu_wait_us=%s x_state_lock_wait_us=%s freeze_diag=on" % (d(100700), d(150000)),
+        "XlorieVk: instance_created=1(+0) frames_presented=%s" % d(596),
+        "XlorieRootCopy: root_gpu_copy=on root_gpu_copy_requests=%s root_copy_cpu_block_us=%s root_copy_pending=0" % (d(580), d(159000)),
+        "XlorieContentFrame: requests=%s skipped=%s gpu_copies=%s cpu_copies=%s copies_done=%s completes=%s completes_skip=%s "
+        "stale_reads=%s compositor_updates=%s root_updates=%s root_publishes=%s screen_new=%s screen_reused=%s" % (
+            d(4900), d(4410), d(490), d(0), d(490), d(490), d(4410), d(0), d(490), d(490), d(480), d(480), d(116)),
+        "XlorieContentLatency: present_to_copy_us=0 copy_to_complete_us=0 complete_to_root_us=0 root_to_publish_us=0 "
+        "publish_to_screen_us=0 content_total_us=480/21000/30000/%s/60000/100/5" % (">100000" if scale > 1 else "40000"),
+        "XlorieContentStall: content_interval_us=0 gaps_pending=%s gaps_client=%s max_gap_us=%d worst_content_us=0" % (
+            d(1), d(0), 120000 * scale),
+        "XlorieComposite: composites=%s px=1 us=%d cpu_us=%d gpu_us=%d root_us=%d lock_us=0 ahb_us=0" % (
+            d(6000), 26000 * scale, 15500 * scale, 6000 * scale, 2000 * scale),
+        "XlorieCopyDamage: exa_composite_opt=on deferred=%s done=%s early=%s dropped=%s pending=0" % (d(490), d(488), d(1), d(1)),
+        "XlorieRootCopySched: root_copy_sched_opt=on vk_schedule_opt=on settled_acquired=%s settled_lock_wait=%s settled_x_waiting=%s" % (
+            d(500), d(3), d(40)),
+        "XlorieXSched: main=S,epoll_pwait,run_us=2600000,runq_us=%d input=S,run_us=1,runq_us=1 vsync=S,run_us=1,runq_us=1 "
+        "watchdog_run_us=1 report_us=1 report_max_us=1 freezes=0" % (1020000 * scale))]
+marks = [Q % at + "XlorieMark: phase=" + m for at, m in (
+    ("01:00.000", "idle start"), ("01:10.000", "idle end"), ("01:20.000", "glmark2 start"), ("01:40.000", "glmark2 end"),
+    ("01:45.000", "glmark2+move start"), ("02:45.000", "glmark2+move end"))]
+r, saved, made, left = session(True, marks + [Q % "01:25.000" + "XlorieBackend: active=VULKAN freeze_diag=on",
+                                              Q % "01:25.000" + "XlorieVk: frames_presented=5950(+595)"]
+                               + [Q % "01:42.000" + "XlorieBackend: active=VULKAN freeze_diag=on"]      # straddles
+                               + phaseReport("01:47.000", 7)                                          # straddles
+                               + phaseReport("01:50.100") + phaseReport("01:55.100") + phaseReport("02:48.000", 7))
+want = ["freezes (TERMUX_X11_FRAME_FREEZE_DIAG): 0 begun, 0 ended",
+        "phase idle: no 5-second report wholly within it",
+        "phase glmark2: 1 reports (5 s)",
+        "  screen frames 119.0/s",
+        "phase glmark2+move: 2 reports (10 s)",
+        "  screen frames 119.2/s, with new client content 96.0/s, with the last one again 23.2/s",
+        "  content: asked 980.0/s (skipped 882.0/s), copied by the GPU 98.0/s (completed 98.0/s), by the CPU 0.0/s; stale reads 0.0/s; "
+        "into the compositor 98.0/s, the screen pixmap 98.0/s, published 96.0/s",
+        "  content to the screen: mean 21000 us, p99 up to 40000 us, max 60000 us; gaps of 50 ms or more: pending 2, client 0, "
+        "longest 120000 us",
+        "  X server per second: GPU wait 20.1 ms, lock and GPU wait 30.0 ms, root copy wait 31.8 ms, main thread runnable 204.0 ms; "
+        "composites 1200.0/s, 5.2 ms (own 3.1, GPU wait 1.2, root copy wait 0.4)",
+        "  root copies 116.0/s; copy damage put off 98.0/s (early 0.2/s, dropped 0.2/s); root copies settled early: once acquired 100.0/s, "
+        "waiting for the lock 0.6/s, the X server waiting 8.0/s"]
+got = r.stdout.splitlines()
+check(r.returncode == 0 and all(w in got for w in want) and "phase glmark2+move: 2 reports (10 s)" in got and
+      got.index(want[2]) + 1 == got.index(want[3]) and got.index(want[4]) + 5 == got.index(want[9]) and
+      got.index(want[1]) < got.index(want[2]) < got.index(want[4]),
+      "frame-diag-session phases:\n" + r.stdout + "\nwant\n" + "\n".join(want))
+# the watchdog on from XlorieBackend alone, from XlorieXSched alone
+for alone in (Q % "01:00.000" + "XlorieBackend: active=VULKAN freeze_diag=on", phaseReport("01:00.000")[-1]):
+    r, saved, made, left = session(True, [alone])
+    check("freezes (TERMUX_X11_FRAME_FREEZE_DIAG): 0 begun, 0 ended" in r.stdout, "frame-diag-session, the watchdog on from %s "
+          "alone: said %s" % (alone.split("LorieNative: ")[1].split(":")[0], r.stdout))
+r, saved, made, left = session(True, marks[4:] + phaseReport("01:50.100", 2)[:6])
+check("  content to the screen: mean 21000 us, p99 up to >100000 us, max 60000 us; gaps of 50 ms or more: pending 2, client 0, "
+      "longest 240000 us" in r.stdout.splitlines() and "freezes (TERMUX_X11_FRAME_FREEZE_DIAG): 0 begun, 0 ended" in r.stdout and
+      "phase glmark2+move: 1 reports (5 s)" in r.stdout, "frame-diag-session, a percentile past the last bucket:\n" + r.stdout)
+
 
 print("renderer diagnostics scripts (%d cases): %s (%d failures)" % (len(cases), "FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

@@ -785,7 +785,7 @@ void ddxBeforeReset(void) {}
 /** This function is called in Xserver/os/inputthread.c when starting
     the input thread. */
 void ddxInputThreadInit(void) {
-    pvfb->inputTid = gettid();      // P11-C3-C: for the freeze watchdog's look at it
+    __atomic_store_n(&pvfb->inputTid, gettid(), __ATOMIC_RELEASE);     // P11-C3-C: for the freeze watchdog's look at it
 }
 #endif
 
@@ -2151,15 +2151,36 @@ static int lorieFreezeLine(char *out, size_t size, const struct lorie_freeze *f,
  * a CPU not given), their state and the main one's system call now - and the 5 second report's own time; a thread
  * starved shows its wait, one blocked shows neither.
  */
+/*
+ * The X server's input thread, as the watchdog can know it: its tid once it has run (ddxInputThreadInit - dix main starts
+ * it last, as Dispatch begins, which can be after the watchdog's first look); 0 until then, with why: "starting" (this
+ * build has one, INPUTTHREAD, and this server too - -dumbSched turns it off, InputThreadEnable), else "none".
+ */
+static pid_t lorieInputTid(const char **why) {
+#if INPUTTHREAD
+    pid_t tid = __atomic_load_n(&pvfb->inputTid, __ATOMIC_ACQUIRE);
+    *why = tid ? NULL : InputThreadEnable ? "starting" : "none";
+    return tid;
+#else
+    *why = "none";
+    return 0;
+#endif
+}
+
 static int lorieXSchedLine(char *out, size_t size, const struct lorie_thread_info *th, const struct lorie_thread_info *at,
                            uint32_t freezes) {
-    char sys[32];
+    char sys[32], input[16];
+    const char *why;
 #define LORIE_D(i, field) (th[i].field >= 0 && at[i].field >= 0 ? th[i].field - at[i].field : -1LL)
     lorieSyscallWord(&th[LORIE_THREAD_MAIN], sys, sizeof(sys));
-    return snprintf(out, size, "XlorieXSched: main=%c,%s,run_us=%lld,runq_us=%lld input=%c,run_us=%lld,runq_us=%lld "
+    if (!lorieInputTid(&why))
+        snprintf(input, sizeof(input), "%s", why);
+    else
+        snprintf(input, sizeof(input), "%c", th[LORIE_THREAD_INPUT].state);
+    return snprintf(out, size, "XlorieXSched: main=%c,%s,run_us=%lld,runq_us=%lld input=%s,run_us=%lld,runq_us=%lld "
                                "vsync=%c,run_us=%lld,runq_us=%lld watchdog_run_us=%lld report_us=%llu report_max_us=%llu freezes=%u",
                     th[LORIE_THREAD_MAIN].state, sys, LORIE_D(LORIE_THREAD_MAIN, runUs), LORIE_D(LORIE_THREAD_MAIN, waitUs),
-                    th[LORIE_THREAD_INPUT].state, LORIE_D(LORIE_THREAD_INPUT, runUs), LORIE_D(LORIE_THREAD_INPUT, waitUs),
+                    input, LORIE_D(LORIE_THREAD_INPUT, runUs), LORIE_D(LORIE_THREAD_INPUT, waitUs),
                     th[LORIE_THREAD_VSYNC].state, LORIE_D(LORIE_THREAD_VSYNC, runUs), LORIE_D(LORIE_THREAD_VSYNC, waitUs),
                     LORIE_D(LORIE_THREAD_WATCH, runUs), (unsigned long long) __atomic_load_n(&pvfb->reportUs, __ATOMIC_RELAXED),
                     (unsigned long long) __atomic_exchange_n(&pvfb->reportMaxUs, 0, __ATOMIC_RELAXED), freezes);
@@ -2176,16 +2197,21 @@ static void *lorieFreezeWatch(__unused void *arg) {
     struct lorie_freeze_sample s;
     struct lorie_thread_info th[LORIE_THREADS], at[LORIE_THREADS], begin[LORIE_THREADS];
     pid_t tids[LORIE_THREADS];
-    char line[1024];
+    char line[1024], input[16];
+    const char *why;
     uint64_t schedUs;
     int what, i;
 
     pthread_setname_np(pthread_self(), "XlorieWatch");
-    usleep(1000000);    // the input thread and the Choreographer's have run by now
-    tids[LORIE_THREAD_MAIN] = pvfb->mainTid, tids[LORIE_THREAD_INPUT] = pvfb->inputTid;
+    usleep(1000000);    // the Choreographer's thread has run by now; the input thread may not (lorieInputTid)
+    tids[LORIE_THREAD_MAIN] = pvfb->mainTid, tids[LORIE_THREAD_INPUT] = lorieInputTid(&why);
     tids[LORIE_THREAD_VSYNC] = pvfb->vsyncTid, tids[LORIE_THREAD_WATCH] = gettid();
-    log(INFO, "XlorieFreeze: phase=armed period_us=%d begin_us=%d levels_us=1000000,2000000,3000000 main_tid=%d input_tid=%d "
-              "vsync_tid=%d", LORIE_FREEZE_PERIOD_US, LORIE_FREEZE_BEGIN_US, tids[0], tids[1], tids[2]);
+    if (tids[LORIE_THREAD_INPUT])
+        snprintf(input, sizeof(input), "%d", tids[LORIE_THREAD_INPUT]);
+    else
+        snprintf(input, sizeof(input), "%s", why);
+    log(INFO, "XlorieFreeze: phase=armed period_us=%d begin_us=%d levels_us=1000000,2000000,3000000 main_tid=%d input_tid=%s "
+              "vsync_tid=%d", LORIE_FREEZE_PERIOD_US, LORIE_FREEZE_BEGIN_US, tids[0], input, tids[2]);
     for (i = 0; i < LORIE_THREADS; i++)
         lorieThreadInfo(tids[i], &at[i]);
     memcpy(begin, at, sizeof(begin));
@@ -2194,6 +2220,8 @@ static void *lorieFreezeWatch(__unused void *arg) {
         usleep(LORIE_FREEZE_PERIOD_US);
         if (!tids[LORIE_THREAD_VSYNC])
             tids[LORIE_THREAD_VSYNC] = pvfb->vsyncTid;
+        if (!tids[LORIE_THREAD_INPUT])
+            tids[LORIE_THREAD_INPUT] = lorieInputTid(&why);     // run since: looked at from now on
         lorieFreezeSample(&s);
         if ((what = lorieFreezeCheck(&f, &s)) != LORIE_FREEZE_NONE) {
             for (i = 0; i < LORIE_THREADS; i++)
