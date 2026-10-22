@@ -347,10 +347,15 @@ the wait) and left the copies queued for the next pass.
 
 `renderer-status.sh [--file LOG]` - prints the latest of those lines (and the GLES driver line).
 
-`frame-diag-session.sh [OUT]` (P11-C3) - with the X server started with `TERMUX_X11_RENDERER_VK_FRAME_DIAG=1`: three
-phases marked in the log (`XlorieMark: phase=...`, also in the file with their times) - the screen left alone for 10 s,
-glmark2 alone for 10 s, glmark2 while XFCE windows are moved for 20 s - each started when you press Enter, then the
-X server's `LorieNative` lines from the session's start saved to OUT (default `~/frame-diag-<date>-<time>.log`).
+`frame-diag-session.sh [--move SECONDS] [--all] [OUT]` (P11-C3) - with the X server started with
+`TERMUX_X11_RENDERER_VK_FRAME_DIAG=1` (and, P11-C3-C, `TERMUX_X11_FRAME_FREEZE_DIAG=1`): three phases marked in the log
+(`XlorieMark: phase=...`, also in the file with their times) - the screen left alone for 10 s, glmark2 alone for 20 s,
+glmark2 while XFCE windows are moved for 60 s (`--move`) - each started when you press Enter, then the X server's
+`LorieNative` lines from the session's start (`--all`: all the log still holds) saved to OUT (default
+`~/frame-diag-<date>-<time>.log`), and a summary of them: each freeze the watchdog logged - its length, side, where it
+stood, what waited and what ended it, and at its begin the X server's thread, request, asks, copies, root copy and
+lock - nothing to do when one happens, it logs itself; the frame gaps by cause and length, summed over the session;
+the X server's threads' last `XlorieXSched` line. The summary only picks keys out of the lines; it judges nothing.
 
 `renderer-proof.sh --expect vulkan|gles [--reports N] [--file LOG]` - judges the last N reports (default 3,
 15 seconds) and prints every check with its numbers; exit 0 PASS, 1 FAIL, 2 not enough reports.
