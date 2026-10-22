@@ -330,7 +330,8 @@ A freeze is logged as it begins (500 ms), at 1, 2 and 3 seconds (`level=1s` ...)
 
 `XlorieXSched`, every 5 seconds with the option: the X server's thread, its input thread and the Choreographer's (the
 vsync callback) over the period - time run and time waited on a run queue - and `report_us` / `report_max_us`, how long
-the 5 second report itself took (it runs under the input lock). `freezes` counts the freezes so far.
+the 5 second report itself took on the X server's thread (since P11-C3-C made as work there, outside the input lock the
+timers run under). `freezes` counts the freezes so far.
 
 ### Buffers waited for before the shared lock (P11-C3-C, always)
 

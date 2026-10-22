@@ -1596,10 +1596,14 @@ static void lorieLogRendererDiag(void) {
     prev = d;
 }
 
-static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+/*
+ * The 5 second report. P11-C3-C: work on this thread (lorieReportWorkProc), not the timer's own: DoTimers runs timers
+ * holding the input lock, which the input thread takes for every event and GPU copy completion it reads - those
+ * waited for the whole report (some 15 lines with the frame diagnostics). Its own time and stage, for the watchdog.
+ */
+static void lorieReport(void) {
     uint32_t samples;
     static Bool driverLogged = FALSE;
-    // P11-C3-C: the report's own time and stage, for the freeze watchdog (DoTimers runs it under the input lock)
     uint64_t reportStartUs = pvfb->freezeDiag ? lorieMonotonicUs() : 0;
     struct lorieXMark reportMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_REPORT);
 
@@ -1652,6 +1656,17 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
         if (us > __atomic_load_n(&pvfb->reportMaxUs, __ATOMIC_RELAXED))
             __atomic_store_n(&pvfb->reportMaxUs, us, __ATOMIC_RELAXED);
     }
+}
+
+static Bool lorieReportWorkProc(__unused ClientPtr client, __unused void *closure) {
+    lorieReport();
+    return TRUE;
+}
+
+// Every 5 seconds: the report queued as work - run as WaitForSomething goes round again (check_timers, having run the
+// timers, gives ospoll_wait no wait), outside the input lock.
+static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    QueueWorkProc(lorieReportWorkProc, NULL, NULL);
     return 5000;
 }
 

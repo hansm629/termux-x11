@@ -1642,6 +1642,16 @@ CONTROLS += [
      "tpresentcopy"),
 ]
 
+# P11-C3-C: the 5 second report outside the input lock
+CONTROLS += [
+    ("report: made in the timer again, under the input lock", "InitOutput.c",
+     """    QueueWorkProc(lorieReportWorkProc, NULL, NULL);
+    return 5000;""",
+     """    lorieReport();
+    return 5000;""",
+     "twiring"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

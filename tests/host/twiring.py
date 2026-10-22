@@ -222,7 +222,7 @@ check("CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, cl
 for what, body, mark in (("tick", xredraw, "struct lorieXMark tickMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_TICK);"),
                          ("root copy wait", func(I, "static void lorieRootCopyWait(Bool takeBack) {"),
                           "struct lorieXMark waitMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_ROOT_COPY_WAIT);"),
-                         ("report", func(I, "static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {"),
+                         ("report", func(I, "static void lorieReport(void) {"),
                           "struct lorieXMark reportMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_REPORT);")):
     check(mark in body, "the X server's thread not marked in its %s" % what)
 in_order("the renderer marked asleep only as it sleeps", func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {"),
@@ -240,6 +240,12 @@ in_order("the asks read as the frame begins", redraw, "if (diag) {", "ft.startUs
          "ft.firstAskUs = askSeq != ft.takenSeq ? lorieAskUs(&state->progress, ft.takenSeq + 1, askSeq) : 0;", "lorieVkAcquire(")
 in_order("the renderer's sleep stamped for the gaps", func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {"),
          "if (rendererProgressOn())", "state->progress.sleepUs = lorieMonotonicUs();", "rendererSleep(seen, -1);")
+
+# P11-C3-C: the 5 second report made as work on the X server's thread, not in the timer DoTimers runs under the input lock
+counter = func(I, "static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {")
+check("QueueWorkProc(lorieReportWorkProc, NULL, NULL);" in counter and "log(" not in counter and "lorieLogRendererDiag" not in counter
+      and "lorieReport();" in func(I, "static Bool lorieReportWorkProc(__unused ClientPtr client, __unused void *closure) {"),
+      "the 5 second report made in the timer, under the input lock")
 
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
