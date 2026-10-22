@@ -321,6 +321,8 @@ struct lorie_backend_control {
                                                  * them is presented before its fence is waited for */
     volatile uint8_t freezeDiag;                /* X: TERMUX_X11_FRAME_FREEZE_DIAG=1 - P11-C3-C's freeze watchdog: the
                                                  * renderer keeps its stage (struct lorie_progress) */
+    volatile uint8_t contentDiag;               /* X: TERMUX_X11_CONTENT_FRAME_DIAG=1 - P11-C3-D0: client content from
+                                                 * its request to the screen (struct lorie_content) */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };
@@ -536,6 +538,26 @@ struct lorie_renderer_diag {
     volatile uint32_t vkGapIdle, vkGapXStalled, vkGapUnwoken, vkGapLate;
     volatile uint32_t vkGapStallGe[LORIE_GAP_GE], vkGapIdleGe[LORIE_GAP_GE];
     volatile uint32_t vkGapWorstStallUs, vkGapWorstCause, vkGapWorstAskWaitUs, vkGapWorstWakeUs, vkGapWorstGapUs, vkGapWorstTicks;
+    /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): client content (struct lorie_content_stamp) from its request to the
+     * screen. X (InitOutput.c lorieContent*): presentations asked for, skipped (overwritten in their frame, or their GPU
+     * copy cancelled), copied by the GPU (queued) or the CPU, GPU copies completed (taken up by the X server), their
+     * CompleteNotify sent (mode copy; skip apart); CPU reads of a pixmap a GPU copy into which is not complete yet
+     * (stale: the read sees the content before it); content carried by a CPU composite or copy into another pixmap
+     * (compositor) and into the screen pixmap (root, copies straight into it too); the screen pixmap published with new
+     * content. Its waits: the request to its copy queued or made, queued to completed, completed to the screen pixmap,
+     * the screen pixmap to its publishing. Renderer (renderer.c rendererContentFrame): Vulkan screen frames presented
+     * with new content and with the last one's again; publishing to the frame's present, the request to it (total),
+     * from one frame with new content to the next (interval); intervals of 50 ms or more, the content shown then asked
+     * for in the first half of the interval (pending: it waited) or later (client: none was asked for); the longest
+     * interval; the period's slowest content - its total and its stages (to its copy complete, to the screen pixmap, to
+     * publishing, to the screen). */
+    struct lorie_hist contentPresentToCopy, contentCopyToComplete, contentCompleteToRoot, contentRootToPublish,
+                      contentPublishToScreen, contentTotal, contentInterval;
+    volatile uint32_t contentRequests, contentSkipped, contentGpuCopies, contentCpuCopies, contentCopiesDone, contentCompletes,
+                      contentCompletesSkip, contentStaleReads, contentCompositorUpdates, contentRootUpdates, contentRootPublishes;
+    volatile uint32_t contentScreenNew, contentScreenReused, contentGapsPending, contentGapsClient;
+    volatile uint32_t contentMaxGapUs, contentWorstUs, contentWorstCopyUs, contentWorstCompositeUs, contentWorstPublishUs,
+                      contentWorstScreenUs;
     /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the
      * X server had to wait for one (lorieRootCopyWait), that wait, and from the renderer settling the copy to the X
      * server going on. The period's slowest request to completion and its parts (its fence: vkFenceRoot's). */
@@ -657,6 +679,28 @@ static inline __always_inline uint64_t lorieAskUs(volatile struct lorie_progress
     if (last - seq >= LORIE_ASK_RING)
         seq = last - (LORIE_ASK_RING - 1);
     return p->askUs[seq % LORIE_ASK_RING];
+}
+
+/*
+ * P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): client content - one client's presentation (PresentPixmap) - followed from
+ * its request to the screen. A pixmap's stamp (InitOutput.c LoriePixmapPriv) is the newest content in it: its number
+ * (wrapping: compared by lorieContentNewer), when it was asked for, when its copy completed, when it reached this pixmap
+ * (copied in, or carried by a CPU composite or copy from a source holding it). 0: none.
+ */
+struct lorie_content_stamp {
+    uint32_t seq;
+    uint64_t requestUs, copyUs, readyUs;
+};
+/* ... and what the X server last published with the screen pixmap (InitOutput.c lorieContentPublish), for the renderer:
+ * a generation (0: none yet), the content's number and stamps, when it reached the screen pixmap, when it was published.
+ * The X server writes `gen` last (release); the renderer reads it first and again after (a change: read again). */
+struct lorie_content {
+    volatile uint32_t gen, seq;
+    volatile uint64_t requestUs, copyUs, rootUs, publishUs;
+};
+
+static inline __always_inline bool lorieContentNewer(uint32_t a, uint32_t b) {
+    return (int32_t) (a - b) > 0;
 }
 
 #define LORIE_DIAG_ADD(st, field, n) \
@@ -808,6 +852,8 @@ struct lorie_shared_server_state {
     struct lorie_backend_control backend;
     /* P11-C3-C: the asks and the renderer's stage (see struct lorie_progress). */
     struct lorie_progress progress;
+    /* P11-C3-D0: the content last published with the screen pixmap (see struct lorie_content). */
+    struct lorie_content content;
 
     struct {
         // We should not allow updating cursor content the same time renderer draws it.

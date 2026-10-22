@@ -1652,6 +1652,69 @@ CONTROLS += [
      "twiring"),
 ]
 
+# P11-C3-D0: client content from its presentation to the screen (TERMUX_X11_CONTENT_FRAME_DIAG)
+CONTROLS += [
+    ("content: what the sources carry kept past the accesses", "InitOutput.c",
+     """    if (--pvfb->contentOpen <= 0) {
+        pvfb->contentOpen = 0;
+        pvfb->contentIn.seq = 0;
+    }""",
+     """    if (--pvfb->contentOpen <= 0) {
+        pvfb->contentOpen = 0;
+    }""",
+     "tcontentframe"),
+    ("content: an older content stamped over a newer one", "InitOutput.c",
+     """    if (!priv || !c->seq || (priv->content.seq && !lorieContentNewer(c->seq, priv->content.seq)))
+        return;
+    priv->content = *c;""",
+     """    if (!priv || !c->seq)
+        return;
+    priv->content = *c;""",
+     "tcontentframe"),
+    ("content: a read of a copy in flight counted stale", "InitOutput.c",
+     """        !lorieGpuCopyIsDone(priv->contentCopySerial) && !lorieGpuInFlight(pvfb->state, LorieBuffer_description(priv->buffer)->id))""",
+     """        !lorieGpuCopyIsDone(priv->contentCopySerial))""",
+     "tcontentframe"),
+    ("content: numbered with the option off", "InitOutput.c",
+     """    if (!pvfb->contentDiag || !pixmap)
+        return 0;""",
+     """    if (!pixmap)
+        return 0;""",
+     "tcontentframe"),
+    ("content: 0 given out at the wrap", "InitOutput.c",
+     """    if (!++pvfb->contentSeq)
+        ++pvfb->contentSeq;     // 0 is none""",
+     """    ++pvfb->contentSeq;""",
+     "tcontentframe"),
+    ("content: a skip counted as a complete", "InitOutput.c",
+     """    __atomic_fetch_add(mode == PresentCompleteModeSkip ? &pvfb->state->diag.contentCompletesSkip : &pvfb->state->diag.contentCompletes,""",
+     """    __atomic_fetch_add(mode == 99 ? &pvfb->state->diag.contentCompletesSkip : &pvfb->state->diag.contentCompletes,""",
+     "tcontentframe"),
+    ("content: a frame showing the last one's content counted new", "renderer.c",
+     """    if (c->gen == vkContentLast.gen) {""",
+     """    if (0) {""",
+     "tcontentframe"),
+    ("content: a gap's content asked for late counted as pending", "renderer.c",
+     """            if (c->requestUs && c->requestUs <= vkContentLast.newUs + gap / 2)""",
+     """            if (c->requestUs && c->requestUs <= vkContentLast.newUs + gap)""",
+     "tcontentframe"),
+    ("content: published at every frame the tick asks for, the back's content too", "InitOutput.c",
+     """        // P11-C3-D0: what the screen pixmap shows from now on - swapped to the front (root double buffering), or drawn
+        lorieContentPublish(priv);
+    }""",
+     """    }
+    lorieContentPublish(priv);""",
+     "twiring"),
+    ("content: the request not numbered by the patch", "xserver.patch",
+     """+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);""",
+     """+    vblank->lorie_content_seq = 0;""",
+     "twiring"),
+    ("content: a CPU copy not handed to the hooks", "xserver.patch",
+     """+        lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, FALSE);""",
+     """+        (void) gpuCopyDst;""",
+     "twiring"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

@@ -419,7 +419,7 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +89,76 @@
+@@ -79,12 +89,79 @@
          return;
      }
  
@@ -459,6 +459,7 @@
 +    if (vblank->gpu_copy_pending) {
 +        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
 +        vblank->gpu_copy_pending = FALSE;
++        lorieContentCopyDone(vblank->lorie_content_seq, vblank->lorie_content_us, vblank->lorie_copy_us, gpuCopyDst);
 +    } else if (present_retired_copy_reserve(vblank) &&
 +               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
@@ -481,6 +482,7 @@
 +        /* Polled at msc+1 - or, that not queued (out of memory), by lorieRecheckGpuCopies at every completion and
 +         * tick: the copy is waited for either way (P10-S1), never taken as done. */
 +        vblank->gpu_copy_pending = TRUE;
++        vblank->lorie_copy_us = lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, TRUE);
 +        vblank->queued = TRUE;
 +        if (Success != screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_POLL_FIRST);
@@ -492,6 +494,7 @@
 +         * which is then freed, freeing the region
 +         */
 +        vblank->update = NULL;
++        lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, FALSE);
 +    }
  
 -    /* present_copy_region sticks the region into a scratch GC,
@@ -501,6 +504,14 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
+@@ -110,6 +187,7 @@
+     else
+         mode = PresentCompleteModeCopy;
+ 
++    lorieContentComplete(vblank->lorie_content_seq, mode);     /* lorie: P11-C3-D0 */
+     present_vblank_notify(vblank, vblank->kind, mode, ust, crtc_msc);
+     present_vblank_destroy(vblank);
+ }
 +++ ./present/present_priv.h
 @@ -24,6 +24,7 @@
  #define _PRESENT_PRIV_H_
@@ -510,7 +521,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,61 @@
+@@ -90,8 +91,75 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -527,6 +538,10 @@
 +    /* lorie: P10-S1 - the retired copy reserved for its GPU copy before that was scheduled (present_execute_copy), so
 +     * that retiring it never allocates: taken by present_retire_copy, otherwise freed with the vblank */
 +    struct present_retired_copy *gpu_copy_retired;
++    /* lorie: P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1) - its content's number (0: not followed), when it was asked
++     * for, and when its copy was queued for the GPU (lorieContent*) */
++    uint32_t            lorie_content_seq;
++    uint64_t            lorie_content_us, lorie_copy_us;
  };
  
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
@@ -568,6 +583,16 @@
 +
 +/* lorie: implemented in present_scmd.c; re-executes any vblank whose GPU copy has finished. */
 +extern void lorieRecheckGpuCopies(void);
++
++/* lorie: P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1) - a presentation's content followed from its request to the screen
++ * (lorie/InitOutput.c): asked for (its number: 0 with the option off or without a pixmap), skipped (overwritten in its
++ * frame, or its copy cancelled), its copy queued for the GPU or made by the CPU (when), its GPU copy complete, its
++ * CompleteNotify sent (in that mode). Each only counts and stamps: nothing waits. */
++extern uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us);
++extern void lorieContentSkipped(uint32_t seq);
++extern uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu);
++extern void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst);
++extern void lorieContentComplete(uint32_t seq, CARD8 mode);
 +
  typedef struct present_screen_priv present_screen_priv_rec, *present_screen_priv_ptr;
  typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
@@ -622,6 +647,15 @@
                  return;
              }
  
+@@ -766,6 +801,8 @@
+         return BadAlloc;
+ 
+     vblank->event_id = ++present_scmd_event_id;
++    /* lorie: P11-C3-D0 - this presentation's content numbered, its request stamped */
++    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);
+ 
+     if (vblank->flip && vblank->sync_flip)
+         vblank->exec_msc--;
 +++ ./present/present_screen.c
 @@ -56,6 +56,9 @@
  {
@@ -644,7 +678,7 @@
          present_clear_window_notifies(window);
          present_free_events(window);
 +++ ./present/present_vblank.c
-@@ -180,6 +180,116 @@
+@@ -180,14 +180,140 @@
      return NULL;
  }
  
@@ -761,7 +795,9 @@
  void
  present_vblank_scrap(present_vblank_ptr vblank)
  {
-@@ -188,6 +298,21 @@
++    lorieContentSkipped(vblank->lorie_content_seq);     /* lorie: P11-C3-D0 */
+     DebugPresent(("\tx %" PRIu64 " %p %" PRIu64 " %" PRIu64 ": %08" PRIx32 " -> %08" PRIx32 " (crtc %p)\n",
+                   vblank->event_id, vblank, vblank->exec_msc, vblank->target_msc,
                    vblank->pixmap->drawable.id, vblank->window->drawable.id,
                    vblank->crtc));
  
@@ -783,7 +819,7 @@
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
      present_fence_destroy(vblank->idle_fence);
      dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
-@@ -200,6 +325,20 @@
+@@ -200,6 +326,20 @@
  void
  present_vblank_destroy(present_vblank_ptr vblank)
  {
@@ -804,7 +840,7 @@
      /* Remove vblank from window and screen lists */
      xorg_list_del(&vblank->window_list);
      /* Also make sure vblank is removed from event queue (wnmd) */
-@@ -229,5 +368,8 @@
+@@ -229,5 +369,8 @@
      if (vblank->notifies)
          present_destroy_notifies(vblank->notifies, vblank->num_notifies);
  

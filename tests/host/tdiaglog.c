@@ -27,6 +27,7 @@ static FILE *logf;
 typedef int Bool;
 #define TRUE 1
 #define FALSE 0
+#include "contentconsts_src.inc"
 static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint64_t frameWantedUs;
                 struct lorie_progress progress; } fakeState;
 static struct {
@@ -39,6 +40,14 @@ static struct {
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
     Bool freezeDiag;
+    Bool contentDiag;
+    struct {
+        const void *client;
+        int index;
+        char cmd[24];
+        uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
+        uint64_t lastUs;
+    } contentClients[LORIE_CONTENT_CLIENTS];
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "diaglog_src.inc"
 
@@ -467,12 +476,89 @@ int main(void) {
               onOk ? "right" : "wrong");
     }
 
+    /* P11-C3-D0: the content lines, only with TERMUX_X11_CONTENT_FRAME_DIAG - the counts as they moved, each wait (its
+     * samples, mean and maximum), the stall line with the longest interval, the slowest content and its slowest stage,
+     * the clients presenting most this period (busiest first, none that did not present); the next report: nothing
+     * moved, the maxima and the worst taken back, no client; off (every log above): none of them */
+    {
+        int offContent = 0, n[4] = { 0 }, frameOk = 0, latencyOk = 0, stallOk = 0, clientsOk = 0, emptyOk = 0;
+        static const char *const offLogs2[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log",
+                                                "diag-transfer.log", "diag-frame.log", "diag-schedule.log" };
+        for (unsigned k = 0; k < sizeof offLogs2 / sizeof *offLogs2; k++) {
+            snprintf(path, sizeof path, "%s/%s", out ? out : ".", offLogs2[k]);
+            logf = fopen(path, "r");
+            while (logf && fgets(line, sizeof line, logf))
+                offContent += strstr(line, "XlorieContent") != NULL;
+            if (logf)
+                fclose(logf);
+        }
+        snprintf(path, sizeof path, "%s/diag-content.log", out ? out : ".");
+        logf = fopen(path, "w");
+        fakePvfb.contentDiag = TRUE;
+        fakeState.diag.contentRequests += 1200, fakeState.diag.contentSkipped += 1000, fakeState.diag.contentGpuCopies += 150;
+        fakeState.diag.contentCpuCopies += 50, fakeState.diag.contentCopiesDone += 140, fakeState.diag.contentCompletes += 190;
+        fakeState.diag.contentCompletesSkip += 5, fakeState.diag.contentStaleReads += 7, fakeState.diag.contentCompositorUpdates += 120;
+        fakeState.diag.contentRootUpdates += 118, fakeState.diag.contentRootPublishes += 110, fakeState.diag.contentScreenNew += 100;
+        fakeState.diag.contentScreenReused += 500, fakeState.diag.contentGapsPending += 2, fakeState.diag.contentGapsClient += 3;
+        lorieHistAdd(&fakeState.diag.contentPresentToCopy, 300), lorieHistAdd(&fakeState.diag.contentCopyToComplete, 2400);
+        lorieHistAdd(&fakeState.diag.contentCompleteToRoot, 1800), lorieHistAdd(&fakeState.diag.contentRootToPublish, 900);
+        lorieHistAdd(&fakeState.diag.contentPublishToScreen, 4100), lorieHistAdd(&fakeState.diag.contentTotal, 9500);
+        lorieHistAdd(&fakeState.diag.contentInterval, 22000);
+        fakeState.diag.contentMaxGapUs = 101000, fakeState.diag.contentWorstUs = 100000, fakeState.diag.contentWorstCopyUs = 1000;
+        fakeState.diag.contentWorstCompositeUs = 2000, fakeState.diag.contentWorstPublishUs = 1000, fakeState.diag.contentWorstScreenUs = 96000;
+        memset(fakePvfb.contentClients, 0, sizeof fakePvfb.contentClients);
+        fakePvfb.contentClients[1] = (typeof(fakePvfb.contentClients[0])) { &fakePvfb, 3, "glmark2-es2", 1000, 900, 0, 0, 4000, 0 };
+        fakePvfb.contentClients[4] = (typeof(fakePvfb.contentClients[0])) { &fakeState, 5, "xfwm4", 120, 0, 0, 0, 0, 0 };
+        fakePvfb.contentClients[6] = (typeof(fakePvfb.contentClients[0])) { &n, 7, "xfce4-terminal", 9, 0, 9, 0, 0, 0 };
+        lorieLogRendererDiag();
+        lorieLogRendererDiag();
+        fakePvfb.contentDiag = FALSE;
+        fclose(logf);
+        logf = fopen(path, "r");
+        while (fgets(line, sizeof line, logf)) {
+            if (strstr(line, "XlorieContentFrame:") && ++n[0] == 1)
+                frameOk = strstr(line, "XlorieContentFrame: requests=1200(+1200) skipped=1000(+1000) gpu_copies=150(+150) "
+                                       "cpu_copies=50(+50) copies_done=140(+140) completes=190(+190) completes_skip=5(+5) "
+                                       "stale_reads=7(+7) compositor_updates=120(+120) root_updates=118(+118) "
+                                       "root_publishes=110(+110) screen_new=100(+100) screen_reused=500(+500)\n") != NULL;
+            if (strstr(line, "XlorieContentFrame:") && n[0] == 2)
+                emptyOk += strstr(line, "XlorieContentFrame: requests=1200(+0) skipped=1000(+0) ") != NULL;
+            if (strstr(line, "XlorieContentLatency:") && ++n[1] == 1)
+                latencyOk = strstr(line, " present_to_copy_us=1/300/") && strstr(line, " copy_to_complete_us=1/2400/") &&
+                            strstr(line, " complete_to_root_us=1/1800/") && strstr(line, " root_to_publish_us=1/900/") &&
+                            strstr(line, " publish_to_screen_us=1/4100/") && strstr(line, " content_total_us=1/9500/");
+            if (strstr(line, "XlorieContentLatency:") && n[1] == 2)
+                emptyOk += strstr(line, "XlorieContentLatency: present_to_copy_us=0 copy_to_complete_us=0 complete_to_root_us=0 "
+                                        "root_to_publish_us=0 publish_to_screen_us=0 content_total_us=0\n") != NULL;
+            if (strstr(line, "XlorieContentStall:") && ++n[2] == 1)
+                stallOk = strstr(line, "XlorieContentStall: content_interval_us=1/22000/") &&
+                          strstr(line, " gaps_pending=2(+2) gaps_client=3(+3) max_gap_us=101000 worst_content_us=100000 "
+                                       "worst_stage=screen worst_copy_us=1000 worst_composite_us=2000 worst_publish_us=1000 "
+                                       "worst_screen_us=96000\n");
+            if (strstr(line, "XlorieContentStall:") && n[2] == 2)
+                emptyOk += strstr(line, "XlorieContentStall: content_interval_us=0 gaps_pending=2(+0) gaps_client=3(+0) max_gap_us=0 "
+                                        "worst_content_us=0 worst_stage=none ") != NULL;
+            if (strstr(line, "XlorieContentClients:") && ++n[3] == 1)
+                clientsOk = strstr(line, "XlorieContentClients: glmark2-es2/3:requests=1000(+1000),skipped=900(+900),max_gap_us=4000 "
+                                         "xfwm4/5:requests=120(+120),skipped=0(+0),max_gap_us=0\n") != NULL;
+            if (strstr(line, "XlorieContentClients:") && n[3] == 2)
+                emptyOk += strstr(line, "XlorieContentClients: none\n") != NULL;
+        }
+        fclose(logf);
+        CHECK(offContent == 0, "content lines without TERMUX_X11_CONTENT_FRAME_DIAG: %d", offContent);
+        CHECK(n[0] == 2 && n[1] == 2 && n[2] == 2 && n[3] == 2, "content lines: %d/%d/%d/%d (want 2 each)", n[0], n[1], n[2], n[3]);
+        CHECK(frameOk && latencyOk && stallOk && clientsOk, "content lines wrong: frame %d latency %d stall %d clients %d", frameOk,
+              latencyOk, stallOk, clientsOk);
+        CHECK(emptyOk == 4 && !fakeState.diag.contentWorstUs && !fakeState.diag.contentMaxGapUs && !fakePvfb.contentClients[1].maxGapUs,
+              "content lines without anything new: %d of 4 right, worst or longest not taken back", emptyOk);
+    }
+
     /* every message within __android_log_print's 1024-byte buffer (longer ones are cut): the copy latency line with
      * every part at its widest, and P11-C3's lines with every timing and worst at its widest, then every line written
      * above */
     {
         static const char *const logs[] = { "diag-vulkan.log", "diag-gles.log", "diag-latency.log", "diag-tick.log", "diag-transfer.log",
-                                            "diag-frame.log", "diag-schedule.log", "diag-wide.log" };
+                                            "diag-frame.log", "diag-schedule.log", "diag-content.log", "diag-wide.log" };
         volatile struct lorie_hist *hists[] = {
             &fakeState.diag.vkFrameStart, &fakeState.diag.vkPresentDelta, &fakeState.diag.vkFrameWake, &fakeState.diag.vkFrameCpu,
             &fakeState.diag.vkFrameAcquire, &fakeState.diag.vkFrameLock, &fakeState.diag.vkFrameRecord, &fakeState.diag.vkFrameSubmit,
@@ -516,6 +602,29 @@ int main(void) {
             fakeState.diag.vkGapStallGe[i] += 999999999, fakeState.diag.vkGapIdleGe[i] += 999999999;
         fakeState.diag.vkGapWorstStallUs = fakeState.diag.vkGapWorstAskWaitUs = fakeState.diag.vkGapWorstWakeUs = 4294967295u;
         fakeState.diag.vkGapWorstGapUs = fakeState.diag.vkGapWorstTicks = 4294967295u, fakeState.diag.vkGapWorstCause = 3;
+        {   /* P11-C3-D0: every content count and wait at its widest, three clients with the longest names */
+            volatile struct lorie_hist *ch[] = { &fakeState.diag.contentPresentToCopy, &fakeState.diag.contentCopyToComplete,
+                &fakeState.diag.contentCompleteToRoot, &fakeState.diag.contentRootToPublish, &fakeState.diag.contentPublishToScreen,
+                &fakeState.diag.contentTotal, &fakeState.diag.contentInterval };
+            volatile uint32_t *cc[] = { &fakeState.diag.contentRequests, &fakeState.diag.contentSkipped, &fakeState.diag.contentGpuCopies,
+                &fakeState.diag.contentCpuCopies, &fakeState.diag.contentCopiesDone, &fakeState.diag.contentCompletes,
+                &fakeState.diag.contentCompletesSkip, &fakeState.diag.contentStaleReads, &fakeState.diag.contentCompositorUpdates,
+                &fakeState.diag.contentRootUpdates, &fakeState.diag.contentRootPublishes, &fakeState.diag.contentScreenNew,
+                &fakeState.diag.contentScreenReused, &fakeState.diag.contentGapsPending, &fakeState.diag.contentGapsClient };
+            for (unsigned k = 0; k < sizeof ch / sizeof *ch; k++)
+                for (i = 0; i < 1000; i++)
+                    lorieHistAdd(ch[k], 4294967295u);
+            for (unsigned k = 0; k < sizeof cc / sizeof *cc; k++)
+                *cc[k] += 999999999;
+            fakeState.diag.contentMaxGapUs = fakeState.diag.contentWorstUs = fakeState.diag.contentWorstCopyUs = 4294967295u;
+            fakeState.diag.contentWorstCompositeUs = fakeState.diag.contentWorstPublishUs = fakeState.diag.contentWorstScreenUs = 4294967295u;
+            for (i = 0; i < LORIE_CONTENT_CLIENTS; i++) {
+                fakePvfb.contentClients[i] = (typeof(fakePvfb.contentClients[0])) { &fakePvfb, 2047, "", 4000000000u, 4000000000u, 0, 0,
+                                                                                    4294967295u, 0 };
+                memset(fakePvfb.contentClients[i].cmd, 'x', 23);
+            }
+            fakePvfb.contentDiag = TRUE;
+        }
         fakePvfb.worstRequest.us = 4294967295u, fakePvfb.worstRequest.client = 2047, fakePvfb.worstRequest.major = 255;
         fakePvfb.worstRequest.minor = 255;
         memset(fakePvfb.worstRequest.cmd, 'c', 23), memset(fakePvfb.worstRequest.ext, 'e', 23);
@@ -526,6 +635,7 @@ int main(void) {
         fakeState.diag.rootAhead += 999999999, fakeState.diag.rootAheadXWaiting += 999999999;
         fakeState.diag.rootChainConsumed += 999999999, fakeState.diag.rootAheadUnavailable += 999999999;
         lorieLogRendererDiag();
+        fakePvfb.contentDiag = FALSE;
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {
             snprintf(path, sizeof path, "%s/%s", out ? out : ".", logs[k]);

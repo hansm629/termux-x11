@@ -168,6 +168,30 @@ recipes = {
     # P11-C3-C: the freeze watchdog's stages - the renderer's (rendererProgressOn, rendererStage) and the X server's
     # thread's (lorieXEnter, lorieXLeave) - tpresentcopy.c, twake.c, townership.c, tfreeze.c
     "rendererstage": lambda: func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {"),
+    "contentconsts": lambda: macro(I, "LORIE_CONTENT_CLIENTS"),
+    # P11-C3-D0: client content from its presentation to the screen - the X server's hooks (counting, stamping,
+    # carrying through CPU accesses, publishing) and the renderer's frames - tcontentframe.c
+    "contentframe": lambda: "".join(macro(os.path.join(XS, "exa", "exa.h"), m) for m in (
+            "EXA_PREPARE_DEST", "EXA_PREPARE_SRC", "EXA_PREPARE_MASK", "EXA_PREPARE_AUX_DEST", "EXA_PREPARE_AUX_SRC",
+            "EXA_PREPARE_AUX_MASK"))
+        + span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
+        + macro(I, "LORIE_PIXMAP_PRIV_FROM_PIXMAP")
+        + func(I, "static void lorieDiagWord(char *out, size_t size, const char *in) {")
+        + func(I, "Bool lorieGpuCopyIsDone(uint64_t serial) {")
+        + "".join(func(I, f) for f in (
+            "static void lorieContentClient(Bool skipped, uint64_t now) {",
+            "uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us) {",
+            "void lorieContentSkipped(uint32_t seq) {",
+            "static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c, uint64_t now, Bool carried) {",
+            "uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {",
+            "void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst) {",
+            "void lorieContentComplete(uint32_t seq, CARD8 mode) {",
+            "static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, Bool done) {",
+            "static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {",
+            "static void lorieContentPublish(LoriePixmapPriv *priv) {"))
+        + span(R, "// P11-C3-D0: the content generation the last frame presented showed", "static struct { uint32_t gen; uint64_t newUs; } vkContentLast;")
+        + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
+        + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {"),
     "xstage_decl": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };"),
     "xstage": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };")
         + func(I, "static struct lorieXMark lorieXEnter(uint32_t stage) {") + func(I, "static void lorieXLeave(struct lorieXMark *prev) {"),
@@ -240,7 +264,7 @@ recipes = {
         + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
         # P11-C3: the Vulkan frames' timings
-        + span(R, "// P11-C3: the last Vulkan frame's start and present call", "    memset(&vkPacingLast, 0, sizeof(vkPacingLast));\n}")
+        + span(R, "// P11-C3: the last Vulkan frame's start and present call", "    memset(&vkContentLast, 0, sizeof(vkContentLast));\n}")
         + span(R, "// Gaps between frames longer than this", "static uint64_t vkRootCopyBusyUs;")
         + span(R, "enum { LORIE_VK_INTERVAL_SAMPLED,", "};") + func(R, "static int rendererVkInterval(")
         + span(R, "struct rendererVkFrameTimes {", "};")
@@ -248,6 +272,9 @@ recipes = {
         + span(R, "#define LORIE_VK_GAP_US 100000", "enum { LORIE_GAP_NONE, LORIE_GAP_X_STALLED, LORIE_GAP_UNWOKEN, LORIE_GAP_LATE };")
         + func(R, "static void rendererVkFrameGap(const struct rendererVkFrameTimes *t, uint64_t lastStartUs, uint32_t lastTicks) {")
         + func(R, "static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {")
+        # P11-C3-D0: the client content the screen frames show
+        + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
+        + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static bool rendererRootCopyPending(void) {")
         + func(R, "static void rendererRootCopySettle(uint32_t seq, bool failed) {")
@@ -267,7 +294,7 @@ recipes = {
     # destroy, the window's vblanks freed, the renderer's completion recheck, and present_scmd_pixmap's loop that
     # scraps a queued presentation a new one overwrites in the same frame
     "presentsafety_struct": lambda: span(present("present_priv.h"), "struct present_vblank {",
-                                         "    struct present_retired_copy *gpu_copy_retired;\n};")
+                                         "    uint64_t            lorie_content_us, lorie_copy_us;\n};")
         + span(present("present_priv.h"), "#define LORIE_GPU_COPY_EARLY_SCRAP 0", "#define LORIE_GPU_COPY_CANCELLED 2"),
     "presentsafety": lambda: "static void\n" + func(present("present_scmd.c"), "present_re_execute(present_vblank_ptr vblank)\n{")
         + "static void\n" + func(present("present_scmd.c"), "present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)\n{")

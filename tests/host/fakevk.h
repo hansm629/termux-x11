@@ -201,6 +201,7 @@ struct lorie_shared_server_state {
     struct lorie_renderer_diag diag;
     struct lorie_backend_control backend;
     struct lorie_progress progress;     /* P11-C3-C */
+    struct lorie_content content;       /* P11-C3-D0 */
     struct {
         int lock, lockingPid;
         uint32_t x, y, xhot, yhot, width, height;

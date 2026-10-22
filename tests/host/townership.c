@@ -143,6 +143,7 @@ struct fake_pvfb {
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
     Bool freezeDiag;            /* P11-C3-C: TERMUX_X11_FRAME_FREEZE_DIAG - the stage this thread is in */
+    Bool contentDiag;           /* P11-C3-D0: TERMUX_X11_CONTENT_FRAME_DIAG (tcontentframe.c runs its hooks) */
     uint32_t xStage;
     uint64_t xStageUs;
 };
@@ -510,6 +511,10 @@ static LorieBuffer **base_bufferOf(void *priv) { return &((LoriePixmapPriv *) pr
 /* ---- this branch ---- */
 static struct fake_pvfb newWorld, *pvfb = &newWorld;
 #include "xstage_src.inc"
+/* P11-C3-D0: the accesses' content hooks - never called here, the option off (tcontentframe.c runs the real ones) */
+static int contentHooks;
+static void lorieContentAccess(PixmapPtr pPix, void *priv, int index, Bool done) { (void) pPix, (void) priv, (void) index, (void) done; contentHooks++; }
+static void lorieContentStaleRead(void *priv, int index) { (void) priv, (void) index; contentHooks++; }
 static void lorieRootCopyWait(Bool takeBack);
 #define lorie_shared_server_state fake_state
 #include "own_new_src.inc"

@@ -67,6 +67,7 @@ static ExaDriverRec lorieExa;
 // P11-C3-C (TERMUX_X11_FRAME_FREEZE_DIAG=1): what the X server's thread is in - for the freeze watchdog - and since when
 // (lorieMonotonicUs): the stage to go back to once it is over (lorieXEnter, lorieXLeave).
 enum { LORIE_X_LOOP, LORIE_X_TICK, LORIE_X_REQUEST, LORIE_X_ROOT_COPY_WAIT, LORIE_X_REPORT, LORIE_X_STAGES };
+#define LORIE_CONTENT_CLIENTS 8     /* P11-C3-D0: the presenting clients counted apart */
 struct lorieXMark { uint32_t stage; uint64_t us; };
 
 typedef struct {
@@ -160,6 +161,22 @@ typedef struct {
     uint64_t reportUs, reportMaxUs;
     uint64_t copyNotifiedSerial, copyNotifiedUs, copyAckedSerial, copyAckedUs;
     pid_t mainTid, inputTid, vsyncTid;
+
+    /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1, lorieContent*): asked for; the presentations numbered, the screen
+     * pixmap's publishings and the content last published; the newest content the sources of the CPU accesses open
+     * carry (into the destination as its access finishes) and how many accesses are open; the clients presenting -
+     * LORIE_CONTENT_CLIENTS of them, each named as it came, its pointer only compared (never followed) */
+    Bool contentDiag;
+    uint32_t contentSeq, contentGen, contentPublishedSeq;
+    int contentOpen;
+    struct lorie_content_stamp contentIn;
+    struct {
+        const void *client;
+        int index;
+        char cmd[24];
+        uint32_t requests, skipped, requestsAt, skippedAt, maxGapUs;
+        uint64_t lastUs;
+    } contentClients[LORIE_CONTENT_CLIENTS];
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -225,7 +242,12 @@ typedef struct {
     uint32_t accessHoldUs;
     /* P11-C3-B1: its open access holds a reservation (lorie.h cpuAccess) instead of the shared lock */
     bool reserved;
+    /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): the newest client content in it; the last GPU copy queued into it -
+     * a CPU read before that completes, the copy not in flight either, sees the content before it */
+    struct lorie_content_stamp content;
+    uint64_t contentCopySerial;
 } LoriePixmapPriv;
+static void lorieContentPublish(LoriePixmapPriv *priv);
 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap)) : NULL)
 #define LORIE_BUFFER_FROM_PIXMAP(pixmap) (pixmap ? ((LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap))->buffer : NULL)
@@ -471,6 +493,11 @@ void OsVendorInit(void) {
     // threads every 5 seconds (XlorieFreeze, XlorieXSched: lorieFreezeWatch). Off, none of it runs: no thread, no stage,
     // no clock.
     lorieScreen.freezeDiag = getenv("TERMUX_X11_FRAME_FREEZE_DIAG") && !strcmp(getenv("TERMUX_X11_FRAME_FREEZE_DIAG"), "1");
+    // Diagnostics: TERMUX_X11_CONTENT_FRAME_DIAG=1 follows each client presentation's content from its request through
+    // its copy, the compositor's CPU accesses and the screen pixmap to the renderer's frame (XlorieContent* lines:
+    // lorieContent*, renderer.c rendererContentFrame). Off, none of it reads a clock or stamps a pixmap.
+    lorieScreen.contentDiag = getenv("TERMUX_X11_CONTENT_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_CONTENT_FRAME_DIAG"), "1");
+    lorieScreen.state->backend.contentDiag = lorieScreen.contentDiag;
     lorieScreen.state->backend.freezeDiag = lorieScreen.freezeDiag;
     lorieScreen.mainTid = gettid();
     dispatchRequestTimed = lorieScreen.frameDiag || lorieScreen.freezeDiag;
@@ -1262,6 +1289,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
 
         DamageEmpty(pvfb->damage);
         pvfb->state->drawRequested = TRUE;
+        // P11-C3-D0: what the screen pixmap shows from now on - swapped to the front (root double buffering), or drawn
+        lorieContentPublish(priv);
     }
 
     if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {
@@ -1553,6 +1582,72 @@ static void lorieLogRendererDiag(void) {
             !pvfb->worstAccess.us ? "none" : pvfb->worstAccess.reserved ? "reserved" : "locked");
         pvfb->worstRequest.us = 0;
         pvfb->worstAccess.us = 0;
+#undef TD32
+#undef HT
+    }
+    // P11-C3-D0, only while TERMUX_X11_CONTENT_FRAME_DIAG=1: client content from its presentation to the screen
+    // (lorieContent*, renderer.c rendererContentFrame); the clients presenting most this period, each with its share
+    if (pvfb->contentDiag) {
+        char h[6][112], clients[400];
+        volatile struct lorie_renderer_diag *live = &pvfb->state->diag;
+        uint32_t worst = __atomic_exchange_n(&live->contentWorstUs, 0, __ATOMIC_RELAXED);
+        uint32_t maxGap = __atomic_exchange_n(&live->contentMaxGapUs, 0, __ATOMIC_RELAXED);
+        uint32_t stages[4] = { d.contentWorstCopyUs, d.contentWorstCompositeUs, d.contentWorstPublishUs, d.contentWorstScreenUs };
+        static const char *const stageNames[4] = { "copy", "composite", "publish", "screen" };
+        int k, slowest = 0, shown = 0;
+        size_t at = 0;
+#define HT(i, f) lorieHistText(h[i], sizeof(h[i]), &d.f, &prev.f, &live->f.maxUs)
+#define TD32(f) d.f, d.f - prev.f
+        for (k = 1; k < 4; k++)
+            if (stages[k] > stages[slowest])
+                slowest = k;
+        log(INFO, "XlorieContentFrame: requests=%u(+%u) skipped=%u(+%u) gpu_copies=%u(+%u) cpu_copies=%u(+%u) "
+                  "copies_done=%u(+%u) completes=%u(+%u) completes_skip=%u(+%u) stale_reads=%u(+%u) "
+                  "compositor_updates=%u(+%u) root_updates=%u(+%u) root_publishes=%u(+%u) screen_new=%u(+%u) "
+                  "screen_reused=%u(+%u)",
+            TD32(contentRequests), TD32(contentSkipped), TD32(contentGpuCopies), TD32(contentCpuCopies),
+            TD32(contentCopiesDone), TD32(contentCompletes), TD32(contentCompletesSkip), TD32(contentStaleReads),
+            TD32(contentCompositorUpdates), TD32(contentRootUpdates), TD32(contentRootPublishes), TD32(contentScreenNew),
+            TD32(contentScreenReused));
+        HT(0, contentPresentToCopy), HT(1, contentCopyToComplete), HT(2, contentCompleteToRoot), HT(3, contentRootToPublish);
+        HT(4, contentPublishToScreen), HT(5, contentTotal);
+        log(INFO, "XlorieContentLatency: present_to_copy_us=%s copy_to_complete_us=%s complete_to_root_us=%s "
+                  "root_to_publish_us=%s publish_to_screen_us=%s content_total_us=%s",
+            h[0], h[1], h[2], h[3], h[4], h[5]);
+        HT(0, contentInterval);
+        log(INFO, "XlorieContentStall: content_interval_us=%s gaps_pending=%u(+%u) gaps_client=%u(+%u) max_gap_us=%u "
+                  "worst_content_us=%u worst_stage=%s worst_copy_us=%u worst_composite_us=%u worst_publish_us=%u "
+                  "worst_screen_us=%u",
+            h[0], TD32(contentGapsPending), TD32(contentGapsClient), maxGap, worst, worst ? stageNames[slowest] : "none",
+            worst ? stages[0] : 0, worst ? stages[1] : 0, worst ? stages[2] : 0, worst ? stages[3] : 0);
+        clients[0] = 0;
+        for (shown = 0; shown < 3; shown++) {
+            int best = -1;
+            for (k = 0; k < LORIE_CONTENT_CLIENTS; k++) {
+                uint32_t n = pvfb->contentClients[k].requests - pvfb->contentClients[k].requestsAt;
+                if (pvfb->contentClients[k].client && n && pvfb->contentClients[k].requestsAt != UINT32_MAX &&
+                    (best < 0 || n > pvfb->contentClients[best].requests - pvfb->contentClients[best].requestsAt))
+                    best = k;
+            }
+            if (best < 0)
+                break;
+            at += (size_t) snprintf(clients + at, sizeof(clients) - at, "%s%s/%d:requests=%u(+%u),skipped=%u(+%u),max_gap_us=%u",
+                                    at ? " " : "", pvfb->contentClients[best].cmd, pvfb->contentClients[best].index,
+                                    pvfb->contentClients[best].requests,
+                                    pvfb->contentClients[best].requests - pvfb->contentClients[best].requestsAt,
+                                    pvfb->contentClients[best].skipped,
+                                    pvfb->contentClients[best].skipped - pvfb->contentClients[best].skippedAt,
+                                    pvfb->contentClients[best].maxGapUs);
+            if (at >= sizeof(clients))
+                at = sizeof(clients) - 1;
+            pvfb->contentClients[best].requestsAt = UINT32_MAX;     // shown: not again in this line
+        }
+        for (k = 0; k < LORIE_CONTENT_CLIENTS; k++) {
+            pvfb->contentClients[k].requestsAt = pvfb->contentClients[k].requests;
+            pvfb->contentClients[k].skippedAt = pvfb->contentClients[k].skipped;
+            pvfb->contentClients[k].maxGapUs = 0;
+        }
+        log(INFO, "XlorieContentClients: %s", clients[0] ? clients : "none");
 #undef TD32
 #undef HT
     }
@@ -2702,6 +2797,172 @@ void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
         LorieBuffer_release((LorieBuffer *) dst_buffer);
 }
 
+/* ---- P11-C3-D0, TERMUX_X11_CONTENT_FRAME_DIAG=1: client content from its presentation to the screen ---- */
+
+// The client presenting (the request being dispatched), counted in its slot - named once as it came.
+static void lorieContentClient(Bool skipped, uint64_t now) {
+    ClientPtr client = GetCurrentClient();
+    int i, free = -1, least = 0;
+
+    if (!client)
+        return;
+    for (i = 0; i < LORIE_CONTENT_CLIENTS; i++) {
+        if (pvfb->contentClients[i].client == client && pvfb->contentClients[i].index == client->index)
+            break;
+        if (!pvfb->contentClients[i].client && free < 0)
+            free = i;
+        if (pvfb->contentClients[i].requests < pvfb->contentClients[least].requests)
+            least = i;
+    }
+    if (i == LORIE_CONTENT_CLIENTS) {
+        if (skipped)
+            return;     // counted from its first request on
+        i = free >= 0 ? free : least;
+        memset(&pvfb->contentClients[i], 0, sizeof(pvfb->contentClients[i]));
+        pvfb->contentClients[i].client = client;
+        pvfb->contentClients[i].index = client->index;
+        lorieDiagWord(pvfb->contentClients[i].cmd, sizeof(pvfb->contentClients[i].cmd), GetClientCmdName(client));
+    }
+    if (skipped) {
+        pvfb->contentClients[i].skipped++;
+        return;
+    }
+    if (pvfb->contentClients[i].lastUs && now > pvfb->contentClients[i].lastUs &&
+        now - pvfb->contentClients[i].lastUs > pvfb->contentClients[i].maxGapUs)
+        pvfb->contentClients[i].maxGapUs = (uint32_t) (now - pvfb->contentClients[i].lastUs > UINT32_MAX ? UINT32_MAX
+                                                                                                      : now - pvfb->contentClients[i].lastUs);
+    pvfb->contentClients[i].lastUs = now;
+    pvfb->contentClients[i].requests++;
+}
+
+// A presentation with a pixmap asked for (patches/xserver.patch present_scmd_pixmap): its content's number, its request.
+uint32_t lorieContentRequest(PixmapPtr pixmap, uint64_t *request_us) {
+    uint64_t now;
+    *request_us = 0;
+    if (!pvfb->contentDiag || !pixmap)
+        return 0;
+    *request_us = now = lorieMonotonicUs();
+    if (!++pvfb->contentSeq)
+        ++pvfb->contentSeq;     // 0 is none
+    __atomic_fetch_add(&pvfb->state->diag.contentRequests, 1, __ATOMIC_RELAXED);
+    lorieContentClient(FALSE, now);
+    return pvfb->contentSeq;
+}
+
+// ... skipped: overwritten in its frame by a newer one, or its GPU copy cancelled (present_vblank_scrap).
+void lorieContentSkipped(uint32_t seq) {
+    if (!seq)
+        return;
+    __atomic_fetch_add(&pvfb->state->diag.contentSkipped, 1, __ATOMIC_RELAXED);
+    lorieContentClient(TRUE, 0);
+}
+
+/*
+ * Content `c` into `dst`, as of `now`, should it be newer than what `dst` holds: `dst`'s stamp - copied in, or carried
+ * by a CPU composite or copy (`carried`) - counted (into the screen pixmap: its wait from its copy complete).
+ */
+static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c, uint64_t now, Bool carried) {
+    LoriePixmapPriv *priv = dst ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
+    if (!priv || !c->seq || (priv->content.seq && !lorieContentNewer(c->seq, priv->content.seq)))
+        return;
+    priv->content = *c;
+    priv->content.readyUs = now;
+    if (pScreenPtr && dst == pScreenPtr->devPrivate) {
+        __atomic_fetch_add(&pvfb->state->diag.contentRootUpdates, 1, __ATOMIC_RELAXED);
+        lorieHistAdd(&pvfb->state->diag.contentCompleteToRoot, now >= c->copyUs ? now - c->copyUs : 0);
+    } else if (carried)
+        __atomic_fetch_add(&pvfb->state->diag.contentCompositorUpdates, 1, __ATOMIC_RELAXED);
+}
+
+/*
+ * Its copy queued for the GPU (`gpu`, present_execute_copy: when, for its completion's wait; the copy's serial kept on
+ * `dst` for stale reads) or made by the CPU (its content in `dst` now). The wait from the request.
+ */
+uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
+    LoriePixmapPriv *priv = dst ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
+    uint64_t now;
+    if (!seq)
+        return 0;
+    now = lorieMonotonicUs();
+    __atomic_fetch_add(gpu ? &pvfb->state->diag.contentGpuCopies : &pvfb->state->diag.contentCpuCopies, 1, __ATOMIC_RELAXED);
+    lorieHistAdd(&pvfb->state->diag.contentPresentToCopy, now >= request_us ? now - request_us : 0);
+    if (gpu && priv)
+        priv->contentCopySerial = pvfb->gpuCopySerialCounter;  // the one lorieTryScheduleGpuCopy just queued
+    else if (!gpu)
+        lorieContentStore(dst, &(struct lorie_content_stamp) { seq, request_us, now, now }, now, FALSE);
+    return now;
+}
+
+// ... its GPU copy complete, taken up by the X server (present_execute_copy): its content in `dst` now.
+void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst) {
+    uint64_t now;
+    if (!seq)
+        return;
+    now = lorieMonotonicUs();
+    __atomic_fetch_add(&pvfb->state->diag.contentCopiesDone, 1, __ATOMIC_RELAXED);
+    if (copy_us)
+        lorieHistAdd(&pvfb->state->diag.contentCopyToComplete, now >= copy_us ? now - copy_us : 0);
+    lorieContentStore(dst, &(struct lorie_content_stamp) { seq, request_us, now, now }, now, FALSE);
+}
+
+// ... its CompleteNotify sent (present_execute_post), in that mode.
+void lorieContentComplete(uint32_t seq, CARD8 mode) {
+    if (!seq)
+        return;
+    __atomic_fetch_add(mode == PresentCompleteModeSkip ? &pvfb->state->diag.contentCompletesSkip : &pvfb->state->diag.contentCompletes,
+                       1, __ATOMIC_RELAXED);
+}
+
+/*
+ * A CPU access opening (`done` false: loriePrepareAccess) or done (lorieFinishAccess): the newest content its sources
+ * hold carried into its destination as the destination's access finishes - EXA opens the destination before the
+ * sources for a composite, after them for a copy, and finishes the sources first either way - and, once no access is
+ * open, forgotten.
+ */
+static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, Bool done) {
+    Bool dest = index == EXA_PREPARE_DEST || index == EXA_PREPARE_AUX_DEST;
+    if (!done) {
+        pvfb->contentOpen++;
+        if (!dest && priv->content.seq && (!pvfb->contentIn.seq || lorieContentNewer(priv->content.seq, pvfb->contentIn.seq)))
+            pvfb->contentIn = priv->content;
+        return;
+    }
+    if (index == EXA_PREPARE_DEST && pvfb->contentIn.seq)
+        lorieContentStore(pPix, &pvfb->contentIn, lorieMonotonicUs(), TRUE);
+    if (--pvfb->contentOpen <= 0) {
+        pvfb->contentOpen = 0;
+        pvfb->contentIn.seq = 0;
+    }
+}
+
+// ... a source read, holding the shared lock: a GPU copy into it not complete and not in flight is still queued - the
+// read sees the content before it (stale).
+static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {
+    if (index != EXA_PREPARE_DEST && index != EXA_PREPARE_AUX_DEST && priv->contentCopySerial &&
+        !lorieGpuCopyIsDone(priv->contentCopySerial) && !lorieGpuInFlight(pvfb->state, LorieBuffer_description(priv->buffer)->id))
+        __atomic_fetch_add(&pvfb->state->diag.contentStaleReads, 1, __ATOMIC_RELAXED);
+}
+
+// The screen pixmap's newest content published with it, for the renderer's frames (lorie.h struct lorie_content).
+static void lorieContentPublish(LoriePixmapPriv *priv) {
+    volatile struct lorie_content *c = &pvfb->state->content;
+    uint64_t now;
+    if (!pvfb->contentDiag || !priv || !priv->content.seq || priv->content.seq == pvfb->contentPublishedSeq)
+        return;
+    now = lorieMonotonicUs();
+    pvfb->contentPublishedSeq = priv->content.seq;
+    c->seq = priv->content.seq;
+    c->requestUs = priv->content.requestUs;
+    c->copyUs = priv->content.copyUs;
+    c->rootUs = priv->content.readyUs;
+    c->publishUs = now;
+    if (!++pvfb->contentGen)
+        ++pvfb->contentGen;
+    __atomic_store_n(&c->gen, pvfb->contentGen, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&pvfb->state->diag.contentRootPublishes, 1, __ATOMIC_RELAXED);
+    lorieHistAdd(&pvfb->state->diag.contentRootToPublish, now >= priv->content.readyUs ? now - priv->content.readyUs : 0);
+}
+
 Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
     LoriePixmapPriv* priv = (LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap);
     if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height)
@@ -2872,6 +3133,8 @@ static void lorieCpuReleasedWake(void) {
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
+    if (pvfb->contentDiag && priv)
+        lorieContentAccess(pPix, priv, index, FALSE);   // P11-C3-D0
     // P11-C2: the root's buffer not before the copy into it the GPU was asked for settled
     if (pvfb->rootCopy.seq && priv && priv->buffer == pvfb->rootCopy.to)
         lorieRootCopyWait(FALSE);
@@ -2879,6 +3142,8 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
         uint64_t waitStartUs = perAccessAhb ? GetTimeInMicros() : 0;
         lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
         pvfb->accessLocks++;
+        if (pvfb->contentDiag && perAccessAhb)
+            lorieContentStaleRead(priv, index);     // P11-C3-D0: before it waits for a frame using it
         // P11-C3: its wait for the lock, and its hold of it from here (lorieFinishAccess)
         if (perAccessAhb && pvfb->frameDiag) {
             priv->accessStartUs = GetTimeInMicros();
@@ -2944,6 +3209,9 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
 
 void lorieFinishAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
+
+    if (pvfb->contentDiag && priv)
+        lorieContentAccess(pPix, priv, index, TRUE);    // P11-C3-D0
 
     // PER_ACCESS: the CPU lock goes before the shared one, so the renderer can never take the shared lock
     // and use the AHB while the X server still has it CPU-locked. 3c98ffa's order is kept otherwise.

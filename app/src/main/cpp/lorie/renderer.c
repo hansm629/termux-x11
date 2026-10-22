@@ -384,10 +384,13 @@ static uint64_t vkPacingLastStartUs, vkPacingLastPresentUs;
 static VkSwapchainKHR vkPacingSwapchain;
 // ... and what that last frame spent, and when it ended
 static struct { uint64_t endUs, cpuUs, lockUs, fenceUs, afterRootUs; uint32_t ticksRun; } vkPacingLast;
+// P11-C3-D0: the content generation the last frame presented showed, and when the last frame with new content presented
+static struct { uint32_t gen; uint64_t newUs; } vkContentLast;
 static void rendererVkPacingReset(void) {
     vkPacingLastStartUs = vkPacingLastPresentUs = 0;
     vkPacingSwapchain = VK_NULL_HANDLE;
     memset(&vkPacingLast, 0, sizeof(vkPacingLast));
+    memset(&vkContentLast, 0, sizeof(vkContentLast));
 }
 
 // Counted after the real call (see rendererMaybeSkipEglSwapBuffers, which can skip a swap and still
@@ -2444,6 +2447,71 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
     vkPacingLast.ticksRun = t->ticksRun;
 }
 
+/* ---- P11-C3-D0, TERMUX_X11_CONTENT_FRAME_DIAG: the client content the screen frames show (lorie.h struct lorie_content) ---- */
+
+// What the X server last published with the screen pixmap; generation 0 with the option off, or when it changed while
+// read (the next frame takes it up).
+static void rendererContentRead(struct lorie_content *out) {
+    uint32_t gen;
+    out->gen = 0;
+    if (!state || !state->backend.contentDiag)
+        return;
+    gen = __atomic_load_n(&state->content.gen, __ATOMIC_ACQUIRE);
+    out->seq = state->content.seq;
+    out->requestUs = state->content.requestUs;
+    out->copyUs = state->content.copyUs;
+    out->rootUs = state->content.rootUs;
+    out->publishUs = state->content.publishUs;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&state->content.gen, __ATOMIC_RELAXED) == gen)
+        out->gen = gen;
+}
+
+/*
+ * A Vulkan screen frame presented at `now` showing content `c` (rendererContentRead as it took the X server's lock): new -
+ * a generation the last frame presented did not show - or the last one's again. New: its waits from publishing and
+ * from its request to this present; the interval from the last frame with new content, one of 50 ms or more counted -
+ * the content shown asked for in its first half (it waited: pending) or later (none was asked for: client) - the
+ * period's longest; the period's slowest content and its stages.
+ */
+#define LORIE_CONTENT_GAP_US 50000
+static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {
+    volatile struct lorie_renderer_diag *d = &state->diag;
+    uint64_t total, gap;
+
+    if (!c->gen)
+        return;
+    if (c->gen == vkContentLast.gen) {
+        LORIE_DIAG_ADD(state, contentScreenReused, 1);
+        return;
+    }
+    vkContentLast.gen = c->gen;
+    LORIE_DIAG_ADD(state, contentScreenNew, 1);
+    lorieHistAdd(&d->contentPublishToScreen, now >= c->publishUs ? now - c->publishUs : 0);
+    total = now >= c->requestUs ? now - c->requestUs : 0;
+    lorieHistAdd(&d->contentTotal, total);
+    if (vkContentLast.newUs && now > vkContentLast.newUs) {
+        gap = now - vkContentLast.newUs;
+        lorieHistAdd(&d->contentInterval, gap);
+        if (gap >= LORIE_CONTENT_GAP_US) {
+            if (c->requestUs && c->requestUs <= vkContentLast.newUs + gap / 2)
+                LORIE_DIAG_ADD(state, contentGapsPending, 1);
+            else
+                LORIE_DIAG_ADD(state, contentGapsClient, 1);
+        }
+        if (gap > d->contentMaxGapUs)
+            d->contentMaxGapUs = (uint32_t) (gap > UINT32_MAX ? UINT32_MAX : gap);
+    }
+    vkContentLast.newUs = now;
+    if (total > d->contentWorstUs) {
+        d->contentWorstUs = (uint32_t) (total > UINT32_MAX ? UINT32_MAX : total);
+        d->contentWorstCopyUs = (uint32_t) (c->copyUs >= c->requestUs ? c->copyUs - c->requestUs : 0);
+        d->contentWorstCompositeUs = (uint32_t) (c->rootUs >= c->copyUs ? c->rootUs - c->copyUs : 0);
+        d->contentWorstPublishUs = (uint32_t) (c->publishUs >= c->rootUs ? c->publishUs - c->rootUs : 0);
+        d->contentWorstScreenUs = (uint32_t) (now >= c->publishUs ? now - c->publishUs : 0);
+    }
+}
+
 // The GPU copies alone, when no frame is drawn (rendererApplyPendingGpuCopies's Vulkan twin).
 static void rendererVkApplyPendingGpuCopies(void) {
     uint64_t serial = 0, startUs, lockedUs, inflightUs, submittedUs = 0, fencedUs = 0;
@@ -2807,6 +2875,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     struct rendererVkFrameTimes ft = { 0 };
     // P11-C3-C: the asks there are as it begins, taken up once it is presented
     uint32_t askSeq = rendererProgressOn() ? state->progress.askSeq : 0;
+    // P11-C3-D0: the client content it shows (read under the X server's lock)
+    struct lorie_content content = { 0 };
 
     rendererStage(LORIE_R_FRAME);
     if (diag) {
@@ -2902,6 +2972,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     rendererStage(LORIE_R_FRAME);
     lockedUs = lorieMonotonicUs();
+    rendererContentRead(&content);
     owned = rendererVkOwnedLocked();
     if (owned) {
         inflightUs = lorieMonotonicUs();
@@ -3056,6 +3127,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     if (presented == LORIE_VK_FRAME_FATAL)
         return rendererVkFail();
     state->renderedFrames++;
+    if (presented == LORIE_VK_FRAME_OK)
+        rendererContentFrame(&content, lorieMonotonicUs());     // P11-C3-D0
     if (rendererProgressOn()) {
         state->progress.takenSeq = askSeq;      // P11-C3-C: presented - the asks there were as it began, taken up
         state->progress.takenUs = startUs;

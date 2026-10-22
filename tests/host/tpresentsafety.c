@@ -194,6 +194,30 @@ static void testFree(void *p) {
     free(p);
 }
 
+/* P11-C3-D0: the content hooks the patch calls (InitOutput.c lorieContent*), as a log of their own - the
+ * presentation's number, copied by the GPU or the CPU, its GPU copy done, its CompleteNotify, skipped */
+static char ctrail[256];
+static uint32_t contentSeqNext;     /* the number presentation() gives the next one (0: not followed) */
+static void cstep(const char *what, uint32_t seq, const char *how) {
+    snprintf(ctrail + strlen(ctrail), sizeof ctrail - strlen(ctrail), "%s%s(%u%s%s)", ctrail[0] ? " " : "", what, seq,
+             how ? "," : "", how ? how : "");
+}
+static void lorieContentSkipped(uint32_t seq) { if (seq) cstep("skipped", seq, NULL); }
+static uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
+    (void) request_us, (void) dst;
+    if (seq)
+        cstep("copied", seq, gpu ? "gpu" : "cpu");
+    return seq ? 1000 + seq : 0;
+}
+static void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst) {
+    (void) request_us, (void) dst;
+    if (seq)
+        cstep(copy_us == 1000 + seq ? "done" : "done(no queue time)", seq, NULL);
+}
+static void lorieContentComplete(uint32_t seq, uint8_t mode) {
+    if (seq)
+        cstep("complete", seq, mode == PresentCompleteModeSkip ? "skip" : "copy");
+}
 void present_execute_copy(struct present_vblank *vblank, uint64_t crtc_msc);
 void present_execute_post(struct present_vblank *vblank, uint64_t ust, uint64_t crtc_msc);
 void present_vblank_scrap(struct present_vblank *vblank);
@@ -226,6 +250,7 @@ static struct present_vblank *presentation(PixmapPtr pixmap) {
     xorg_list_append(&v->window_list, &windowPriv.vblank);
     xorg_list_append(&v->event_queue, &present_exec_queue);
     v->queued = TRUE;
+    v->lorie_content_seq = contentSeqNext;
     current = pixmap;
     present_execute(v, 0, 10);
     return v;
@@ -632,6 +657,43 @@ int main(void) {
     lorieRecheckGpuCopies();
     expect("renderer without a surface, the shared lock busy, then free", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
     clean("lock busy", &a, 0);
+
+    /* P11-C3-D0: a followed presentation's content - its GPU copy queued, done, then its CompleteNotify; copied by the CPU;
+     * overwritten in its frame by the next one, which is then copied; nothing for one not followed */
+    reset();
+    ctrail[0] = 0;
+    contentSeqNext = 5;
+    v = presentation(&a);
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(ctrail, "copied(5,gpu) done(5) complete(5,copy)"), "content, GPU copy: %s", ctrail);
+    clean("content, GPU copy", &a, 0);
+    reset();
+    ctrail[0] = 0;
+    contentSeqNext = 6;
+    outOfMemory = true;
+    v = presentation(&a);
+    outOfMemory = false;
+    CHECK(!strcmp(ctrail, "copied(6,cpu) complete(6,copy)"), "content, CPU copy: %s", ctrail);
+    clean("content, CPU copy", &a, 0);
+    reset();
+    ctrail[0] = 0;
+    contentSeqNext = 7;
+    v = presentation(&a);
+    recorded = a.copySerial;
+    contentSeqNext = 8;
+    presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
+    present_execute(v, 0, 11);
+    gpuDone(a.copySerial);
+    CHECK(!strncmp(ctrail, "copied(7,gpu) skipped(7)", strlen("copied(7,gpu) skipped(7)")) && !strstr(ctrail, "done(7)") &&
+          strstr(ctrail, "complete(7,skip)"), "content, overwritten while its copy runs: %s", ctrail);
+    clean("content, overwritten", &a, 0);
+    reset();
+    ctrail[0] = 0;
+    contentSeqNext = 0;
+    v = presentation(&a);
+    gpuDone(a.copySerial);
+    CHECK(!ctrail[0], "content not followed: %s", ctrail);
+    clean("content not followed", &a, 0);
 
     printf("TPRESENTSAFETY a GPU-copied presentation's end, on the patched xserver: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;

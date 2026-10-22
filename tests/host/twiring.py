@@ -216,7 +216,9 @@ watch = fsrc[fsrc.index("/* ---- P11-C3-C, TERMUX_X11_FRAME_FREEZE_DIAG=1: the f
 for bad in ("lorie_mutex_lock", "lorie_mutex_trylock", "pthread_mutex_lock", "input_lock", "lorieGpuWaitIdle", "lorieRootCopyWait",
             "WaitForFences", "pthread_cond_wait", "FUTEX_WAIT"):
     check(bad not in watch, "the freeze watchdog calls %s" % bad)
-dsp = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "app", "src", "main", "cpp", "patches", "xserver.patch"), encoding="utf-8").read()
+# patches/xserver.patch - or, for a negative control, the changed copy of it (tcontrols.py)
+dsp = open(os.environ.get("LORIE_XSERVER_PATCH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "app", "src",
+           "main", "cpp", "patches", "xserver.patch"), encoding="utf-8").read()
 check("CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, client->majorOp, client->minorOp) : 0;" in dsp,
       "Dispatch does not hand the request's start to the DDX only while requests are timed")
 for what, body, mark in (("tick", xredraw, "struct lorieXMark tickMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_TICK);"),
@@ -246,6 +248,44 @@ counter = func(I, "static CARD32 lorieFramecounter(unused OsTimerPtr timer, unus
 check("QueueWorkProc(lorieReportWorkProc, NULL, NULL);" in counter and "log(" not in counter and "lorieLogRendererDiag" not in counter
       and "lorieReport();" in func(I, "static Bool lorieReportWorkProc(__unused ClientPtr client, __unused void *closure) {"),
       "the 5 second report made in the timer, under the input lock")
+
+# P11-C3-D0: client content (TERMUX_X11_CONTENT_FRAME_DIAG): the option read into its flags; the patch hands each step to
+# the hooks where it happens; the accesses carry content only with the option on, a stale read looked for under the lock
+# before the wait for a frame; the screen pixmap published only where its damage is taken up (swapped or drawn: never
+# at a tick for the cursor alone); the renderer takes the content under the lock, counts it once presented
+check('lorieScreen.contentDiag = getenv("TERMUX_X11_CONTENT_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_CONTENT_FRAME_DIAG"), "1");' in init
+      and "lorieScreen.state->backend.contentDiag = lorieScreen.contentDiag;" in init,
+      "OsVendorInit does not read TERMUX_X11_CONTENT_FRAME_DIAG=1 into the renderer's flag")
+xp = dsp
+for what, first, then in (
+        ("the request numbered", "     vblank->event_id = ++present_scmd_event_id;",
+         "+    vblank->lorie_content_seq = lorieContentRequest(pixmap, &vblank->lorie_content_us);"),
+        ("its GPU copy done", "+        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);\n+        vblank->gpu_copy_pending = FALSE;\n",
+         "+        lorieContentCopyDone(vblank->lorie_content_seq, vblank->lorie_content_us, vblank->lorie_copy_us, gpuCopyDst);"),
+        ("its GPU copy queued", "+        vblank->gpu_copy_pending = TRUE;\n",
+         "+        vblank->lorie_copy_us = lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, TRUE);"),
+        ("its CPU copy", "+        present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);",
+         "+        lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, FALSE);"),
+        ("its CompleteNotify", "+    lorieContentComplete(vblank->lorie_content_seq, mode);     /* lorie: P11-C3-D0 */",
+         "present_vblank_notify(vblank, vblank->kind, mode, ust, crtc_msc);"),
+        ("skipped", "present_vblank_scrap(present_vblank_ptr vblank)\n {\n", "+    lorieContentSkipped(vblank->lorie_content_seq);     /* lorie: P11-C3-D0 */")):
+    i, j = xp.find(first), xp.find(then)
+    check(i >= 0 and j > i and j - i < 400, "patches/xserver.patch: the content hook for %s not where it happens" % what)
+prep = func(I, "Bool loriePrepareAccess(PixmapPtr pPix, int index) {")
+check("    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, FALSE);" in prep and
+      "    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, TRUE);" in func(I, "void lorieFinishAccess(PixmapPtr pPix, int index) {"),
+      "the accesses do not carry content only with the option on")
+in_order("a stale read looked for under the lock, before the frame's wait", prep, "lorie_mutex_lock(&pvfb->state->lock",
+         "lorieContentStaleRead(priv, index);", "lorieGpuWaitIdle(")
+in_order("published where the damage is taken up", xredraw, "if (rootDouble && (nonEmpty || pvfb->rootTwinStale)) {", "lorieRootSwap(priv)",
+         "DamageEmpty(pvfb->damage);", "pvfb->state->drawRequested = TRUE;", "lorieContentPublish(priv);",
+         "if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {")
+check(xredraw.count("lorieContentPublish(") == 1 and
+      "    if (nonEmpty && priv->buffer) {" in xredraw and
+      xredraw.split("    if (nonEmpty && priv->buffer) {", 1)[1].split("\n    }\n", 1)[0].count("\n        lorieContentPublish(priv);") == 1,
+      "the screen pixmap published at a tick for the cursor too (outside the block that takes its damage up)")
+in_order("the content taken under the lock, counted once presented", redraw, "lorie_mutex_lock(&state->lock", "rendererContentRead(&content);",
+         "lorie_mutex_unlock(&state->lock", "lorieVkPresent(", "if (presented == LORIE_VK_FRAME_OK)", "rendererContentFrame(&content, lorieMonotonicUs());")
 
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
