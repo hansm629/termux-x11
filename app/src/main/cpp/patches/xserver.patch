@@ -404,14 +404,45 @@
  
      screen_priv->re_execute(vblank);
  }
-@@ -61,12 +63,45 @@
+@@ -61,12 +63,74 @@
      return FALSE;
  }
  
++/* lorie: what a GPU copy draws, damaged on its window: the update region - in the presented pixmap's coordinates; the
++ * whole pixmap without one (lorieTryScheduleGpuCopy's rectangles) - at (dx, dy) in `dst`, the pixmap the window draws
++ * into (its own, a redirected ancestor's or the screen's), within that pixmap's bounds (the renderer's draw is), in
++ * screen coordinates - `dst`'s screen_x/y - as DamageDamageRegion takes them for a window. Out of memory, the window's
++ * whole clip instead. */
++static void
++present_damage_gpu_copy_region(WindowPtr window, PixmapPtr dst, PixmapPtr pixmap, RegionPtr update, int dx, int dy)
++{
++    BoxRec                      whole = { 0, 0, (short) pixmap->drawable.width, (short) pixmap->drawable.height };
++    BoxRec                      bounds = { dst->screen_x, dst->screen_y, (short) (dst->screen_x + dst->drawable.width),
++                                           (short) (dst->screen_y + dst->drawable.height) };
++    RegionRec                   damage, clip;
++
++    if (update) {
++        RegionNull(&damage);
++        if (!RegionCopy(&damage, update)) {
++            RegionUninit(&damage);
++            DamageDamageRegion(&window->drawable, &window->clipList);
++            return;
++        }
++    } else
++        RegionInit(&damage, &whole, 1);
++    RegionTranslate(&damage, dx + dst->screen_x, dy + dst->screen_y);
++    RegionInit(&clip, &bounds, 1);
++    RegionIntersect(&damage, &damage, &clip);
++    DamageDamageRegion(&window->drawable, &damage);
++    RegionUninit(&clip);
++    RegionUninit(&damage);
++}
++
 +/* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - a GPU copy's damage, put off as it was queued, reported now (`how`:
-+ * its copy done, or still possibly running) or dropped (the copy never runs, or the window goes): the update region - in
-+ * the pixmap's coordinates, x_off/y_off into the window, the window where it is now - or the window's whole clip, as
-+ * present_copy_region draws them. Dropped, the update region goes with the vblank. */
++ * its copy done, or still possibly running) or dropped (the copy never runs, or the window goes): what the copy draws,
++ * at its place in the pixmap the window draws into now - which moves with the window (its screen_x/y; a client
++ * window moved within its frame does not move it), its own (or its ancestor's) as when the copy was queued, or one
++ * made since (a resize: the same place in it). Dropped, the update region goes with the vblank. */
 +void
 +present_damage_gpu_copy(present_vblank_ptr vblank, int how)
 +{
@@ -423,14 +454,12 @@
 +    lorieCountCopyDamage(how);
 +    if (how == LORIE_COPY_DAMAGE_DROPPED || !window)
 +        return;
++    present_damage_gpu_copy_region(window, window->drawable.pScreen->GetWindowPixmap(window), vblank->pixmap, vblank->update,
++                                   vblank->lorie_copy_dx, vblank->lorie_copy_dy);
 +    if (vblank->update) {
-+        RegionTranslate(vblank->update, vblank->x_off + window->drawable.x, vblank->y_off + window->drawable.y);
-+        RegionIntersect(vblank->update, vblank->update, &window->clipList);
-+        DamageDamageRegion(&window->drawable, vblank->update);
 +        RegionDestroy(vblank->update);
 +        vblank->update = NULL;
-+    } else
-+        DamageDamageRegion(&window->drawable, &window->clipList);
++    }
 +}
 +
  void
@@ -450,7 +479,7 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +114,85 @@
+@@ -79,12 +143,84 @@
          return;
      }
  
@@ -497,17 +526,16 @@
 +               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
-+         * ops that Damage tracking hooks into, so report it manually - same drawable and region
-+         * present_scmd.c's flip success path already uses, so this also reaches Composite's
-+         * per-window damage for redirected windows, not just lorie's own root damage.
++         * ops that Damage tracking hooks into, so report it manually - on the window, so this also
++         * reaches Composite's per-window damage for redirected windows, not just lorie's own root
++         * damage: what the copy draws (present_damage_gpu_copy_region - the update region was
++         * taken as screen coordinates before, which it is not: the presented pixmap's).
 +         * P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1): reported once the copy is done instead
 +         * (present_damage_gpu_copy), the update region kept for it. */
-+        if (!(vblank->lorie_damage_deferred = lorieDeferCopyDamage())) {
-+            RegionPtr damage = vblank->update ? vblank->update : &window->clipList;
-+            if (vblank->update)
-+                RegionIntersect(damage, damage, &window->clipList);
-+            DamageDamageRegion(&window->drawable, damage);
-+        }
++        vblank->lorie_copy_dx = gpuCopyXOff;
++        vblank->lorie_copy_dy = gpuCopyYOff;
++        if (!(vblank->lorie_damage_deferred = lorieDeferCopyDamage()))
++            present_damage_gpu_copy_region(window, gpuCopyDst, vblank->pixmap, vblank->update, gpuCopyXOff, gpuCopyYOff);
 +
 +        /* lorie: copy offloaded to the renderer's GPU context. The region was already
 +         * consumed (copied into the shared command queue), so free it like
@@ -541,7 +569,7 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
-@@ -110,6 +218,7 @@
+@@ -110,6 +246,7 @@
      else
          mode = PresentCompleteModeCopy;
  
@@ -558,7 +586,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,90 @@
+@@ -90,8 +91,93 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -582,6 +610,9 @@
 +    /* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - its GPU copy's damage put off until the copy is done
 +     * (present_damage_gpu_copy), its update region kept for it until then */
 +    Bool                lorie_damage_deferred;
++    /* lorie: where in its destination pixmap its GPU copy draws (present_execute_copy's gpuCopyXOff/YOff), for that
++     * damage */
++    int16_t             lorie_copy_dx, lorie_copy_dy;
  };
  
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the

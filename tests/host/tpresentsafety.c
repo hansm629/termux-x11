@@ -46,8 +46,9 @@ typedef uint16_t CARD16;
 #define DebugPresent(x)
 #include "xorglist_src.inc"
 typedef struct { int n; int x1, y1, x2, y2; } RegionRec, *RegionPtr;     /* one box: n 0 (empty) or 1 */
+typedef struct { short x1, y1, x2, y2; } BoxRec;
 typedef struct _Screen *ScreenPtr;
-typedef struct { ScreenPtr pScreen; int16_t x, y; XID id; } DrawableRec;
+typedef struct { ScreenPtr pScreen; int16_t x, y; XID id; uint16_t width, height; } DrawableRec;
 typedef struct _Window { DrawableRec drawable; RegionRec clipList; struct present_window_priv *priv; } WindowRec, *WindowPtr;
 typedef struct _Pixmap { DrawableRec drawable; int16_t screen_x, screen_y; int refs; uint64_t copySerial; } PixmapRec, *PixmapPtr;
 typedef struct _RRCrtc { ScreenPtr pScreen; } *RRCrtcPtr;
@@ -169,8 +170,13 @@ static void present_vblank_notify(struct present_vblank *v, CARD16 kind, CARD16 
     (void) v; (void) kind; (void) ust; (void) msc;
     step(mode == PresentCompleteModeSkip ? "complete(skip)" : "complete(copy)", current);
 }
-static int regionsDestroyed;
+static int regionsDestroyed, regionsLive;
+static bool regionCopyFails;
 static void RegionDestroy(RegionPtr r) { if (r) regionsDestroyed++; }
+static void RegionNull(RegionPtr r) { *r = (RegionRec) { 0 }; regionsLive++; }
+static void RegionInit(RegionPtr r, BoxRec *b, int n) { *r = b && n ? (RegionRec) { 1, b->x1, b->y1, b->x2, b->y2 } : (RegionRec) { 0 }; regionsLive++; }
+static void RegionUninit(RegionPtr r) { (void) r; regionsLive--; }
+static Bool RegionCopy(RegionPtr d, RegionPtr s) { if (regionCopyFails) return FALSE; *d = *s; return TRUE; }
 static void RegionTranslate(RegionPtr r, int dx, int dy) { r->x1 += dx, r->y1 += dy, r->x2 += dx, r->y2 += dy; }
 static void RegionIntersect(RegionPtr d, RegionPtr a, RegionPtr b) {
     RegionRec r = { 1, a->x1 > b->x1 ? a->x1 : b->x1, a->y1 > b->y1 ? a->y1 : b->y1, a->x2 < b->x2 ? a->x2 : b->x2,
@@ -703,18 +709,52 @@ int main(void) {
     expect("renderer without a surface, the shared lock busy, then free", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_STALLED);
     clean("lock busy", &a, 0);
 
-    /* P11-C3-D1-A: the copy's damage. Off: reported as the copy is queued (the GPU may still write), once */
+    /* P11-C3-D1-A: the copy's damage - what it draws: the presented pixmap (800x600; or its update region, in its own
+     * coordinates) at x_off/y_off in the window, which is at (100,50) inside a redirected frame whose pixmap (804x604,
+     * a 2 pixel border) is at (98,48) on the screen; the region the copy draws there, within that pixmap, on the screen.
+     * Off: reported as the copy is queued (the GPU may still write), once. */
     window.drawable.x = 100, window.drawable.y = 50;
     window.clipList = (RegionRec) { 1, 100, 50, 900, 650 };
+    a.drawable.width = b.drawable.width = 800, a.drawable.height = b.drawable.height = 600;
+    dstPixmap.screen_x = 98, dstPixmap.screen_y = 48, dstPixmap.drawable.width = 804, dstPixmap.drawable.height = 604;
     reset();
     dreset();
     v = presentation(&a);
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !v->lorie_damage_deferred, "off: not damaged as the copy is queued: %s", dtrail);
     gpuDone(a.copySerial);
-    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !damageDeferred && !damageHow[0] && !damageHow[1] && !damageHow[2],
-          "off: damaged again, or counted: %s", dtrail);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !damageDeferred && !damageHow[0] && !damageHow[1] && !damageHow[2] &&
+          !regionsLive, "off: damaged again, or counted, or a region left (%d): %s", regionsLive, dtrail);
     expect("damage, off: as the copy is queued", "ack+ idle+ complete(copy)+", -1);
     clean("damage, off", &a, 0);
+
+    /* off, an update region: in the presented pixmap's coordinates - moved into the window by x_off/y_off, where the copy
+     * draws it, not taken as the screen's (which put it outside the window: no damage) - within the frame's pixmap; the
+     * update region destroyed once; out of memory copying it, the window's whole clip */
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 10 }, nextXOff = 5, nextYOff = 6;
+    v = presentation(&a);
+    CHECK(!strcmp(dtrail, "damage(105,56,115,66)!") && regionsDestroyed == 1 && !regionsLive, "off, update: %s, its region destroyed "
+          "%d times, %d left (want damage(105,56,115,66)!, once, none)", dtrail, regionsDestroyed, regionsLive);
+    gpuDone(a.copySerial);
+    expect("damage, off, an update region: where the copy draws it", "ack+ idle+ complete(copy)+", -1);
+    clean("damage, off, update", &a, 0);
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 700 };
+    v = presentation(&a);
+    CHECK(!strcmp(dtrail, "damage(100,50,110,652)!"), "off, update past the frame's pixmap: %s (want damage(100,50,110,652)!)", dtrail);
+    gpuDone(a.copySerial);
+    clean("damage, off, update past the pixmap", &a, 0);
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 10 };
+    regionCopyFails = true;
+    v = presentation(&a);
+    regionCopyFails = false;
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !regionsLive, "off, out of memory: %s (want the clip)", dtrail);
+    gpuDone(a.copySerial);
+    clean("damage, off, out of memory", &a, 0);
 
     /* on: none as it is queued, nor while it runs; once it is done, before the client is told its pixmap is idle */
     deferDamage = true;
@@ -732,21 +772,45 @@ int main(void) {
     expect("damage, on: once the copy is done", "ack+ idle+ complete(copy)+", -1);
     clean("damage, on", &a, 0);
 
-    /* on, an update region: moved into the window by x_off/y_off and the window where it is once the copy is done (it
-     * moved meanwhile), clipped; destroyed once */
+    /* on, an update region, the frame moved 100 to the right meanwhile (the window and its pixmap with it): where the
+     * copy drew it, which moved with them - within the pixmap; destroyed once */
     reset();
     dreset();
     nextUpdate = (RegionRec) { 1, 0, 0, 10, 700 }, nextXOff = 5, nextYOff = 6;
     v = presentation(&a);
     CHECK(!dtrail[0] && v->update == &nextUpdate && !regionsDestroyed, "on, update: damaged, or its region gone, as it is queued: %s",
           dtrail);
-    window.drawable.x = 200, window.clipList = (RegionRec) { 1, 200, 50, 1000, 650 };
+    window.drawable.x = 200, window.clipList = (RegionRec) { 1, 200, 50, 1000, 650 }, dstPixmap.screen_x = 198;
     gpuDone(a.copySerial);
-    CHECK(!strcmp(dtrail, "damage(205,56,215,650)+") && regionsDestroyed == 1, "on, update: %s, its region destroyed %d times "
-          "(want damage(205,56,215,650)+, once)", dtrail, regionsDestroyed);
-    expect("damage, on, an update region: moved into the window, clipped", "ack+ idle+ complete(copy)+", -1);
+    CHECK(!strcmp(dtrail, "damage(205,56,215,652)+") && regionsDestroyed == 1 && !regionsLive, "on, update, the frame moved: %s, its "
+          "region destroyed %d times (want damage(205,56,215,652)+, once)", dtrail, regionsDestroyed);
+    expect("damage, on, an update region, the frame moved meanwhile", "ack+ idle+ complete(copy)+", -1);
     clean("damage, on, update", &a, 0);
+    /* on, the window moved within its frame meanwhile (its pixmap did not move): where the copy drew it, in that pixmap -
+     * not where the window is now */
+    reset();
+    dreset();
+    window.drawable.x = 100, window.clipList = (RegionRec) { 1, 100, 50, 900, 650 }, dstPixmap.screen_x = 98;
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 10 }, nextXOff = 5, nextYOff = 6;
+    v = presentation(&a);
+    window.drawable.x = 150, window.clipList = (RegionRec) { 1, 150, 50, 850, 650 };
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(105,56,115,66)+"), "on, moved within its frame: %s (want damage(105,56,115,66)+)", dtrail);
+    clean("damage, on, moved within its frame", &a, 0);
+    /* on, a window drawn into the screen pixmap (not redirected, at 0,0, 1920x1080), moved meanwhile: where the copy drew
+     * it - the screen pixmap does not move */
+    reset();
+    dreset();
+    window.drawable.x = 100;
+    dstPixmap.screen_x = dstPixmap.screen_y = 0, dstPixmap.drawable.width = 1920, dstPixmap.drawable.height = 1080;
+    nextUpdate = (RegionRec) { 1, 0, 0, 10, 10 }, nextXOff = 5, nextYOff = 6;
+    v = presentation(&a);
+    window.drawable.x = 300, window.clipList = (RegionRec) { 1, 300, 50, 1100, 650 };
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(105,56,115,66)+"), "on, into the screen pixmap, moved: %s (want damage(105,56,115,66)+)", dtrail);
+    clean("damage, on, screen pixmap", &a, 0);
     window.drawable.x = 100, window.clipList = (RegionRec) { 1, 100, 50, 900, 650 };
+    dstPixmap.screen_x = 98, dstPixmap.screen_y = 48, dstPixmap.drawable.width = 804, dstPixmap.drawable.height = 604;
 
     /* on, overwritten in its frame while the copy runs: damaged then, as off (the GPU may still write), not again */
     reset();
