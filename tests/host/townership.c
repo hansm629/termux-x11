@@ -514,7 +514,19 @@ static struct fake_pvfb newWorld, *pvfb = &newWorld;
 #include "xstage_src.inc"
 /* P11-C3-D0: the accesses' content hooks - never called here, the option off (tcontentframe.c runs the real ones) */
 static int contentHooks;
-static void lorieContentAccess(PixmapPtr pPix, void *priv, int index, Bool done) { (void) pPix, (void) priv, (void) index, (void) done; contentHooks++; }
+/* P11-C3-D0: the accesses the content hooks were told of, open (a bit by EXA's index), and failed ones */
+enum { LORIE_CONTENT_OPEN, LORIE_CONTENT_DONE, LORIE_CONTENT_FAILED };
+static uint32_t contentOpen;
+static int contentFailed;
+static void lorieContentAccess(PixmapPtr pPix, void *priv, int index, int how) {
+    (void) pPix, (void) priv;
+    contentHooks++;
+    if (how == LORIE_CONTENT_OPEN)
+        contentOpen |= 1u << index;
+    else
+        contentOpen &= ~(1u << index);
+    contentFailed += how == LORIE_CONTENT_FAILED;
+}
 static void lorieContentStaleRead(void *priv, int index) { (void) priv, (void) index; contentHooks++; }
 static void lorieRootCopyWait(Bool takeBack);
 #define lorie_shared_server_state fake_state
@@ -751,11 +763,17 @@ static void exec(const struct impl *im, struct op o) {
             if (!perAccess)
                 break;
             b->failLock = 1;
+            w->contentDiag = im->ownership;     /* P11-C3-D0: told of, and undone (3c98ffa has no such hooks) */
+            contentFailed = 0;
         }
         ok = im->prepare(p, index);
         if (o.what == FAIL_SRC) {
             CHECK(!ok && b->lockAttempts == attempts + 1, "%s op %d: PrepareAccess did not fail on a buffer that cannot be locked",
                   runName, opIndex);
+            CHECK(!im->ownership || (contentFailed == 1 && !(contentOpen & 1u << index)),
+                  "%s op %d: the failed access left open to the content hooks (%#x, %d failed)", runName, opIndex, contentOpen,
+                  contentFailed);
+            w->contentDiag = FALSE;
             CHECK(w->state->lock == 0, "%s op %d: failed PrepareAccess left the shared lock held", runName, opIndex);
             CHECK(!im->ownership || (w->state->cpuAccess.count == 0 && w->accessLocks == 0),
                   "%s op %d: failed PrepareAccess left a reservation (%u) or an access lock", runName, opIndex,

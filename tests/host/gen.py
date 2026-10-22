@@ -168,7 +168,7 @@ recipes = {
     # P11-C3-C: the freeze watchdog's stages - the renderer's (rendererProgressOn, rendererStage) and the X server's
     # thread's (lorieXEnter, lorieXLeave) - tpresentcopy.c, twake.c, townership.c, tfreeze.c
     "rendererstage": lambda: func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {"),
-    "contentconsts": lambda: macro(I, "LORIE_CONTENT_CLIENTS"),
+    "contentconsts": lambda: macro(I, "LORIE_CONTENT_CLIENTS") + macro(os.path.join(XS, "exa", "exa.h"), "EXA_NUM_PREPARE_INDICES"),
     # P11-C3-D0: client content from its presentation to the screen - the X server's hooks (counting, stamping,
     # carrying through CPU accesses, publishing) and the renderer's frames - tcontentframe.c
     "contentframe": lambda: "".join(macro(os.path.join(XS, "exa", "exa.h"), m) for m in (
@@ -185,8 +185,10 @@ recipes = {
             "static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c, uint64_t now, Bool carried) {",
             "uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {",
             "void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst) {",
-            "void lorieContentComplete(uint32_t seq, CARD8 mode) {",
-            "static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, Bool done) {",
+            "void lorieContentComplete(uint32_t seq, CARD8 mode) {"))
+        + span(I, "enum { LORIE_CONTENT_OPEN,", "LORIE_CONTENT_FAILED };")
+        + "".join(func(I, f) for f in (
+            "static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, int how) {",
             "static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {",
             "static void lorieContentPublish(LoriePixmapPriv *priv) {"))
         + span(R, "// P11-C3-D0: the content generation the last frame presented showed", "static struct { uint32_t gen; uint64_t newUs; } vkContentLast;")

@@ -168,13 +168,14 @@ typedef struct {
     pid_t mainTid, inputTid, vsyncTid;
 
     /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1, lorieContent*): asked for; the presentations numbered, the screen
-     * pixmap's publishings and the content last published; the newest content the sources of the CPU accesses open
-     * carry (into the destination as its access finishes) and how many accesses are open; the clients presenting -
-     * LORIE_CONTENT_CLIENTS of them, each named as it came, its pointer only compared (never followed) */
+     * pixmap's publishings and the content last published; the CPU accesses open (a bit by EXA's index) and the content
+     * each index's sources carry (into the destination as its access finishes) - and what it carried before its last
+     * opening, for an opening that fails; the clients presenting - LORIE_CONTENT_CLIENTS of them, each named as it
+     * came, its pointer only compared (never followed) */
     Bool contentDiag;
     uint32_t contentSeq, contentGen, contentPublishedSeq;
-    int contentOpen;
-    struct lorie_content_stamp contentIn;
+    uint32_t contentOpen;
+    struct lorie_content_stamp contentFrom[EXA_NUM_PREPARE_INDICES], contentBefore[EXA_NUM_PREPARE_INDICES];
     struct {
         const void *client;
         int index;
@@ -3013,24 +3014,43 @@ void lorieContentComplete(uint32_t seq, CARD8 mode) {
 }
 
 /*
- * A CPU access opening (`done` false: loriePrepareAccess) or done (lorieFinishAccess): the newest content its sources
- * hold carried into its destination as the destination's access finishes - EXA opens the destination before the
- * sources for a composite, after them for a copy, and finishes the sources first either way - and, once no access is
- * open, forgotten.
+ * A CPU access opening (loriePrepareAccess), done (lorieFinishAccess), or failed (loriePrepareAccess returning FALSE:
+ * EXA calls no FinishAccess for it - ExaDoPrepareAccess). By EXA's index - one pixmap open at each at a time (EXA's
+ * access[]; nested accesses to one pixmap reach the driver once): a source's content kept for its index from its
+ * opening on - newest kept, should another source open there before the destination finishes - and the newest of them
+ * all carried into the destination as the destination's access finishes (EXA opens the destination before the sources
+ * for a composite, after them for a copy, and finishes the sources first either way); once no access is open, all
+ * forgotten. A failed opening is undone: its index carries what it did before, and counts as not open.
  */
-static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, Bool done) {
+enum { LORIE_CONTENT_OPEN, LORIE_CONTENT_DONE, LORIE_CONTENT_FAILED };
+static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, int how) {
     Bool dest = index == EXA_PREPARE_DEST || index == EXA_PREPARE_AUX_DEST;
-    if (!done) {
-        pvfb->contentOpen++;
-        if (!dest && priv->content.seq && (!pvfb->contentIn.seq || lorieContentNewer(priv->content.seq, pvfb->contentIn.seq)))
-            pvfb->contentIn = priv->content;
+    struct lorie_content_stamp in = { 0 };
+    int i;
+
+    if (index < 0 || index >= EXA_NUM_PREPARE_INDICES)
+        return;
+    if (how == LORIE_CONTENT_OPEN) {
+        pvfb->contentOpen |= 1u << index;
+        pvfb->contentBefore[index] = pvfb->contentFrom[index];
+        if (!dest && priv->content.seq &&
+            (!pvfb->contentFrom[index].seq || lorieContentNewer(priv->content.seq, pvfb->contentFrom[index].seq)))
+            pvfb->contentFrom[index] = priv->content;
         return;
     }
-    if (index == EXA_PREPARE_DEST && pvfb->contentIn.seq)
-        lorieContentStore(pPix, &pvfb->contentIn, lorieMonotonicUs(), TRUE);
-    if (--pvfb->contentOpen <= 0) {
-        pvfb->contentOpen = 0;
-        pvfb->contentIn.seq = 0;
+    if (how == LORIE_CONTENT_FAILED)
+        pvfb->contentFrom[index] = pvfb->contentBefore[index];
+    else if (dest) {
+        for (i = 0; i < EXA_NUM_PREPARE_INDICES; i++)
+            if (pvfb->contentFrom[i].seq && (!in.seq || lorieContentNewer(pvfb->contentFrom[i].seq, in.seq)))
+                in = pvfb->contentFrom[i];
+        if (in.seq)
+            lorieContentStore(pPix, &in, lorieMonotonicUs(), TRUE);
+    }
+    pvfb->contentOpen &= ~(1u << index);
+    if (!pvfb->contentOpen) {
+        memset(pvfb->contentFrom, 0, sizeof(pvfb->contentFrom));
+        memset(pvfb->contentBefore, 0, sizeof(pvfb->contentBefore));
     }
 }
 
@@ -3401,7 +3421,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     if (pvfb->frameDiag)
         pvfb->xAccessesOpened++;    // P11-C3-D1: for each composite's (lorieCompositeTimed)
     if (pvfb->contentDiag && priv)
-        lorieContentAccess(pPix, priv, index, FALSE);   // P11-C3-D0
+        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_OPEN);      // P11-C3-D0
     // P11-C2: the root's buffer not before the copy into it the GPU was asked for settled
     if (pvfb->rootCopy.seq && priv && priv->buffer == pvfb->rootCopy.to)
         lorieRootCopyWait(FALSE);
@@ -3462,6 +3482,8 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
                     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
                 }
             }
+            if (pvfb->contentDiag)
+                lorieContentAccess(pPix, priv, index, LORIE_CONTENT_FAILED);    // P11-C3-D0: as if never opened
             return FALSE;
         }
         priv->wasLocked = FALSE;
@@ -3478,7 +3500,7 @@ void lorieFinishAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
 
     if (pvfb->contentDiag && priv)
-        lorieContentAccess(pPix, priv, index, TRUE);    // P11-C3-D0
+        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_DONE);      // P11-C3-D0
 
     // PER_ACCESS: the CPU lock goes before the shared one, so the renderer can never take the shared lock
     // and use the AHB while the X server still has it CPU-locked. 3c98ffa's order is kept otherwise.

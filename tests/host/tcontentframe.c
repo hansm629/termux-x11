@@ -11,7 +11,10 @@
  *   older content never over a newer one. Numbers past their wrap. A publish with nothing new changes nothing. Frames
  *   with new content 22 ms apart, then 101 ms apart (asked for in the first half: pending), then 99 ms apart (asked for
  *   late: client): their intervals, the longest, the slowest content with its stages. Clients: named once, counted
- *   apart, a ninth taking the least-used slot, a reused index with another client a new slot. With
+ *   apart, a ninth taking the least-used slot, a reused index with another client a new slot. An access whose
+ *   PrepareAccess failed (EXA finishes none): as if never opened - its source carried nowhere, its index not left open,
+ *   what the index carried before kept, the next composite clean; a failed destination carries nothing; nested
+ *   accesses by their index (source and mask: the newer); two sources one after the other at one index: the newer. With
  *   TERMUX_X11_EXA_COMPOSITE_OPT=1 (P11-C3-D1-A: a copy's damage reported once it is done) no read is stale: the
  *   compositor is told of the copy only once it is there - a read while it is queued sees what it was told of.
  */
@@ -81,8 +84,8 @@ static struct {
     Bool contentDiag;
     Bool exaCompositeOpt;           /* P11-C3-D1-A: the copies' damage once they are done */
     uint32_t contentSeq, contentGen, contentPublishedSeq;
-    int contentOpen;
-    struct lorie_content_stamp contentIn;
+    uint32_t contentOpen;
+    struct lorie_content_stamp contentFrom[EXA_NUM_PREPARE_INDICES], contentBefore[EXA_NUM_PREPARE_INDICES];
     struct {
         const void *client;
         int index;
@@ -118,22 +121,23 @@ static void world(void) {
     fakePvfb.contentDiag = TRUE;
     st.backend.contentDiag = 1;
     fakePvfb.contentOpen = 0;
-    fakePvfb.contentIn.seq = 0;
+    memset(fakePvfb.contentFrom, 0, sizeof fakePvfb.contentFrom);
+    memset(fakePvfb.contentBefore, 0, sizeof fakePvfb.contentBefore);
     memset(&vkContentLast, 0, sizeof(vkContentLast));
 }
 /* EXA's order: a composite opens its destination, then its source; a copy its source, then its destination; both
  * finish the source first (loriePrepareAccess, lorieFinishAccess call these, with the option on) */
 static void composite(int src, int dst) {
-    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, FALSE);
-    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, FALSE);
-    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, TRUE);
-    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, TRUE);
+    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
 }
 static void copyArea(int src, int dst) {
-    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, FALSE);
-    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, FALSE);
-    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, TRUE);
-    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, TRUE);
+    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+    lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
 }
 /* a frame presented at `fakeNow`: as rendererVkRedraw takes the content under the lock and counts it once presented */
 static void frame(void) {
@@ -210,10 +214,10 @@ int main(void) {
           "copy done: stamp %u at %llu, wait %llu", privs[WINDOW].content.seq, (unsigned long long) privs[WINDOW].content.copyUs,
           (unsigned long long) d->contentCopyToComplete.sumUs);
     /* a read of the window alone, then a terminal drawn: nothing carried into it */
-    lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, FALSE);
-    lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, TRUE);
-    lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_DEST, FALSE);
-    lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_DEST, TRUE);
+    lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+    lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+    lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
     CHECK(!privs[TERMINAL].content.seq && fakePvfb.contentOpen == 0, "a source read alone carried into a later destination");
     curClient = &xfwm;
     fakeNow = 4000;
@@ -337,6 +341,68 @@ int main(void) {
     n = d->contentRequests;
     lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
     CHECK(d->contentRequests == n + 1, "a presentation with no current client not counted");
+
+    /* a failed opening (loriePrepareAccess returning FALSE: EXA finishes no such access): as if never opened - its source
+     * carried nowhere, its index not left open, what that index carried before kept; nested accesses each by their
+     * index, the newest of a composite's source and mask carried; a failed destination carries nothing */
+    {
+        struct lorie_content_stamp older = { 30, 100, 200, 300 }, newer = { 31, 110, 210, 310 }, newest = { 32, 120, 220, 320 };
+        world();
+        privs[WINDOW].content = newer;
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_FAILED);
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
+        CHECK(!privs[COMPOSITOR].content.seq && !fakePvfb.contentOpen, "a failed source carried (%u) or left open (%#x)",
+              privs[COMPOSITOR].content.seq, fakePvfb.contentOpen);
+        composite(TERMINAL, ROOT);
+        CHECK(!privs[ROOT].content.seq && !fakePvfb.contentOpen, "after a failed source, the next composite carried %u",
+              privs[ROOT].content.seq);
+
+        privs[TERMINAL].content = older;
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_FAILED);
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
+        CHECK(privs[COMPOSITOR].content.seq == older.seq && !fakePvfb.contentOpen, "a failed source after another at its index: "
+              "carried %u (want %u, the one before)", privs[COMPOSITOR].content.seq, older.seq);
+
+        world();
+        privs[WINDOW].content = newer, privs[TERMINAL].content = older;
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
+        CHECK(privs[COMPOSITOR].content.seq == newer.seq, "two sources one after the other at one index: carried %u (want the "
+              "newer %u)", privs[COMPOSITOR].content.seq, newer.seq);
+
+        world();
+        privs[TERMINAL].content = newer, privs[WINDOW].content = newest;
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_MASK, LORIE_CONTENT_OPEN);
+        CHECK(fakePvfb.contentOpen == (1u << EXA_PREPARE_DEST | 1u << EXA_PREPARE_SRC | 1u << EXA_PREPARE_MASK),
+              "nested: open %#x", fakePvfb.contentOpen);
+        lorieContentAccess(&pix[TERMINAL], &privs[TERMINAL], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_MASK, LORIE_CONTENT_DONE);
+        lorieContentAccess(&pix[COMPOSITOR], &privs[COMPOSITOR], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
+        CHECK(privs[COMPOSITOR].content.seq == newest.seq && !fakePvfb.contentOpen, "nested: carried %u (want the mask's %u)",
+              privs[COMPOSITOR].content.seq, newest.seq);
+
+        world();
+        privs[WINDOW].content = newer;
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[ROOT], &privs[ROOT], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
+        lorieContentAccess(&pix[ROOT], &privs[ROOT], EXA_PREPARE_DEST, LORIE_CONTENT_FAILED);
+        lorieContentAccess(&pix[WINDOW], &privs[WINDOW], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
+        CHECK(!privs[ROOT].content.seq && !fakePvfb.contentOpen && !fakePvfb.contentFrom[EXA_PREPARE_SRC].seq,
+              "a failed destination: carried %u, open %#x, kept %u", privs[ROOT].content.seq, fakePvfb.contentOpen,
+              fakePvfb.contentFrom[EXA_PREPARE_SRC].seq);
+    }
 
     /* P11-C3-D1-A: the copy's damage reported once it is done - a read while it is queued sees what the compositor was
      * told of, not stale */

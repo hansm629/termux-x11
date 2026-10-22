@@ -132,11 +132,11 @@ CONTROLS = [
                     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
                 }
             }
-            return FALSE;""",
+            if (pvfb->contentDiag)""",
      """                } else {
                 }
             }
-            return FALSE;""",
+            if (pvfb->contentDiag)""",
      "townership"),
     ("PER_ACCESS CPU accesses not counted", "InitOutput.c",
      """        if (perAccessAhb)
@@ -1655,13 +1655,9 @@ CONTROLS += [
 # P11-C3-D0: client content from its presentation to the screen (TERMUX_X11_CONTENT_FRAME_DIAG)
 CONTROLS += [
     ("content: what the sources carry kept past the accesses", "InitOutput.c",
-     """    if (--pvfb->contentOpen <= 0) {
-        pvfb->contentOpen = 0;
-        pvfb->contentIn.seq = 0;
-    }""",
-     """    if (--pvfb->contentOpen <= 0) {
-        pvfb->contentOpen = 0;
-    }""",
+     """    if (!pvfb->contentOpen) {
+        memset(pvfb->contentFrom, 0, sizeof(pvfb->contentFrom));""",
+     """    if (!pvfb->contentOpen) {""",
      "tcontentframe"),
     ("content: an older content stamped over a newer one", "InitOutput.c",
      """    if (!priv || !c->seq || (priv->content.seq && !lorieContentNewer(c->seq, priv->content.seq)))
@@ -1713,6 +1709,30 @@ CONTROLS += [
      """+        lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, FALSE);""",
      """+        (void) gpuCopyDst;""",
      "twiring"),
+]
+
+# P11-C3-D0 review: a failed PrepareAccess undone for the content (EXA calls no FinishAccess for it)
+CONTROLS += [
+    ("content: a failed access left open", "InitOutput.c",
+     """            if (pvfb->contentDiag)
+                lorieContentAccess(pPix, priv, index, LORIE_CONTENT_FAILED);    // P11-C3-D0: as if never opened""",
+     """            if (pvfb->contentDiag)
+                (void) 0;""",
+     "townership"),
+    ("content: a failed source still carried", "InitOutput.c",
+     """    if (how == LORIE_CONTENT_FAILED)
+        pvfb->contentFrom[index] = pvfb->contentBefore[index];
+    else if (dest) {""",
+     """    if (how == LORIE_CONTENT_FAILED)
+        (void) 0;
+    else if (dest) {""",
+     "tcontentframe"),
+    ("content: a source's content dropped by the next opening at its index", "InitOutput.c",
+     """        if (!dest && priv->content.seq &&
+            (!pvfb->contentFrom[index].seq || lorieContentNewer(priv->content.seq, pvfb->contentFrom[index].seq)))""",
+     """        pvfb->contentFrom[index].seq = 0;
+        if (!dest && priv->content.seq)""",
+     "tcontentframe"),
 ]
 
 # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG)

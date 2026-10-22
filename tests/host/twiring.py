@@ -272,9 +272,14 @@ for what, first, then in (
     i, j = xp.find(first), xp.find(then)
     check(i >= 0 and j > i and j - i < 400, "patches/xserver.patch: the content hook for %s not where it happens" % what)
 prep = func(I, "Bool loriePrepareAccess(PixmapPtr pPix, int index) {")
-check("    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, FALSE);" in prep and
-      "    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, TRUE);" in func(I, "void lorieFinishAccess(PixmapPtr pPix, int index) {"),
-      "the accesses do not carry content only with the option on")
+check("    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_OPEN);" in prep and
+      "    if (pvfb->contentDiag && priv)\n        lorieContentAccess(pPix, priv, index, LORIE_CONTENT_DONE);" in
+      func(I, "void lorieFinishAccess(PixmapPtr pPix, int index) {"), "the accesses do not carry content only with the option on")
+# ... and an access whose PrepareAccess fails (EXA calls no FinishAccess for it: ExaDoPrepareAccess) is undone before it
+# returns, its lock and reservation let go first
+in_order("a failed access undone for the content", prep, 'Failed to lock buffer, err %d',
+         "lorie_mutex_unlock(&pvfb->state->lock", "lorieContentAccess(pPix, priv, index, LORIE_CONTENT_FAILED);", "return FALSE;")
+check(prep.count("return FALSE;") == 1, "loriePrepareAccess fails other than where the content is undone")
 in_order("a stale read looked for under the lock, before the frame's wait", prep, "lorie_mutex_lock(&pvfb->state->lock",
          "lorieContentStaleRead(priv, index);", "lorieGpuWaitIdle(")
 in_order("published where the damage is taken up", xredraw, "if (rootDouble && (nonEmpty || pvfb->rootTwinStale)) {", "lorieRootSwap(priv)",
