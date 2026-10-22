@@ -1815,6 +1815,56 @@ CONTROLS += [
      "twiring"),
 ]
 
+# P11-C3-D2: the root copy submitted ahead settled as soon as it may be (TERMUX_X11_ROOT_COPY_SCHED_OPT)
+CONTROLS += [
+    ("root copy sched: settled early with the option off", "renderer.c",
+     """    if (!vkAux.pending || !state->backend.rootCopySchedOpt)
+        return;
+    xWaiting""",
+     """    if (!vkAux.pending)
+        return;
+    xWaiting""",
+     "tpresentcopy"),
+    ("root copy sched: a fence not signalled taken as signalled", "renderer.c",
+     """        if (status == VK_NOT_READY)
+            return;""",
+     """        if (0)
+            return;""",
+     "tpresentcopy"),
+    ("root copy sched: settled without its fence waited for", "renderer.c",
+     """    rendererVkAuxFinish();      // any other answer (the device lost): its fence's wait says so, and Vulkan fails""",
+     """    vkAux.pending = false, rendererRootCopySettle(vkAux.work.seq, false);""",
+     "tpresentcopy"),
+    ("root copy sched: the X server's waiting not looked at", "renderer.c",
+     """    xWaiting = __atomic_load_n(&state->rootCopy.waiting, __ATOMIC_ACQUIRE) == vkAux.work.seq;""",
+     """    xWaiting = false;""",
+     "tpresentcopy"),
+    ("root copy sched: the lock waited for while the X server holds it waiting", "renderer.c",
+     """        rendererVkAuxEarly(LORIE_ROOT_EARLY_LOCK);
+        if (!vkActive)
+            return false;""",
+     """        if (!vkActive)
+            return false;""",
+     "tpresentcopy"),
+    ("root copy sched: Vulkan failed early, the frame going on", "renderer.c",
+     """    rendererVkAuxEarly(LORIE_ROOT_EARLY_ACQUIRED);
+    if (!vkActive)
+        return;
+""",
+     """    rendererVkAuxEarly(LORIE_ROOT_EARLY_ACQUIRED);
+""",
+     "tpresentcopy"),
+    ("root copy sched: the copies alone wait for the lock as before", "renderer.c",
+     """    if (!rendererVkLock())      // P11-C3-D2: a root copy submitted ahead settled while it may hold up the X server
+        return;""",
+     """    lorie_mutex_lock(&state->lock, &state->lockingPid);""",
+     "twiring"),
+    ("root copy sched: no settle time for the root copies ahead", "renderer.c",
+     """            if (ahead)      // P11-C3-D2: from its submission to here, settled next""",
+     """            if (0)      // P11-C3-D2: from its submission to here, settled next""",
+     "tpresentcopy"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):

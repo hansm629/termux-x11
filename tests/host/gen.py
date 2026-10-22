@@ -274,7 +274,7 @@ recipes = {
         + func(R, "static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n, const struct lorie_vk_image *s,")
         # P11-C3-B2: the others' frames; a root copy ahead of the frame
         + func(R, "static void rendererVkWaitOthers(void) {")
-        + span(R, "struct rendererVkRootWork {", "static struct { struct rendererVkRootWork work; bool pending, chained; } vkAux;")
+        + span(R, "struct rendererVkRootWork {", "static struct { struct rendererVkRootWork work; bool pending, chained; } vkAux;\nstatic bool rendererVkLock(void);")
         + func(R, "static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {")
         + func(R, "static uint32_t rendererVkQueuedTimes(uint32_t readIndex, uint64_t *queued) {")
         + func(R, "static void rendererVkCountCopies(const uint64_t *queued, uint32_t n, bool frame, uint64_t startUs, uint64_t lockedUs,")
@@ -299,6 +299,9 @@ recipes = {
         + func(R, "static void rendererVkRootCopy(void) {")
         + func(R, "static void rendererVkRootCopyAhead(void) {")
         + func(R, "static void rendererVkAuxFinish(void) {")
+        + span(R, "enum { LORIE_ROOT_EARLY_ACQUIRED, LORIE_ROOT_EARLY_LOCK };", "LORIE_ROOT_EARLY_LOCK };")
+        + func(R, "static void rendererVkAuxEarly(int at) {") + macro(R, "LORIE_ROOT_EARLY_POLL_US")
+        + func(R, "static bool rendererVkLock(void) {")
         + func(R, "static void rendererVkAuxSettle(void) {")
         + func(R, "static void rendererVkAuxForget(void) {")
         + func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")

@@ -91,6 +91,10 @@ static struct {
     int earlyPresents;              /* presents made before the frame's fence was waited for (on the semaphore alone) */
     int auxCmdFail;                 /* P11-C3-B2: a second command buffer cannot be allocated */
     int submitFailAfter;            /* the n-th submission from now fails (device lost) */
+    bool fenceRunning;              /* P11-C3-D2: vkGetFenceStatus says a submitted fence is not signalled yet (the
+                                     * device still running it - this one runs what it is given at once) */
+    VkResult fenceStatusResult;     /* ... or answers this instead of what it is (VK_SUCCESS: what it is) */
+    int fenceStatusAsks;            /* vkGetFenceStatus calls made */
     int submits;                    /* submissions made */
     int violations, acquires, acquiresFromUndefined, releases, ahbLive, pools, fences, buffers, mapped;
     int flushes, invalidates, downloads, hostBarriers, cpuWrites;
@@ -977,6 +981,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL fWaitForFences(VkDevice d, uint32_t n, con
     pendingRecount();
     return VK_SUCCESS;
 }
+/* P11-C3-D2: whether a fence is signalled, without waiting - its submission ran at once, so signalled unless a test
+ * says the device still runs it; what it says leaves the fence as it is (it is waited for, and reset, as before) */
+static VKAPI_ATTR VkResult VKAPI_CALL fGetFenceStatus(VkDevice d, VkFence f) {
+    (void) d;
+    emu.fenceStatusAsks++;
+    if (!signaled(f))
+        violation("the status of a fence that is not one");
+    if (emu.fenceStatusResult != VK_SUCCESS)
+        return emu.fenceStatusResult;
+    return signaled(f) && *signaled(f) && !(emu.fenceRunning && pendingOf(f) && *pendingOf(f)) ? VK_SUCCESS : VK_NOT_READY;
+}
 static VKAPI_ATTR VkResult VKAPI_CALL fResetFences(VkDevice d, uint32_t n, const VkFence *f) {
     (void) d;
     pendingSync();
@@ -1304,7 +1319,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fGetDeviceProcAddr(VkDevice d, c
     F(DestroyImage) F(AllocateMemory) F(FreeMemory) F(BindImageMemory) F(CreateImageView) F(DestroyImageView)
     F(CreateCommandPool) F(DestroyCommandPool) F(AllocateCommandBuffers) F(ResetCommandBuffer) F(BeginCommandBuffer)
     F(EndCommandBuffer) F(CmdPipelineBarrier) F(CmdCopyImage) F(CmdCopyBufferToImage) F(CmdCopyImageToBuffer)
-    F(QueueSubmit) F(CreateFence) F(DestroyFence) F(WaitForFences) F(ResetFences) F(CreateBuffer) F(DestroyBuffer)
+    F(QueueSubmit) F(CreateFence) F(DestroyFence) F(WaitForFences) F(ResetFences) F(GetFenceStatus) F(CreateBuffer) F(DestroyBuffer)
     F(GetBufferMemoryRequirements) F(BindBufferMemory) F(MapMemory) F(UnmapMemory) F(FlushMappedMemoryRanges)
     F(InvalidateMappedMemoryRanges) F(GetImageMemoryRequirements) F(CreateSwapchainKHR) F(DestroySwapchainKHR)
     F(GetSwapchainImagesKHR) F(AcquireNextImageKHR) F(QueuePresentKHR) F(CreateRenderPass) F(DestroyRenderPass)

@@ -249,15 +249,33 @@ static void lorie_mutex_lock(volatile int *m, volatile int *pid) {
 }
 /* the shared lock if no one holds it (lorieGpuCopySettle): a case makes a renderer process hold it (lockHolder) */
 static pid_t lockHolder;
+/* P11-C3-D2: run as a try finds the lock held - and, past 200 tries, the lock let go (a case that never settles what it
+ * waits for ends instead of hanging) */
+static void (*atTryBusy)(void);
+static int triesBusy;
 static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
-    if (lockHolder)
+    if (lockHolder && ++triesBusy > 200)
+        lockHolder = 0;
+    if (lockHolder) {
+        if (atTryBusy)
+            atTryBusy();
         return false;
+    }
     (*m)++;
     *pid = 1;
     return true;
 }
 #include "settleconsts_src.inc"
 #include "presentcopy_src.inc"
+
+/* P11-C3-D2: what the X server does meanwhile - whether the root copy was settled as the renderer took the lock (-1: it
+ * did not take it); the X server beginning to wait for it (as the renderer acquires its image; holding the lock, as the
+ * renderer tries for it); the device finishing it as the renderer tries for the lock */
+static int rootDoneLocked = -1;
+static void rootDoneAtLock(void) { rootDoneLocked = state->rootCopy.done == state->rootCopy.seq; }
+static void xWaitsForRoot(void) { state->rootCopy.waiting = state->rootCopy.seq; }
+static void deviceFinishes(void) { emu.fenceRunning = false; }
+static bool loseAtFence;        /* the device lost as the renderer next waits for a submission's fence (not an image's) */
 
 /* the moment the renderer waits for a frame's fence: the device runs the frame */
 static struct { int waits; bool lockHeld, otherOver; uint32_t busy, count; uint64_t ids[LORIE_GPU_IN_FLIGHT_MAX]; int presents;
@@ -274,6 +292,10 @@ static uint32_t stageAtFence;   /* P11-C3-C: the renderer's stage as it waits fo
 static void lookAtFence(VkFence fence) {
     if (fence != vkr.frameFence)
         return;             /* a swapchain image's */
+    if (loseAtFence) {
+        loseAtFence = false;
+        emu.fenceResult = emu.idleResult = VK_ERROR_DEVICE_LOST;
+    }
     stageAtFence = state->progress.rStage;
     if (fenceLog.n < 8) {
         fenceLog.fence[fenceLog.n] = fence;
@@ -1954,6 +1976,159 @@ int main(void) {
         lorieGpuCopyAck(&bgraPix, db1);
         st.cpuAccess.waiter = 0;
         st.gpuInFlight.busy = 0;
+
+        /* P11-C3-D2, TERMUX_X11_ROOT_COPY_SCHED_OPT=1: the root copy submitted ahead settled as soon as it may be. Its
+         * fence signalled once the frame's image is acquired: settled then - its fence waited for first - before the X
+         * server's lock is taken and the frame submitted; counted; the frame as before. Not signalled then (the device
+         * still running it): after the frame's submission, as without the option. The X server found waiting for it
+         * once the image is acquired (the frame's start found it not waiting): settled then, its fence not asked about.
+         * The X server holding the lock as it waits for it (InitOutput.c lorieRootCopyWait's `held`): settled while the
+         * frame tries for the lock - which would otherwise never come - and the frame made once it is free; its fence
+         * found signalled while the frame tries: likewise. The option off: none of that, the fence never asked about. Its
+         * fence lost: not copied, Vulkan given up, the frame neither locked nor submitted. */
+        st.backend.rootCopySchedOpt = 1;
+        {
+            uint32_t acquired0 = dg->rootEarlyAcquired, lockEarly0 = dg->rootEarlyLock, xEarly0 = dg->rootEarlyXWaiting;
+            uint32_t xAhead0 = dg->rootAheadXWaiting;
+            int asks0;
+            struct histMark settle0 = mark(&dg->rootAheadSettle);
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            presented = dg->vkFramesPresented;
+            rendererVkRootCopyAhead();
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            atLock = rootDoneAtLock;
+            rootDoneLocked = -1;
+            rendererVkRedraw(&waiting);
+            atLock = NULL;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyAcquired == acquired0 + 1 && rootDoneLocked == 1 && fenceLog.n == 2 && fenceLog.submits[0] == submits &&
+                  !fenceLog.rootDone[0] && st.rootCopy.done == rootSeq && st.rootCopy.failed != rootSeq && !vkAux.pending &&
+                  !vkAux.chained && dg->vkFramesPresented == presented + 1 && emu.violations == 0 && vkFailures == fails0 &&
+                  newSamples(&dg->rootAheadSettle, settle0) == 1,
+                  "D2 signalled once acquired: counted %u, done at the lock %d, %d fences, the root copy's before the frame's "
+                  "submission %d, settled after its wait %d, presented %u, %u settle samples", dg->rootEarlyAcquired - acquired0,
+                  rootDoneLocked, fenceLog.n, fenceLog.n > 0 && fenceLog.submits[0] == submits, fenceLog.n > 0 && !fenceLog.rootDone[0],
+                  dg->vkFramesPresented - presented, (unsigned) newSamples(&dg->rootAheadSettle, settle0));
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            rendererVkRootCopyAhead();
+            emu.fenceRunning = true;
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            rendererVkRedraw(&waiting);
+            emu.fenceRunning = false;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyAcquired == acquired0 + 1 && dg->rootEarlyLock == lockEarly0 && fenceLog.n == 2 &&
+                  fenceLog.submits[0] == submits + 1 && st.rootCopy.done == rootSeq && emu.violations == 0 && vkFailures == fails0,
+                  "D2 still running: settled early %u/%u, %d fences, the root copy's after the frame's submission %d",
+                  dg->rootEarlyAcquired - acquired0, dg->rootEarlyLock - lockEarly0, fenceLog.n,
+                  fenceLog.n > 0 && fenceLog.submits[0] == submits + 1);
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            rendererVkRootCopyAhead();
+            emu.fenceRunning = true;
+            emuOnAcquire = xWaitsForRoot;
+            asks0 = emu.fenceStatusAsks;
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            rendererVkRedraw(&waiting);
+            emuOnAcquire = NULL;
+            emu.fenceRunning = false;
+            st.rootCopy.waiting = 0;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyXWaiting == xEarly0 + 1 && dg->rootAheadXWaiting == xAhead0 && emu.fenceStatusAsks == asks0 &&
+                  fenceLog.n == 2 && fenceLog.submits[0] == submits && st.rootCopy.done == rootSeq && emu.violations == 0 &&
+                  vkFailures == fails0, "D2 X waiting once acquired: counted %u (at the start %u), %d fence asks, the root copy's "
+                  "before the frame's submission %d", dg->rootEarlyXWaiting - xEarly0, dg->rootAheadXWaiting - xAhead0,
+                  emu.fenceStatusAsks - asks0, fenceLog.n > 0 && fenceLog.submits[0] == submits);
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            presented = dg->vkFramesPresented;
+            rendererVkRootCopyAhead();
+            emu.fenceRunning = true;
+            lockHolder = 1, triesBusy = 0;
+            atTryBusy = xWaitsForRoot;          /* holding the lock (lockHolder) */
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            rendererVkRedraw(&waiting);
+            atTryBusy = NULL;
+            emu.fenceRunning = false;
+            lockHolder = 0;
+            st.rootCopy.waiting = 0;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyXWaiting == xEarly0 + 2 && triesBusy == 1 && fenceLog.n == 2 && fenceLog.submits[0] == submits &&
+                  st.rootCopy.done == rootSeq && dg->vkFramesPresented == presented + 1 && emu.violations == 0 && vkFailures == fails0,
+                  "D2 X waiting, holding the lock: counted %u, %d tries, the root copy's before the frame's submission %d, done %d, "
+                  "presented %u", dg->rootEarlyXWaiting - xEarly0, triesBusy, fenceLog.n > 0 && fenceLog.submits[0] == submits,
+                  st.rootCopy.done == rootSeq, dg->vkFramesPresented - presented);
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            rendererVkRootCopyAhead();
+            emu.fenceRunning = true;
+            lockHolder = 1, triesBusy = 0;
+            atTryBusy = deviceFinishes;
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            rendererVkRedraw(&waiting);
+            atTryBusy = NULL;
+            emu.fenceRunning = false;
+            lockHolder = 0;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyLock == lockEarly0 + 1 && triesBusy == 1 && fenceLog.n == 2 && fenceLog.submits[0] == submits &&
+                  st.rootCopy.done == rootSeq && emu.violations == 0 && vkFailures == fails0, "D2 signalled as the frame tries for "
+                  "the lock: counted %u, %d tries, the root copy's before the frame's submission %d", dg->rootEarlyLock - lockEarly0,
+                  triesBusy, fenceLog.n > 0 && fenceLog.submits[0] == submits);
+
+            st.backend.rootCopySchedOpt = 0;
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            rendererVkRootCopyAhead();
+            emuOnAcquire = xWaitsForRoot;
+            asks0 = emu.fenceStatusAsks;
+            submits = (uint32_t) emu.submits;
+            fenceLog.n = 0;
+            rendererVkRedraw(&waiting);
+            emuOnAcquire = NULL;
+            st.rootCopy.waiting = 0;
+            st.gpuInFlight.busy = 0;
+            CHECK(dg->rootEarlyAcquired == acquired0 + 1 && dg->rootEarlyLock == lockEarly0 + 1 && dg->rootEarlyXWaiting == xEarly0 + 2 &&
+                  emu.fenceStatusAsks == asks0 && fenceLog.n == 2 && fenceLog.submits[0] == submits + 1 && st.rootCopy.done == rootSeq &&
+                  emu.violations == 0 && vkFailures == fails0, "D2 off: settled early, or the fence asked about (%d), or the root "
+                  "copy's not after the frame's submission (%d)", emu.fenceStatusAsks - asks0,
+                  fenceLog.n > 0 && fenceLog.submits[0] == submits + 1);
+            st.backend.rootCopySchedOpt = 1;
+
+            rootAsk(ra, rb, one, 1);
+            st.drawRequested = 1;
+            rendererVkRootCopyAhead();
+            emu.fenceStatusResult = VK_ERROR_DEVICE_LOST;
+            loseAtFence = true;
+            failEndsVulkan = true;
+            submits = (uint32_t) emu.submits;
+            rendererVkRedraw(&waiting);
+            emu.fenceStatusResult = emu.fenceResult = emu.idleResult = VK_SUCCESS;
+            CHECK(st.rootCopy.done == rootSeq && st.rootCopy.failed == rootSeq && vkFailures == fails0 + 1 && !vkActive && st.lock == 0 &&
+                  emu.submits == submits && !vkAux.pending, "D2 fence lost: failed %d, %d failures, active %d, lock %d, %ld submissions",
+                  st.rootCopy.failed == rootSeq, vkFailures - fails0, vkActive, st.lock, (long) (emu.submits - submits));
+            failEndsVulkan = false;
+            vkActive = true;
+            st.surfaceAvailable = 1;
+            vkFailures = fails0;
+            vkAux.chained = false;
+            vkr.chainWait = false;
+            semaphoreSignalled(vkr.chain, 0);
+            emu.fencePending = false;
+            st.gpuInFlight.busy = 0;
+            st.diag.lastFallbackClass = st.diag.lastFallbackReason = 0;
+        }
+        st.backend.rootCopySchedOpt = 0;
 
         /* the second submission's objects not made: the root copy as before, counted */
         {

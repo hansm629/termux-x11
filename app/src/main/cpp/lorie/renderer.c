@@ -2188,6 +2188,7 @@ struct rendererVkRootWork {
  * empty one (rendererVkAuxSettle).
  */
 static struct { struct rendererVkRootWork work; bool pending, chained; } vkAux;
+static bool rendererVkLock(void);
 
 static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
     uint32_t i = state->gpuCopyQueue.readIndex, end = __atomic_load_n(&state->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
@@ -2522,7 +2523,8 @@ static void rendererVkApplyPendingGpuCopies(void) {
     if (!state || state->gpuCopyQueue.readIndex == state->gpuCopyQueue.writeIndex)
         return;
     startUs = lorieMonotonicUs();
-    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    if (!rendererVkLock())      // P11-C3-D2: a root copy submitted ahead settled while it may hold up the X server
+        return;
     lockedUs = lorieMonotonicUs();
     if (!rendererVkOwnedLocked()) {
         lorie_mutex_unlock(&state->lock, &state->lockingPid);
@@ -2754,6 +2756,8 @@ static void rendererVkRootCopyEnd(struct rendererVkRootWork *w, bool ahead) {
             lorieHistAdd(&dg->rootTake, take);
             lorieHistAdd(&dg->rootRecord, w->submittedUs - w->takenUs);
             lorieHistAdd(&dg->vkFenceRoot, fenceUs);
+            if (ahead)      // P11-C3-D2: from its submission to here, settled next
+                lorieHistAdd(&dg->rootAheadSettle, now > w->submittedUs ? now - w->submittedUs : 0);
             if (total > dg->rootWorstUs) {
                 dg->rootWorstUs = (uint32_t) total;
                 dg->rootWorstTakeUs = (uint32_t) take;
@@ -2808,6 +2812,58 @@ static void rendererVkAuxFinish(void) {
         return;
     vkAux.pending = false;
     rendererVkRootCopyEnd(&vkAux.work, true);
+}
+
+/*
+ * P11-C3-D2 (TERMUX_X11_ROOT_COPY_SCHED_OPT=1): the root copy submitted ahead settled as soon as it may be, at the steps
+ * of the frame that would otherwise keep it unsettled until the frame is submitted (`at`: its image acquired, the X
+ * server's lock not free) - should the X server wait for it already, or its fence be signalled by now (asked without
+ * waiting: vkGetFenceStatus). Settled as rendererVkAuxFinish settles it: its fence waited for first (at once, then).
+ */
+enum { LORIE_ROOT_EARLY_ACQUIRED, LORIE_ROOT_EARLY_LOCK };
+static void rendererVkAuxEarly(int at) {
+    VkResult status = VK_SUCCESS;
+    bool xWaiting;
+
+    if (!vkAux.pending || !state->backend.rootCopySchedOpt)
+        return;
+    xWaiting = __atomic_load_n(&state->rootCopy.waiting, __ATOMIC_ACQUIRE) == vkAux.work.seq;
+    if (!xWaiting) {
+        lorieVkSlotSwap(&vkr);
+        status = vk.GetFenceStatus(vk.device, vkr.frameFence);
+        lorieVkSlotSwap(&vkr);
+        if (status == VK_NOT_READY)
+            return;
+    }
+    if (xWaiting)
+        LORIE_DIAG_ADD(state, rootEarlyXWaiting, 1);
+    else if (status == VK_SUCCESS && at == LORIE_ROOT_EARLY_ACQUIRED)
+        LORIE_DIAG_ADD(state, rootEarlyAcquired, 1);
+    else if (status == VK_SUCCESS)
+        LORIE_DIAG_ADD(state, rootEarlyLock, 1);
+    rendererVkAuxFinish();      // any other answer (the device lost): its fence's wait says so, and Vulkan fails
+}
+
+/*
+ * ... and the X server's lock taken while one is pending: tried, and between tries (LORIE_ROOT_EARLY_POLL_US apart) the
+ * root copy settled should the X server wait for it, or its fence be signalled - the X server may hold the lock while it
+ * waits for that copy (an EXA access open: InitOutput.c lorieRootCopyWait's `held`), so that the frame, waiting for the
+ * lock first, would never settle it. Settled (or none pending, or the option off), the lock taken as always. False:
+ * Vulkan failed meanwhile, the lock not taken.
+ */
+#define LORIE_ROOT_EARLY_POLL_US 500
+static bool rendererVkLock(void) {
+    while (vkAux.pending && state->backend.rootCopySchedOpt) {
+        if (lorie_mutex_trylock(&state->lock, &state->lockingPid))
+            return true;
+        rendererVkAuxEarly(LORIE_ROOT_EARLY_LOCK);
+        if (!vkActive)
+            return false;
+        if (vkAux.pending)
+            usleep(LORIE_ROOT_EARLY_POLL_US);
+    }
+    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    return true;
 }
 
 // P11-C3-B2: ... and, should no frame have waited for its chain semaphore, an empty submission does (lorieVkChainConsume).
@@ -2965,11 +3021,16 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     }
     if (status == LORIE_VK_FRAME_FATAL)
         return rendererVkFail();
+    // P11-C3-D2: the root copy submitted ahead settled now, should the X server wait for it or its fence be signalled
+    rendererVkAuxEarly(LORIE_ROOT_EARLY_ACQUIRED);
+    if (!vkActive)
+        return;
 
     // We should signal X server to not use root window while we actively copy it
     startUs = lorieMonotonicUs();
     rendererStage(LORIE_R_LOCK_WAIT);
-    lorie_mutex_lock(&state->lock, &state->lockingPid);
+    if (!rendererVkLock())
+        return;
     rendererStage(LORIE_R_FRAME);
     lockedUs = lorieMonotonicUs();
     rendererContentRead(&content);

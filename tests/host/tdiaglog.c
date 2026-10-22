@@ -320,6 +320,7 @@ int main(void) {
         lorieHistAdd(&fakeState.diag.vkFenceCopy, 700);
         lorieHistAdd(&fakeState.diag.rootTake, 400), lorieHistAdd(&fakeState.diag.rootRecord, 250);
         lorieHistAdd(&fakeState.diag.rootResume, 90), lorieHistAdd(&fakeState.diag.rootBlock, 2000);
+        lorieHistAdd(&fakeState.diag.rootAheadSettle, 2000);       /* P11-C3-D2 */
         fakeState.diag.rootWorstUs = 5000, fakeState.diag.rootWorstTakeUs = 400, fakeState.diag.rootWorstRecordUs = 250;
         fakeState.diag.rootWorstFenceUs = 4000;
         for (i = 0; i < 3; i++)
@@ -375,7 +376,8 @@ int main(void) {
             if (strstr(line, "XlorieRootCopyTiming:") && ++n[2] == 2)
                 rootOk = strstr(line, "XlorieRootCopyTiming: take_us=1/400/500/500/400/0/0 record_us=1/250/300/300/250/0/0 "
                                       "resume_us=1/90/100/100/90/0/0 x_block_us=1/2000/2000/2000/2000/0/0 worst_total_us=5000 "
-                                      "worst_take_us=400 worst_record_us=250 worst_fence_us=4000\n") != NULL;
+                                      "worst_take_us=400 worst_record_us=250 worst_fence_us=4000 "
+                                      "ahead_settle_us=1/2000/2000/2000/2000/0/0\n") != NULL;
             if (strstr(line, "XlorieRootCopyTiming:") && n[2] == 3)
                 emptyOk += strstr(line, "take_us=0 record_us=0 resume_us=0 x_block_us=0 worst_total_us=0 ") != NULL;
             if (strstr(line, "XlorieXLatency:") && ++n[3] == 2)
@@ -470,7 +472,7 @@ int main(void) {
      * the buffers waited for, given up, and the copies left for them, always. P11-C3-D1-A: XlorieCopyDamage likewise -
      * TERMUX_X11_EXA_COMPOSITE_OPT off, on, the damage put off and how it went, those still running */
     {
-        int lines = 0, offOk = 0, onOk = 0, damageLines = 0, damageOk = 0;
+        int lines = 0, offOk = 0, onOk = 0, damageLines = 0, damageOk = 0, schedLines = 0, schedOk = 0;
         snprintf(path, sizeof path, "%s/diag-schedule.log", out ? out : ".");
         logf = fopen(path, "w");
         lorieLogRendererDiag();
@@ -483,15 +485,26 @@ int main(void) {
         fakeState.diag.buffersAwaited += 4, fakeState.diag.bufferAwaitUs += 123456, fakeState.diag.buffersGivenUp += 1;
         fakeState.diag.copiesLeftForBuffers += 2;      /* P11-C3-C */
         fakePvfb.exaCompositeOpt = TRUE;                /* P11-C3-D1-A */
+        fakeState.backend.rootCopySchedOpt = 1;         /* P11-C3-D2 */
+        fakeState.diag.rootEarlyAcquired += 420, fakeState.diag.rootEarlyLock += 3, fakeState.diag.rootEarlyXWaiting += 17;
         fakeState.diag.copyDamageDeferred += 1000, fakeState.diag.copyDamageDone += 990, fakeState.diag.copyDamageEarly += 4;
         fakeState.diag.copyDamageDropped += 3;
         lorieLogRendererDiag();
         fakePvfb.exaLockOpt = FALSE;
         fakePvfb.exaCompositeOpt = FALSE;
+        fakeState.backend.rootCopySchedOpt = 0;
         fakeState.backend.vkScheduleOpt = 0;
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
+            if (strstr(line, "XlorieRootCopySched:")) {
+                schedLines++;
+                schedOk += schedLines == 1 && strstr(line, "XlorieRootCopySched: root_copy_sched_opt=off vk_schedule_opt=off "
+                                                           "settled_acquired=0(+0) settled_lock_wait=0(+0) settled_x_waiting=0(+0)\n") != NULL;
+                schedOk += schedLines == 2 && strstr(line, "XlorieRootCopySched: root_copy_sched_opt=on vk_schedule_opt=on "
+                                                           "settled_acquired=420(+420) settled_lock_wait=3(+3) "
+                                                           "settled_x_waiting=17(+17)\n") != NULL;
+            }
             if (strstr(line, "XlorieCopyDamage:")) {
                 damageLines++;
                 damageOk += damageLines == 1 && strstr(line, "XlorieCopyDamage: exa_composite_opt=off deferred=0(+0) done=0(+0) "
@@ -517,6 +530,7 @@ int main(void) {
         CHECK(lines == 2 && offOk && onOk, "schedule log: %d lines (want 2), off %s, on %s", lines, offOk ? "right" : "wrong",
               onOk ? "right" : "wrong");
         CHECK(damageLines == 2 && damageOk == 2, "copy damage: %d lines (want 2), %d right", damageLines, damageOk);
+        CHECK(schedLines == 2 && schedOk == 2, "root copy scheduling: %d lines (want 2), %d right", schedLines, schedOk);
     }
 
     /* P11-C3-D0: the content lines, only with TERMUX_X11_CONTENT_FRAME_DIAG - the counts as they moved, each wait (its
@@ -609,7 +623,7 @@ int main(void) {
             &fakeState.diag.vkFenceCopy, &fakeState.diag.rootTake, &fakeState.diag.rootRecord, &fakeState.diag.rootResume,
             &fakeState.diag.rootBlock, &fakeState.diag.xRequest, &fakeState.diag.xAccess, &fakeState.diag.xAccessLock,
             &fakeState.diag.xAccessGpu, &fakeState.diag.xTickDelay, &fakeState.diag.xTickWork, &fakeState.diag.xAccessHold,
-            &fakeState.diag.vkAskWait };
+            &fakeState.diag.vkAskWait, &fakeState.diag.rootAheadSettle };
         volatile struct lorie_latency *parts[] = { &fakeState.diag.copyQueue, &fakeState.diag.copyLock, &fakeState.diag.copyInflightWait,
                                                    &fakeState.diag.copyRecord, &fakeState.diag.copyGpuWait, &fakeState.diag.copyFrameGpuWait,
                                                    &fakeState.diag.copyTotal, &fakeState.diag.copyAck, &fakeState.diag.xVsyncToCallback,
@@ -679,6 +693,8 @@ int main(void) {
         fakeState.diag.rootChainConsumed += 999999999, fakeState.diag.rootAheadUnavailable += 999999999;
         fakeState.diag.copyDamageDeferred += 4294967295u, fakeState.diag.copyDamageDone += 999999999;      /* P11-C3-D1-A */
         fakeState.diag.copyDamageEarly += 999999999, fakeState.diag.copyDamageDropped += 999999999;
+        fakeState.diag.rootEarlyAcquired += 999999999, fakeState.diag.rootEarlyLock += 999999999;      /* P11-C3-D2 */
+        fakeState.diag.rootEarlyXWaiting += 999999999, fakeState.backend.rootCopySchedOpt = 1;
         fakePvfb.exaCompositeOpt = TRUE;
         /* P11-C3-D1: every composite class at its widest - the longest names, every count and time at its type's
          * widest (the sums at 2^64 - 1: they do not wrap in a period, so never wider) - and the slowest */
@@ -691,6 +707,7 @@ int main(void) {
         lorieLogRendererDiag();
         fakePvfb.contentDiag = FALSE;
         fakePvfb.exaCompositeOpt = FALSE;
+        fakeState.backend.rootCopySchedOpt = 0;
         fclose(logf);
         for (unsigned k = 0; k < sizeof logs / sizeof *logs; k++) {
             snprintf(path, sizeof path, "%s/%s", out ? out : ".", logs[k]);

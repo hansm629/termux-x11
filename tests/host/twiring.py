@@ -101,11 +101,11 @@ in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused Clie
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
 # the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
 check("ANativeWindow_get" not in redraw, "a Vulkan frame compares the window's size with the swapchain's")
-in_order("Vulkan frame", redraw, "lorieVkAcquire(", "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()",
+in_order("Vulkan frame", redraw, "lorieVkAcquire(", "rendererVkLock()", "rendererVkOwnedLocked()",
          "state->rootWindowTextureID != desc->id", "rendererVkCopiesLocked(", "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock",
          "lorieVkFrameWait(", "rendererVkFrameDone();", "completedSerial", "lorieVkPresent(")
 alone = func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
-in_order("Vulkan copies alone", alone, "lorie_mutex_lock(&state->lock", "rendererVkOwnedLocked()", "rendererVkCopiesLocked(",
+in_order("Vulkan copies alone", alone, "rendererVkLock()", "rendererVkOwnedLocked()", "rendererVkCopiesLocked(",
          "lorieVkFrameQueue(", "rendererVkInFlight();", "lorie_mutex_unlock(&state->lock", "lorieVkFrameWait(",
          "rendererVkFrameDone();", "completedSerial")
 select = func(R, "static void rendererSelectBackend(void) {")
@@ -230,7 +230,7 @@ for what, body, mark in (("tick", xredraw, "struct lorieXMark tickMark __attribu
 in_order("the renderer marked asleep only as it sleeps", func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {"),
          "rendererStage(LORIE_R_SLEEP);", "rendererSleep(seen, -1);", "rendererStage(LORIE_R_PASS);")
 in_order("the Vulkan frame's stages", redraw, "rendererStage(LORIE_R_FRAME);", "rendererStage(LORIE_R_ACQUIRE);", "lorieVkAcquire(",
-         "rendererStage(LORIE_R_LOCK_WAIT);", "lorie_mutex_lock(&state->lock", "rendererStage(LORIE_R_FENCE_WAIT);", "lorieVkFrameWait(",
+         "rendererStage(LORIE_R_LOCK_WAIT);", "rendererVkLock()", "rendererStage(LORIE_R_FENCE_WAIT);", "lorieVkFrameWait(",
          "rendererStage(LORIE_R_PRESENT);", "lorieVkPresent(", "state->progress.takenSeq = askSeq;")
 
 # P11-C3-C: the frame gaps (TERMUX_X11_RENDERER_VK_FRAME_DIAG): each frame's gap classified before the frame starts'
@@ -284,7 +284,7 @@ check(xredraw.count("lorieContentPublish(") == 1 and
       "    if (nonEmpty && priv->buffer) {" in xredraw and
       xredraw.split("    if (nonEmpty && priv->buffer) {", 1)[1].split("\n    }\n", 1)[0].count("\n        lorieContentPublish(priv);") == 1,
       "the screen pixmap published at a tick for the cursor too (outside the block that takes its damage up)")
-in_order("the content taken under the lock, counted once presented", redraw, "lorie_mutex_lock(&state->lock", "rendererContentRead(&content);",
+in_order("the content taken under the lock, counted once presented", redraw, "rendererVkLock()", "rendererContentRead(&content);",
          "lorie_mutex_unlock(&state->lock", "lorieVkPresent(", "if (presented == LORIE_VK_FRAME_OK)", "rendererContentFrame(&content, lorieMonotonicUs());")
 
 # P11-C3-D1: the RENDER composites timed (TERMUX_X11_RENDERER_VK_FRAME_DIAG; texacomposite.c runs the timing) - wrapped
@@ -304,6 +304,25 @@ check('lorieScreen.exaCompositeOpt = getenv("TERMUX_X11_EXA_COMPOSITE_OPT") && !
       in init, "OsVendorInit does not read TERMUX_X11_EXA_COMPOSITE_OPT=1")
 check("    if (!pvfb->exaCompositeOpt)\n        return FALSE;" in func(I, "Bool lorieDeferCopyDamage(void) {"),
       "a copy's damage put off with TERMUX_X11_EXA_COMPOSITE_OPT off")
+
+# P11-C3-D2: TERMUX_X11_ROOT_COPY_SCHED_OPT read when the server state is made, "1" only, into the renderer's flag; the
+# frame and the copies alone take the X server's lock through rendererVkLock (which tpresentcopy.c runs) - tries while
+# a root copy submitted ahead is pending, then as always; the frame's root copy settled early once its image is
+# acquired, before the lock - and settled, early, only through rendererVkAuxFinish (its fence waited for)
+check('lorieScreen.state->backend.rootCopySchedOpt = getenv("TERMUX_X11_ROOT_COPY_SCHED_OPT") &&' in init and
+      '!strcmp(getenv("TERMUX_X11_ROOT_COPY_SCHED_OPT"), "1");' in init, "OsVendorInit does not read TERMUX_X11_ROOT_COPY_SCHED_OPT=1")
+vklock = func(R, "static bool rendererVkLock(void) {")
+in_order("the frame's lock, a root copy ahead pending", vklock, "while (vkAux.pending && state->backend.rootCopySchedOpt) {",
+         "if (lorie_mutex_trylock(&state->lock, &state->lockingPid))", "rendererVkAuxEarly(LORIE_ROOT_EARLY_LOCK);",
+         "    lorie_mutex_lock(&state->lock, &state->lockingPid);\n    return true;")
+for what, body in (("frame", redraw), ("copies alone", alone)):
+    check(body.count("rendererVkLock()") == 1 and "lorie_mutex_lock(&state->lock" not in body,
+          "the Vulkan %s takes the X server's lock other than through rendererVkLock" % what)
+in_order("the frame's root copy settled early once its image is acquired", redraw, "lorieVkAcquire(",
+         "rendererVkAuxEarly(LORIE_ROOT_EARLY_ACQUIRED);", "if (!vkActive)", "if (!rendererVkLock())")
+early = func(R, "static void rendererVkAuxEarly(int at) {")
+check("if (!vkAux.pending || !state->backend.rootCopySchedOpt)\n        return;" in early and "rendererVkAuxFinish();" in early and
+      "rendererRootCopySettle(" not in early, "a root copy ahead settled early without the option, or without its fence waited for")
 
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker

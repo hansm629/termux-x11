@@ -323,6 +323,8 @@ struct lorie_backend_control {
                                                  * renderer keeps its stage (struct lorie_progress) */
     volatile uint8_t contentDiag;               /* X: TERMUX_X11_CONTENT_FRAME_DIAG=1 - P11-C3-D0: client content from
                                                  * its request to the screen (struct lorie_content) */
+    volatile uint8_t rootCopySchedOpt;          /* X: TERMUX_X11_ROOT_COPY_SCHED_OPT=1 - P11-C3-D2: the root copy
+                                                 * submitted ahead (B2) settled as soon as it may be (renderer.c) */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };
@@ -562,6 +564,8 @@ struct lorie_renderer_diag {
      * X server had to wait for one (lorieRootCopyWait), that wait, and from the renderer settling the copy to the X
      * server going on. The period's slowest request to completion and its parts (its fence: vkFenceRoot's). */
     struct lorie_hist rootTake, rootRecord, rootResume, rootBlock;
+    /* P11-C3-D2: a root copy submitted ahead (P11-C3-B2), from its submission to its fence waited for - and so settled */
+    struct lorie_hist rootAheadSettle;
     volatile uint32_t rootWorstUs, rootWorstTakeUs, rootWorstRecordUs, rootWorstFenceUs;
     /* X: each client request's handling (Dispatch); each PER_ACCESS AHB access's hold of the shared lock (from taking
      * it in PrepareAccess to letting it go in FinishAccess), its wait for that lock and for a Vulkan frame using the
@@ -587,6 +591,10 @@ struct lorie_renderer_diag {
      * them; chain semaphores no frame waited for (an empty submission did); and root copies made the old way because
      * the second submission's objects could not be made. */
     volatile uint32_t rootAhead, rootAheadXWaiting, rootChainConsumed, rootAheadUnavailable;
+    /* P11-C3-D2 (TERMUX_X11_ROOT_COPY_SCHED_OPT=1), always counted: root copies submitted ahead settled before the
+     * frame's submission - their fence found signalled once the frame's image was acquired, or while the X server's
+     * lock was not free - and those the X server was found waiting for then. */
+    volatile uint32_t rootEarlyAcquired, rootEarlyLock, rootEarlyXWaiting;
     /* P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1), always counted: Present GPU copies whose damage was put off until
      * the copy was done (patches/xserver.patch present_damage_gpu_copy), and how each went - reported with its copy
      * done; reported before, its presentation scrapped while the copy may still run (as without the option); dropped,

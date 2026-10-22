@@ -534,6 +534,12 @@ void OsVendorInit(void) {
     // ahead of the frame, which waits for it on the device instead of the renderer waiting for its fence (renderer.c).
     lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&
                                                !strcmp(getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT"), "1");
+    // Experimental: TERMUX_X11_ROOT_COPY_SCHED_OPT=1 has the renderer settle that root copy submitted ahead as soon as it
+    // may - its fence signalled, or the X server waiting for it - at each step of the frame that would keep it
+    // unsettled until the frame is submitted, its wait for this lock too (renderer.c rendererVkAuxEarly). Only with
+    // TERMUX_X11_RENDERER_VK_SCHEDULE_OPT=1: without it the root copy is settled before the frame begins.
+    lorieScreen.state->backend.rootCopySchedOpt = getenv("TERMUX_X11_ROOT_COPY_SCHED_OPT") &&
+                                                  !strcmp(getenv("TERMUX_X11_ROOT_COPY_SCHED_OPT"), "1");
     if (lorieScreen.freezeDiag) {
         pthread_t watch;
         if (pthread_create(&watch, NULL, lorieFreezeWatch, NULL) == 0)
@@ -1457,6 +1463,11 @@ static void lorieLogRendererDiag(void) {
         pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes),
         pvfb->state->backend.vkScheduleOpt ? "on" : "off", TD(rootAhead), TD(rootAheadXWaiting), TD(rootChainConsumed),
         TD(rootAheadUnavailable), TD(buffersAwaited), TD(bufferAwaitUs), TD(buffersGivenUp), TD(copiesLeftForBuffers));
+    // P11-C3-D2: the root copies submitted ahead settled before their frame's submission, and why
+    log(INFO, "XlorieRootCopySched: root_copy_sched_opt=%s vk_schedule_opt=%s settled_acquired=%llu(+%llu) "
+              "settled_lock_wait=%llu(+%llu) settled_x_waiting=%llu(+%llu)",
+        pvfb->state->backend.rootCopySchedOpt ? "on" : "off", pvfb->state->backend.vkScheduleOpt ? "on" : "off",
+        TD(rootEarlyAcquired), TD(rootEarlyLock), TD(rootEarlyXWaiting));
     // P11-C3-D1-A: the Present GPU copies' damage put off until the copy was done, and how each went; those still running
     log(INFO, "XlorieCopyDamage: exa_composite_opt=%s deferred=%llu(+%llu) done=%llu(+%llu) early=%llu(+%llu) dropped=%llu(+%llu) "
               "pending=%u",
@@ -1595,10 +1606,10 @@ static void lorieLogRendererDiag(void) {
                   "fence_root_us=%s fence_copy_us=%s present_us=%s after_root_us=%s",
             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
         worst = __atomic_exchange_n(&live->rootWorstUs, 0, __ATOMIC_RELAXED);
-        HT(0, rootTake), HT(1, rootRecord), HT(2, rootResume), HT(3, rootBlock);
+        HT(0, rootTake), HT(1, rootRecord), HT(2, rootResume), HT(3, rootBlock), HT(4, rootAheadSettle);
         log(INFO, "XlorieRootCopyTiming: take_us=%s record_us=%s resume_us=%s x_block_us=%s worst_total_us=%u "
-                  "worst_take_us=%u worst_record_us=%u worst_fence_us=%u",
-            h[0], h[1], h[2], h[3], worst, d.rootWorstTakeUs, d.rootWorstRecordUs, d.rootWorstFenceUs);
+                  "worst_take_us=%u worst_record_us=%u worst_fence_us=%u ahead_settle_us=%s",
+            h[0], h[1], h[2], h[3], worst, d.rootWorstTakeUs, d.rootWorstRecordUs, d.rootWorstFenceUs, h[4]);
         HT(0, xRequest), HT(1, xAccess), HT(2, xAccessLock), HT(3, xAccessGpu), HT(4, xTickDelay), HT(5, xTickWork);
         HT(6, xAccessHold);
         log(INFO, "XlorieXLatency: request_us=%s access_us=%s access_lock_us=%s access_gpu_us=%s tick_delay_us=%s "
