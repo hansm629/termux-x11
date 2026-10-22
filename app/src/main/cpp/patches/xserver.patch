@@ -404,7 +404,7 @@
  
      screen_priv->re_execute(vblank);
  }
-@@ -61,12 +63,74 @@
+@@ -61,12 +63,75 @@
      return FALSE;
  }
  
@@ -456,6 +456,7 @@
 +        return;
 +    present_damage_gpu_copy_region(window, window->drawable.pScreen->GetWindowPixmap(window), vblank->pixmap, vblank->update,
 +                                   vblank->lorie_copy_dx, vblank->lorie_copy_dy);
++    lorieContentDamaged(vblank->gpu_copy_serial);       /* lorie: P11-C3-D0 */
 +    if (vblank->update) {
 +        RegionDestroy(vblank->update);
 +        vblank->update = NULL;
@@ -479,7 +480,7 @@
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +143,84 @@
+@@ -79,12 +144,86 @@
          return;
      }
  
@@ -548,6 +549,8 @@
 +         * tick: the copy is waited for either way (P10-S1), never taken as done. */
 +        vblank->gpu_copy_pending = TRUE;
 +        vblank->lorie_copy_us = lorieContentCopied(vblank->lorie_content_seq, vblank->lorie_content_us, gpuCopyDst, TRUE);
++        if (!vblank->lorie_damage_deferred)
++            lorieContentDamaged(vblank->gpu_copy_serial);       /* lorie: P11-C3-D0 - reported above */
 +        vblank->queued = TRUE;
 +        if (Success != screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id, crtc_msc + 1))
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_POLL_FIRST);
@@ -569,7 +572,7 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
-@@ -110,6 +246,7 @@
+@@ -110,6 +249,7 @@
      else
          mode = PresentCompleteModeCopy;
  
@@ -586,7 +589,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,93 @@
+@@ -90,8 +91,96 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -664,6 +667,9 @@
 +extern uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu);
 +extern void lorieContentCopyDone(uint32_t seq, uint64_t request_us, uint64_t copy_us, PixmapPtr dst);
 +extern void lorieContentComplete(uint32_t seq, CARD8 mode);
++/* ... a GPU copy's damage reported (as it is queued, or once it is done or its presentation scrapped while it may still
++ * run): the content diagnostics' stale reads tell a read the compositor was told about from one it was not */
++extern void lorieContentDamaged(uint64_t serial);
 +
 +/* lorie: P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1) - a GPU-copied presentation's damage reported once its copy is
 + * done, not as it is queued: a compositor told then reads the window's pixmap before the copy wrote it, or waits for

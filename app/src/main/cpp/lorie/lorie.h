@@ -543,8 +543,10 @@ struct lorie_renderer_diag {
     /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): client content (struct lorie_content_stamp) from its request to the
      * screen. X (InitOutput.c lorieContent*): presentations asked for, skipped (overwritten in their frame, or their GPU
      * copy cancelled), copied by the GPU (queued) or the CPU, GPU copies completed (taken up by the X server), their
-     * CompleteNotify sent (mode copy; skip apart); CPU reads of a pixmap a GPU copy into which is not complete yet
-     * (stale: the read sees the content before it); content carried by a CPU composite or copy into another pixmap
+     * CompleteNotify sent (mode copy; skip apart); CPU reads of a pixmap a GPU copy into which is still queued - not
+     * recorded by the renderer yet: the read sees the content before it - its damage already reported (stale: the
+     * compositor was told of content not there) or not yet (pending: what it was told of is there), or whose damage
+     * could not be told (unknown); content carried by a CPU composite or copy into another pixmap
      * (compositor) and into the screen pixmap (root, copies straight into it too); the screen pixmap published with new
      * content. Its waits: the request to its copy queued or made, queued to completed, completed to the screen pixmap,
      * the screen pixmap to its publishing. Renderer (renderer.c rendererContentFrame): Vulkan screen frames presented
@@ -557,6 +559,7 @@ struct lorie_renderer_diag {
                       contentPublishToScreen, contentTotal, contentInterval;
     volatile uint32_t contentRequests, contentSkipped, contentGpuCopies, contentCpuCopies, contentCopiesDone, contentCompletes,
                       contentCompletesSkip, contentStaleReads, contentCompositorUpdates, contentRootUpdates, contentRootPublishes;
+    volatile uint32_t contentPendingReads, contentUnknownReads;
     volatile uint32_t contentScreenNew, contentScreenReused, contentGapsPending, contentGapsClient;
     volatile uint32_t contentMaxGapUs, contentWorstUs, contentWorstCopyUs, contentWorstCompositeUs, contentWorstPublishUs,
                       contentWorstScreenUs;

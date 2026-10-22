@@ -53,7 +53,7 @@ XlorieComposite: composites px us cpu_us gpu_us root_us lock_us ahb_us accesses 
 XlorieCompositeClasses: class=n/kpx/us/cpu_us/gpu_us/root_us/accesses/max_us,... classes_more (P11-C3-D1)
 (only with TERMUX_X11_CONTENT_FRAME_DIAG=1, P11-C3-D0:)
 XlorieContentFrame: requests skipped gpu_copies cpu_copies copies_done completes completes_skip stale_reads
-                compositor_updates root_updates root_publishes screen_new screen_reused
+                pending_reads unknown_reads compositor_updates root_updates root_publishes screen_new screen_reused
 XlorieContentLatency: present_to_copy_us copy_to_complete_us complete_to_root_us root_to_publish_us publish_to_screen_us
                 content_total_us
 XlorieContentStall: content_interval_us gaps_pending gaps_client max_gap_us worst_content_us worst_stage worst_copy_us
@@ -369,9 +369,14 @@ fixed histograms only.
 
 - `XlorieContentFrame` (counts): `requests` presentations asked for, `skipped` (overwritten in their frame by a newer
   one, or their copy cancelled), `gpu_copies` / `cpu_copies`, `copies_done` (GPU copies completed and taken up by the X
-  server), `completes` / `completes_skip` (CompleteNotify sent, copy or skip), `stale_reads` (a CPU read of a pixmap
-  whose Present damage was reported while its GPU copy into it was still queued - the read sees the content before
-  it; none with `TERMUX_X11_EXA_COMPOSITE_OPT=1`, which reports the damage once the copy is done), `compositor_updates`
+  server), `completes` / `completes_skip` (CompleteNotify sent, copy or skip); CPU reads (as a source, under the shared
+  lock the access takes) of a pixmap a GPU copy into which is still queued - not recorded by the renderer yet, so the
+  read sees the content before it - by whether that copy's damage was reported already: `stale_reads` (it was: the
+  compositor was told of content not there yet - every such read with `TERMUX_X11_EXA_COMPOSITE_OPT` off, which reports
+  it as the copy is queued; with it on, only after a presentation scrapped while its copy may still run),
+  `pending_reads` (it was not: what the compositor was told of is there), `unknown_reads` (the X server's note of the
+  copy's queue slot is another copy's - not expected); the front of the queue whose two buffers are listed in flight
+  counts as recorded (the renderers record it in order; the read waits for its frame); `compositor_updates`
   (content carried by a CPU composite or copy into another pixmap), `root_updates` (into the screen pixmap),
   `root_publishes` (the screen pixmap published with new content), `screen_new` / `screen_reused` (Vulkan frames
   presented with new content, with the last one's again).

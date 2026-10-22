@@ -122,6 +122,7 @@ awk '
         if (/XlorieContentFrame: /) {
             content[p] = 1; creq[p] += plus($0, "requests"); cskip[p] += plus($0, "skipped"); cgpu[p] += plus($0, "gpu_copies")
             ccpu[p] += plus($0, "cpu_copies"); cdone[p] += plus($0, "copies_done"); cstale[p] += plus($0, "stale_reads")
+            cpending[p] += plus($0, "pending_reads"); cunknown[p] += plus($0, "unknown_reads")
             ccomp[p] += plus($0, "compositor_updates"); croot[p] += plus($0, "root_updates"); cpub[p] += plus($0, "root_publishes")
             cnew[p] += plus($0, "screen_new"); creused[p] += plus($0, "screen_reused")
         }
@@ -175,8 +176,9 @@ awk '
             else
                 printf "  screen frames %s/s\n", rate(frames[p])
             if (content[p]) {
-                printf "  content: asked %s/s (skipped %s/s), copied by the GPU %s/s (completed %s/s), by the CPU %s/s; stale reads %s/s; into the compositor %s/s, the screen pixmap %s/s, published %s/s\n",
-                       rate(creq[p]), rate(cskip[p]), rate(cgpu[p]), rate(cdone[p]), rate(ccpu[p]), rate(cstale[p]), rate(ccomp[p]), rate(croot[p]), rate(cpub[p])
+                printf "  content: asked %s/s (skipped %s/s), copied by the GPU %s/s (completed %s/s), by the CPU %s/s; reads of a copy still queued: stale %s/s, pending %s/s, unknown %s/s; into the compositor %s/s, the screen pixmap %s/s, published %s/s\n",
+                       rate(creq[p]), rate(cskip[p]), rate(cgpu[p]), rate(cdone[p]), rate(ccpu[p]), rate(cstale[p]), rate(cpending[p]),
+                       rate(cunknown[p]), rate(ccomp[p]), rate(croot[p]), rate(cpub[p])
                 printf "  content to the screen: mean %d us, p99 up to %s%d us, max %d us; gaps of 50 ms or more: pending %d, client %d, longest %d us\n",
                        tn[p] ? tsum[p] / tn[p] : 0, tover[p] ? ">" : "", tp99[p] + 0, tmax[p] + 0, gpend[p], gcli[p], gmax[p] + 0
             }

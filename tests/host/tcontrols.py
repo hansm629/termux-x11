@@ -1667,10 +1667,6 @@ CONTROLS += [
         return;
     priv->content = *c;""",
      "tcontentframe"),
-    ("content: a read of a copy in flight counted stale", "InitOutput.c",
-     """        !lorieGpuCopyIsDone(priv->contentCopySerial) && !lorieGpuInFlight(pvfb->state, LorieBuffer_description(priv->buffer)->id))""",
-     """        !lorieGpuCopyIsDone(priv->contentCopySerial))""",
-     "tcontentframe"),
     ("content: numbered with the option off", "InitOutput.c",
      """    if (!pvfb->contentDiag || !pixmap)
         return 0;""",
@@ -1733,6 +1729,38 @@ CONTROLS += [
      """        pvfb->contentFrom[index].seq = 0;
         if (!dest && priv->content.seq)""",
      "tcontentframe"),
+]
+
+# P11-C3-D0 review: reads of a copy still queued - stale (its damage reported), pending (not yet), unknown
+CONTROLS += [
+    ("content: a read of a recorded copy counted as queued", "InitOutput.c",
+     """        if (recorded && lorieGpuInFlight(st, e->srcBufferId) && lorieGpuInFlight(st, e->dstBufferId))
+            continue;""",
+     """        if (0)
+            continue;""",
+     "tcontentframe"),
+    ("content: a copy queued behind a recorded one into the same window taken as recorded", "InitOutput.c",
+     """        if (recorded && lorieGpuInFlight(st, e->srcBufferId) && lorieGpuInFlight(st, e->dstBufferId))""",
+     """        if (recorded && (lorieGpuInFlight(st, e->srcBufferId) || lorieGpuInFlight(st, e->dstBufferId)))""",
+     "tcontentframe"),
+    ("content: a read of a copy whose damage was not reported counted stale", "InitOutput.c",
+     """        else if (pvfb->contentQueued[slot].damaged)""",
+     """        else if (1)""",
+     "tcontentframe"),
+    ("content: a slot noted with another copy taken as the queued one's", "InitOutput.c",
+     """        if (pvfb->contentQueued[slot].serial != e->serial)
+            unknown = TRUE;""",
+     """        if (0)
+            unknown = TRUE;""",
+     "tcontentframe"),
+    ("content: the damage reported as the copy is queued not told", "xserver.patch",
+     """+            lorieContentDamaged(vblank->gpu_copy_serial);       /* lorie: P11-C3-D0 - reported above */""",
+     """+            (void) 0;""",
+     "tpresentsafety"),
+    ("content: the damage put off, once reported, not told", "xserver.patch",
+     """+    lorieContentDamaged(vblank->gpu_copy_serial);       /* lorie: P11-C3-D0 */""",
+     """+    (void) 0;""",
+     "tpresentsafety"),
 ]
 
 # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG)
@@ -1833,10 +1861,6 @@ CONTROLS += [
      """+        if (vblank->update && !vblank->lorie_damage_deferred) {""",
      """+        if (vblank->update) {""",
      "tpresentsafety"),
-    ("copy damage: stale reads counted with the damage put off", "InitOutput.c",
-     """    if (gpu && priv && !pvfb->exaCompositeOpt)""",
-     """    if (gpu && priv)""",
-     "tcontentframe"),
     ("copy damage: put off with the option off", "InitOutput.c",
      """    if (!pvfb->exaCompositeOpt)
         return FALSE;

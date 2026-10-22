@@ -176,6 +176,9 @@ typedef struct {
     uint32_t contentSeq, contentGen, contentPublishedSeq;
     uint32_t contentOpen;
     struct lorie_content_stamp contentFrom[EXA_NUM_PREPARE_INDICES], contentBefore[EXA_NUM_PREPARE_INDICES];
+    /* ... and, for each slot of the GPU copy queue, the copy the X server queued there last and whether its damage was
+     * reported (lorieContentDamaged): the stale reads' (lorieContentStaleRead) */
+    struct { uint64_t serial; Bool damaged; } contentQueued[LORIE_GPU_COPY_QUEUE_CAPACITY];
     struct {
         const void *client;
         int index;
@@ -265,10 +268,8 @@ typedef struct {
     uint32_t accessHoldUs;
     /* P11-C3-B1: its open access holds a reservation (lorie.h cpuAccess) instead of the shared lock */
     bool reserved;
-    /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): the newest client content in it; the last GPU copy queued into it -
-     * a CPU read before that completes, the copy not in flight either, sees the content before it */
+    /* P11-C3-D0 (TERMUX_X11_CONTENT_FRAME_DIAG=1): the newest client content in it */
     struct lorie_content_stamp content;
-    uint64_t contentCopySerial;
 } LoriePixmapPriv;
 static void lorieContentPublish(LoriePixmapPriv *priv);
 
@@ -1652,11 +1653,13 @@ static void lorieLogRendererDiag(void) {
             if (stages[k] > stages[slowest])
                 slowest = k;
         log(INFO, "XlorieContentFrame: requests=%u(+%u) skipped=%u(+%u) gpu_copies=%u(+%u) cpu_copies=%u(+%u) "
-                  "copies_done=%u(+%u) completes=%u(+%u) completes_skip=%u(+%u) stale_reads=%u(+%u) "
+                  "copies_done=%u(+%u) completes=%u(+%u) completes_skip=%u(+%u) stale_reads=%u(+%u) pending_reads=%u(+%u) "
+                  "unknown_reads=%u(+%u) "
                   "compositor_updates=%u(+%u) root_updates=%u(+%u) root_publishes=%u(+%u) screen_new=%u(+%u) "
                   "screen_reused=%u(+%u)",
             TD32(contentRequests), TD32(contentSkipped), TD32(contentGpuCopies), TD32(contentCpuCopies),
             TD32(contentCopiesDone), TD32(contentCompletes), TD32(contentCompletesSkip), TD32(contentStaleReads),
+            TD32(contentPendingReads), TD32(contentUnknownReads),
             TD32(contentCompositorUpdates), TD32(contentRootUpdates), TD32(contentRootPublishes), TD32(contentScreenNew),
             TD32(contentScreenReused));
         HT(0, contentPresentToCopy), HT(1, contentCopyToComplete), HT(2, contentCompleteToRoot), HT(3, contentRootToPublish);
@@ -2974,9 +2977,9 @@ static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c
 }
 
 /*
- * Its copy queued for the GPU (`gpu`, present_execute_copy: when, for its completion's wait; the copy's serial kept on
- * `dst` for stale reads - its damage reported as it is queued, before the copy: not with TERMUX_X11_EXA_COMPOSITE_OPT=1,
- * which reports it once the copy is done) or made by the CPU (its content in `dst` now). The wait from the request.
+ * Its copy queued for the GPU (`gpu`, present_execute_copy: when, for its completion's wait; the copy noted with its
+ * queue slot - the one lorieTryScheduleGpuCopy just filled - its damage not reported yet: lorieContentDamaged) or made
+ * by the CPU (its content in `dst` now). The wait from the request.
  */
 uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
     LoriePixmapPriv *priv = dst ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
@@ -2986,9 +2989,10 @@ uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bo
     now = lorieMonotonicUs();
     __atomic_fetch_add(gpu ? &pvfb->state->diag.contentGpuCopies : &pvfb->state->diag.contentCpuCopies, 1, __ATOMIC_RELAXED);
     lorieHistAdd(&pvfb->state->diag.contentPresentToCopy, now >= request_us ? now - request_us : 0);
-    if (gpu && priv && !pvfb->exaCompositeOpt)
-        priv->contentCopySerial = pvfb->gpuCopySerialCounter;  // the one lorieTryScheduleGpuCopy just queued
-    else if (!gpu)
+    if (gpu)
+        pvfb->contentQueued[(pvfb->state->gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY] =
+            (typeof(pvfb->contentQueued[0])) { pvfb->gpuCopySerialCounter, FALSE };
+    else
         lorieContentStore(dst, &(struct lorie_content_stamp) { seq, request_us, now, now }, now, FALSE);
     return now;
 }
@@ -3054,12 +3058,57 @@ static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index,
     }
 }
 
-// ... a source read, holding the shared lock: a GPU copy into it not complete and not in flight is still queued - the
-// read sees the content before it (stale).
+// GPU copy `serial`'s damage reported (patches/xserver.patch: as it is queued, or - TERMUX_X11_EXA_COMPOSITE_OPT=1 - once it
+// is done or its presentation scrapped while it may still run): noted with its queue slot.
+void lorieContentDamaged(uint64_t serial) {
+    uint32_t i;
+    if (!pvfb->contentDiag)
+        return;
+    for (i = 0; i < LORIE_GPU_COPY_QUEUE_CAPACITY; i++)
+        if (pvfb->contentQueued[i].serial == serial)
+            pvfb->contentQueued[i].damaged = TRUE;
+}
+
+/*
+ * ... a source read, holding the shared lock (no renderer takes from the queue or lists a frame meanwhile): a GPU copy
+ * into it still queued - not recorded yet, so not waited for by the access (a recorded one is in a frame in flight,
+ * which is) - and read now: the read sees the content before it. Stale, should its damage be reported already (the
+ * compositor told of content not there yet); pending, should it not (what it was told of is there); unknown, should
+ * the slot's note be another copy's. The renderers record the queue's front in order: an entry whose two buffers are
+ * listed in flight, the entries before it recorded too, is taken as recorded.
+ */
 static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {
-    if (index != EXA_PREPARE_DEST && index != EXA_PREPARE_AUX_DEST && priv->contentCopySerial &&
-        !lorieGpuCopyIsDone(priv->contentCopySerial) && !lorieGpuInFlight(pvfb->state, LorieBuffer_description(priv->buffer)->id))
-        __atomic_fetch_add(&pvfb->state->diag.contentStaleReads, 1, __ATOMIC_RELAXED);
+    struct lorie_shared_server_state *st = pvfb->state;
+    uint32_t i, end, slot;
+    uint64_t id;
+    Bool recorded = TRUE, queued = FALSE, stale = FALSE, unknown = FALSE;
+
+    if (index == EXA_PREPARE_DEST || index == EXA_PREPARE_AUX_DEST || !priv->buffer)
+        return;
+    id = LorieBuffer_description(priv->buffer)->id;
+    end = st->gpuCopyQueue.writeIndex;      // this thread's own
+    for (i = st->gpuCopyQueue.readIndex; i != end; i++) {
+        const LorieGpuCopyEntry *e = &st->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        if (e->cancelled)
+            continue;
+        if (recorded && lorieGpuInFlight(st, e->srcBufferId) && lorieGpuInFlight(st, e->dstBufferId))
+            continue;
+        recorded = FALSE;
+        if (e->dstBufferId != id)
+            continue;
+        slot = i % LORIE_GPU_COPY_QUEUE_CAPACITY;
+        queued = TRUE;
+        if (pvfb->contentQueued[slot].serial != e->serial)
+            unknown = TRUE;
+        else if (pvfb->contentQueued[slot].damaged)
+            stale = TRUE;
+    }
+    if (stale)
+        __atomic_fetch_add(&st->diag.contentStaleReads, 1, __ATOMIC_RELAXED);
+    else if (unknown)
+        __atomic_fetch_add(&st->diag.contentUnknownReads, 1, __ATOMIC_RELAXED);
+    else if (queued)
+        __atomic_fetch_add(&st->diag.contentPendingReads, 1, __ATOMIC_RELAXED);
 }
 
 // The screen pixmap's newest content published with it, for the renderer's frames (lorie.h struct lorie_content).

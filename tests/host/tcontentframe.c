@@ -15,8 +15,10 @@
  *   PrepareAccess failed (EXA finishes none): as if never opened - its source carried nowhere, its index not left open,
  *   what the index carried before kept, the next composite clean; a failed destination carries nothing; nested
  *   accesses by their index (source and mask: the newer); two sources one after the other at one index: the newer. With
- *   TERMUX_X11_EXA_COMPOSITE_OPT=1 (P11-C3-D1-A: a copy's damage reported once it is done) no read is stale: the
- *   compositor is told of the copy only once it is there - a read while it is queued sees what it was told of.
+ *   a copy still queued: stale once its damage was reported (as it is queued - TERMUX_X11_EXA_COMPOSITE_OPT off - or,
+ *   with it on, as its presentation is scrapped while it may run), pending before (on: the compositor not told yet);
+ *   the queue's recorded front (both buffers in flight) not queued for the read, a copy behind it into the same window
+ *   queued; cancelled copies and other pixmaps' none of it; a slot noted with another copy: unknown; across the wrap.
  */
 #include <errno.h>
 #include <limits.h>
@@ -48,7 +50,11 @@ typedef uint8_t CARD8;
 
 /* the shared state, as far as the code under test uses it (lorie.h's fields) */
 struct lorie_shared_server_state {
-    struct { volatile uint64_t completedSerial; } gpuCopyQueue;
+    struct {
+        volatile uint32_t writeIndex, readIndex;
+        volatile uint64_t completedSerial;
+        LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
+    } gpuCopyQueue;
     struct {
         volatile uint32_t busy;
         volatile pid_t pid;
@@ -82,10 +88,10 @@ static struct {
     struct lorie_shared_server_state *state;
     uint64_t gpuCopySerialCounter;
     Bool contentDiag;
-    Bool exaCompositeOpt;           /* P11-C3-D1-A: the copies' damage once they are done */
     uint32_t contentSeq, contentGen, contentPublishedSeq;
     uint32_t contentOpen;
     struct lorie_content_stamp contentFrom[EXA_NUM_PREPARE_INDICES], contentBefore[EXA_NUM_PREPARE_INDICES];
+    struct { uint64_t serial; Bool damaged; } contentQueued[LORIE_GPU_COPY_QUEUE_CAPACITY];
     struct {
         const void *client;
         int index;
@@ -125,6 +131,36 @@ static void world(void) {
     memset(fakePvfb.contentBefore, 0, sizeof fakePvfb.contentBefore);
     memset(&vkContentLast, 0, sizeof(vkContentLast));
 }
+/* a GPU copy of `src` into `dst` queued as lorieTryScheduleGpuCopy queues it (its serial, the queue's next slot), and the
+ * front of the queue's copies recorded by the renderer: listed in flight with both their buffers, taken out of it */
+static void queueCopy(uint64_t serial, int src, int dst) {
+    LorieGpuCopyEntry *e = &st.gpuCopyQueue.entries[st.gpuCopyQueue.writeIndex % LORIE_GPU_COPY_QUEUE_CAPACITY];
+    memset(e, 0, sizeof *e);
+    e->serial = serial, e->srcBufferId = bufs[src].d.id, e->dstBufferId = bufs[dst].d.id;
+    st.gpuCopyQueue.writeIndex++;
+    fakePvfb.gpuCopySerialCounter = serial;
+}
+static void inFlight(int n) {
+    uint32_t i;
+    st.gpuInFlight.count = 0;
+    for (i = 0; i < (uint32_t) n; i++) {
+        const LorieGpuCopyEntry *e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.readIndex + i) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        st.gpuInFlight.ids[st.gpuInFlight.count++] = e->srcBufferId;
+        st.gpuInFlight.ids[st.gpuInFlight.count++] = e->dstBufferId;
+    }
+    st.gpuInFlight.busy = n ? LORIE_GPU_IN_FLIGHT_MAIN : 0;
+}
+static uint32_t reads[3];      /* the stale, pending and unknown reads counted until now */
+static bool readAs(int pixmap, int stale, int pending, int unknown) {
+    volatile struct lorie_renderer_diag *d = &st.diag;
+    bool ok;
+    lorieContentStaleRead(&privs[pixmap], EXA_PREPARE_SRC);
+    ok = d->contentStaleReads - reads[0] == (uint32_t) stale && d->contentPendingReads - reads[1] == (uint32_t) pending &&
+         d->contentUnknownReads - reads[2] == (uint32_t) unknown;
+    reads[0] = d->contentStaleReads, reads[1] = d->contentPendingReads, reads[2] = d->contentUnknownReads;
+    return ok;
+}
+
 /* EXA's order: a composite opens its destination, then its source; a copy its source, then its destination; both
  * finish the source first (loriePrepareAccess, lorieFinishAccess call these, with the option on) */
 static void composite(int src, int dst) {
@@ -190,23 +226,25 @@ int main(void) {
     seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
     CHECK(seq && requestUs == 1000 && d->contentRequests == 1, "request: %u at %llu", seq, (unsigned long long) requestUs);
     fakeNow = 1100;
-    fakePvfb.gpuCopySerialCounter = 40;     /* lorieTryScheduleGpuCopy queued serial 40 */
-    copyUs = lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
-    CHECK(copyUs == 1100 && privs[WINDOW].contentCopySerial == 40 && !privs[WINDOW].content.seq && d->contentGpuCopies == 1 &&
-          d->contentPresentToCopy.count == 1 && d->contentPresentToCopy.sumUs == 100,
-          "GPU copy queued: at %llu, serial %llu kept, stamp %u, %u copies, wait %llu", (unsigned long long) copyUs,
-          (unsigned long long) privs[WINDOW].contentCopySerial, privs[WINDOW].content.seq, d->contentGpuCopies,
-          (unsigned long long) d->contentPresentToCopy.sumUs);
-    /* the compositor reads the window before the copy ran: stale; with it in flight or done: not */
     st.gpuCopyQueue.completedSerial = 39;
-    lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_SRC);
+    queueCopy(40, CLIENT_PIX, WINDOW);      /* lorieTryScheduleGpuCopy queued serial 40 */
+    copyUs = lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
+    CHECK(copyUs == 1100 && fakePvfb.contentQueued[0].serial == 40 && !fakePvfb.contentQueued[0].damaged && !privs[WINDOW].content.seq &&
+          d->contentGpuCopies == 1 && d->contentPresentToCopy.count == 1 && d->contentPresentToCopy.sumUs == 100,
+          "GPU copy queued: at %llu, serial %llu noted, stamp %u, %u copies, wait %llu", (unsigned long long) copyUs,
+          (unsigned long long) fakePvfb.contentQueued[0].serial, privs[WINDOW].content.seq, d->contentGpuCopies,
+          (unsigned long long) d->contentPresentToCopy.sumUs);
+    lorieContentDamaged(40);                /* its damage reported as it is queued (TERMUX_X11_EXA_COMPOSITE_OPT off) */
+    /* the compositor reads the window while the copy is queued: stale; as a destination: nothing; the copy recorded (in a
+     * frame in flight, which the read waits for): nothing; done and taken out of the queue: nothing */
     lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_DEST);
-    st.gpuInFlight.ids[0] = bufs[WINDOW].d.id, st.gpuInFlight.count = 1, st.gpuInFlight.busy = LORIE_GPU_IN_FLIGHT_MAIN;
-    lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_SRC);
-    st.gpuInFlight.busy = 0;
+    CHECK(readAs(WINDOW, 1, 0, 0), "stale reads: %u (want 1: queued, damaged, read as a source)", d->contentStaleReads);
+    inFlight(1);
+    CHECK(readAs(WINDOW, 0, 0, 0), "a recorded copy read as queued");
+    inFlight(0);
+    st.gpuCopyQueue.readIndex = st.gpuCopyQueue.writeIndex;
     st.gpuCopyQueue.completedSerial = 40;
-    lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_SRC);
-    CHECK(d->contentStaleReads == 1, "stale reads: %u (want 1: queued, read as a source)", d->contentStaleReads);
+    CHECK(readAs(WINDOW, 0, 0, 0), "a copy done read as queued");
     fakeNow = 3000;
     lorieContentCopyDone(seq, requestUs, copyUs, &pix[WINDOW]);
     CHECK(privs[WINDOW].content.seq == seq && privs[WINDOW].content.copyUs == 3000 && d->contentCopiesDone == 1 &&
@@ -404,18 +442,41 @@ int main(void) {
               fakePvfb.contentFrom[EXA_PREPARE_SRC].seq);
     }
 
-    /* P11-C3-D1-A: the copy's damage reported once it is done - a read while it is queued sees what the compositor was
-     * told of, not stale */
+    /* reads of copies still queued, by whether their damage was reported: TERMUX_X11_EXA_COMPOSITE_OPT=1 puts it off until
+     * the copy is done - a read meanwhile sees what the compositor was told of (pending, not stale) - unless its
+     * presentation is scrapped while the copy may still run (reported then: stale). The queue's front recorded (both
+     * buffers in flight) is not queued for the read; a copy after it into the same window is, though the window's buffer
+     * is in flight. Cancelled copies, and copies into other pixmaps, are none of the read's. A slot noted with another
+     * copy: unknown. Across the queue's indices' wrap. */
     world();
-    fakePvfb.exaCompositeOpt = TRUE;
-    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
-    fakePvfb.gpuCopySerialCounter = 90;
+    memset(reads, 0, sizeof reads);
+    st.gpuCopyQueue.readIndex = st.gpuCopyQueue.writeIndex = UINT32_MAX - 1;
     st.gpuCopyQueue.completedSerial = 89;
+    seq = lorieContentRequest(&pix[CLIENT_PIX], &requestUs);
+    queueCopy(90, CLIENT_PIX, WINDOW);
     lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
-    lorieContentStaleRead(&privs[WINDOW], EXA_PREPARE_SRC);
-    CHECK(!privs[WINDOW].contentCopySerial && d->contentStaleReads == 0 && d->contentGpuCopies == 1, "with the damage put off: "
-          "serial %llu kept, %u stale reads (want none)", (unsigned long long) privs[WINDOW].contentCopySerial, d->contentStaleReads);
-    fakePvfb.exaCompositeOpt = FALSE;
+    CHECK(readAs(WINDOW, 0, 1, 0), "a read of a copy queued, its damage put off: not pending (stale %u, unknown %u)",
+          d->contentStaleReads, d->contentUnknownReads);
+    lorieContentDamaged(90);                /* scrapped while it may still run: reported */
+    CHECK(readAs(WINDOW, 1, 0, 0), "a read of a copy queued, its damage reported early: not stale");
+    queueCopy(91, TERMINAL, WINDOW);        /* the next presentation's, past the wrap */
+    lorieContentCopied(seq, requestUs, &pix[WINDOW], TRUE);
+    lorieContentDamaged(91);
+    inFlight(1);                            /* 90 recorded: the window's buffer in flight */
+    CHECK(readAs(WINDOW, 1, 0, 0), "a copy queued behind a recorded one into the same window: not stale (pending %u)",
+          d->contentPendingReads);
+    inFlight(2);
+    CHECK(readAs(WINDOW, 0, 0, 0), "two recorded copies read as queued");
+    inFlight(0);
+    st.gpuCopyQueue.entries[st.gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY].cancelled = 1;
+    st.gpuCopyQueue.entries[(st.gpuCopyQueue.readIndex + 1) % LORIE_GPU_COPY_QUEUE_CAPACITY].cancelled = 1;
+    CHECK(readAs(WINDOW, 0, 0, 0), "cancelled copies read as queued");
+    queueCopy(92, CLIENT_PIX, TERMINAL);
+    lorieContentCopied(seq, requestUs, &pix[TERMINAL], TRUE);
+    CHECK(readAs(WINDOW, 0, 0, 0) && readAs(TERMINAL, 0, 1, 0), "a copy into another pixmap read as the window's");
+    fakePvfb.contentQueued[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY].serial = 7;
+    CHECK(readAs(TERMINAL, 0, 0, 1), "a slot noted with another copy: not unknown");
+    CHECK(st.gpuCopyQueue.writeIndex == 1, "the indices did not wrap (%u)", st.gpuCopyQueue.writeIndex);
 
     printf("TCONTENTFRAME client content from its presentation to the screen (TERMUX_X11_CONTENT_FRAME_DIAG): %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);

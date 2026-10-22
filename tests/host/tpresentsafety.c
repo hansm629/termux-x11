@@ -194,6 +194,18 @@ static void DamageDamageRegion(DrawableRec *d, RegionPtr r) {
              r->n ? r->x1 : 0, r->n ? r->y1 : 0, r->n ? r->x2 : 0, r->n ? r->y2 : 0, gpuMay(current ? current->copySerial : 0) ? "!" : "+");
     damageBeforeIdle = !strstr(trail, "idle");
 }
+/* P11-C3-D0: the content diagnostics told a copy's damage was reported - which copy, and whether the damage was, just
+ * before (dtrail's last entry is that copy's) */
+static uint64_t damagedSerial;
+static int damagedTold, damagedUntold;
+static size_t damagedAt;
+static void lorieContentDamaged(uint64_t serial) {
+    damagedSerial = serial;
+    damagedTold++;
+    if (strlen(dtrail) == damagedAt)
+        damagedUntold++;        /* no damage reported since the last time */
+    damagedAt = strlen(dtrail);
+}
 static bool deferDamage;            /* TERMUX_X11_EXA_COMPOSITE_OPT */
 static int damageDeferred, damageHow[3];
 static Bool lorieDeferCopyDamage(void) { damageDeferred += deferDamage; return deferDamage; }
@@ -302,6 +314,7 @@ static struct present_vblank *presentation(PixmapPtr pixmap) {
 /* P11-C3-D1-A: the damage logged and counted, and no update region for the next presentation */
 static void dreset(void) {
     dtrail[0] = 0;
+    damagedSerial = 0, damagedTold = damagedUntold = 0, damagedAt = 0;
     damageDeferred = regionsDestroyed = 0;
     memset(damageHow, 0, sizeof damageHow);
     nextUpdate = (RegionRec) { 0 }, nextXOff = nextYOff = 0;
@@ -721,6 +734,8 @@ int main(void) {
     dreset();
     v = presentation(&a);
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !v->lorie_damage_deferred, "off: not damaged as the copy is queued: %s", dtrail);
+    CHECK(damagedTold == 1 && !damagedUntold && damagedSerial == a.copySerial, "off: the content diagnostics told of the damage "
+          "%d times (%d without it), serial %llu", damagedTold, damagedUntold, (unsigned long long) damagedSerial);
     gpuDone(a.copySerial);
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !damageDeferred && !damageHow[0] && !damageHow[1] && !damageHow[2] &&
           !regionsLive, "off: damaged again, or counted, or a region left (%d): %s", regionsLive, dtrail);
@@ -764,8 +779,11 @@ int main(void) {
     recorded = a.copySerial;
     lorieRecheckGpuCopies();                /* a tick, still copying */
     present_execute(v, 0, 11);              /* its poll, still copying */
-    CHECK(!dtrail[0] && v->lorie_damage_deferred && damageDeferred == 1, "on: damaged before the copy is done: %s", dtrail);
+    CHECK(!dtrail[0] && v->lorie_damage_deferred && damageDeferred == 1 && !damagedTold, "on: damaged before the copy is done: %s "
+          "(told %d)", dtrail, damagedTold);
     gpuDone(a.copySerial);
+    CHECK(damagedTold == 1 && !damagedUntold && damagedSerial == a.copySerial, "on: the content diagnostics told of the damage "
+          "%d times (%d without it)", damagedTold, damagedUntold);
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)+") && damageBeforeIdle && damageHow[LORIE_COPY_DAMAGE_DONE] == 1 &&
           !damageHow[LORIE_COPY_DAMAGE_EARLY] && !damageHow[LORIE_COPY_DAMAGE_DROPPED], "on: not damaged once the copy is done, "
           "before idle (%d): %s", damageBeforeIdle, dtrail);
@@ -818,8 +836,8 @@ int main(void) {
     v = presentation(&a);
     recorded = a.copySerial;
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
-    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && damageHow[LORIE_COPY_DAMAGE_EARLY] == 1, "on, overwritten while copying: %s",
-          dtrail);
+    CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && damageHow[LORIE_COPY_DAMAGE_EARLY] == 1 && damagedTold == 1 &&
+          damagedSerial == a.copySerial, "on, overwritten while copying: %s (told %d)", dtrail, damagedTold);
     present_execute(v, 0, 11);
     gpuDone(a.copySerial);
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && damageHow[LORIE_COPY_DAMAGE_EARLY] == 1 && !damageHow[LORIE_COPY_DAMAGE_DONE],
@@ -844,7 +862,7 @@ int main(void) {
     v = presentation(&a);
     presentOverwrite(&windowPriv, NULL, &b, &crtcRec, 10);
     present_execute(v, 0, 11);
-    CHECK(!dtrail[0] && damageHow[LORIE_COPY_DAMAGE_DROPPED] == 1, "on, cancelled: %s", dtrail);
+    CHECK(!dtrail[0] && damageHow[LORIE_COPY_DAMAGE_DROPPED] == 1 && !damagedTold, "on, cancelled: %s (told %d)", dtrail, damagedTold);
     expect("damage, on, overwritten before it was recorded: none (scrap)", "ack+ idle+ complete(skip)+", LORIE_X_EARLY_SCRAP);
     clean("damage, on, cancelled", &a, 0);
     reset();

@@ -189,6 +189,7 @@ recipes = {
         + span(I, "enum { LORIE_CONTENT_OPEN,", "LORIE_CONTENT_FAILED };")
         + "".join(func(I, f) for f in (
             "static void lorieContentAccess(PixmapPtr pPix, LoriePixmapPriv *priv, int index, int how) {",
+            "void lorieContentDamaged(uint64_t serial) {",
             "static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {",
             "static void lorieContentPublish(LoriePixmapPriv *priv) {"))
         + span(R, "// P11-C3-D0: the content generation the last frame presented showed", "static struct { uint32_t gen; uint64_t newUs; } vkContentLast;")
