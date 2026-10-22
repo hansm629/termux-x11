@@ -1656,12 +1656,12 @@ static void lorieLogRendererDiag(void) {
                   "copies_done=%u(+%u) completes=%u(+%u) completes_skip=%u(+%u) stale_reads=%u(+%u) pending_reads=%u(+%u) "
                   "unknown_reads=%u(+%u) "
                   "compositor_updates=%u(+%u) root_updates=%u(+%u) root_publishes=%u(+%u) screen_new=%u(+%u) "
-                  "screen_reused=%u(+%u)",
+                  "screen_reused=%u(+%u) screen_unknown=%u(+%u)",
             TD32(contentRequests), TD32(contentSkipped), TD32(contentGpuCopies), TD32(contentCpuCopies),
             TD32(contentCopiesDone), TD32(contentCompletes), TD32(contentCompletesSkip), TD32(contentStaleReads),
             TD32(contentPendingReads), TD32(contentUnknownReads),
             TD32(contentCompositorUpdates), TD32(contentRootUpdates), TD32(contentRootPublishes), TD32(contentScreenNew),
-            TD32(contentScreenReused));
+            TD32(contentScreenReused), TD32(contentScreenUnknown));
         HT(0, contentPresentToCopy), HT(1, contentCopyToComplete), HT(2, contentCompleteToRoot), HT(3, contentRootToPublish);
         HT(4, contentPublishToScreen), HT(5, contentTotal);
         log(INFO, "XlorieContentLatency: present_to_copy_us=%s copy_to_complete_us=%s complete_to_root_us=%s "
@@ -2982,7 +2982,6 @@ static void lorieContentStore(PixmapPtr dst, const struct lorie_content_stamp *c
  * by the CPU (its content in `dst` now). The wait from the request.
  */
 uint64_t lorieContentCopied(uint32_t seq, uint64_t request_us, PixmapPtr dst, Bool gpu) {
-    LoriePixmapPriv *priv = dst ? LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst) : NULL;
     uint64_t now;
     if (!seq)
         return 0;
@@ -3111,7 +3110,8 @@ static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {
         __atomic_fetch_add(&st->diag.contentPendingReads, 1, __ATOMIC_RELAXED);
 }
 
-// The screen pixmap's newest content published with it, for the renderer's frames (lorie.h struct lorie_content).
+// The screen pixmap's newest content published with it, for the renderer's frames, under the sequence lock of lorie.h's
+// struct lorie_content: `gen` odd (the fence: before any field), the fields, `gen` even again - the next generation.
 static void lorieContentPublish(LoriePixmapPriv *priv) {
     volatile struct lorie_content *c = &pvfb->state->content;
     uint64_t now;
@@ -3119,13 +3119,15 @@ static void lorieContentPublish(LoriePixmapPriv *priv) {
         return;
     now = lorieMonotonicUs();
     pvfb->contentPublishedSeq = priv->content.seq;
-    c->seq = priv->content.seq;
-    c->requestUs = priv->content.requestUs;
-    c->copyUs = priv->content.copyUs;
-    c->rootUs = priv->content.readyUs;
-    c->publishUs = now;
-    if (!++pvfb->contentGen)
-        ++pvfb->contentGen;
+    __atomic_store_n(&c->gen, pvfb->contentGen + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    LORIE_CONTENT_PUT(c->seq, priv->content.seq);
+    LORIE_CONTENT_PUT(c->requestUs, priv->content.requestUs);
+    LORIE_CONTENT_PUT(c->copyUs, priv->content.copyUs);
+    LORIE_CONTENT_PUT(c->rootUs, priv->content.readyUs);
+    LORIE_CONTENT_PUT(c->publishUs, now);
+    if (!(pvfb->contentGen += 2))
+        pvfb->contentGen = 2;       // 0 is none
     __atomic_store_n(&c->gen, pvfb->contentGen, __ATOMIC_RELEASE);
     __atomic_fetch_add(&pvfb->state->diag.contentRootPublishes, 1, __ATOMIC_RELAXED);
     lorieHistAdd(&pvfb->state->diag.contentRootToPublish, now >= priv->content.readyUs ? now - priv->content.readyUs : 0);

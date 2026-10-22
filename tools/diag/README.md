@@ -54,6 +54,7 @@ XlorieCompositeClasses: class=n/kpx/us/cpu_us/gpu_us/root_us/accesses/max_us,...
 (only with TERMUX_X11_CONTENT_FRAME_DIAG=1, P11-C3-D0:)
 XlorieContentFrame: requests skipped gpu_copies cpu_copies copies_done completes completes_skip stale_reads
                 pending_reads unknown_reads compositor_updates root_updates root_publishes screen_new screen_reused
+                screen_unknown
 XlorieContentLatency: present_to_copy_us copy_to_complete_us complete_to_root_us root_to_publish_us publish_to_screen_us
                 content_total_us
 XlorieContentStall: content_interval_us gaps_pending gaps_client max_gap_us worst_content_us worst_stage worst_copy_us
@@ -363,8 +364,11 @@ the number rides the destination pixmap's private through its GPU copy (queued, 
 CPU access carries the newest content its sources hold into its destination as the destination's access finishes - a
 compositor's composite into its own buffer, its copy into the screen pixmap - never an older one over a newer one.
 `lorieRedraw` publishes what the screen pixmap holds from then on (where it takes its damage up: swapped to the front,
-or drawn), and the renderer, which reads it under the lock it takes anyway, counts each presented frame as showing
-new content or the last one's again. No lock, fence wait, pixel readback or per-frame line is added; counters and
+or drawn), under a sequence lock (lorie.h `struct lorie_content`: the generation odd while the X server writes the
+fields, even once done; every field an atomic, the 64-bit ones 8-byte aligned so that 32-bit ABIs' atomics are
+lock-free), and the renderer, which reads it as it takes the shared lock anyway, keeps only a whole copy (the same even
+generation before and after, a few tries) and counts each presented frame as showing new content, the last one's again,
+or - no whole copy taken - not known (`screen_unknown`). No lock, fence wait, pixel readback or per-frame line is added; counters and
 fixed histograms only.
 
 - `XlorieContentFrame` (counts): `requests` presentations asked for, `skipped` (overwritten in their frame by a newer

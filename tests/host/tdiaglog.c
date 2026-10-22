@@ -555,7 +555,7 @@ int main(void) {
         fakeState.diag.contentRequests += 1200, fakeState.diag.contentSkipped += 1000, fakeState.diag.contentGpuCopies += 150;
         fakeState.diag.contentCpuCopies += 50, fakeState.diag.contentCopiesDone += 140, fakeState.diag.contentCompletes += 190;
         fakeState.diag.contentCompletesSkip += 5, fakeState.diag.contentStaleReads += 7, fakeState.diag.contentCompositorUpdates += 120;
-        fakeState.diag.contentPendingReads += 11, fakeState.diag.contentUnknownReads += 1;
+        fakeState.diag.contentPendingReads += 11, fakeState.diag.contentUnknownReads += 1, fakeState.diag.contentScreenUnknown += 2;
         fakeState.diag.contentRootUpdates += 118, fakeState.diag.contentRootPublishes += 110, fakeState.diag.contentScreenNew += 100;
         fakeState.diag.contentScreenReused += 500, fakeState.diag.contentGapsPending += 2, fakeState.diag.contentGapsClient += 3;
         lorieHistAdd(&fakeState.diag.contentPresentToCopy, 300), lorieHistAdd(&fakeState.diag.contentCopyToComplete, 2400);
@@ -579,7 +579,8 @@ int main(void) {
                                        "cpu_copies=50(+50) copies_done=140(+140) completes=190(+190) completes_skip=5(+5) "
                                        "stale_reads=7(+7) pending_reads=11(+11) unknown_reads=1(+1) compositor_updates=120(+120) "
                                        "root_updates=118(+118) "
-                                       "root_publishes=110(+110) screen_new=100(+100) screen_reused=500(+500)\n") != NULL;
+                                       "root_publishes=110(+110) screen_new=100(+100) screen_reused=500(+500) "
+                                       "screen_unknown=2(+2)\n") != NULL;
             if (strstr(line, "XlorieContentFrame:") && n[0] == 2)
                 emptyOk += strstr(line, "XlorieContentFrame: requests=1200(+0) skipped=1000(+0) ") != NULL;
             if (strstr(line, "XlorieContentLatency:") && ++n[1] == 1)
@@ -668,7 +669,7 @@ int main(void) {
             volatile uint32_t *cc[] = { &fakeState.diag.contentRequests, &fakeState.diag.contentSkipped, &fakeState.diag.contentGpuCopies,
                 &fakeState.diag.contentCpuCopies, &fakeState.diag.contentCopiesDone, &fakeState.diag.contentCompletes,
                 &fakeState.diag.contentCompletesSkip, &fakeState.diag.contentStaleReads, &fakeState.diag.contentCompositorUpdates,
-                &fakeState.diag.contentPendingReads, &fakeState.diag.contentUnknownReads,
+                &fakeState.diag.contentPendingReads, &fakeState.diag.contentUnknownReads, &fakeState.diag.contentScreenUnknown,
                 &fakeState.diag.contentRootUpdates, &fakeState.diag.contentRootPublishes, &fakeState.diag.contentScreenNew,
                 &fakeState.diag.contentScreenReused, &fakeState.diag.contentGapsPending, &fakeState.diag.contentGapsClient };
             for (unsigned k = 0; k < sizeof ch / sizeof *ch; k++)

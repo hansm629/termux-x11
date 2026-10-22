@@ -19,6 +19,8 @@
  *   with it on, as its presentation is scrapped while it may run), pending before (on: the compositor not told yet);
  *   the queue's recorded front (both buffers in flight) not queued for the read, a copy behind it into the same window
  *   queued; cancelled copies and other pixmaps' none of it; a slot noted with another copy: unknown; across the wrap.
+ *   The published content's sequence lock: read midway through its writing (torn, never old and new mixed), written
+ *   midway through a read (read again: the new one whole), a frame with no whole copy (unknown), the generation's wrap.
  */
 #include <errno.h>
 #include <limits.h>
@@ -104,6 +106,14 @@ static volatile struct lorie_shared_server_state *state = &st;     /* the render
 
 static uint64_t fakeNow = 1000;
 #define lorieMonotonicUs() (fakeNow)
+/* struct lorie_content's fields as its sequence lock reads and writes them (lorie.h's: relaxed atomics), a case's step
+ * run right after the n-th write or before the n-th read - the other side meeting this one midway */
+static void (*afterPut)(int), (*beforeGet)(int);
+static int putCount, getCount;
+static void putDone(void) { putCount++; if (afterPut) afterPut(putCount); }
+static void getStart(void) { getCount++; if (beforeGet) beforeGet(getCount); }
+#define LORIE_CONTENT_PUT(field, value) (__atomic_store_n(&(field), (value), __ATOMIC_RELAXED), putDone())
+#define LORIE_CONTENT_GET(field) (getStart(), __atomic_load_n(&(field), __ATOMIC_RELAXED))
 #include "contentframe_src.inc"
 #undef lorieMonotonicUs
 
@@ -129,6 +139,7 @@ static void world(void) {
     fakePvfb.contentOpen = 0;
     memset(fakePvfb.contentFrom, 0, sizeof fakePvfb.contentFrom);
     memset(fakePvfb.contentBefore, 0, sizeof fakePvfb.contentBefore);
+    fakePvfb.contentGen = fakePvfb.contentPublishedSeq = 0;      /* as the shared state, new */
     memset(&vkContentLast, 0, sizeof(vkContentLast));
 }
 /* a GPU copy of `src` into `dst` queued as lorieTryScheduleGpuCopy queues it (its serial, the queue's next slot), and the
@@ -174,6 +185,17 @@ static void copyArea(int src, int dst) {
     lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_OPEN);
     lorieContentAccess(&pix[src], &privs[src], EXA_PREPARE_SRC, LORIE_CONTENT_DONE);
     lorieContentAccess(&pix[dst], &privs[dst], EXA_PREPARE_DEST, LORIE_CONTENT_DONE);
+}
+/* the renderer reading the content after the X server's second write of it; the X server publishing the next one before
+ * the renderer's third read of it */
+static struct lorie_content midWrite;
+static void readMidWrite(int n) { if (n == 2) rendererContentRead(&midWrite); }
+static void publishMidRead(int n) {
+    if (n == 3) {
+        privs[ROOT].content = (struct lorie_content_stamp) { 52, 7000, 7100, 7200 };
+        fakeNow = 7300;
+        lorieContentPublish(&privs[ROOT]);
+    }
 }
 /* a frame presented at `fakeNow`: as rendererVkRedraw takes the content under the lock and counts it once presented */
 static void frame(void) {
@@ -271,12 +293,12 @@ int main(void) {
           (unsigned long long) d->contentCompleteToRoot.sumUs);
     fakeNow = 6000;
     lorieContentPublish(&privs[ROOT]);
-    CHECK(st.content.gen == 1 && st.content.seq == seq && st.content.rootUs == 5000 && st.content.publishUs == 6000 &&
+    CHECK(st.content.gen == 2 && st.content.seq == seq && st.content.rootUs == 5000 && st.content.publishUs == 6000 &&
           d->contentRootPublishes == 1 && d->contentRootToPublish.sumUs == 1000, "published: gen %u seq %u, root %llu, at %llu",
           st.content.gen, st.content.seq, (unsigned long long) st.content.rootUs, (unsigned long long) st.content.publishUs);
     fakeNow = 7000;
     lorieContentPublish(&privs[ROOT]);
-    CHECK(st.content.gen == 1 && d->contentRootPublishes == 1, "published again with nothing new: gen %u", st.content.gen);
+    CHECK(st.content.gen == 2 && d->contentRootPublishes == 1, "published again with nothing new: gen %u", st.content.gen);
     fakeNow = 8000;
     frame();
     fakeNow = 16000;
@@ -440,6 +462,45 @@ int main(void) {
         CHECK(!privs[ROOT].content.seq && !fakePvfb.contentOpen && !fakePvfb.contentFrom[EXA_PREPARE_SRC].seq,
               "a failed destination: carried %u, open %#x, kept %u", privs[ROOT].content.seq, fakePvfb.contentOpen,
               fakePvfb.contentFrom[EXA_PREPARE_SRC].seq);
+    }
+
+    /* the published content's sequence lock (lorie.h struct lorie_content): read while the X server writes it - between two
+     * of its fields - no whole copy (torn), never the old generation with some new fields; written while the renderer
+     * reads it - between two of its fields - read again, the new one whole; a frame with no whole copy counted as such,
+     * neither new nor reused; the generations even, past their wrap (0: none) */
+    {
+        struct lorie_content snap;
+        uint32_t reused, fresh;
+        world();
+        privs[ROOT].content = (struct lorie_content_stamp) { 50, 5000, 5100, 5200 };
+        lorieContentPublish(&privs[ROOT]);
+        CHECK(st.content.gen == 2 && fakePvfb.contentGen == 2, "the first generation %u (want 2)", st.content.gen);
+        privs[ROOT].content = (struct lorie_content_stamp) { 51, 6000, 6100, 6200 };
+        afterPut = readMidWrite, putCount = 0;
+        lorieContentPublish(&privs[ROOT]);
+        afterPut = NULL;
+        CHECK(midWrite.gen == LORIE_CONTENT_TORN, "read while written: generation %u (want torn), seq %u, request %llu, copy %llu", midWrite.gen,
+              midWrite.seq, (unsigned long long) midWrite.requestUs, (unsigned long long) midWrite.copyUs);
+        rendererContentRead(&snap);
+        CHECK(snap.gen == 4 && snap.seq == 51 && snap.requestUs == 6000 && snap.copyUs == 6100 && snap.rootUs == 6200,
+              "read after: generation %u seq %u", snap.gen, snap.seq);
+        beforeGet = publishMidRead, getCount = 0;
+        rendererContentRead(&snap);
+        beforeGet = NULL;
+        CHECK(snap.gen == 6 && snap.seq == 52 && snap.requestUs == 7000 && snap.copyUs == 7100 && snap.rootUs == 7200 &&
+              snap.publishUs == 7300, "written while read: generation %u seq %u request %llu copy %llu (want 6, 52, 7000, 7100: "
+              "the new one, whole)", snap.gen, snap.seq, (unsigned long long) snap.requestUs, (unsigned long long) snap.copyUs);
+        reused = st.diag.contentScreenReused, fresh = st.diag.contentScreenNew;
+        st.content.gen = 7;                 /* the X server stopped midway (descheduled): every try finds it odd */
+        frame();
+        CHECK(st.diag.contentScreenUnknown == 1 && st.diag.contentScreenReused == reused && st.diag.contentScreenNew == fresh,
+              "a frame with no whole copy: %u unknown, %u reused, %u new", st.diag.contentScreenUnknown,
+              st.diag.contentScreenReused - reused, st.diag.contentScreenNew - fresh);
+        st.content.gen = 6;
+        fakePvfb.contentGen = UINT32_MAX - 1;
+        privs[ROOT].content.seq = 53;
+        lorieContentPublish(&privs[ROOT]);
+        CHECK(st.content.gen == 2 && fakePvfb.contentGen == 2, "past the wrap: generation %u (want 2)", st.content.gen);
     }
 
     /* reads of copies still queued, by whether their damage was reported: TERMUX_X11_EXA_COMPOSITE_OPT=1 puts it off until

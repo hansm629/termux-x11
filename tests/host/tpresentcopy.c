@@ -266,6 +266,7 @@ static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
     return true;
 }
 #include "settleconsts_src.inc"
+#include "contentsync_src.inc"
 #include "presentcopy_src.inc"
 
 /* P11-C3-D2: what the X server does meanwhile - whether the root copy was settled as the renderer took the lock (-1: it

@@ -168,6 +168,8 @@ recipes = {
     # P11-C3-C: the freeze watchdog's stages - the renderer's (rendererProgressOn, rendererStage) and the X server's
     # thread's (lorieXEnter, lorieXLeave) - tpresentcopy.c, twake.c, townership.c, tfreeze.c
     "rendererstage": lambda: func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {"),
+    # P11-C3-D0: struct lorie_content's sequence lock's reads and writes - tpresentcopy.c (tcontentframe.c steps between them)
+    "contentsync": lambda: macro(H, "LORIE_CONTENT_PUT") + macro(H, "LORIE_CONTENT_GET"),
     "contentconsts": lambda: macro(I, "LORIE_CONTENT_CLIENTS") + macro(os.path.join(XS, "exa", "exa.h"), "EXA_NUM_PREPARE_INDICES"),
     # P11-C3-D0: client content from its presentation to the screen - the X server's hooks (counting, stamping,
     # carrying through CPU accesses, publishing) and the renderer's frames - tcontentframe.c
@@ -193,7 +195,7 @@ recipes = {
             "static void lorieContentStaleRead(LoriePixmapPriv *priv, int index) {",
             "static void lorieContentPublish(LoriePixmapPriv *priv) {"))
         + span(R, "// P11-C3-D0: the content generation the last frame presented showed", "static struct { uint32_t gen; uint64_t newUs; } vkContentLast;")
-        + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
+        + macro(R, "LORIE_CONTENT_TRIES") + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
         + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {"),
     # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG) - the X server's own fields
     # for them, their report (tdiaglog.c, texacomposite.c) and the timing itself (texacomposite.c)
@@ -291,7 +293,7 @@ recipes = {
         + func(R, "static void rendererVkFrameGap(const struct rendererVkFrameTimes *t, uint64_t lastStartUs, uint32_t lastTicks) {")
         + func(R, "static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {")
         # P11-C3-D0: the client content the screen frames show
-        + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
+        + macro(R, "LORIE_CONTENT_TRIES") + func(R, "static void rendererContentRead(struct lorie_content *out) {") + macro(R, "LORIE_CONTENT_GAP_US")
         + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {")
         + func(R, "static void rendererVkApplyPendingGpuCopies(void) {")
         + func(R, "static bool rendererRootCopyPending(void) {")

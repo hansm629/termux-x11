@@ -1763,6 +1763,34 @@ CONTROLS += [
      "tpresentsafety"),
 ]
 
+# P11-C3-D0 review: the published content's sequence lock (lorie.h struct lorie_content)
+CONTROLS += [
+    ("content: published without marking it as being written", "InitOutput.c",
+     """    __atomic_store_n(&c->gen, pvfb->contentGen + 1, __ATOMIC_RELAXED);
+""",
+     "",
+     "tcontentframe"),
+    ("content: a copy kept without the generation read again", "renderer.c",
+     """        if (__atomic_load_n(&state->content.gen, __ATOMIC_RELAXED) == gen) {""",
+     """        if (1) {""",
+     "tcontentframe"),
+    ("content: a copy taken while it is being written", "renderer.c",
+     """        if (gen & 1)
+            continue;       // being written""",
+     """        if (0)
+            continue;       // being written""",
+     "tcontentframe"),
+    ("content: a frame with no whole copy counted as new", "renderer.c",
+     """    if (c->gen == LORIE_CONTENT_TORN) {""",
+     """    if (0) {""",
+     "tcontentframe"),
+    ("content: generation 0 given past the wrap", "InitOutput.c",
+     """    if (!(pvfb->contentGen += 2))
+        pvfb->contentGen = 2;       // 0 is none""",
+     """    pvfb->contentGen += 2;""",
+     "tcontentframe"),
+]
+
 # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG)
 CONTROLS += [
     ("composite: the lock's wait counted with the GPU's in it", "InitOutput.c",

@@ -229,8 +229,8 @@ def phaseReport(at, scale=1):
         "XlorieRootCopy: root_gpu_copy=on root_gpu_copy_requests=%s root_copy_cpu_block_us=%s root_copy_pending=0" % (d(580), d(159000)),
         "XlorieContentFrame: requests=%s skipped=%s gpu_copies=%s cpu_copies=%s copies_done=%s completes=%s completes_skip=%s "
         "stale_reads=%s pending_reads=%s unknown_reads=%s compositor_updates=%s root_updates=%s root_publishes=%s screen_new=%s "
-        "screen_reused=%s" % (d(4900), d(4410), d(490), d(0), d(490), d(490), d(4410), d(0), d(300), d(1), d(490), d(490), d(480),
-                              d(480), d(116)),
+        "screen_reused=%s screen_unknown=%s" % (d(4900), d(4410), d(490), d(0), d(490), d(490), d(4410), d(0), d(300), d(1), d(490),
+                                                 d(490), d(480), d(480), d(116), d(2)),
         "XlorieContentLatency: present_to_copy_us=0 copy_to_complete_us=0 complete_to_root_us=0 root_to_publish_us=0 "
         "publish_to_screen_us=0 content_total_us=480/21000/30000/%s/60000/100/5" % (">100000" if scale > 1 else "40000"),
         "XlorieContentStall: content_interval_us=0 gaps_pending=%s gaps_client=%s max_gap_us=%d worst_content_us=0" % (
@@ -255,7 +255,7 @@ want = ["freezes (TERMUX_X11_FRAME_FREEZE_DIAG): 0 begun, 0 ended",
         "phase glmark2: 1 reports (5 s)",
         "  screen frames 119.0/s",
         "phase glmark2+move: 2 reports (10 s)",
-        "  screen frames 119.2/s, with new client content 96.0/s, with the last one again 23.2/s",
+        "  screen frames 119.2/s, with new client content 96.0/s, with the last one again 23.2/s, not known 0.4/s",
         "  content: asked 980.0/s (skipped 882.0/s), copied by the GPU 98.0/s (completed 98.0/s), by the CPU 0.0/s; reads of a copy "
         "still queued: stale 0.0/s, pending 60.0/s, unknown 0.2/s; into the compositor 98.0/s, the screen pixmap 98.0/s, published 96.0/s",
         "  content to the screen: mean 21000 us, p99 up to 40000 us, max 60000 us; gaps of 50 ms or more: pending 2, client 0, "

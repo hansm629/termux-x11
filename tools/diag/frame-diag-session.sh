@@ -124,7 +124,7 @@ awk '
             ccpu[p] += plus($0, "cpu_copies"); cdone[p] += plus($0, "copies_done"); cstale[p] += plus($0, "stale_reads")
             cpending[p] += plus($0, "pending_reads"); cunknown[p] += plus($0, "unknown_reads")
             ccomp[p] += plus($0, "compositor_updates"); croot[p] += plus($0, "root_updates"); cpub[p] += plus($0, "root_publishes")
-            cnew[p] += plus($0, "screen_new"); creused[p] += plus($0, "screen_reused")
+            cnew[p] += plus($0, "screen_new"); creused[p] += plus($0, "screen_reused"); cunk[p] += plus($0, "screen_unknown")
         }
         if (/XlorieContentLatency: /) {
             # count/mean/p95/p99/max/over 16.7 ms/over 33.3 ms (a percentile past the last bucket: ">100000")
@@ -172,7 +172,7 @@ awk '
             if (!reports[p]) { printf "phase %s: no 5-second report wholly within it\n", p; continue }
             printf "phase %s: %d reports (%d s)\n", p, reports[p], reports[p] * 5
             if (content[p])
-                printf "  screen frames %s/s, with new client content %s/s, with the last one again %s/s\n", rate(frames[p]), rate(cnew[p]), rate(creused[p])
+                printf "  screen frames %s/s, with new client content %s/s, with the last one again %s/s, not known %s/s\n", rate(frames[p]), rate(cnew[p]), rate(creused[p]), rate(cunk[p])
             else
                 printf "  screen frames %s/s\n", rate(frames[p])
             if (content[p]) {

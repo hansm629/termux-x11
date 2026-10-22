@@ -2450,22 +2450,31 @@ static void rendererVkFrameTimed(const struct rendererVkFrameTimes *t) {
 
 /* ---- P11-C3-D0, TERMUX_X11_CONTENT_FRAME_DIAG: the client content the screen frames show (lorie.h struct lorie_content) ---- */
 
-// What the X server last published with the screen pixmap; generation 0 with the option off, or when it changed while
-// read (the next frame takes it up).
+// What the X server last published with the screen pixmap, a whole copy of it - lorie.h struct lorie_content's sequence
+// lock: `gen` even (acquire), the fields, the fence, `gen` the same - tried LORIE_CONTENT_TRIES times, the X server writing
+// it meanwhile (none whole: LORIE_CONTENT_TORN). Generation 0 with the option off, or nothing published yet.
+#define LORIE_CONTENT_TRIES 4
 static void rendererContentRead(struct lorie_content *out) {
-    uint32_t gen;
+    uint32_t gen, tries;
     out->gen = 0;
     if (!state || !state->backend.contentDiag)
         return;
-    gen = __atomic_load_n(&state->content.gen, __ATOMIC_ACQUIRE);
-    out->seq = state->content.seq;
-    out->requestUs = state->content.requestUs;
-    out->copyUs = state->content.copyUs;
-    out->rootUs = state->content.rootUs;
-    out->publishUs = state->content.publishUs;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    if (__atomic_load_n(&state->content.gen, __ATOMIC_RELAXED) == gen)
-        out->gen = gen;
+    for (tries = 0; tries < LORIE_CONTENT_TRIES; tries++) {
+        gen = __atomic_load_n(&state->content.gen, __ATOMIC_ACQUIRE);
+        if (gen & 1)
+            continue;       // being written
+        out->seq = LORIE_CONTENT_GET(state->content.seq);
+        out->requestUs = LORIE_CONTENT_GET(state->content.requestUs);
+        out->copyUs = LORIE_CONTENT_GET(state->content.copyUs);
+        out->rootUs = LORIE_CONTENT_GET(state->content.rootUs);
+        out->publishUs = LORIE_CONTENT_GET(state->content.publishUs);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&state->content.gen, __ATOMIC_RELAXED) == gen) {
+            out->gen = gen;
+            return;
+        }
+    }
+    out->gen = LORIE_CONTENT_TORN;
 }
 
 /*
@@ -2482,6 +2491,10 @@ static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {
 
     if (!c->gen)
         return;
+    if (c->gen == LORIE_CONTENT_TORN) {
+        LORIE_DIAG_ADD(state, contentScreenUnknown, 1);     // shown, but what it shows not known
+        return;
+    }
     if (c->gen == vkContentLast.gen) {
         LORIE_DIAG_ADD(state, contentScreenReused, 1);
         return;

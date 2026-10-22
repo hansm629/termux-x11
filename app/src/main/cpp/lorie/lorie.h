@@ -561,6 +561,7 @@ struct lorie_renderer_diag {
                       contentCompletesSkip, contentStaleReads, contentCompositorUpdates, contentRootUpdates, contentRootPublishes;
     volatile uint32_t contentPendingReads, contentUnknownReads;
     volatile uint32_t contentScreenNew, contentScreenReused, contentGapsPending, contentGapsClient;
+    volatile uint32_t contentScreenUnknown;     /* frames presented with no whole copy of the content taken (torn) */
     volatile uint32_t contentMaxGapUs, contentWorstUs, contentWorstCopyUs, contentWorstCompositeUs, contentWorstPublishUs,
                       contentWorstScreenUs;
     /* The root copies (rootCopy): the request to the renderer taking it, its recording and submission; and, when the
@@ -708,12 +709,21 @@ struct lorie_content_stamp {
     uint64_t requestUs, copyUs, readyUs;
 };
 /* ... and what the X server last published with the screen pixmap (InitOutput.c lorieContentPublish), for the renderer:
- * a generation (0: none yet), the content's number and stamps, when it reached the screen pixmap, when it was published.
- * The X server writes `gen` last (release); the renderer reads it first and again after (a change: read again). */
+ * a generation, the content's number and stamps, when it reached the screen pixmap, when it was published. The X server
+ * is its only writer, under a sequence lock: `gen` odd while it writes the rest, even once they are all written - the
+ * new generation (0: none yet); the renderer keeps a copy only if `gen` was even and the same before and after it read
+ * the rest (renderer.c rendererContentRead; LORIE_CONTENT_TORN: no whole copy). Each field is read and written
+ * atomically (LORIE_CONTENT_GET, LORIE_CONTENT_PUT: relaxed - the fences around `gen` order them), so neither side races
+ * the other; the 64-bit ones 8-byte aligned, so that 32-bit ABIs' atomics on them are the processor's own - lock-free
+ * across the two processes (ARMv7 ldrexd/strexd, x86 movq) - not a library's lock. */
+typedef uint64_t lorie_u64 __attribute__((aligned(8)));
 struct lorie_content {
     volatile uint32_t gen, seq;
-    volatile uint64_t requestUs, copyUs, rootUs, publishUs;
+    volatile lorie_u64 requestUs, copyUs, rootUs, publishUs;
 };
+_Static_assert(__atomic_always_lock_free(sizeof(lorie_u64), 0) && _Alignof(struct lorie_content) == 8,
+               "struct lorie_content needs lock-free, 8-byte aligned 64-bit atomics");
+#define LORIE_CONTENT_TORN 1u       /* a copy no whole one was taken of (an odd generation: never published) */
 
 static inline __always_inline bool lorieContentNewer(uint32_t a, uint32_t b) {
     return (int32_t) (a - b) > 0;
@@ -721,6 +731,10 @@ static inline __always_inline bool lorieContentNewer(uint32_t a, uint32_t b) {
 
 #define LORIE_DIAG_ADD(st, field, n) \
     do { if (st) __atomic_fetch_add(&(st)->diag.field, (n), __ATOMIC_RELAXED); } while (0)
+
+/* P11-C3-D0: struct lorie_content's fields, as its sequence lock reads and writes them (relaxed atomics) */
+#define LORIE_CONTENT_PUT(field, value) __atomic_store_n(&(field), (value), __ATOMIC_RELAXED)
+#define LORIE_CONTENT_GET(field) __atomic_load_n(&(field), __ATOMIC_RELAXED)
 
 struct lorie_shared_server_state {
     /*
