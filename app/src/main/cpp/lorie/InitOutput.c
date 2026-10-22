@@ -161,10 +161,10 @@ static lorieScreenInfo lorieScreen = {
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 
-// Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
-// the first connection so callers don't need a NULL check.
-static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
+// The renderer's wake (lorie.h struct lorie_renderer_wake), owned by the activity process, handed to us over the
+// connection socket. Points at a placeholder until the first connection so callers don't need a NULL check.
+static struct lorie_renderer_wake rendererWakePlaceholder;
+static struct lorie_renderer_wake* volatile rendererWake = &rendererWakePlaceholder;
 
 typedef struct {
     LorieBuffer *buffer;
@@ -281,7 +281,7 @@ static void lorieProcessOwnershipRequest(void) {
         mode = LORIE_OWNERSHIP_PERSISTENT;
     }
     lorieApplyOwnership(mode, LORIE_OWNERSHIP_SEQ(req));
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer(rendererWake);
 }
 
 /*
@@ -465,24 +465,27 @@ void ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs) {
     }
 }
 
-// Queued from handleLorieEvents (input thread) to run on the main thread, i.e. the same thread that
-// signals rendererCond from lorieRedraw/lorieMoveCursor - so the swap and the unmap below can never race
-// a signal.
+// Queued from handleLorieEvents (input thread) to run on the main thread, which wakes the renderer from
+// lorieRedraw and the rest. lorieMoveCursor wakes it from the input thread too (QueuePointerEvents moves the sprite
+// there, under the input lock): the swap is made under that lock, so the unmap below can never race a wake.
 static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* closure) {
     int fd = (int) (intptr_t) closure;
-    pthread_cond_t* newCond = mmap(NULL, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    struct lorie_renderer_wake* newWake = mmap(NULL, sizeof(struct lorie_renderer_wake), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    struct lorie_renderer_wake* old;
     close(fd); // mmap already keeps the region alive.
-    if (newCond == MAP_FAILED) {
-        log(ERROR, "Failed to map renderer wakeup cond var, keeping the old one");
+    if (newWake == MAP_FAILED) {
+        log(ERROR, "Failed to map renderer wakeup region, keeping the old one");
         return TRUE;
     }
 
-    pthread_cond_t* old = rendererCond;
-    rendererCond = newCond;
-    pthread_cond_signal(newCond); // in case a signal was sent to `old` right before this swap
+    input_lock();
+    old = rendererWake;
+    rendererWake = newWake;
+    input_unlock();
+    lorieWakeRenderer(newWake); // in case a wake was sent to `old` right before this swap
 
-    if (old != &rendererCondPlaceholder)
-        munmap(old, sizeof(pthread_cond_t));
+    if (old != &rendererWakePlaceholder)
+        munmap(old, sizeof(struct lorie_renderer_wake));
 
     return TRUE;
 }
@@ -728,8 +731,8 @@ static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int
     pvfb->state->cursor.y = y;
     pvfb->state->cursor.moved = TRUE;
     // No need to explicitly lock the mutex, it will cause waiting for rendering to be finished.
-    // We are simply signaling the renderer in the case if it sleeps.
-    pthread_cond_signal(rendererCond);
+    // We are simply waking the renderer in the case if it sleeps.
+    lorieWakeRenderer(rendererWake);
 }
 
 static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
@@ -937,7 +940,7 @@ static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr bo
         pvfb->rootCopy.boxes[i] = (BoxRec) { rects[i].x1, rects[i].y1, rects[i].x2, rects[i].y2 };
     pvfb->rootCopy.abandoned = FALSE;
     __atomic_fetch_add(&st->diag.rootGpuCopyRequests, 1, __ATOMIC_RELAXED);
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer(rendererWake);
     return TRUE;
 }
 
@@ -1180,10 +1183,10 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
         // Sending signal about pending root window changes to renderer thread.
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
         // for all drawing operations to be finished.
-        // Renderer thread will check the `drawRequested` flag right before going to sleep.
+        // P11-C3-C: published first, then the wake - the renderer cannot sleep through it (lorieWakeRenderer).
         if (tickUs)
             lorieTickAsked(tickUs);
-        pthread_cond_signal(rendererCond);
+        lorieWakeRenderer(rendererWake);
     }
 
     return TRUE;
@@ -2042,7 +2045,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
     __atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE); // release-publish entry writes above
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer(rendererWake);
 
     *out_serial = entry->serial;
     gpuCopyAttempts++;
@@ -2320,7 +2323,7 @@ static Bool lorieCpuRelease(uint64_t id) {
 static void lorieCpuReleasedWake(void) {
     __atomic_fetch_add(&pvfb->state->diag.copiesDeferredWakes, 1, __ATOMIC_RELAXED);
     syscall(SYS_futex, &pvfb->state->cpuAccess.releases, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer(rendererWake);
 }
 
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {

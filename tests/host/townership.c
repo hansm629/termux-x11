@@ -448,7 +448,7 @@ static bool rootConnection = true, rootSurface = true;
 static bool lorieConnectionAlive(void) { return rootConnection; }
 static bool lorieRendererAvailable(void) { return rootSurface; }
 static Bool (*queuedProc)(ClientPtr, void *);
-static int wakes, condSignals;
+static int wakes, rendererWakes;
 static Bool QueueWorkProc(Bool (*proc)(ClientPtr, void *), __unused ClientPtr client, __unused void *closure) {
     queuedProc = proc;
     return TRUE;
@@ -457,8 +457,8 @@ static void lorieWakeServer(void) { wakes++; }
 /* P10-S1: the X server's GPU copies rechecked (patches/xserver.patch) - the renderer gone, they settle at once */
 static int rechecks;
 static void lorieRecheckGpuCopies(void) { rechecks++; }
-static pthread_cond_t *rendererCond;
-#define pthread_cond_signal(c) ((void) (c), condSignals++)
+static void *rendererWake;
+#define lorieWakeRenderer(w) ((void) (w), rendererWakes++)
 /* a freed pixmap private is kept, never reused, so one still on the list can be seen without touching freed memory */
 static void *freed[256];
 static int nfreed;
@@ -715,7 +715,7 @@ static void exec(const struct impl *im, struct op o) {
     LorieBuffer *b = p->driverPriv ? *im->bufferOf(p->driverPriv) : NULL;
     bool perAccess = im->ownership && answered() == LORIE_OWNERSHIP_PER_ACCESS && b &&
                      b->desc.type == LORIEBUFFER_AHARDWAREBUFFER;
-    int pitch, transitions = w->state->diag.xOwnershipTransitions, signals = condSignals;
+    int pitch, transitions = w->state->diag.xOwnershipTransitions, signals = rendererWakes;
     Bool ok;
 
     switch (o.what) {
@@ -827,7 +827,7 @@ static void exec(const struct impl *im, struct op o) {
     }
     case ASK_NOTHING_NEW:
         lorieProcessOwnershipRequest();
-        CHECK(w->state->diag.xOwnershipTransitions == transitions && condSignals == signals,
+        CHECK(w->state->diag.xOwnershipTransitions == transitions && rendererWakes == signals,
               "%s op %d: an answered request taken up again", runName, opIndex);
         break;
     case DISCONNECT: {
@@ -972,15 +972,15 @@ static void scenarios(void) {
     CHECK(d->xOwnershipTransitions == 0 && d->xAhbCpuAcquires == 0, "unasked: ownership moved");
 
     /* Vulkan takes PER_ACCESS, then gives it back (fallback): 3c98ffa before and after */
-    signals = condSignals;
+    signals = rendererWakes;
     acquires = scenario("vulkan, then fallback", LORIE_BACKEND_AUTO, ASK_PER_ACCESS, ASK_PERSISTENT, true);
     d = &newWorld.state->diag;
     CHECK(acquires > 0 && d->xAhbCpuAcquires == (unsigned long long) acquires,
           "vulkan, then fallback: %llu AHB CPU accesses counted, %d made", (unsigned long long) d->xAhbCpuAcquires, acquires);
     CHECK(d->xStateLockWaitUs > 0, "vulkan, then fallback: no shared-lock wait recorded");
-    CHECK(d->xOwnershipTransitions == 2 && d->xOwnershipRefused == 0 && condSignals == signals + 2,
+    CHECK(d->xOwnershipTransitions == 2 && d->xOwnershipRefused == 0 && rendererWakes == signals + 2,
           "vulkan, then fallback: %u transitions, %u refused, %d answers signalled", d->xOwnershipTransitions,
-          d->xOwnershipRefused, condSignals - signals);
+          d->xOwnershipRefused, rendererWakes - signals);
     CHECK(newWorld.state->backend.ownershipAck == LORIE_OWNERSHIP_WORD(2, LORIE_OWNERSHIP_PERSISTENT),
           "vulkan, then fallback: last answer %#x", newWorld.state->backend.ownershipAck);
 
@@ -1452,7 +1452,7 @@ int main(void) {
                 xr[k] = (PixmapRec) { { NULL }, &xp[k], { 8, 8 } };
             }
             releases = st->cpuAccess.releases;
-            signals0 = condSignals;
+            signals0 = rendererWakes;
             ok = loriePrepareAccess(&xr[0], EXA_PREPARE_DEST) && loriePrepareAccess(&xr[1], EXA_PREPARE_SRC) &&
                  loriePrepareAccess(&xr[2], EXA_PREPARE_MASK);
             CHECK(ok && st->lock == 0 && newWorld.accessLocks == 0 && st->cpuAccess.count == 3 && xb[0]->cpuHeld && xb[1]->cpuHeld &&
@@ -1465,9 +1465,9 @@ int main(void) {
                   "B1 nested: after two finished, %u reserved", st->cpuAccess.count);
             lorieFinishAccess(&xr[0], EXA_PREPARE_DEST);
             CHECK(st->cpuAccess.count == 0 && st->lock == 0 && st->cpuAccess.releases == releases + 3 && !xb[0]->cpuHeld &&
-                  st->diag.xAccessReserved == 3 && condSignals == signals0 && st->diag.xAccessHold.count == 3 &&
+                  st->diag.xAccessReserved == 3 && rendererWakes == signals0 && st->diag.xAccessHold.count == 3 &&
                   st->diag.xAccess.count == 3, "B1 nested: %u left, %u releases, %u counted, %d signals, %u holds timed",
-                  st->cpuAccess.count, st->cpuAccess.releases - releases, st->diag.xAccessReserved, condSignals - signals0,
+                  st->cpuAccess.count, st->cpuAccess.releases - releases, st->diag.xAccessReserved, rendererWakes - signals0,
                   st->diag.xAccessHold.count);
             {
                 /* each: the shared lock let go before the CPU lock; the CPU lock let go before the shared lock is taken again */
@@ -1520,15 +1520,15 @@ int main(void) {
                   "B1 refused: prepared %d, lock %d, %u reserved", ok, st->lock, st->cpuAccess.count);
 
             /* a renderer waiting for a release: woken once, the waiter cleared */
-            signals0 = condSignals, wakes0 = releaseWakes;
+            signals0 = rendererWakes, wakes0 = releaseWakes;
             loriePrepareAccess(&xr[6], EXA_PREPARE_SRC);
             st->cpuAccess.waiter = 1;
             lorieFinishAccess(&xr[6], EXA_PREPARE_SRC);
-            CHECK(condSignals == signals0 + 1 && releaseWakes == wakes0 + 1 && !st->cpuAccess.waiter && st->diag.copiesDeferredWakes == 1,
-                  "B1 waiter: %d signals, %d futex wakes, waiter %u", condSignals - signals0, releaseWakes - wakes0, st->cpuAccess.waiter);
+            CHECK(rendererWakes == signals0 + 1 && releaseWakes == wakes0 + 1 && !st->cpuAccess.waiter && st->diag.copiesDeferredWakes == 1,
+                  "B1 waiter: %d signals, %d futex wakes, waiter %u", rendererWakes - signals0, releaseWakes - wakes0, st->cpuAccess.waiter);
             loriePrepareAccess(&xr[6], EXA_PREPARE_SRC);
             lorieFinishAccess(&xr[6], EXA_PREPARE_SRC);
-            CHECK(condSignals == signals0 + 1 && releaseWakes == wakes0 + 1, "B1 no waiter: woken anyway");
+            CHECK(rendererWakes == signals0 + 1 && releaseWakes == wakes0 + 1, "B1 no waiter: woken anyway");
 
             /* off: the shared lock throughout, nothing reserved */
             newWorld.exaLockOpt = FALSE;

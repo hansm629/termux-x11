@@ -134,12 +134,12 @@ static volatile int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0, 
 static volatile bool expectedSizeChanged = false;
 
 static pthread_mutex_t stateLock;
-// Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
-// (the companion mutex) doesn't need to be shared too.
-static pthread_cond_t* stateCond;
+// P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake), shared with the X server so it can wake us
+// directly; this process's threads wake us through it too. Only the renderer thread sleeps on it (rendererSleep).
+static struct lorie_renderer_wake* rendererWake;
 static pthread_cond_t stateChangeFinishCond;
 static pthread_spinlock_t bufferLock;
-static int stateCondFd = -1;
+static int rendererWakeFd = -1;
 
 static volatile bool smoothPresentationEnabled = false;
 static volatile bool rendererPerfLogEnabled = false;
@@ -543,17 +543,14 @@ void rendererInit(JNIEnv* env) {
 
     pthread_mutex_init(&stateLock, NULL);
 
-    // Created once, never recreated; only the fd is (re)sent to the X server whenever it (re)connects.
-    pthread_condattr_t cond_attr;
-    pthread_condattr_init(&cond_attr);
-    pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-    stateCondFd = LorieBuffer_createRegion("renderer-cond", sizeof(pthread_cond_t));
-    stateCond = stateCondFd == -1 ? MAP_FAILED : mmap(NULL, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, stateCondFd, 0);
-    if (stateCond == MAP_FAILED) {
-        loge("Failed to allocate renderer wakeup cond var, aborting");
+    // Created once, never recreated; only the fd is (re)sent to the X server whenever it (re)connects. A new
+    // region is zero-filled: the count starts at 0.
+    rendererWakeFd = LorieBuffer_createRegion("renderer-wake", sizeof(struct lorie_renderer_wake));
+    rendererWake = rendererWakeFd == -1 ? MAP_FAILED : mmap(NULL, sizeof(struct lorie_renderer_wake), PROT_READ|PROT_WRITE, MAP_SHARED, rendererWakeFd, 0);
+    if (rendererWake == MAP_FAILED) {
+        loge("Failed to allocate renderer wakeup region, aborting");
         abort();
     }
-    pthread_cond_init(stateCond, &cond_attr);
 
     pthread_cond_init(&stateChangeFinishCond, NULL);
     pthread_spin_init(&bufferLock, false);
@@ -562,7 +559,7 @@ void rendererInit(JNIEnv* env) {
 }
 
 int rendererGetWakeupCondFd(void) {
-    return stateCondFd;
+    return rendererWakeFd;
 }
 
 void rendererSetFiltering(JNIEnv* env, jobject self, jint f) {
@@ -580,7 +577,7 @@ void rendererSetSmoothPresentationEnabled(JNIEnv* env, jobject self, jboolean en
 
     pthread_mutex_lock(&stateLock);
     presentModeChanged = true;
-    pthread_cond_signal(stateCond);
+    lorieWakeRenderer(rendererWake);
     pthread_mutex_unlock(&stateLock);
 }
 
@@ -755,7 +752,7 @@ __unused void rendererSetSharedState(struct lorie_shared_server_state* newState)
     pthread_mutex_lock(&stateLock);
     pendingState = newState;
     stateChanged = true;
-    pthread_cond_signal(stateCond);
+    lorieWakeRenderer(rendererWake);
 
     while(stateChanged)
         pthread_cond_wait(&stateChangeFinishCond, &stateLock);
@@ -766,8 +763,8 @@ __unused void rendererSetSharedState(struct lorie_shared_server_state* newState)
 void rendererAddBuffer(LorieBuffer* buf) {
     pthread_spin_lock(&bufferLock);
     LorieBuffer_addToList(buf, &addedBuffers);
-    pthread_cond_signal(stateCond);
     pthread_spin_unlock(&bufferLock);
+    lorieWakeRenderer(rendererWake);     // after the buffer is in the list the renderer looks at
 }
 
 void rendererRemoveBuffer(uint64_t id) {
@@ -823,7 +820,7 @@ void rendererSetWindow(JNIEnv *env, __unused jobject thiz, jobject jsfc) {
     expectedW = expectedH = 0;
     windowChanged = TRUE;
 
-    pthread_cond_signal(stateCond);
+    lorieWakeRenderer(rendererWake);
 
     // We should wait until renderer destroys EGLSurface before SurfaceCallback::surfaceDestroyed finishes
     // Otherwise we will have weird errors like
@@ -864,7 +861,7 @@ void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int
     expectedSizeChanged = true;
     if (state)
         state->drawRequested = true;
-    pthread_cond_signal(stateCond);
+    lorieWakeRenderer(rendererWake);
     pthread_mutex_unlock(&stateLock);
 }
 
@@ -980,14 +977,16 @@ static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float 
 static void drawCursor(float displayWidth, float displayHeight);
 
 
-static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {
-    ts->tv_sec += us / 1000000;
-    ts->tv_nsec += (long) ((us % 1000000) * 1000);
-
-    while (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec++;
-        ts->tv_nsec -= 1000000000L;
-    }
+/*
+ * P11-C3-C: the renderer thread asleep, stateLock let go, until its wake count moves from `seen` - read before it last
+ * looked for work (lorie.h struct lorie_renderer_wake) - or, `timeoutUs` not negative, that long. At once if the count
+ * moved already. A wake without work is allowed: the caller looks again.
+ */
+static void rendererSleep(uint32_t seen, int64_t timeoutUs) {
+    struct timespec rel = { (time_t) (timeoutUs / 1000000), (long) (timeoutUs % 1000000) * 1000 };
+    pthread_mutex_unlock(&stateLock);
+    syscall(SYS_futex, &rendererWake->seq, FUTEX_WAIT, seen, timeoutUs >= 0 ? &rel : NULL, NULL, 0);
+    pthread_mutex_lock(&stateLock);
 }
 
 __unused void rendererSetDisplayRefreshRate(JNIEnv* env, jobject self, jfloat refreshRate) {
@@ -1232,10 +1231,9 @@ static LorieBuffer *rendererFindBufferWithRetry(uint64_t id) {
  * P11-C3-B1 (lorie.h cpuAccess): a queued copy using a buffer the X server holds reserved for a CPU access is not
  * recorded, nor any copy after it (the queue's order kept): the pass goes on without them - its frame drawn. The
  * X server is asked to wake the renderer when it lets a reservation go (`waiter`); until one is let go the copies
- * left queued are no reason to run again (rendererShouldWait), and the wait for that is bounded
- * (LORIE_COPIES_DEFERRED_RECHECK_US): its wake may come between the check and the wait.
+ * left queued are no reason to run again (rendererShouldWait). P11-C3-C: that wake is not lost between the look and
+ * the sleep (rendererWaitForWork), so the sleep needs no bound.
  */
-#define LORIE_COPIES_DEFERRED_RECHECK_US 4000
 static bool deferredCopies;
 static uint32_t deferredAt, deferredReleases;
 
@@ -1679,16 +1677,20 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
  */
 static bool rendererVkOwnership(uint8_t mode) {
     uint32_t ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE), seq = LORIE_OWNERSHIP_SEQ(ack) + 1;
-    struct timespec deadline;
+    uint64_t deadlineUs;
 
     vkOwned = false;
     __atomic_store_n(&state->backend.ownershipRequest, LORIE_OWNERSHIP_WORD(seq, mode), __ATOMIC_RELEASE);
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    rendererTimespecAddUs(&deadline, 1000000);
-    while (LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) != seq)
-        if (pthread_cond_timedwait(stateCond, &stateLock, &deadline) == ETIMEDOUT &&
-            LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) != seq)
+    deadlineUs = lorieMonotonicUs() + 1000000;
+    while (true) {
+        // P11-C3-C: the wake count before the look - an answer given after it moved it (rendererSleep)
+        uint32_t seen = lorieWakeSeen(rendererWake);
+        uint64_t now;
+        if (LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) == seq ||
+            (now = lorieMonotonicUs()) >= deadlineUs)
             break;
+        rendererSleep(seen, (int64_t) (deadlineUs - now));
+    }
     if (LORIE_OWNERSHIP_SEQ(ack) != seq || LORIE_OWNERSHIP_MODE(ack) != mode) {
         loge("Xlorie: X server CPU ownership %u: %s", mode, LORIE_OWNERSHIP_SEQ(ack) != seq ? "not answered" : "refused");
         return false;
@@ -2926,10 +2928,8 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
         rendererLastHighRefreshLimitWaitUs = highRefreshWaitUs;
 
         if (waitUs > 0) {
-            struct timespec deadline;
-
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            rendererTimespecAddUs(&deadline, waitUs);
+            // P11-C3-C: the delay asked for, cut short by a wake (taken as now: one just before ends it too)
+            uint32_t seen = lorieWakeSeen(rendererWake);
 
             if (coalesceWaitUs > 0) {
                 rendererPreRedrawCoalescedCount++;
@@ -2947,7 +2947,7 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
                     rendererHighRefreshLimitWaitUs = 0;
             }
 
-            pthread_cond_timedwait(stateCond, &stateLock, &deadline);
+            rendererSleep(seen, waitUs);
         } else {
             rendererLastPreRedrawCoalesceWaitUs = -1;
             rendererLastHighRefreshLimitWaitUs = -1;
@@ -2958,6 +2958,20 @@ static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {
 
     // Probably spurious wake, no changes we can work with.
     return true;
+}
+
+/*
+ * P11-C3-C: until there is work (rendererShouldWait), stateLock held but while asleep. The wake count is read before
+ * each look: work published after the look has moved it, and the sleep returns at once (lorie.h struct
+ * lorie_renderer_wake) - not one is slept through, whoever published it.
+ */
+static void rendererWaitForWork(bool *waitingForBuffers) {
+    while (true) {
+        uint32_t seen = lorieWakeSeen(rendererWake);
+        if (!rendererShouldWait(waitingForBuffers))
+            return;
+        rendererSleep(seen, -1);
+    }
 }
 
 // Whether this loop pass draws a Vulkan frame: a window, a frame allowed, something to draw.
@@ -3015,16 +3029,7 @@ __noreturn static void* rendererThread(void) {
     LorieBuffer* buf;
     bool waitingForBuffers = false;
     while (true) {
-        while (rendererShouldWait(&waitingForBuffers)) {
-            if (rendererCopiesStillDeferred()) {
-                // P11-C3-B1: the X server's wake at the release, or this bound - should it have come just before
-                struct timespec deadline;
-                clock_gettime(CLOCK_REALTIME, &deadline);
-                rendererTimespecAddUs(&deadline, LORIE_COPIES_DEFERRED_RECHECK_US);
-                pthread_cond_timedwait(stateCond, &stateLock, &deadline);
-            } else
-                pthread_cond_wait(stateCond, &stateLock);
-        }
+        rendererWaitForWork(&waitingForBuffers);
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = NULL;

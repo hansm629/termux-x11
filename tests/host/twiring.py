@@ -154,7 +154,7 @@ check('lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !s
 xredraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {")
 check(before_first_return(xredraw, "lorieTickTimed(tickUs, ") and "uint64_t tickUs = pvfb->frameDiag ? lorieMonotonicUs() : 0;" in xredraw,
       "lorieRedraw does not check the last frame asked for before its first return, or reads the clock with the option off")
-check("        if (tickUs)\n            lorieTickAsked(tickUs);\n        pthread_cond_signal(rendererCond);" in xredraw,
+check("        if (tickUs)\n            lorieTickAsked(tickUs);\n        lorieWakeRenderer(rendererWake);" in xredraw,
       "lorieRedraw does not stamp its request right before waking the renderer")
 in_order("Vulkan frame timed", redraw, "bool diag = state->backend.vkFrameDiag;", "lorieVkFrameWait(", "ft.fenceUs = vkr.fenceWaitUs;",
          "lorieVkPresent(", "state->renderedFrames++;", "if (diag) {", "rendererVkFrameTimed(&ft);")
@@ -183,9 +183,32 @@ check('lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(get
 should = func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {")
 check("gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();" in should,
       "copies left queued for a reservation wake the renderer again and again")
-in_order("the bounded wait for a release", loop, "while (rendererShouldWait(&waitingForBuffers)) {", "if (rendererCopiesStillDeferred()) {",
-         "rendererTimespecAddUs(&deadline, LORIE_COPIES_DEFERRED_RECHECK_US);", "pthread_cond_timedwait(stateCond, &stateLock, &deadline);",
-         "pthread_cond_wait(stateCond, &stateLock);")
+
+# P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
+# twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker
+# publishes its work before it moves the count.
+check("rendererWaitForWork(&waitingForBuffers);" in loop and "pthread_cond_wait(" not in loop and "rendererShouldWait(" not in loop,
+      "the renderer's loop does not wait for work in rendererWaitForWork")
+rsrc = open(R, encoding="utf-8").read()
+check("stateCond" not in rsrc and "pthread_cond_timedwait(" not in rsrc and "pthread_cond_signal(stateCond" not in rsrc,
+      "the renderer still waits on or signals the old condition variable")
+check("rendererCond" not in open(I, encoding="utf-8").read(), "the X server still signals the old condition variable")
+for what, body, publish in (
+        ("tick", xredraw, "pvfb->state->rootWindowTextureID = LorieBuffer_description(rootDouble"),
+        ("GPU copy queued", func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,"),
+         "__atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE);"),
+        ("root copy asked for", func(I, "static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n) {"),
+         "__atomic_store_n(&st->rootCopy.seq, pvfb->rootCopySeq, __ATOMIC_RELEASE);"),
+        ("ownership answered", func(I, "static void lorieProcessOwnershipRequest(void) {"), "lorieApplyOwnership(mode, LORIE_OWNERSHIP_SEQ(req));"),
+        ("cursor moved", func(I, "static void lorieMoveCursor(unused DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {"),
+         "pvfb->state->cursor.moved = TRUE;"),
+        ("reservation let go", func(I, "static void lorieCpuReleasedWake(void) {"), "FUTEX_WAKE"),
+        ("buffer added", func(R, "void rendererAddBuffer(LorieBuffer* buf) {"), "pthread_spin_unlock(&bufferLock);"),
+        ("window changed", func(R, "void rendererSetWindow(JNIEnv *env, __unused jobject thiz, jobject jsfc) {"), "windowChanged = TRUE;"),
+        ("session changed", func(R, "__unused void rendererSetSharedState(struct lorie_shared_server_state* newState) {"), "stateChanged = true;")):
+    in_order("published, then the renderer woken: " + what, body, publish, "lorieWakeRenderer(")
+in_order("the wake region swapped under the input lock", func(I, "static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* closure) {"),
+         "input_lock();", "rendererWake = newWake;", "input_unlock();", "lorieWakeRenderer(newWake);", "munmap(old")
 in_order("copies left queued forgotten with the session", loop, "if (stateChanged) {", "deferredCopies = false;", "if (windowChanged)")
 check("&& !rendererCopiesStillDeferred();\n    if (vkActive) {" in rpass, "the loop runs copies left queued for a reservation alone, again and again")
 

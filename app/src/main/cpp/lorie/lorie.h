@@ -11,6 +11,7 @@
 #include <jni.h>
 #include <screenint.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -116,6 +117,30 @@ static inline __always_inline bool lorie_mutex_trylock(pthread_mutex_t* mutex, p
 static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex, pid_t* lockingPid) {
     *lockingPid = 0;
     pthread_mutex_unlock(mutex);
+}
+
+/*
+ * P11-C3-C: the renderer's wake - an event count in the region the renderer makes and hands the X server
+ * (rendererGetWakeupCondFd, lorieSetRendererWakeupCond). Whoever gives the renderer work publishes it first, then
+ * calls lorieWakeRenderer: the count moves (release) and a renderer sleeping on it is woken (a futex on a shared
+ * mapping: across the two processes). The renderer reads the count (lorieWakeSeen, acquire) before it looks for work
+ * and sleeps only while the count is still what it read - FUTEX_WAIT compares it under the futex's own lock, and a
+ * wake after that compare finds the renderer queued. So work published after the look moved the count and the sleep
+ * returns at once, and work published before it is seen by the look. A condition variable signalled without its
+ * mutex, as the X server did (it cannot hold the renderer's process-local stateLock), loses a signal sent between the
+ * look and pthread_cond_wait: the wait reads the condition's state only once it is entered.
+ */
+struct lorie_renderer_wake {
+    uint32_t seq;
+};
+
+static inline __always_inline void lorieWakeRenderer(volatile struct lorie_renderer_wake *w) {
+    __atomic_fetch_add(&w->seq, 1, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &w->seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+static inline __always_inline uint32_t lorieWakeSeen(volatile struct lorie_renderer_wake *w) {
+    return __atomic_load_n(&w->seq, __ATOMIC_ACQUIRE);
 }
 
 typedef enum {
@@ -621,8 +646,8 @@ struct lorie_shared_server_state {
      * a queued copy that would use one stays queued, with every copy after it (renderer.c). The root the X server
      * publishes (rootWindowTextureID, which the renderer samples) it never reserves: accesses to it hold `lock` as
      * before. `releases` counts the reservations let go; `waiter`, set under `lock` by a renderer that left a copy
-     * queued for one, the X server clears at the next release, waking the renderer then (rendererCond, and a futex
-     * on `releases`).
+     * queued for one, the X server clears at the next release, waking the renderer then (lorieWakeRenderer, and a
+     * futex on `releases`).
      */
     struct {
         uint32_t count;

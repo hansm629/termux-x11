@@ -113,9 +113,9 @@ static void LorieBuffer_gpuCopyPendingDec(LorieBuffer *b) { b->gpuCopyPending--;
 static int LorieBuffer_lock(LorieBuffer *b, void **out) { *out = b; return 0; }
 static void LorieBuffer_unlock(LorieBuffer *b) { (void) b; }
 static void FatalError(const char *f, ...) { printf("FatalError %s\n", f); abort(); }
-static pthread_cond_t *rendererCond;
+static void *rendererWake;
 static int wakeups;
-#define pthread_cond_signal(c) ((void) (c), wakeups++)
+#define lorieWakeRenderer(w) ((void) (w), wakeups++)
 
 /* ---- GL, as far as GLES's copies use it: each draw's corners, program, texture and framebuffer texture ---- */
 typedef unsigned GLuint, GLenum;

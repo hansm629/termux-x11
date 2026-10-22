@@ -162,9 +162,20 @@ recipes = {
     "vkrenderer": lambda: span(R, "enum { RENDERER_USE_GLES, RENDERER_USE_VULKAN, RENDERER_USE_NONE };", "RENDERER_USE_NONE };")
         + func(R, "static int rendererBackendFor(uint8_t requested, bool vulkanFailed) {")
         + func(R, "static bool rendererGlesEager(void) {")
-        + func(R, "static void rendererTimespecAddUs(struct timespec *ts, int64_t us) {")
+        + func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
+    # P11-C3-C: the renderer's wake, both ends (lorie.h) - tvkrenderer.c, twake.c
+    "wake": lambda: span(H, "struct lorie_renderer_wake {", "    return __atomic_load_n(&w->seq, __ATOMIC_ACQUIRE);\n}"),
+    # ... and the renderer's wait for work: its look (rendererShouldWait, with the pending root copy and the copies left
+    # queued for a reservation it asks about), its sleep, and the loop of the two - twake.c
+    "rendererwait": lambda: func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
+        + span(R, "static bool deferredCopies;", "static uint32_t deferredAt, deferredReleases;")
+        + func(R, "static bool rendererCopiesStillDeferred(void) {")
+        + func(R, "static bool rendererRootCopyPending(void) {")
+        + func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {")
+        + func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {")
+        + func(R, "void rendererAddBuffer(LorieBuffer* buf) {"),
     # the GPU copy queue's types (fakevk.h)
     "gpucopytypes": lambda: span(H, "typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;", "} LorieGpuCopyEntry;")
         + macro(H, "LORIE_GPU_IN_FLIGHT_MAX"),
@@ -180,7 +191,7 @@ recipes = {
     "buffertypes": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "} LorieBuffer_Desc;"),
     "presentcopy": lambda: func(B, "__LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {")
         # P11-C3-B1: copies left queued for the X server's reservations
-        + span(R, "#define LORIE_COPIES_DEFERRED_RECHECK_US", "static uint32_t deferredAt, deferredReleases;")
+        + span(R, "static bool deferredCopies;", "static uint32_t deferredAt, deferredReleases;")
         + func(R, "static bool rendererCopyDeferred(const LorieGpuCopyEntry *entry, uint32_t index) {")
         + func(R, "static bool rendererCopiesStillDeferred(void) {")
         + func(I, "bool lorieRendererAvailable(void) {")

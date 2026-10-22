@@ -1417,6 +1417,83 @@ CONTROLS += [
      "tpresentcopy"),
 ]
 
+# P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake): each way to lose a wake again
+CONTROLS += [
+    ("wake: the count read after the look (the lost wakeup put back)", "renderer.c",
+     """    while (true) {
+        uint32_t seen = lorieWakeSeen(rendererWake);
+        if (!rendererShouldWait(waitingForBuffers))
+            return;
+        rendererSleep(seen, -1);
+    }""",
+     """    while (true) {
+        uint32_t seen;
+        if (!rendererShouldWait(waitingForBuffers))
+            return;
+        seen = lorieWakeSeen(rendererWake);
+        rendererSleep(seen, -1);
+    }""",
+     "twake"),
+    ("wake: the sleep compares the count as it is then, not as the look saw it", "renderer.c",
+     """    syscall(SYS_futex, &rendererWake->seq, FUTEX_WAIT, seen, timeoutUs >= 0 ? &rel : NULL, NULL, 0);""",
+     """    syscall(SYS_futex, &rendererWake->seq, FUTEX_WAIT, lorieWakeSeen(rendererWake) + 0 * seen, timeoutUs >= 0 ? &rel : NULL, NULL, 0);""",
+     "twake"),
+    ("wake: a wake that does not move the count", "lorie.h",
+     """    __atomic_fetch_add(&w->seq, 1, __ATOMIC_RELEASE);
+    syscall(SYS_futex, &w->seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);""",
+     """    syscall(SYS_futex, &w->seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);""",
+     "twake"),
+    ("wake: a private futex wake, which a sleep in another process never sees", "lorie.h",
+     """    syscall(SYS_futex, &w->seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);""",
+     """    syscall(SYS_futex, &w->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);""",
+     "twake"),
+    ("wake: copies left for a reservation polled for, not slept on until the X server's wake", "renderer.c",
+     """        rendererSleep(seen, -1);
+    }
+}""",
+     """        rendererSleep(seen + (rendererCopiesStillDeferred() ? 1 : 0), -1);
+    }
+}""",
+     "twake"),
+    ("wake: the ownership answer looked for before the count is read", "renderer.c",
+     """        uint32_t seen = lorieWakeSeen(rendererWake);
+        uint64_t now;
+        if (LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) == seq ||
+            (now = lorieMonotonicUs()) >= deadlineUs)
+            break;
+        rendererSleep(seen, (int64_t) (deadlineUs - now));""",
+     """        uint32_t seen;
+        uint64_t now;
+        if (LORIE_OWNERSHIP_SEQ(ack = __atomic_load_n(&state->backend.ownershipAck, __ATOMIC_ACQUIRE)) == seq ||
+            (now = lorieMonotonicUs()) >= deadlineUs)
+            break;
+        seen = lorieWakeSeen(rendererWake);
+        rendererSleep(seen, (int64_t) (deadlineUs - now));""",
+     "tvkrenderer"),
+    ("wake: a buffer's wake before it is in the list", "renderer.c",
+     """    LorieBuffer_addToList(buf, &addedBuffers);
+    pthread_spin_unlock(&bufferLock);
+    lorieWakeRenderer(rendererWake);     // after the buffer is in the list the renderer looks at""",
+     """    lorieWakeRenderer(rendererWake);     // after the buffer is in the list the renderer looks at
+    LorieBuffer_addToList(buf, &addedBuffers);
+    pthread_spin_unlock(&bufferLock);""",
+     "twiring"),
+    ("wake: the X server's GPU copy wake before the copy is queued", "InitOutput.c",
+     """    __atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE); // release-publish entry writes above
+    lorieWakeRenderer(rendererWake);""",
+     """    lorieWakeRenderer(rendererWake);
+    __atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE); // release-publish entry writes above""",
+     "twiring"),
+    ("wake: the region swapped without the input lock", "InitOutput.c",
+     """    input_lock();
+    old = rendererWake;
+    rendererWake = newWake;
+    input_unlock();""",
+     """    old = rendererWake;
+    rendererWake = newWake;""",
+     "twiring"),
+]
+
 def copy_sources(dst):
     os.makedirs(dst, exist_ok=True)
     for f in os.listdir(L):
