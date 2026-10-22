@@ -38,6 +38,7 @@
 #endif
 
 #include "xorglist_src.inc"
+#include "diagtypes_src.inc"
 #include "gpucopytypes_src.inc"
 #include "wake_src.inc"
 
@@ -60,6 +61,8 @@ struct lorie_shared_server_state {
     struct {
         volatile uint8_t updated, moved;
     } cursor;
+    struct lorie_backend_control backend;     /* P11-C3-C: the options the stage and the asks are kept for */
+    struct lorie_progress progress;
 };
 static volatile struct lorie_shared_server_state *state;
 static struct lorie_renderer_wake *rendererWake;
@@ -209,6 +212,10 @@ static void *laterThread(void *arg) {
     l->what();
     return NULL;
 }
+
+/* the stage the renderer gave itself as its sleep starts (P11-C3-C) */
+static uint32_t stageAtSleep = LORIE_R_STAGES;
+static void noteStage(void) { stageAtSleep = state->progress.rStage; }
 
 /* 20000 copies queued from another thread at random times */
 static volatile int xDone;
@@ -431,6 +438,31 @@ int main(void) {
         waitpid(pid, &status, 0);
         CHECK(!rescued && ms < 250, "another process's draw %s: slept through it (%ld ms)",
               i == 0 ? "while the renderer sleeps" : "between the renderer's look and its sleep", ms);
+    }
+
+    /* TERMUX_X11_FRAME_FREEZE_DIAG: asleep, the stage says so; woken to work, the stage says a pass, the asks it saw kept */
+    {
+        reset();
+        st.backend.freezeDiag = 1;
+        st.progress.askSeq = 4;
+        l = (struct later) { xDraw, 60 };
+        pthread_create(&t, NULL, laterThread, &l);
+        ms = waitForWork();
+        pthread_join(t, NULL);
+        CHECK(!rescued && st.progress.rStage == LORIE_R_PASS && st.progress.seenSeq == 4 && st.progress.seenUs && st.progress.rStageUs,
+              "freeze diag: woken, stage %u (want a pass), seen %u", st.progress.rStage, st.progress.seenSeq);
+        reset();
+        st.backend.freezeDiag = 1;
+        hookSleepStart = noteStage;
+        l = (struct later) { xDraw, 40 };
+        pthread_create(&t, NULL, laterThread, &l);
+        ms = waitForWork();
+        pthread_join(t, NULL);
+        CHECK(stageAtSleep == LORIE_R_SLEEP, "freeze diag: asleep, stage %u (want asleep)", stageAtSleep);
+        reset();
+        xDraw();
+        waitForWork();
+        CHECK(st.progress.rStage == 0 && st.progress.rStageUs == 0 && st.progress.seenUs == 0, "freeze diag off: a stage kept");
     }
 
     /* the previous protocol: the X server's signal between the look and pthread_cond_wait, slept through */

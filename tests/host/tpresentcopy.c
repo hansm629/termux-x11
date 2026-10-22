@@ -229,9 +229,10 @@ static void notifyGpuCopyDone(void) {
     notified.completed = state->gpuCopyQueue.completedSerial;
 }
 /* the Vulkan backend's notification carries when it published (P10-B0): the stamp it stored */
-static uint64_t notifiedPublishedUs;
-static void notifyGpuCopyPublished(uint64_t publishedUs) {
+static uint64_t notifiedPublishedUs, notifiedSerial;
+static void notifyGpuCopyPublished(uint64_t publishedUs, uint64_t serial) {
     notifiedPublishedUs = publishedUs;
+    notifiedSerial = serial;    /* P11-C3-C: the serial it published */
     notifyGpuCopyDone();
 }
 static void (*atLock)(void);     /* P11-C3-C: run once, as the renderer takes the shared lock */
@@ -269,9 +270,11 @@ static volatile bool otherOver;     /* the frame another submitter listed is ove
 /* P11-C3-B2: the order the frame's and the second submission's fences were waited for, and what stood then */
 static struct { int n; VkFence fence[8]; bool rootDone[8], auxListed[8], dstInFlight[8], rootInFlight[8]; uint32_t submits[8]; } fenceLog;
 static uint64_t fenceLogDst, fenceLogRoot;
+static uint32_t stageAtFence;   /* P11-C3-C: the renderer's stage as it waits for a frame's fence */
 static void lookAtFence(VkFence fence) {
     if (fence != vkr.frameFence)
         return;             /* a swapchain image's */
+    stageAtFence = state->progress.rStage;
     if (fenceLog.n < 8) {
         fenceLog.fence[fenceLog.n] = fence;
         fenceLog.rootDone[fenceLog.n] = state->rootCopy.done == state->rootCopy.seq;
@@ -1557,6 +1560,31 @@ int main(void) {
                   "B1 published root let go: held %d, %u presented", vkr.held, st.diag.vkFramesPresented - presented);
         }
         st.cpuAccess.waiter = 0;
+    }
+
+    /* P11-C3-C, TERMUX_X11_FRAME_FREEZE_DIAG: the renderer's stage as its frame waits for its fence, and once the pass is
+     * over; the asks its frame took up - those there were as it began, once it is presented; none of it with the option
+     * off. */
+    {
+        uint32_t presented = st.diag.vkFramesPresented;
+        own(47);
+        st.backend.freezeDiag = 1;
+        st.progress.askSeq = 7, st.progress.takenSeq = 3, st.progress.rStage = LORIE_R_SLEEP, st.progress.rStageUs = 0;
+        stageAtFence = LORIE_R_STAGES;
+        st.drawRequested = 1, st.waitForNextFrame = 0;     /* a tick's */
+        rendererPass(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(st.diag.vkFramesPresented == presented + 1 && stageAtFence == LORIE_R_FENCE_WAIT && st.progress.rStage == LORIE_R_PASS &&
+              st.progress.rStageUs && st.progress.takenSeq == 7 && st.progress.takenUs,
+              "freeze diag: stage %u at the fence (want %d), %u after the pass, taken %u (want 7)", stageAtFence, LORIE_R_FENCE_WAIT,
+              st.progress.rStage, st.progress.takenSeq);
+        st.backend.freezeDiag = 0;
+        st.progress.askSeq = 9, st.progress.rStage = LORIE_R_SLEEP, st.progress.rStageUs = 0, st.progress.takenUs = 0;
+        st.drawRequested = 1, st.waitForNextFrame = 0;
+        rendererPass(&waiting);
+        st.gpuInFlight.busy = 0;
+        CHECK(st.progress.rStage == LORIE_R_SLEEP && st.progress.rStageUs == 0 && st.progress.takenSeq == 7 && st.progress.takenUs == 0,
+              "freeze diag off: stage %u, taken %u - kept", st.progress.rStage, st.progress.takenSeq);
     }
 
     /* P11-C3-C: a buffer a queued copy uses that has not come yet from the connection - waited for before the shared

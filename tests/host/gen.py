@@ -165,6 +165,15 @@ recipes = {
         + func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
         + func(R, "static bool rendererVkOwnership(uint8_t mode) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {"),
+    # P11-C3-C: the freeze watchdog's stages - the renderer's (rendererProgressOn, rendererStage) and the X server's
+    # thread's (lorieXEnter, lorieXLeave) - tpresentcopy.c, twake.c, townership.c, tfreeze.c
+    "rendererstage": lambda: func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {"),
+    "xstage_decl": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };"),
+    "xstage": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };")
+        + func(I, "static struct lorieXMark lorieXEnter(uint32_t stage) {") + func(I, "static void lorieXLeave(struct lorieXMark *prev) {"),
+    # P11-C3-C: the freeze watchdog - its look, its judgement, its lines (all but its thread) - tfreeze.c
+    "freeze": lambda: func(I, "static uint32_t lorieFramesShown(void) {")
+        + span(I, "#define LORIE_FREEZE_PERIOD_US 100000", "#undef LORIE_D\n}"),
     # P11-C3-C: the shared lock's wait (lorie.h) - tsharedlock.c
     "sharedlock": lambda: func(H, "static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {")
         + func(H, "static inline __always_inline void lorie_mutex_unlock(pthread_mutex_t* mutex, pid_t* lockingPid) {"),
@@ -172,7 +181,8 @@ recipes = {
     "wake": lambda: span(H, "struct lorie_renderer_wake {", "    return __atomic_load_n(&w->seq, __ATOMIC_ACQUIRE);\n}"),
     # ... and the renderer's wait for work: its look (rendererShouldWait, with the pending root copy and the copies left
     # queued for a reservation it asks about), its sleep, and the loop of the two - twake.c
-    "rendererwait": lambda: func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
+    "rendererwait": lambda: func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {")
+        + func(R, "static void rendererSleep(uint32_t seen, int64_t timeoutUs) {")
         + span(R, "static bool deferredCopies;", "static uint32_t deferredAt, deferredReleases;")
         + func(R, "static bool rendererCopiesStillDeferred(void) {")
         + func(R, "static bool rendererRootCopyPending(void) {")
@@ -193,6 +203,7 @@ recipes = {
     # GLES copies (what Vulkan must match) and its Vulkan copies, alone and in a frame
     "buffertypes": lambda: span(os.path.join(L, "buffer.h"), "enum {\n    LORIEBUFFER_UNKNOWN __unused,", "} LorieBuffer_Desc;"),
     "presentcopy": lambda: func(B, "__LIBC_HIDDEN__ bool LorieBuffer_isRgba(LorieBuffer *buffer) {")
+        + func(R, "static bool rendererProgressOn(void) {") + func(R, "static void rendererStage(uint32_t stage) {")
         # P11-C3-B1: copies left queued for the X server's reservations
         + span(R, "static bool deferredCopies;", "static uint32_t deferredAt, deferredReleases;")
         + func(R, "static bool rendererCopyDeferred(const LorieGpuCopyEntry *entry, uint32_t index) {")

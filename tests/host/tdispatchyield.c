@@ -98,7 +98,13 @@ static uint64_t GetTimeInMicros(void) {
     return (uint64_t) SmartScheduleTime * 1000 + 1000000;
 }
 static struct { int index, major, minor; uint64_t us; } timedReq[4096];
-static int ntimed;
+static int ntimed, nstarted;
+/* P11-C3-C: each request's start, as InitOutput.c's ddxRequestStart gives it: the clock */
+static CARD64 ddxRequestStart(int clientIndex, int major, int minor) {
+    (void) clientIndex, (void) major, (void) minor;
+    nstarted++;
+    return GetTimeInMicros();
+}
 static void ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs) {
     if (ntimed < 4096)
         timedReq[ntimed] = (typeof(timedReq[0])) { clientIndex, major, minor, GetTimeInMicros() - startUs };
@@ -294,7 +300,7 @@ static void run(void (*dispatch)(void), int yield, const struct script *s, struc
     memset(SmartLastIndex, 0, sizeof SmartLastIndex);
     dispatchException = isItTimeToYield = 0;
     dispatchYieldRequested = 0;
-    ntimed = clockReads = 0;
+    ntimed = nstarted = clockReads = 0;
     pvfb->yieldOnWake = yield;
     for (int i = 0; i < 256; i++)
         requestVector[i] = request;
@@ -468,7 +474,7 @@ int main(void) {
             int untimedCalls, untimedReads, bad = 0;
             dispatchRequestTimed = 0;
             run(Dispatch, yield, &s, off);
-            untimedCalls = ntimed, untimedReads = clockReads;
+            untimedCalls = ntimed + nstarted, untimedReads = clockReads;
             dispatchRequestTimed = 1;
             scribble = true;
             run(Dispatch, yield, &s, on);
@@ -481,8 +487,8 @@ int main(void) {
             }
             CHECK(untimedCalls == 0 && untimedReads == 0, "timed requests (yield %d): untimed, %d requests handed on, %d clock reads",
                   yield, untimedCalls, untimedReads);
-            CHECK(ntimed == 100 && bad == 0, "timed requests (yield %d): %d handed on (want 100), %d with the wrong client, "
-                  "opcodes or time", yield, ntimed, bad);
+            CHECK(ntimed == 100 && nstarted == 100 && bad == 0, "timed requests (yield %d): %d handed on, %d started (want 100 "
+                  "each), %d with the wrong client, opcodes or time", yield, ntimed, nstarted, bad);
             CHECK(!strcmp(on->trail, off->trail) && on->rounds == off->rounds && !memcmp(on->served, off->served, sizeof on->served),
                   "timed requests (yield %d): served otherwise than untimed", yield);
         }

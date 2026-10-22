@@ -64,6 +64,11 @@ static struct present_screen_info loriePresentInfo;
 static dri3_screen_info_rec lorieDri3Info;
 static ExaDriverRec lorieExa;
 
+// P11-C3-C (TERMUX_X11_FRAME_FREEZE_DIAG=1): what the X server's thread is in - for the freeze watchdog - and since when
+// (lorieMonotonicUs): the stage to go back to once it is over (lorieXEnter, lorieXLeave).
+enum { LORIE_X_LOOP, LORIE_X_TICK, LORIE_X_REQUEST, LORIE_X_ROOT_COPY_WAIT, LORIE_X_REPORT, LORIE_X_STAGES };
+struct lorieXMark { uint32_t stage; uint64_t us; };
+
 typedef struct {
     DamagePtr damage;
     OsTimerPtr fpsTimer;
@@ -140,6 +145,21 @@ typedef struct {
     /* P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1, lorie.h cpuAccess): PER_ACCESS AHB accesses reserve the AHB instead of
      * holding the shared lock through the access */
     Bool exaLockOpt;
+
+    /* P11-C3-C (TERMUX_X11_FRAME_FREEZE_DIAG=1, the freeze watchdog: lorieFreezeWatch): asked for; where this thread is
+     * (LORIE_X_*, since when), the request it is in and the stage it came from, the requests run; the 5 second
+     * report's own time (the last, and the most since the watchdog last logged the threads); the last GPU copy
+     * completion the input thread was told of, and the last this thread rechecked the copies for (serial, when) - all
+     * read by the watchdog's thread, atomically. The threads it looks at in /proc: this one, the input thread, the
+     * Choreographer's. */
+    Bool freezeDiag;
+    uint32_t xStage, xRequests;
+    uint64_t xStageUs;
+    int xRequestClient, xRequestMajor, xRequestMinor;
+    struct lorieXMark requestMark;
+    uint64_t reportUs, reportMaxUs;
+    uint64_t copyNotifiedSerial, copyNotifiedUs, copyAckedSerial, copyAckedUs;
+    pid_t mainTid, inputTid, vsyncTid;
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -160,6 +180,28 @@ static lorieScreenInfo lorieScreen = {
         .ahbPersistent = { &lorieScreen.ahbPersistent, &lorieScreen.ahbPersistent },
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
+
+// P11-C3-C: this thread into `stage`, if the freeze watchdog is on - what it was in, to go back to
+static struct lorieXMark lorieXEnter(uint32_t stage) {
+    struct lorieXMark prev = { LORIE_X_LOOP, 0 };
+    if (pvfb->freezeDiag) {
+        prev.stage = __atomic_load_n(&pvfb->xStage, __ATOMIC_RELAXED);
+        prev.us = __atomic_load_n(&pvfb->xStageUs, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->xStageUs, lorieMonotonicUs(), __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->xStage, stage, __ATOMIC_RELEASE);
+    }
+    return prev;
+}
+
+// ... and back: to the stage it was in, since when it was (the main loop: since now). A cleanup attribute's too.
+static void lorieXLeave(struct lorieXMark *prev) {
+    if (pvfb->freezeDiag) {
+        __atomic_store_n(&pvfb->xStageUs, prev->stage == LORIE_X_LOOP ? lorieMonotonicUs() : prev->us, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->xStage, prev->stage, __ATOMIC_RELEASE);
+    }
+}
+
+static void *lorieFreezeWatch(void *arg);
 
 // The renderer's wake (lorie.h struct lorie_renderer_wake), owned by the activity process, handed to us over the
 // connection socket. Points at a placeholder until the first connection so callers don't need a NULL check.
@@ -424,7 +466,14 @@ void OsVendorInit(void) {
     // of them reads a clock.
     lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
     lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
-    dispatchRequestTimed = lorieScreen.frameDiag;
+    // Diagnostics: TERMUX_X11_FRAME_FREEZE_DIAG=1 watches, from a thread of its own, for work waiting with nothing
+    // moving - in the X server or the renderer - and logs each such freeze as it begins and ends, and this process's
+    // threads every 5 seconds (XlorieFreeze, XlorieXSched: lorieFreezeWatch). Off, none of it runs: no thread, no stage,
+    // no clock.
+    lorieScreen.freezeDiag = getenv("TERMUX_X11_FRAME_FREEZE_DIAG") && !strcmp(getenv("TERMUX_X11_FRAME_FREEZE_DIAG"), "1");
+    lorieScreen.state->backend.freezeDiag = lorieScreen.freezeDiag;
+    lorieScreen.mainTid = gettid();
+    dispatchRequestTimed = lorieScreen.frameDiag || lorieScreen.freezeDiag;
     // Experimental: TERMUX_X11_EXA_LOCK_OPT=1 has a PER_ACCESS AHB access reserve the AHB for itself instead of holding
     // the shared lock - and so the renderer's frames - through the CPU drawing (loriePrepareAccess, lorie.h cpuAccess).
     lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");
@@ -432,6 +481,13 @@ void OsVendorInit(void) {
     // ahead of the frame, which waits for it on the device instead of the renderer waiting for its fence (renderer.c).
     lorieScreen.state->backend.vkScheduleOpt = getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT") &&
                                                !strcmp(getenv("TERMUX_X11_RENDERER_VK_SCHEDULE_OPT"), "1");
+    if (lorieScreen.freezeDiag) {
+        pthread_t watch;
+        if (pthread_create(&watch, NULL, lorieFreezeWatch, NULL) == 0)
+            pthread_detach(watch);
+        else
+            log(ERROR, "XlorieFreeze: the watchdog's thread was not made");
+    }
 }
 
 // A name as one word for a log line: a path's last part, up to its first space, anything else odd as '_'.
@@ -450,8 +506,29 @@ static void lorieDiagWord(char *out, size_t size, const char *in) {
  * before it ran, as it may have closed its own client. The period's slowest is kept with its client's command name
  * and its extension's name.
  */
+/*
+ * P11-C3-C: a client request about to be handled (dix/dispatch.c Dispatch, while dispatchRequestTimed): for the freeze
+ * watchdog, which request this thread is in; the clock for ddxRequestTimed.
+ */
+CARD64 ddxRequestStart(int clientIndex, int major, int minor) {
+    if (pvfb->freezeDiag) {
+        __atomic_store_n(&pvfb->xRequestClient, clientIndex, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->xRequestMajor, major, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->xRequestMinor, minor, __ATOMIC_RELAXED);
+        pvfb->requestMark = lorieXEnter(LORIE_X_REQUEST);
+    }
+    return GetTimeInMicros();
+}
+
 void ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs) {
-    CARD64 us = GetTimeInMicros() - startUs;
+    CARD64 us;
+    if (pvfb->freezeDiag) {
+        __atomic_fetch_add(&pvfb->xRequests, 1, __ATOMIC_RELAXED);
+        lorieXLeave(&pvfb->requestMark);
+    }
+    if (!pvfb->frameDiag)
+        return;
+    us = GetTimeInMicros() - startUs;
     lorieHistAdd(&pvfb->state->diag.xRequest, us);
     if (us > pvfb->worstRequest.us) {
         ClientPtr client = clientIndex >= 0 && clientIndex < MAXCLIENTS ? clients[clientIndex] : NULL;
@@ -648,7 +725,9 @@ void ddxBeforeReset(void) {}
 #if INPUTTHREAD
 /** This function is called in Xserver/os/inputthread.c when starting
     the input thread. */
-void ddxInputThreadInit(void) {}
+void ddxInputThreadInit(void) {
+    pvfb->inputTid = gettid();      // P11-C3-C: for the freeze watchdog's look at it
+}
 #endif
 
 void ddxUseMsg(void) {
@@ -962,6 +1041,7 @@ static void lorieRootCopyWait(Bool takeBack) {
 
     if (!seq)
         return;
+    struct lorieXMark waitMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_ROOT_COPY_WAIT);  // P11-C3-C
     startUs = GetTimeInMicros();
     while ((done = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE)) != seq) {
         struct timespec slice = { 0, 33 * 1000000 };
@@ -1100,11 +1180,16 @@ static void lorieTickTimed(uint64_t tickUs, uint32_t postedUs, Bool posted) {
 // P11-C3: that tick asking the renderer for a frame - when (for the renderer's wake), the frames presented by then, its work.
 static void lorieTickAsked(uint64_t tickUs) {
     uint64_t now = lorieMonotonicUs();
+    volatile struct lorie_progress *p = &pvfb->state->progress;
+    uint32_t seq = p->askSeq + 1;
     pvfb->frameAsked = TRUE;
     pvfb->framesAtAsk = lorieFramesShown();
     __atomic_store_n(&pvfb->state->frameWantedUs, now, __ATOMIC_RELAXED);
     __atomic_fetch_add(&pvfb->state->diag.xTicksFrameWanted, 1, __ATOMIC_RELAXED);
     lorieHistAdd(&pvfb->state->diag.xTickWork, now - tickUs);
+    // P11-C3-C: this ask, numbered, and when (lorie.h struct lorie_progress): the frame that takes it up says so
+    p->askUs[seq % LORIE_ASK_RING] = now;
+    __atomic_store_n(&p->askSeq, seq, __ATOMIC_RELEASE);
 }
 
 static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
@@ -1112,7 +1197,9 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
     Bool twinned, rootDouble;
-    uint64_t tickUs = pvfb->frameDiag ? lorieMonotonicUs() : 0;
+    uint64_t tickUs = pvfb->frameDiag || pvfb->freezeDiag ? lorieMonotonicUs() : 0;
+    // P11-C3-C: in a tick, for the freeze watchdog, until it is over
+    struct lorieXMark tickMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_TICK);
 
     // P10-B0: from its Choreographer callback to here, and the ticks still waiting behind it.
     if (closure)
@@ -1290,7 +1377,7 @@ static void lorieLogRendererDiag(void) {
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
               "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s exa_lock_opt=%s "
-              "vk_schedule_opt=%s",
+              "vk_schedule_opt=%s freeze_diag=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -1303,7 +1390,8 @@ static void lorieLogRendererDiag(void) {
         TD(xAhbCpuLockUs), d.xRootBuffers ? d.xRootBuffers : 1, TD(xRootCopyUs),
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
         !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off",
-        pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off", pvfb->state->backend.vkScheduleOpt ? "on" : "off");
+        pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off", pvfb->state->backend.vkScheduleOpt ? "on" : "off",
+        pvfb->freezeDiag ? "on" : "off");
     // P11-C3-B: what the scheduling options did - B1's reservations instead of the shared lock, and the copies the
     // renderer left queued for one
     log(INFO, "XlorieSchedule: exa_lock_opt=%s x_access_reserved=%llu(+%llu) x_access_reserve_full=%llu(+%llu) "
@@ -1496,6 +1584,9 @@ static void lorieLogRendererDiag(void) {
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint32_t samples;
     static Bool driverLogged = FALSE;
+    // P11-C3-C: the report's own time and stage, for the freeze watchdog (DoTimers runs it under the input lock)
+    uint64_t reportStartUs = pvfb->freezeDiag ? lorieMonotonicUs() : 0;
+    struct lorieXMark reportMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_REPORT);
 
     if (!driverLogged && pvfb->state->rendererDriver[0]) {
         driverLogged = TRUE;
@@ -1540,7 +1631,414 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
 
     if (lorieConnectionAlive())
         lorieLogRendererDiag();
+    if (reportStartUs) {
+        uint64_t us = lorieMonotonicUs() - reportStartUs;
+        __atomic_store_n(&pvfb->reportUs, us, __ATOMIC_RELAXED);
+        if (us > __atomic_load_n(&pvfb->reportMaxUs, __ATOMIC_RELAXED))
+            __atomic_store_n(&pvfb->reportMaxUs, us, __ATOMIC_RELAXED);
+    }
     return 5000;
+}
+
+/* ---- P11-C3-C, TERMUX_X11_FRAME_FREEZE_DIAG=1: the freeze watchdog ---- */
+
+#define LORIE_FREEZE_PERIOD_US 100000       /* the watchdog looks every 100 ms */
+#define LORIE_FREEZE_BEGIN_US 500000        /* work waiting, none of it moving, this long: a freeze */
+
+static const char *const lorieXStageNames[LORIE_X_STAGES] = { "loop", "tick", "request", "root_copy_wait", "report" };
+static const char *const lorieRStageNames[LORIE_R_STAGES] = {
+    "sleep", "pass", "buffer_wait", "root_copy", "frame", "acquire", "lock_wait", "fence_wait", "present", "copies", "gles",
+    "backend", "device_idle" };
+
+// What the watchdog saw at nowUs - each part read without a lock, as it was then.
+struct lorie_freeze_sample {
+    uint64_t nowUs;
+    Bool connected, surface;
+    // what moves: frames presented, the last GPU copy completed, root copies settled, ticks run, requests run
+    uint32_t framesShown, ticksPosted, ticksRun, requests;
+    uint64_t copiesDone;
+    uint32_t rootSeq, rootTaken, rootDone, rootCancelled, rootWaiting;
+    uint64_t rootQueuedUs;
+    // the renderer's work waiting: frames asked for and not presented (since the first such ask), GPU copies queued
+    // (since the oldest)
+    uint32_t askSeq, takenSeq;
+    uint64_t askUs;
+    uint32_t copiesQueued;
+    uint64_t copyQueuedUs;
+    // where each side is
+    uint32_t xStage, rStage;
+    uint64_t xStageUs, rStageUs;
+    int requestClient, requestMajor, requestMinor;
+    uint32_t gpuBusy;
+    int lockPid;
+    uint64_t notifiedSerial, ackedSerial;
+};
+
+// The watchdog's own: the last sample, when each kind of work last moved, and the freeze it is in, if any.
+struct lorie_freeze {
+    struct lorie_freeze_sample last;
+    Bool started, on;
+    uint64_t framesUs, copiesUs, rootUs, ticksUs;
+    uint32_t id, levels, level, pending, beginPending, moved;
+    uint64_t beginUs, stallUs, xStallUs, rStallUs;
+    char side;
+    uint32_t beginXStage, beginRStage;
+};
+
+enum { LORIE_FREEZE_NONE, LORIE_FREEZE_BEGIN, LORIE_FREEZE_LEVEL, LORIE_FREEZE_END };
+// What waits (pending), what moved (ended_by)
+#define LORIE_FREEZE_FRAME 1u       /* a frame asked for, not presented */
+#define LORIE_FREEZE_COPY 2u        /* GPU copies queued, none completed */
+#define LORIE_FREEZE_ROOT 4u        /* a root copy asked for, not settled */
+#define LORIE_FREEZE_RSTAGE 8u      /* the renderer in one stage - not asleep, not between steps */
+#define LORIE_FREEZE_XSTAGE 16u     /* the X server's thread in one stage - a tick, a request, a wait, the report */
+#define LORIE_FREEZE_TICKS 32u      /* ticks posted to the X server's thread, none run */
+#define LORIE_FREEZE_KINDS 6
+
+// How long since the later of `a` and `b` (0: neither, or later than now).
+static uint64_t lorieFreezeSince(uint64_t now, uint64_t a, uint64_t b) {
+    uint64_t from = a > b ? a : b;
+    return from && from <= now ? now - from : 0;
+}
+
+/*
+ * One look: whether a freeze begins, goes past 1, 2 or 3 seconds (a level), or ends. A freeze is work waiting with none
+ * of it moving for LORIE_FREEZE_BEGIN_US, each kind timed from when it was asked for or last moved, whichever is later:
+ * the renderer's (frames asked for, GPU copies, itself in one stage - while it has a window; a root copy, while it is
+ * connected), the X server's (its thread in one stage, ticks posted that it does not run). Nothing waiting is no
+ * freeze, however long: an idle screen, a client drawing nothing, no window. It ends at the first look that finds what
+ * waited moved or gone (`moved`: what of that, as it began, moved - a stage left counts). Times are within a period
+ * (LORIE_FREEZE_PERIOD_US) of the event.
+ */
+static int lorieFreezeCheck(struct lorie_freeze *f, const struct lorie_freeze_sample *s) {
+    uint64_t now = s->nowUs, u, x = 0, r = 0;
+    uint32_t pending = 0, moved = 0, k;
+    int what = LORIE_FREEZE_NONE;
+
+    if (!f->started) {
+        f->started = TRUE;
+        f->framesUs = f->copiesUs = f->rootUs = f->ticksUs = now;
+        f->last = *s;
+        return what;
+    }
+    if (s->framesShown != f->last.framesShown)
+        f->framesUs = now, moved |= LORIE_FREEZE_FRAME;
+    if (s->copiesDone != f->last.copiesDone)
+        f->copiesUs = now, moved |= LORIE_FREEZE_COPY;
+    if (s->rootDone != f->last.rootDone || s->rootCancelled != f->last.rootCancelled)
+        f->rootUs = now, moved |= LORIE_FREEZE_ROOT;
+    if (s->ticksRun != f->last.ticksRun)
+        f->ticksUs = now, moved |= LORIE_FREEZE_TICKS;
+    if (s->rStage != f->last.rStage || s->rStageUs != f->last.rStageUs)
+        moved |= LORIE_FREEZE_RSTAGE;
+    if (s->xStage != f->last.xStage || s->xStageUs != f->last.xStageUs)
+        moved |= LORIE_FREEZE_XSTAGE;
+    if (s->surface) {
+        if (s->askSeq != s->takenSeq && (u = lorieFreezeSince(now, s->askUs, f->framesUs)) >= LORIE_FREEZE_PERIOD_US)
+            pending |= LORIE_FREEZE_FRAME, r = u > r ? u : r;
+        if (s->copiesQueued && (u = lorieFreezeSince(now, s->copyQueuedUs, f->copiesUs)) >= LORIE_FREEZE_PERIOD_US)
+            pending |= LORIE_FREEZE_COPY, r = u > r ? u : r;
+        if (s->rStage != LORIE_R_SLEEP && s->rStage != LORIE_R_PASS &&
+            (u = lorieFreezeSince(now, s->rStageUs, 0)) >= LORIE_FREEZE_PERIOD_US)
+            pending |= LORIE_FREEZE_RSTAGE, r = u > r ? u : r;
+    }
+    if (s->connected && s->rootSeq && s->rootSeq != s->rootDone && s->rootSeq != s->rootCancelled &&
+        (u = lorieFreezeSince(now, s->rootQueuedUs, f->rootUs)) >= LORIE_FREEZE_PERIOD_US)
+        pending |= LORIE_FREEZE_ROOT, r = u > r ? u : r;
+    if (s->xStage != LORIE_X_LOOP && (u = lorieFreezeSince(now, s->xStageUs, 0)) >= LORIE_FREEZE_PERIOD_US)
+        pending |= LORIE_FREEZE_XSTAGE, x = u > x ? u : x;
+    if (s->ticksPosted != s->ticksRun && (u = lorieFreezeSince(now, f->ticksUs, 0)) >= LORIE_FREEZE_PERIOD_US)
+        pending |= LORIE_FREEZE_TICKS, x = u > x ? u : x;
+
+    f->pending = pending;
+    f->xStallUs = x;
+    f->rStallUs = r;
+    f->stallUs = x > r ? x : r;
+    if (!f->on) {
+        if (f->stallUs >= LORIE_FREEZE_BEGIN_US) {
+            f->on = TRUE;
+            f->id++;
+            f->levels = f->level = 0;
+            f->beginUs = now - f->stallUs;
+            f->side = x >= LORIE_FREEZE_BEGIN_US ? (r >= LORIE_FREEZE_BEGIN_US ? 'b' : 'x') : 'r';
+            f->beginPending = pending;
+            f->beginXStage = s->xStage;
+            f->beginRStage = s->rStage;
+            what = LORIE_FREEZE_BEGIN;
+        }
+    } else if (f->stallUs < LORIE_FREEZE_BEGIN_US) {
+        f->on = FALSE;
+        f->moved = moved & f->beginPending;     // of what waited as it began, what moved (none: it is no longer waited for)
+        what = LORIE_FREEZE_END;
+    } else {
+        for (k = 0; k < 3; k++)
+            if (!(f->levels & (1u << k)) && now - f->beginUs >= (uint64_t) (k + 1) * 1000000) {
+                f->levels |= 1u << k;
+                f->level = k + 1;
+                what = LORIE_FREEZE_LEVEL;
+            }
+    }
+    f->last = *s;
+    return what;
+}
+
+// The watchdog's look at the shared state and this process's own, as they are - no lock taken, nothing waited for.
+static void lorieFreezeSample(struct lorie_freeze_sample *s) {
+    volatile struct lorie_shared_server_state *st = pvfb->state;
+    volatile struct lorie_progress *p = &st->progress;
+    uint32_t r = __atomic_load_n(&st->gpuCopyQueue.readIndex, __ATOMIC_ACQUIRE);
+    uint32_t w = __atomic_load_n(&st->gpuCopyQueue.writeIndex, __ATOMIC_ACQUIRE);
+
+    memset(s, 0, sizeof(*s));
+    s->nowUs = lorieMonotonicUs();
+    s->connected = lorieConnectionAlive();
+    s->surface = s->connected && st->surfaceAvailable;
+    s->framesShown = lorieFramesShown();
+    s->ticksPosted = __atomic_load_n(&st->diag.xTicksPosted, __ATOMIC_RELAXED);
+    s->ticksRun = __atomic_load_n(&st->diag.xTicksRun, __ATOMIC_RELAXED);
+    s->requests = __atomic_load_n(&pvfb->xRequests, __ATOMIC_RELAXED);
+    s->copiesDone = __atomic_load_n(&st->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE);
+    s->rootSeq = __atomic_load_n(&st->rootCopy.seq, __ATOMIC_ACQUIRE);
+    s->rootTaken = st->rootCopy.taken;
+    s->rootDone = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE);
+    s->rootCancelled = st->rootCopy.cancelled;
+    s->rootWaiting = st->rootCopy.waiting;
+    s->rootQueuedUs = st->rootCopy.queuedUs;
+    s->askSeq = __atomic_load_n(&p->askSeq, __ATOMIC_ACQUIRE);
+    s->takenSeq = __atomic_load_n(&p->takenSeq, __ATOMIC_ACQUIRE);
+    s->askUs = s->askSeq != s->takenSeq ? lorieAskUs(p, s->takenSeq + 1, s->askSeq) : 0;
+    s->copiesQueued = w - r;
+    s->copyQueuedUs = w != r ? st->gpuCopyQueue.entries[r % LORIE_GPU_COPY_QUEUE_CAPACITY].queuedUs : 0;
+    s->xStage = __atomic_load_n(&pvfb->xStage, __ATOMIC_ACQUIRE);
+    s->xStageUs = __atomic_load_n(&pvfb->xStageUs, __ATOMIC_RELAXED);
+    s->requestClient = __atomic_load_n(&pvfb->xRequestClient, __ATOMIC_RELAXED);
+    s->requestMajor = __atomic_load_n(&pvfb->xRequestMajor, __ATOMIC_RELAXED);
+    s->requestMinor = __atomic_load_n(&pvfb->xRequestMinor, __ATOMIC_RELAXED);
+    s->rStage = __atomic_load_n(&p->rStage, __ATOMIC_ACQUIRE);
+    s->rStageUs = p->rStageUs;
+    s->gpuBusy = __atomic_load_n(&st->gpuInFlight.busy, __ATOMIC_ACQUIRE);
+    s->lockPid = st->lockingPid;
+    s->notifiedSerial = __atomic_load_n(&pvfb->copyNotifiedSerial, __ATOMIC_ACQUIRE);
+    s->ackedSerial = __atomic_load_n(&pvfb->copyAckedSerial, __ATOMIC_ACQUIRE);
+}
+
+/*
+ * A thread of this process, as /proc has it: its state (R running or waiting to, S asleep, D in the kernel and not to be
+ * interrupted), its time run and waited on a run queue (schedstat, microseconds; -1: not there), and the system call it
+ * is in (-1: none, asleep anyway; -2: not known) with its first argument.
+ */
+struct lorie_thread_info {
+    char state;
+    long long runUs, waitUs;
+    long sys;
+    unsigned long long arg;
+    Bool running;
+};
+
+static ssize_t lorieReadSmall(const char *path, char *buf, size_t size) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, size - 1);
+    if (fd >= 0)
+        close(fd);
+    buf[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+static void lorieThreadInfo(pid_t tid, struct lorie_thread_info *t) {
+    char path[64], buf[512], *p;
+    unsigned long long run, wait;
+
+    *t = (struct lorie_thread_info) { '?', -1, -1, -2, 0, FALSE };
+    if (tid <= 0)
+        return;
+    snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    if (lorieReadSmall(path, buf, sizeof(buf)) > 0 && (p = strrchr(buf, ')')) && p[1] == ' ' && p[2])
+        t->state = p[2];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+    if (lorieReadSmall(path, buf, sizeof(buf)) > 0 && sscanf(buf, "%llu %llu", &run, &wait) == 2)
+        t->runUs = (long long) (run / 1000), t->waitUs = (long long) (wait / 1000);
+    snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+    if (lorieReadSmall(path, buf, sizeof(buf)) > 0) {
+        if (!strncmp(buf, "running", 7))
+            t->running = TRUE;
+        else if (sscanf(buf, "%ld %llx", &t->sys, &t->arg) < 1)
+            t->sys = -2;
+    }
+}
+
+// That system call as a word: a futex on one of the shared state's words by that word's name, else by its kind.
+static void lorieSyscallWord(const struct lorie_thread_info *t, char *out, size_t size) {
+    volatile struct lorie_shared_server_state *st = pvfb->state;
+    uintptr_t a = (uintptr_t) t->arg;
+    const char *what = t->running ? "running" : t->sys == -2 ? "unknown" : t->sys == -1 ? "none" : NULL;
+
+    if (!what && t->sys == SYS_futex)
+        what = a == (uintptr_t) &st->lock ? "futex:lock" : a == (uintptr_t) &st->cursor.lock ? "futex:cursor_lock" :
+               a == (uintptr_t) &st->rootCopy.done ? "futex:root_done" : a == (uintptr_t) &st->gpuInFlight.busy ? "futex:gpu_busy" :
+               "futex";
+#ifdef SYS_epoll_pwait
+    if (!what && t->sys == SYS_epoll_pwait)
+        what = "epoll_pwait";
+#endif
+#ifdef SYS_ppoll
+    if (!what && t->sys == SYS_ppoll)
+        what = "ppoll";
+#endif
+    if (what)
+        snprintf(out, size, "%s", what);
+    else
+        snprintf(out, size, "nr%ld", t->sys);
+}
+
+// What waits or moved (LORIE_FREEZE_*), as a word.
+static void lorieFreezeKinds(uint32_t m, const char *none, char *out, size_t size) {
+    static const char *const names[LORIE_FREEZE_KINDS] = { "frame", "copy", "root", "renderer", "x", "ticks" };
+    size_t n = 0;
+    int i;
+    out[0] = 0;
+    for (i = 0; i < LORIE_FREEZE_KINDS && n + 1 < size; i++)
+        if (m & (1u << i))
+            n += (size_t) snprintf(out + n, size - n, "%s%s", n ? "," : "", names[i]);
+    if (!n)
+        snprintf(out, size, "%s", none);
+}
+
+// Where it was seen to stand: the X server's thread's stage, the renderer's, or both (the side that waits).
+static void lorieFreezeStage(char side, uint32_t xStage, uint32_t rStage, char *out, size_t size) {
+    const char *xs = lorieXStageNames[xStage < LORIE_X_STAGES ? xStage : 0];
+    const char *rs = lorieRStageNames[rStage < LORIE_R_STAGES ? rStage : 0];
+    if (side == 'x')
+        snprintf(out, size, "x:%s", xs);
+    else if (side == 'r')
+        snprintf(out, size, "renderer:%s", rs);
+    else
+        snprintf(out, size, "x:%s+renderer:%s", xs, rs);
+}
+
+// The threads the watchdog looks at: the X server's, the input thread, the Choreographer's, its own.
+enum { LORIE_THREAD_MAIN, LORIE_THREAD_INPUT, LORIE_THREAD_VSYNC, LORIE_THREAD_WATCH, LORIE_THREADS };
+
+/*
+ * The line for `what` (begin, level or end) into `out`, within logcat's 1023 bytes: `th` the threads now, `begin` them
+ * as the freeze began. Begin and level: how long and what waits, where each side stands (the X server's thread also by
+ * /proc: its state and system call), the asks, the copies (queued, done, told of, rechecked), the root copy
+ * (seq/taken/done/cancelled), the GPU's list, who holds the shared lock. End: how long, where it stood when it began
+ * and last, what moved, and the X server's threads' time run and waited for a CPU meanwhile. A stage is where it was
+ * seen to stand, not a cause.
+ */
+static int lorieFreezeLine(char *out, size_t size, const struct lorie_freeze *f, const struct lorie_freeze_sample *s, int what,
+                           const struct lorie_thread_info *th, const struct lorie_thread_info *begin) {
+    static const char *const sides[] = { "x", "renderer", "both" };
+    const char *side = sides[f->side == 'x' ? 0 : f->side == 'r' ? 1 : 2];
+    char pending[64], stage[64], sys[32], last[64], moved[64];
+
+    if (what == LORIE_FREEZE_END) {
+        lorieFreezeStage(f->side, f->beginXStage, f->beginRStage, stage, sizeof(stage));
+        lorieFreezeStage(f->side, s->xStage, s->rStage, last, sizeof(last));
+        lorieFreezeKinds(f->beginPending, "none", pending, sizeof(pending));
+        lorieFreezeKinds(f->moved, "nothing_waits", moved, sizeof(moved));
+#define LORIE_DELTA(i, field) (th[i].field >= 0 && begin[i].field >= 0 ? th[i].field - begin[i].field : -1LL)
+        return snprintf(out, size, "XlorieFreeze: phase=end id=%u duration_us=%llu side=%s stalled_stage=%s last_stage=%s "
+                                   "pending_at_begin=%s ended_by=%s levels=%u x_main_run_us=%lld x_main_runq_us=%lld "
+                                   "input_runq_us=%lld vsync_runq_us=%lld",
+                        f->id, (unsigned long long) (s->nowUs - f->beginUs), side, stage, last, pending, moved,
+                        (unsigned) __builtin_popcount(f->levels), LORIE_DELTA(LORIE_THREAD_MAIN, runUs),
+                        LORIE_DELTA(LORIE_THREAD_MAIN, waitUs), LORIE_DELTA(LORIE_THREAD_INPUT, waitUs),
+                        LORIE_DELTA(LORIE_THREAD_VSYNC, waitUs));
+#undef LORIE_DELTA
+    }
+    lorieFreezeKinds(f->pending, "none", pending, sizeof(pending));
+    lorieFreezeStage(f->side, s->xStage, s->rStage, stage, sizeof(stage));
+    lorieSyscallWord(&th[LORIE_THREAD_MAIN], sys, sizeof(sys));
+    return snprintf(out, size, "XlorieFreeze: phase=%s id=%u%s side=%s stall_us=%llu x_stall_us=%llu r_stall_us=%llu pending=%s "
+                               "stage=%s x_stage=%s x_stage_us=%llu x_request=%d.%d@%d x_main=%c,%s ticks_posted=%u ticks_run=%u "
+                               "r_stage=%s r_stage_us=%llu surface=%d asks=%u taken=%u ask_wait_us=%llu copies_queued=%u "
+                               "copy_wait_us=%llu copies_done=%llu notified=%llu acked=%llu root=%u/%u/%u/%u root_wait_us=%llu "
+                               "x_waiting_root=%u gpu_busy=%u lock_pid=%d",
+                    what == LORIE_FREEZE_BEGIN ? "begin" : "level", f->id,
+                    what == LORIE_FREEZE_LEVEL ? (f->level == 1 ? " level=1s" : f->level == 2 ? " level=2s" : " level=3s") : "",
+                    side, (unsigned long long) f->stallUs, (unsigned long long) f->xStallUs, (unsigned long long) f->rStallUs,
+                    pending, stage, lorieXStageNames[s->xStage < LORIE_X_STAGES ? s->xStage : 0],
+                    (unsigned long long) lorieFreezeSince(s->nowUs, s->xStageUs, 0), s->requestMajor, s->requestMinor,
+                    s->requestClient, th[LORIE_THREAD_MAIN].state, sys, s->ticksPosted, s->ticksRun,
+                    lorieRStageNames[s->rStage < LORIE_R_STAGES ? s->rStage : 0],
+                    (unsigned long long) lorieFreezeSince(s->nowUs, s->rStageUs, 0), s->surface ? 1 : 0, s->askSeq, s->takenSeq,
+                    (unsigned long long) (s->askSeq != s->takenSeq ? lorieFreezeSince(s->nowUs, s->askUs, 0) : 0), s->copiesQueued,
+                    (unsigned long long) (s->copiesQueued ? lorieFreezeSince(s->nowUs, s->copyQueuedUs, 0) : 0),
+                    (unsigned long long) s->copiesDone, (unsigned long long) s->notifiedSerial, (unsigned long long) s->ackedSerial,
+                    s->rootSeq, s->rootTaken, s->rootDone, s->rootCancelled,
+                    (unsigned long long) (s->rootSeq && s->rootSeq != s->rootDone && s->rootSeq != s->rootCancelled
+                                          ? lorieFreezeSince(s->nowUs, s->rootQueuedUs, 0) : 0),
+                    s->rootWaiting, s->gpuBusy, s->lockPid);
+}
+
+/*
+ * Every 5 seconds: the X server's threads over the period - time run, time waited on a run queue (runnable, not run:
+ * a CPU not given), their state and the main one's system call now - and the 5 second report's own time; a thread
+ * starved shows its wait, one blocked shows neither.
+ */
+static int lorieXSchedLine(char *out, size_t size, const struct lorie_thread_info *th, const struct lorie_thread_info *at,
+                           uint32_t freezes) {
+    char sys[32];
+#define LORIE_D(i, field) (th[i].field >= 0 && at[i].field >= 0 ? th[i].field - at[i].field : -1LL)
+    lorieSyscallWord(&th[LORIE_THREAD_MAIN], sys, sizeof(sys));
+    return snprintf(out, size, "XlorieXSched: main=%c,%s,run_us=%lld,runq_us=%lld input=%c,run_us=%lld,runq_us=%lld "
+                               "vsync=%c,run_us=%lld,runq_us=%lld watchdog_run_us=%lld report_us=%llu report_max_us=%llu freezes=%u",
+                    th[LORIE_THREAD_MAIN].state, sys, LORIE_D(LORIE_THREAD_MAIN, runUs), LORIE_D(LORIE_THREAD_MAIN, waitUs),
+                    th[LORIE_THREAD_INPUT].state, LORIE_D(LORIE_THREAD_INPUT, runUs), LORIE_D(LORIE_THREAD_INPUT, waitUs),
+                    th[LORIE_THREAD_VSYNC].state, LORIE_D(LORIE_THREAD_VSYNC, runUs), LORIE_D(LORIE_THREAD_VSYNC, waitUs),
+                    LORIE_D(LORIE_THREAD_WATCH, runUs), (unsigned long long) __atomic_load_n(&pvfb->reportUs, __ATOMIC_RELAXED),
+                    (unsigned long long) __atomic_exchange_n(&pvfb->reportMaxUs, 0, __ATOMIC_RELAXED), freezes);
+#undef LORIE_D
+}
+
+/*
+ * The watchdog's thread: a look every LORIE_FREEZE_PERIOD_US (lorieFreezeSample, lorieFreezeCheck), a line only when a
+ * freeze begins, passes a level or ends, and the threads' line every 5 seconds. It takes no lock, waits for nothing
+ * but its own sleep and restarts nothing: it only reports.
+ */
+static void *lorieFreezeWatch(__unused void *arg) {
+    static struct lorie_freeze f;
+    struct lorie_freeze_sample s;
+    struct lorie_thread_info th[LORIE_THREADS], at[LORIE_THREADS], begin[LORIE_THREADS];
+    pid_t tids[LORIE_THREADS];
+    char line[1024];
+    uint64_t schedUs;
+    int what, i;
+
+    pthread_setname_np(pthread_self(), "XlorieWatch");
+    usleep(1000000);    // the input thread and the Choreographer's have run by now
+    tids[LORIE_THREAD_MAIN] = pvfb->mainTid, tids[LORIE_THREAD_INPUT] = pvfb->inputTid;
+    tids[LORIE_THREAD_VSYNC] = pvfb->vsyncTid, tids[LORIE_THREAD_WATCH] = gettid();
+    log(INFO, "XlorieFreeze: phase=armed period_us=%d begin_us=%d levels_us=1000000,2000000,3000000 main_tid=%d input_tid=%d "
+              "vsync_tid=%d", LORIE_FREEZE_PERIOD_US, LORIE_FREEZE_BEGIN_US, tids[0], tids[1], tids[2]);
+    for (i = 0; i < LORIE_THREADS; i++)
+        lorieThreadInfo(tids[i], &at[i]);
+    memcpy(begin, at, sizeof(begin));
+    schedUs = lorieMonotonicUs();
+    for (;;) {
+        usleep(LORIE_FREEZE_PERIOD_US);
+        if (!tids[LORIE_THREAD_VSYNC])
+            tids[LORIE_THREAD_VSYNC] = pvfb->vsyncTid;
+        lorieFreezeSample(&s);
+        if ((what = lorieFreezeCheck(&f, &s)) != LORIE_FREEZE_NONE) {
+            for (i = 0; i < LORIE_THREADS; i++)
+                lorieThreadInfo(tids[i], &th[i]);
+            if (what == LORIE_FREEZE_BEGIN)
+                memcpy(begin, th, sizeof(begin));
+            lorieFreezeLine(line, sizeof(line), &f, &s, what, th, begin);
+            log(INFO, "%s", line);
+        }
+        if (s.nowUs - schedUs >= 5000000) {
+            for (i = 0; i < LORIE_THREADS; i++)
+                lorieThreadInfo(tids[i], &th[i]);
+            lorieXSchedLine(line, sizeof(line), th, at, f.id);
+            log(INFO, "%s", line);
+            memcpy(at, th, sizeof(at));
+            schedUs = s.nowUs;
+        }
+    }
+    return NULL;
 }
 
 static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
@@ -1718,6 +2216,8 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
 
 void lorieChoreographerFrameCallback(long t, AChoreographer* d) {
     uint64_t now = lorieMonotonicUs();
+    if (!pvfb->vsyncTid)
+        pvfb->vsyncTid = gettid();  // P11-C3-C: for the freeze watchdog's look at it
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
     if (pScreenPtr) {
         // P10-B0: the vsync's frame time to here (a 32-bit long cannot hold it); the tick carries this callback's stamp.
@@ -2057,8 +2557,13 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 
 // P10-B0: GPU copy completions, from the renderer's publish to the input thread (here, on it) - the low 32 bits of
 // when it was received are what the work procedure carries to the X server's thread (lorieGpuCopyDoneHandled).
-uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs) {
+uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs, uint64_t serial) {
     uint64_t now = lorieMonotonicUs();
+    if (pvfb->freezeDiag) {
+        // P11-C3-C: the last completion told of (the Vulkan renderer's serial), and when
+        __atomic_store_n(&pvfb->copyNotifiedUs, now, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->copyNotifiedSerial, serial, __ATOMIC_RELEASE);
+    }
     if (publishedUs)
         lorieStampPair(&pvfb->state->diag.xCopyNotify, publishedUs, now);
     __atomic_fetch_add(&pvfb->state->diag.xCopyDonePosted, 1, __ATOMIC_RELAXED);
@@ -2069,6 +2574,12 @@ uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs) {
 void lorieGpuCopyDoneHandled(uint32_t receivedUs) {
     lorieRanAfter(&pvfb->state->diag.xCopyRecheck, receivedUs, &pvfb->state->diag.xCopyDonePosted,
                   &pvfb->state->diag.xCopyDoneRun, &pvfb->state->diag.xCopyDoneWaitingMax);
+    if (pvfb->freezeDiag) {
+        // P11-C3-C: the copies rechecked up to the completion published by then, and when
+        __atomic_store_n(&pvfb->copyAckedUs, lorieMonotonicUs(), __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->copyAckedSerial, __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE),
+                         __ATOMIC_RELEASE);
+    }
 }
 
 /*

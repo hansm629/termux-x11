@@ -160,10 +160,10 @@ in_order("GLES frame", func(R, "void rendererRedrawLocked(bool* waitingForBuffer
 
 # P11-C3: the frame diagnostics' wiring
 check('lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");' in init
-      and "lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;" in init and "dispatchRequestTimed = lorieScreen.frameDiag;" in init,
+      and "lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;" in init and "dispatchRequestTimed = lorieScreen.frameDiag || lorieScreen.freezeDiag;" in init,
       "OsVendorInit does not read TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 into the renderer's flag and Dispatch's")
 xredraw = func(I, "static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {")
-check(before_first_return(xredraw, "lorieTickTimed(tickUs, ") and "uint64_t tickUs = pvfb->frameDiag ? lorieMonotonicUs() : 0;" in xredraw,
+check(before_first_return(xredraw, "lorieTickTimed(tickUs, ") and "uint64_t tickUs = pvfb->frameDiag || pvfb->freezeDiag ? lorieMonotonicUs() : 0;" in xredraw,
       "lorieRedraw does not check the last frame asked for before its first return, or reads the clock with the option off")
 check("        if (tickUs)\n            lorieTickAsked(tickUs);\n        lorieWakeRenderer(rendererWake);" in xredraw,
       "lorieRedraw does not stamp its request right before waking the renderer")
@@ -194,6 +194,42 @@ check('lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(get
 should = func(R, "static inline __always_inline bool rendererShouldWait(bool *waitingForBuffers) {")
 check("gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex && !rendererCopiesStillDeferred();" in should,
       "copies left queued for a reservation wake the renderer again and again")
+
+# P11-C3-C: the freeze watchdog (TERMUX_X11_FRAME_FREEZE_DIAG=1) - read in OsVendorInit into the renderer's flag and
+# Dispatch's; its thread made only then; off, no stage kept and no clock read on either side; the thread itself takes no
+# lock and waits for nothing but its own sleep; the request's start handed to the DDX only while requests are timed
+check('lorieScreen.freezeDiag = getenv("TERMUX_X11_FRAME_FREEZE_DIAG") && !strcmp(getenv("TERMUX_X11_FRAME_FREEZE_DIAG"), "1");' in init
+      and "lorieScreen.state->backend.freezeDiag = lorieScreen.freezeDiag;" in init,
+      "OsVendorInit does not read TERMUX_X11_FRAME_FREEZE_DIAG=1 into the renderer's flag")
+in_order("the watchdog's thread only with the option", init, "if (lorieScreen.freezeDiag) {", "pthread_create(&watch, NULL, lorieFreezeWatch, NULL)")
+check(open(I, encoding="utf-8").read().count("lorieFreezeWatch, NULL)") == 1, "the watchdog's thread made elsewhere too")
+stage = func(R, "static void rendererStage(uint32_t stage) {")
+check(stage.index("if (state && state->backend.freezeDiag) {") < stage.index("lorieMonotonicUs()"), "the renderer's stage kept with the option off")
+check(func(R, "static bool rendererProgressOn(void) {").count("state->backend.vkFrameDiag || state->backend.freezeDiag") == 1,
+      "the asks kept without either option")
+xenter = func(I, "static struct lorieXMark lorieXEnter(uint32_t stage) {")
+check(xenter.index("if (pvfb->freezeDiag) {") < xenter.index("lorieMonotonicUs()") and
+      "if (pvfb->freezeDiag) {" in func(I, "static void lorieXLeave(struct lorieXMark *prev) {"),
+      "the X server's stage kept with the option off")
+fsrc = open(I, encoding="utf-8").read()
+watch = fsrc[fsrc.index("/* ---- P11-C3-C, TERMUX_X11_FRAME_FREEZE_DIAG=1: the freeze watchdog ---- */"):fsrc.index("static Bool lorieCreateScreenResources(")]
+for bad in ("lorie_mutex_lock", "lorie_mutex_trylock", "pthread_mutex_lock", "input_lock", "lorieGpuWaitIdle", "lorieRootCopyWait",
+            "WaitForFences", "pthread_cond_wait", "FUTEX_WAIT"):
+    check(bad not in watch, "the freeze watchdog calls %s" % bad)
+dsp = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "app", "src", "main", "cpp", "patches", "xserver.patch"), encoding="utf-8").read()
+check("CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, client->majorOp, client->minorOp) : 0;" in dsp,
+      "Dispatch does not hand the request's start to the DDX only while requests are timed")
+for what, body, mark in (("tick", xredraw, "struct lorieXMark tickMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_TICK);"),
+                         ("root copy wait", func(I, "static void lorieRootCopyWait(Bool takeBack) {"),
+                          "struct lorieXMark waitMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_ROOT_COPY_WAIT);"),
+                         ("report", func(I, "static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {"),
+                          "struct lorieXMark reportMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_REPORT);")):
+    check(mark in body, "the X server's thread not marked in its %s" % what)
+in_order("the renderer marked asleep only as it sleeps", func(R, "static void rendererWaitForWork(bool *waitingForBuffers) {"),
+         "rendererStage(LORIE_R_SLEEP);", "rendererSleep(seen, -1);", "rendererStage(LORIE_R_PASS);")
+in_order("the Vulkan frame's stages", redraw, "rendererStage(LORIE_R_FRAME);", "rendererStage(LORIE_R_ACQUIRE);", "lorieVkAcquire(",
+         "rendererStage(LORIE_R_LOCK_WAIT);", "lorie_mutex_lock(&state->lock", "rendererStage(LORIE_R_FENCE_WAIT);", "lorieVkFrameWait(",
+         "rendererStage(LORIE_R_PRESENT);", "lorieVkPresent(", "state->progress.takenSeq = askSeq;")
 
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake). The loop sleeps only in rendererWaitForWork (which
 # twake.c runs), nothing in the renderer waits on a condition variable the X server would signal, and each waker

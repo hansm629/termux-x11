@@ -27,7 +27,8 @@ static FILE *logf;
 typedef int Bool;
 #define TRUE 1
 #define FALSE 0
-static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint64_t frameWantedUs; } fakeState;
+static struct { struct lorie_renderer_diag diag; struct lorie_backend_control backend; volatile uint64_t frameWantedUs;
+                struct lorie_progress progress; } fakeState;
 static struct {
     typeof(&fakeState) state;
     int yieldOnWake, rootCopyOpt, rootCopyOptFailed, rootGpuCopy;
@@ -37,6 +38,7 @@ static struct {
     struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
+    Bool freezeDiag;
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "diaglog_src.inc"
 
@@ -273,7 +275,7 @@ int main(void) {
             while (logf && fgets(line, sizeof line, logf)) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
                             strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:");
-                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off\n");
+                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
             if (logf)
@@ -320,7 +322,7 @@ int main(void) {
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
-            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off vk_schedule_opt=off\n");
+            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
             if (strstr(line, "XlorieVkFramePacing:") && ++n[0] == 2)
                 pacingOk = strstr(line, "XlorieVkFramePacing: frame_start_us=100/9620/20000/50000/35000/10/4 "
                                         "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "

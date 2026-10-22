@@ -10,7 +10,7 @@ XlorieBackend:  requested=auto|vulkan|gles vk_fail_at=none|instance|... active=G
                 ownership_transitions ownership_refused x_ahb_cpu_acquires=N(+d) x_state_lock_wait_us=N(+d)
                 x_gpu_wait_us=N(+d) x_ahb_cpu_lock_us=N(+d) root_buffers=1|2 x_root_copy_us=N(+d) vk_transfer_copy=on|off
                 x_yield_on_wake=on|off root_copy_opt=on|off|fallback vk_submit_opt=on|off vk_frame_diag=on|off
-                exa_lock_opt=on|off vk_schedule_opt=on|off
+                exa_lock_opt=on|off vk_schedule_opt=on|off freeze_diag=on|off
 XlorieGles:     egl_image_imports=N(+d) gles_copy_frames=N(+d) egl_swap_buffers=N(+d)
 XlorieVk:       instance_created=... ahb_import_success=... imported_source_draws=... queue_submits=...
                 queue_present_success=... frames_presented=... (and the rest)
@@ -41,6 +41,12 @@ XlorieRootCopyTiming: take_us record_us resume_us x_block_us worst_total_us wors
 XlorieXLatency: request_us access_us access_lock_us access_gpu_us tick_delay_us tick_work_us worst_request_us
                 worst_request=client:command:extension:major.minor access_hold_us worst_access_us
                 worst_access=WxH:dest|src|mask:reserved|locked
+(only with TERMUX_X11_FRAME_FREEZE_DIAG=1, P11-C3-C - from the watchdog's thread, not every 5 seconds but as they come:)
+XlorieFreeze:   phase=armed|begin|level|end id side stall_us pending stage x_stage x_main r_stage asks taken
+                ask_wait_us copies_queued copy_wait_us copies_done notified acked root root_wait_us ... (begin, level)
+                duration_us stalled_stage last_stage pending_at_begin ended_by levels x_main_run_us x_main_runq_us
+                input_runq_us vsync_runq_us (end)
+XlorieXSched:   main=S,syscall,run_us,runq_us input=... vsync=... watchdog_run_us report_us report_max_us freezes
 ```
 
 `key=N(+d)`: N is the total since the X server started, d what it moved by since the previous report.
@@ -275,6 +281,40 @@ only when the X server is started with `TERMUX_X11_RENDERER_VK_SELFTEST=full`. `
 `formats_passed` / `formats_unavailable` are bit masks (1 RGBA, 2 RGBX, 4 BGRA - only BGRA may be
 unavailable). On a failure the `fail_*` fields say where: the step, the AHB format, the direction (1 or 2),
 the iteration, the byte and its expected and actual value, and the VkResult.
+
+### The freeze watchdog (P11-C3-C, `TERMUX_X11_FRAME_FREEZE_DIAG=1`)
+
+Off by default, independent of `TERMUX_X11_RENDERER_VK_FRAME_DIAG`. With it, a thread of the X server looks every
+100 ms - without the shared lock, waiting for nothing, restarting nothing - for work waiting with none of it moving:
+the renderer's (a frame a tick asked for and not presented, GPU copies queued and none completed, a root copy asked
+for and not settled, the renderer in one stage - fence, present, acquire, the shared lock, buffers... - rather than
+asleep or between steps) and the X server's (its thread in one tick, request, root copy wait or 5 s report, ticks
+posted to it and none run). Each kind is timed from when it was asked for or last moved, whichever is later. Nothing
+waiting is no freeze however long the screen stands still: an idle desktop, a client drawing nothing, a scene change,
+no window (the renderer's work is not looked at then; the X server's thread still is). The X server and the renderer
+keep their stage only with the option on; off, no stage, no clock, no thread.
+
+A freeze is logged as it begins (500 ms), at 1, 2 and 3 seconds (`level=1s` ...) and as it ends - all under one `id`:
+
+- `side`: `x`, `renderer` or `both` - which side's work waited 500 ms; `stall_us` (`x_stall_us`, `r_stall_us`) how long.
+- `pending`: what waits - `frame`, `copy`, `root`, `renderer` (its stage), `x` (its thread's stage), `ticks`.
+- `stage`: where it was seen to stand - `x:<stage>` (`tick`, `request`, `root_copy_wait`, `report`; `loop` - none of
+  them), `renderer:<stage>` (`sleep` - asleep with work waiting, `pass`, `buffer_wait`, `root_copy`, `frame`, `acquire`,
+  `lock_wait`, `fence_wait`, `present`, `copies`, `gles`, `backend`, `device_idle`). An observed position, not a cause.
+- `x_request=major.minor@client` the request the X server's thread is (or was last) in; `x_main=<state>,<system call>`
+  its thread in /proc: `S` asleep, `R` running or waiting for a CPU, `D` in the kernel; `futex:lock` (the shared lock),
+  `futex:root_done` (a root copy), `futex:gpu_busy` (a Vulkan frame), `futex:cursor_lock`, `epoll_pwait` (idle), ...
+- `asks`, `taken`, `ask_wait_us`: the frames the ticks asked for, the asks the last presented frame took up, how long
+  the first one still waiting has waited. `copies_queued`, `copy_wait_us`, `copies_done` (the last serial completed),
+  `notified` (the last one the X server's input thread was told of), `acked` (the last its thread rechecked the copies
+  for). `root=seq/taken/done/cancelled`, `root_wait_us`, `x_waiting_root`, `gpu_busy`, `lock_pid` (who holds the lock).
+- End: `duration_us` (within the 100 ms period), `stalled_stage` (as it began) and `last_stage`, `pending_at_begin`,
+  `ended_by` (what of that moved; `nothing_waits`: it went), `levels`, and the X server's threads' time run and waited
+  for a CPU meanwhile (`*_runq_us`: a long wait is a thread starved, not blocked).
+
+`XlorieXSched`, every 5 seconds with the option: the X server's thread, its input thread and the Choreographer's (the
+vsync callback) over the period - time run and time waited on a run queue - and `report_us` / `report_max_us`, how long
+the 5 second report itself took (it runs under the input lock). `freezes` counts the freezes so far.
 
 ### Buffers waited for before the shared lock (P11-C3-C, always)
 

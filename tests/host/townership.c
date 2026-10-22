@@ -142,6 +142,9 @@ struct fake_pvfb {
     Bool frameDiag;             /* P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG */
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
+    Bool freezeDiag;            /* P11-C3-C: TERMUX_X11_FRAME_FREEZE_DIAG - the stage this thread is in */
+    uint32_t xStage;
+    uint64_t xStageUs;
 };
 
 static ScreenRec screen;
@@ -506,6 +509,7 @@ static LorieBuffer **base_bufferOf(void *priv) { return &((LoriePixmapPriv *) pr
 
 /* ---- this branch ---- */
 static struct fake_pvfb newWorld, *pvfb = &newWorld;
+#include "xstage_src.inc"
 static void lorieRootCopyWait(Bool takeBack);
 #define lorie_shared_server_state fake_state
 #include "own_new_src.inc"

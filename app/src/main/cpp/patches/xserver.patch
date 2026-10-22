@@ -34,9 +34,9 @@
 + * choice as without the yield. */
 +int dispatchYieldRequested;
 +
-+/* lorie: P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1) - set by the DDX at startup: each request's handling timed and
-+ * handed to ddxRequestTimed, with what it was, taken before it ran (it may close its own client). Not set, no clock
-+ * is read. */
++/* lorie: P11-C3 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, TERMUX_X11_FRAME_FREEZE_DIAG=1) - set by the DDX at startup: each
++ * request's handling begun with ddxRequestStart and handed to ddxRequestTimed, with what it was, taken before it ran
++ * (it may close its own client). Not set, neither is called, no clock is read. */
 +int dispatchRequestTimed;
 +
  #define SAME_SCREENS(a, b) (\
@@ -96,7 +96,7 @@
                  else {
                      result = XaceHookDispatch(client, client->majorOp);
                      if (result == Success) {
-+                        CARD64 timedUs = dispatchRequestTimed ? GetTimeInMicros() : 0;
++                        CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, client->majorOp, client->minorOp) : 0;
 +                        int timedIndex = client->index, timedMajor = client->majorOp, timedMinor = client->minorOp;
                          currentClient = client;
                          result =
@@ -238,7 +238,7 @@
          InputThreadInit();
  
 +++ ./include/os.h
-@@ -557,6 +557,14 @@
+@@ -557,6 +557,16 @@
  extern _X_EXPORT void
  ddxGiveUp(enum ExitCode error);
  extern _X_EXPORT void
@@ -249,6 +249,8 @@
 +extern _X_EXPORT int dispatchRequestTimed;
 +extern _X_EXPORT void
 +ddxRequestTimed(int clientIndex, int major, int minor, CARD64 startUs);
++extern _X_EXPORT CARD64
++ddxRequestStart(int clientIndex, int major, int minor);
 +extern _X_EXPORT void
  ddxInputThreadInit(void);
  extern _X_EXPORT int

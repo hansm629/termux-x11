@@ -36,7 +36,7 @@ void lorieWakeServer(void);
 void lorieQueueUrgentWorkProc(Bool (*proc)(struct _Client *, void *), void *closure);
 void lorieRecheckGpuCopies(void);
 void lorieCountCopyAck(void);
-uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs);
+uint32_t lorieGpuCopyDoneReceived(uint64_t publishedUs, uint64_t serial);
 void lorieGpuCopyDoneHandled(uint32_t receivedUs);
 void lorieCountGpuCopyEarly(int how);
 int lorieGpuCopySettle(uint64_t serial);
@@ -221,6 +221,7 @@ typedef union {
     struct {
         uint8_t t;
         uint64_t publishedUs;   /* the Vulkan renderer: when it published completedSerial (lorieMonotonicUs); GLES: 0 */
+        uint64_t serial;        /* P11-C3-C: the Vulkan renderer: the completedSerial it published; GLES: 0 */
     } gpuCopyDone;
 } lorieEvent;
 
@@ -318,6 +319,8 @@ struct lorie_backend_control {
                                                  * rendererVkRedraw): the copies queued go ahead of a frame, in a
                                                  * submission of their own, in every present mode; a frame with none of
                                                  * them is presented before its fence is waited for */
+    volatile uint8_t freezeDiag;                /* X: TERMUX_X11_FRAME_FREEZE_DIAG=1 - P11-C3-C's freeze watchdog: the
+                                                 * renderer keeps its stage (struct lorie_progress) */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };
@@ -600,6 +603,48 @@ struct lorie_renderer_diag {
     volatile uint32_t xCopyRetired, xCopyRetiredReleased, xCopyCancelled;
 };
 
+/*
+ * P11-C3-C: what the X server's ticks asked of the renderer and where the renderer is - for the X server's freeze
+ * watchdog (TERMUX_X11_FRAME_FREEZE_DIAG=1, InitOutput.c lorieFreezeCheck), which reads it from a thread of its own
+ * without `lock` and waits for nothing, and for the frame gaps (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1, renderer.c
+ * rendererVkFrameGap). Kept only while one of the two is on, each field by one side, with plain stores: hints, read
+ * as they are. Times are lorieMonotonicUs.
+ *   askSeq, askUs        X: the frames its ticks asked for (lorieTickAsked), counted, and when the last LORIE_ASK_RING
+ *                        of them were asked for (lorieAskUs)
+ *   takenSeq, takenUs    renderer: the asks its last frame presented took up (askSeq as it began), and its start
+ *   seenSeq, seenUs      renderer: the asks it saw when it last woke to work (rendererWaitForWork), and when
+ *   rStage, rStageUs     renderer, the watchdog only: what it is doing (LORIE_R_*), and since when
+ */
+enum {
+    LORIE_R_SLEEP,          /* asleep, nothing to do it knows of (rendererWaitForWork) */
+    LORIE_R_PASS,           /* a pass of its loop, none of the below */
+    LORIE_R_BUFFER_WAIT,    /* buffers its copies use not come yet (rendererAwaitBuffers) */
+    LORIE_R_ROOT_COPY,      /* a root copy: taken, submitted, its fence (P11-C2, P11-C3-B2) */
+    LORIE_R_FRAME,          /* a Vulkan frame, none of the below */
+    LORIE_R_ACQUIRE,        /* its swapchain image (lorieVkAcquire) */
+    LORIE_R_LOCK_WAIT,      /* the shared lock, asked for by the frame */
+    LORIE_R_FENCE_WAIT,     /* the frame's fence (lorieVkFrameWait) */
+    LORIE_R_PRESENT,        /* vkQueuePresentKHR (lorieVkPresent) */
+    LORIE_R_COPIES,         /* Vulkan copies alone */
+    LORIE_R_GLES,           /* a GLES frame, or GLES copies alone */
+    LORIE_R_BACKEND,        /* a backend chosen, started or given up; a window taken up */
+    LORIE_R_DEVICE_IDLE,    /* vkDeviceWaitIdle */
+    LORIE_R_STAGES
+};
+#define LORIE_ASK_RING 32
+struct lorie_progress {
+    volatile uint32_t askSeq, takenSeq, seenSeq, rStage;
+    volatile uint64_t askUs[LORIE_ASK_RING], takenUs, seenUs, rStageUs;
+};
+
+// When ask `seq` was made, `last` being the last one made: kept for the last LORIE_ASK_RING; for an older one, the
+// oldest kept - a lower bound of how long it waited. 0: not made (or not kept yet).
+static inline __always_inline uint64_t lorieAskUs(volatile struct lorie_progress *p, uint32_t seq, uint32_t last) {
+    if (last - seq >= LORIE_ASK_RING)
+        seq = last - (LORIE_ASK_RING - 1);
+    return p->askUs[seq % LORIE_ASK_RING];
+}
+
 #define LORIE_DIAG_ADD(st, field, n) \
     do { if (st) __atomic_fetch_add(&(st)->diag.field, (n), __ATOMIC_RELAXED); } while (0)
 
@@ -747,6 +792,8 @@ struct lorie_shared_server_state {
     struct lorie_renderer_diag diag;
     /* Backend selection and the AHB ownership handshake (see struct lorie_backend_control). */
     struct lorie_backend_control backend;
+    /* P11-C3-C: the asks and the renderer's stage (see struct lorie_progress). */
+    struct lorie_progress progress;
 
     struct {
         // We should not allow updating cursor content the same time renderer draws it.

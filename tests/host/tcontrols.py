@@ -671,7 +671,9 @@ CONTROLS = [
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
         if (diag)
             ft.presentStartUs = lorieMonotonicUs();
+        rendererStage(LORIE_R_PRESENT);
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        rendererStage(LORIE_R_FRAME);
         if (diag)
             ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
@@ -685,7 +687,9 @@ CONTROLS = [
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
+        rendererStage(LORIE_R_FENCE_WAIT);
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        rendererStage(LORIE_R_FRAME);
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
@@ -699,7 +703,9 @@ CONTROLS = [
     if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
         if (diag)
             ft.presentStartUs = lorieMonotonicUs();
+        rendererStage(LORIE_R_PRESENT);
         presented = lorieVkPresent(&vk, &vkr, index, state);
+        rendererStage(LORIE_R_FRAME);
         if (diag)
             ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
@@ -713,7 +719,9 @@ CONTROLS = [
     if (res == VK_SUCCESS) {
         // The device runs the frame; the X server goes on, without the frame's buffers (rendererVkInFlight).
         bool over;
+        rendererStage(LORIE_R_FENCE_WAIT);
         res = lorieVkFrameWait(&vk, &vkr, state, &over);
+        rendererStage(LORIE_R_FRAME);
         fencedUs = lorieMonotonicUs();
         if (over)
             rendererVkFrameDone();  // otherwise once rendererVkFail's teardown found the device idle or lost
@@ -1206,11 +1214,11 @@ CONTROLS += [
      """+                            ddxRequestTimed(client->index, client->majorOp, client->minorOp, timedUs);""",
      "tdispatchyield"),
     ("P11-C3: the clock read for every request with the option off", "xserver.patch",
-     """+                        CARD64 timedUs = dispatchRequestTimed ? GetTimeInMicros() : 0;""",
+     """+                        CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, client->majorOp, client->minorOp) : 0;""",
      """+                        CARD64 timedUs = GetTimeInMicros();""",
      "tdispatchyield"),
     ("P11-C3: the option read into the renderer's flag only", "InitOutput.c",
-     """    dispatchRequestTimed = lorieScreen.frameDiag;""",
+     """    dispatchRequestTimed = lorieScreen.frameDiag || lorieScreen.freezeDiag;""",
      """""",
      "twiring"),
     ("P11-C3: the pacing not started over with another X server session", "renderer.c",
@@ -1420,19 +1428,13 @@ CONTROLS += [
 # P11-C3-C: the renderer's wake (lorie.h struct lorie_renderer_wake): each way to lose a wake again
 CONTROLS += [
     ("wake: the count read after the look (the lost wakeup put back)", "renderer.c",
-     """    while (true) {
-        uint32_t seen = lorieWakeSeen(rendererWake);
+     """        uint32_t seen = lorieWakeSeen(rendererWake);
         if (!rendererShouldWait(waitingForBuffers))
-            return;
-        rendererSleep(seen, -1);
-    }""",
-     """    while (true) {
-        uint32_t seen;
+            break;""",
+     """        uint32_t seen;
         if (!rendererShouldWait(waitingForBuffers))
-            return;
-        seen = lorieWakeSeen(rendererWake);
-        rendererSleep(seen, -1);
-    }""",
+            break;
+        seen = lorieWakeSeen(rendererWake);""",
      "twake"),
     ("wake: the sleep compares the count as it is then, not as the look saw it", "renderer.c",
      """    syscall(SYS_futex, &rendererWake->seq, FUTEX_WAIT, seen, timeoutUs >= 0 ? &rel : NULL, NULL, 0);""",
@@ -1450,10 +1452,10 @@ CONTROLS += [
     ("wake: copies left for a reservation polled for, not slept on until the X server's wake", "renderer.c",
      """        rendererSleep(seen, -1);
     }
-}""",
+    // P11-C3-C: the asks it woke to""",
      """        rendererSleep(seen + (rendererCopiesStillDeferred() ? 1 : 0), -1);
     }
-}""",
+    // P11-C3-C: the asks it woke to""",
      "twake"),
     ("wake: the ownership answer looked for before the count is read", "renderer.c",
      """        uint32_t seen = lorieWakeSeen(rendererWake);
@@ -1569,6 +1571,53 @@ CONTROLS += [
             if (buffersGivenUp[i] == id)
                 *later = true;""",
      "tpresentcopy"),
+]
+
+# P11-C3-C: the freeze watchdog (TERMUX_X11_FRAME_FREEZE_DIAG=1)
+CONTROLS += [
+    ("freeze: time since the last frame taken for a freeze, whatever waits", "InitOutput.c",
+     """    f->stallUs = x > r ? x : r;""",
+     """    f->stallUs = x > r ? x : r;
+    if (now - f->framesUs > f->stallUs)
+        f->stallUs = now - f->framesUs;""",
+     "tfreeze"),
+    ("freeze: a frame asked for and not presented not watched (a stall taken for idle)", "InitOutput.c",
+     """        if (s->askSeq != s->takenSeq && (u = lorieFreezeSince(now, s->askUs, f->framesUs)) >= LORIE_FREEZE_PERIOD_US)""",
+     """        if (0 && s->askSeq != s->takenSeq && (u = lorieFreezeSince(now, s->askUs, f->framesUs)) >= LORIE_FREEZE_PERIOD_US)""",
+     "tfreeze"),
+    ("freeze: its end not tied to its begin", "InitOutput.c",
+     """        f->moved = moved & f->beginPending;     // of what waited as it began, what moved (none: it is no longer waited for)""",
+     """        f->moved = moved & f->beginPending;     // of what waited as it began, what moved (none: it is no longer waited for)
+        f->id++;""",
+     "tfreeze"),
+    ("freeze: a level logged again and again", "InitOutput.c",
+     """            if (!(f->levels & (1u << k)) && now - f->beginUs >= (uint64_t) (k + 1) * 1000000) {""",
+     """            if (now - f->beginUs >= (uint64_t) (k + 1) * 1000000) {""",
+     "tfreeze"),
+    ("freeze: the X server's thread's stage not watched", "InitOutput.c",
+     """    if (s->xStage != LORIE_X_LOOP && (u = lorieFreezeSince(now, s->xStageUs, 0)) >= LORIE_FREEZE_PERIOD_US)""",
+     """    if (0 && s->xStage != LORIE_X_LOOP && (u = lorieFreezeSince(now, s->xStageUs, 0)) >= LORIE_FREEZE_PERIOD_US)""",
+     "tfreeze"),
+    ("freeze: the renderer's work watched with no window", "InitOutput.c",
+     """    if (s->surface) {
+        if (s->askSeq != s->takenSeq""",
+     """    if (1) {
+        if (s->askSeq != s->takenSeq""",
+     "tfreeze"),
+    ("freeze: the ask timed from the last one, not the first still waiting", "InitOutput.c",
+     """    s->askUs = s->askSeq != s->takenSeq ? lorieAskUs(p, s->takenSeq + 1, s->askSeq) : 0;""",
+     """    s->askUs = s->askSeq != s->takenSeq ? lorieAskUs(p, s->askSeq, s->askSeq) : 0;""",
+     "tfreeze"),
+    ("freeze: the renderer's stage kept with the option off", "renderer.c",
+     """static void rendererStage(uint32_t stage) {
+    if (state && state->backend.freezeDiag) {""",
+     """static void rendererStage(uint32_t stage) {
+    if (state) {""",
+     "tpresentcopy"),
+    ("freeze: Dispatch starts the request's timing while untimed", "xserver.patch",
+     """+                        CARD64 timedUs = dispatchRequestTimed ? ddxRequestStart(client->index, client->majorOp, client->minorOp) : 0;""",
+     """+                        CARD64 timedUs = ddxRequestStart(client->index, client->majorOp, client->minorOp) * (dispatchRequestTimed != 0);""",
+     "tdispatchyield"),
 ]
 
 def copy_sources(dst):
