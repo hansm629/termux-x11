@@ -81,6 +81,8 @@ def own(path, ownership):
             "void lorieFinishAccess(PixmapPtr pPix, int index) {")))
 
 recipes = {
+    # P11-C3-E: the opt-in Xorg request-dispatch interval, not the Android kernel scheduler.
+    "xscheduler": lambda: func(I, "static Bool lorieTuneXRequestScheduler(const char *text) {"),
     # the renderer diagnostics, as lorie.h declares them and the X server logs them - tdiaglog.c
     "diagtypes": lambda: span(H, "enum { LORIE_ACTIVE_NONE = 0", "__ATOMIC_RELAXED); } while (0)"),
     "diaglog": lambda: span(I, "static const char *lorieActiveName(uint8_t a) {", "#undef LORIE_NAME") + FAILAT()

@@ -41,6 +41,7 @@
 #include "globals.h"
 #include "property.h"
 #include "client.h"
+#include "dixstruct.h" // Xorg's SmartScheduleInterval/Slice/MaxSlice; configured before SmartScheduleInit.
 #include "extnsionst.h"
 #include "lorie.h"
 
@@ -460,11 +461,45 @@ static uint8_t lorieRequestedVkFailAt(const char *value, volatile uint8_t *inval
     return LORIE_VK_FAIL_AT_NONE;
 }
 
+/*
+ * P11-C3-E experiment: shorten the *Xorg client request dispatch* timeslice to see whether a competing xfwm4
+ * compositor prevents the glmark2 client's PresentPixmap requests from being serviced promptly.  This is NOT an
+ * Android/Linux CPU scheduler, uclamp, nice or affinity change.  Xorg already exposes -schedInterval/-schedMax;
+ * the environment option lets tx11start users run an A/B test without changing its command line.
+ *
+ * OsVendorInit runs before SmartScheduleInit (xserver/os/osinit.c), so the timer is started with the chosen interval.
+ * Only opt in with a whole number from 1 to 10 ms.  Unset or invalid: keep Xorg's values, including CLI overrides.
+ */
+static Bool lorieTuneXRequestScheduler(const char *text) {
+    char *end = NULL;
+    long ms;
+
+    if (!text || text[0] < '0' || text[0] > '9')
+        return FALSE;
+    errno = 0;
+    ms = strtol(text, &end, 10);
+    if (errno || end == text || *end || ms < 1 || ms > 10)
+        return FALSE;
+    SmartScheduleInterval = ms;
+    SmartScheduleSlice = ms;
+    SmartScheduleMaxSlice = 3 * ms;
+    return TRUE;
+}
+
 void OsVendorInit(void) {
     pthread_mutexattr_t mutex_attr;
+    const char *xSchedMs = getenv("TERMUX_X11_X_SCHED_INTERVAL_MS");
 
     if (lorieScreen.stateFd != -1) // already initialized
         return;
+
+    if (xSchedMs) {
+        if (lorieTuneXRequestScheduler(xSchedMs))
+            log(INFO, "XlorieXScheduler: xorg_interval_ms=%ld xorg_max_slice_ms=%ld experimental=on android_scheduler_unchanged=1",
+                SmartScheduleInterval, SmartScheduleMaxSlice);
+        else
+            log(WARN, "XlorieXScheduler: invalid TERMUX_X11_X_SCHED_INTERVAL_MS (expected integer 1..10); defaults retained");
+    }
 
     lorieServerDebugEnabled = getenv("TERMUX_X11_DEBUG") != NULL;
 
