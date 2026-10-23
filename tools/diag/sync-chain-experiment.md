@@ -22,6 +22,13 @@ this branch, which is based on `d1fe278`.
 
 ## S24+ test steps (new ARM64 APK AND matching Companion from this branch's CI)
 
+**Actual workload topology (important):** the graphical desktop is **Termux-Desktop XFCE4 running in native Termux**.
+Its `xfwm4` is the compositor under test.  The benchmark/application (`glmark2`, etc.) runs **inside a Debian PRoot
+rootfs**, drawing windows into that same Termux-Desktop X11 display.  The X server/Companion and the Android Vulkan
+Activity are outside that PRoot environment.  Do **not** launch a second Debian XFCE desktop or try to change xfwm4's
+configuration from a Debian PRoot terminal: that terminal may have a different (or no) xfconf D-Bus session.  In this
+test, **only the application belongs in PRoot; xfwm4 configuration belongs to native Termux-Desktop XFCE**.
+
 Download these two scripts into Termux.  There is no need to clone the repository on the S24+:
 
 ```sh
@@ -47,14 +54,19 @@ To check the flag after starting X11, the 5-second Logcat reports should contain
 
 ### A: XFCE Compositor ON
 
-In the **Debian XFCE terminal**, not in Termux:
+Open a terminal **inside the native Termux-Desktop XFCE session**, not inside Debian PRoot.  Check that the command
+resolves to Termux's prefix and the requested value actually changes the running Termux-Desktop xfwm4:
 
 ```sh
+command -v xfconf-query
 xfconf-query -c xfwm4 -p /general/use_compositing -s true
 xfconf-query -c xfwm4 -p /general/use_compositing
 ```
 
-Back in **Termux**:
+Run **glmark2 from the existing Debian PRoot environment**, using exactly the same application launch and GL/Vulkan
+settings as the earlier measurements.  Do **not** replace it with a native Termux build of glmark2: that would change
+the client and invalidate the A/B comparison.  The diagnostic scripts run from a **native Termux shell** (they observe
+the existing XFCE desktop and the PRoot application's X11 activity):
 
 ```sh
 sh "$HOME/cpu-sched-sample.sh" 150 "$HOME/tx11-sched-compositor-on.log" &
@@ -69,14 +81,14 @@ state must stay consistent; avoid a thermal state change between trials.
 
 ### B: XFCE Compositor OFF
 
-In the **Debian XFCE terminal**:
+Again, in the **native Termux-Desktop XFCE terminal** (same xfconf instance as arm A):
 
 ```sh
 xfconf-query -c xfwm4 -p /general/use_compositing -s false
 xfconf-query -c xfwm4 -p /general/use_compositing
 ```
 
-Close and relaunch the same glmark2 scene, then in **Termux**:
+Close and relaunch the same **Debian PRoot glmark2** scene, then in **native Termux**:
 
 ```sh
 sh "$HOME/cpu-sched-sample.sh" 150 "$HOME/tx11-sched-compositor-off.log" &
@@ -85,7 +97,7 @@ sh "$HOME/frame-diag-session.sh" "$HOME/frame-diag-compositor-off.log"
 wait "$SAMP_PID"
 ```
 
-After the test, restore your usual XFCE Compositor setting, normally `true`, in Debian:
+After the test, restore your original compositor setting (normally `true`) in the **native Termux-Desktop XFCE session**:
 
 ```sh
 xfconf-query -c xfwm4 -p /general/use_compositing -s true
@@ -103,3 +115,7 @@ the X11 Present request dispatch and Android-side renderer synchronization indep
 stays low but off-CPU and GPU/root waits rise, target those waits instead of pixman arithmetic.  This comparison
 changes the window redirection/presentation path as well as CPU workload, so it does NOT isolate the pixman kernel
 alone.  These are hypotheses, not a declaration that One UI/ANGLE caused the regression.
+
+Disabling native Termux-Desktop xfwm4's compositor does **not** disable the separate Android Vulkan renderer's own
+final rendering/composition.  The comparison tests the host desktop compositor's contribution to the same PRoot
+client's frames, not the Linux distro's desktop performance.
