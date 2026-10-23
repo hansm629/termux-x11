@@ -74,6 +74,12 @@ init = func(I, "void OsVendorInit(void) {")
 check('lorieScreen.state->backend.requested = lorieRequestedBackend(getenv("TERMUX_X11_RENDERER_BACKEND"),' in init,
       "OsVendorInit does not read TERMUX_X11_RENDERER_BACKEND into the server state")
 
+# P11-C3-E2: no new timing clocks or causal samples without the explicit diagnostic option AND the ordinary
+# Vulkan frame diagnostics. The probe does not alter the Xorg or Android CPU scheduler.
+check('lorieScreen.syncChainDiag = lorieScreen.frameDiag && getenv("TERMUX_X11_SYNC_CHAIN_DIAG")' in init and
+      '!strcmp(getenv("TERMUX_X11_SYNC_CHAIN_DIAG"), "1")' in init,
+      "sync-chain probe not gated by both the frame diagnostic and an explicit opt-in")
+
 # P11-A: the tick and the completion as urgent work - and nowhere queued as any work
 frame = func(I, "void lorieChoreographerFrameCallback(long t, AChoreographer* d) {")
 check("lorieQueueUrgentWorkProc(lorieRedraw, " in frame and "QueueWorkProc(lorieRedraw" not in frame.replace("lorieQueueUrgentWorkProc(", ""),

@@ -68,9 +68,22 @@ static struct {
 } fakePvfb = { &st }, *pvfb = &fakePvfb;
 
 static uint64_t fakeNow = 1000;
+static uint64_t fakeThreadCpuNs = 1000000000ULL;
+static int fakeThreadClockFails;
+static int fakeThreadClock(clockid_t clock, struct timespec *t) {
+    if (clock != CLOCK_THREAD_CPUTIME_ID || fakeThreadClockFails)
+        return -1;
+    t->tv_sec = (time_t) (fakeThreadCpuNs / 1000000000ULL);
+    t->tv_nsec = (long) (fakeThreadCpuNs % 1000000000ULL);
+    return 0;
+}
 #define GetTimeInMicros() (fakeNow)
+#define clock_gettime fakeThreadClock
 #include "compositetimed_src.inc"
+#undef clock_gettime
 #include "compositereport_src.inc"
+#include "syncchainreport_src.inc"
+#include "syncchainwait_src.inc"
 #undef GetTimeInMicros
 
 static int fails;
@@ -85,7 +98,7 @@ static struct {
     PicturePtr src, mask, dst;
     INT16 args[6];
     CARD16 width, height;
-    uint64_t us, gpu, lock, root, ahb;
+    uint64_t us, gpu, lock, root, ahb, threadCpuNs;
     uint32_t accesses, locks;
     bool rewrap;
 } below;
@@ -102,6 +115,7 @@ static void exaComposite(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr d
     below.args[0] = xSrc, below.args[1] = ySrc, below.args[2] = xMask, below.args[3] = yMask, below.args[4] = xDst, below.args[5] = yDst;
     below.width = width, below.height = height;
     fakeNow += below.us;
+    fakeThreadCpuNs += below.threadCpuNs;
     st.diag.xGpuWaitUs += below.gpu;
     st.diag.xStateLockWaitUs += below.gpu + below.lock;
     st.diag.rootCopyCpuBlockUs += below.root;
@@ -259,6 +273,60 @@ int main(void) {
         CHECK(!strcmp(totals, want) && !strcmp(classes, "none classes_more=0"), "an empty period: %s / %s", totals, classes);
     }
 
-    printf("TEXACOMPOSITE the RENDER composites timed by class (P11-C3-D1): %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
+    /* P11-C3-E2: the real opt-in Composite CPU clock and wait attribution, not merely the old inferred CPU time. */
+    {
+        char chain[512], waits[512];
+        struct lorie_sync_chain *s = &fakePvfb.syncChain;
+        fakePvfb.syncChainDiag = TRUE;
+        below.threadCpuNs = 1250000;
+        composite(3, &ahbSrc, &maskA, &memDst, 320, 240, 5000, 1200, 300, 700, 100, 3, 2);
+        CHECK(s->composites == 1 && s->compositeWallUs == 5000 && s->compositeThreadCpuUs == 1250 &&
+              s->compositeOffCpuUs == 3750 && !s->clockFailures && !fakePvfb.syncCompositeActive,
+              "sync-chain 5ms Composite split: wall=%llu thread=%llu offcpu=%llu failures=%llu",
+              (unsigned long long) s->compositeWallUs, (unsigned long long) s->compositeThreadCpuUs,
+              (unsigned long long) s->compositeOffCpuUs, (unsigned long long) s->clockFailures);
+        fakePvfb.syncCompositeActive = TRUE;
+        lorieSyncChainRootWait(42, 2300, TRUE, FALSE, 5000);
+        lorieSyncChainGpuWait(1400, EXA_PREPARE_SRC);
+        lorieSyncChainGpuWait(700, EXA_PREPARE_DEST);
+        lorieSyncChainGpuWait(300, EXA_PREPARE_MASK);
+        fakePvfb.syncCompositeActive = FALSE;
+        lorieSyncChainRootWait(43, 1700, TRUE, TRUE, 9000);
+        lorieSyncChainRootWait(44, 9999, FALSE, FALSE, 0);  /* no sleeping: not an actual wait */
+        CHECK(s->rootWaits == 2 && s->rootWaitUs == 4000 && s->rootInsideWaits == 1 &&
+              s->rootInsideUs == 2300 && s->rootNotTakenAtEntry == 1 && s->worstRootUs == 2300 && s->worstRootSeq == 42 &&
+              s->worstRootQueuedToDoneUs == 5000 && s->gpuWaits == 3 && s->gpuWaitUs == 2400 && s->gpuInsideUs == 2400 &&
+              s->gpuSrcUs == 1400 && s->gpuDstUs == 700 && s->gpuMaskUs == 300,
+              "sync-chain root/gpu wait classification: root %llu/%llu inside %llu, gpu %llu/%llu",
+              (unsigned long long) s->rootWaits, (unsigned long long) s->rootWaitUs,
+              (unsigned long long) s->rootInsideWaits, (unsigned long long) s->gpuWaits, (unsigned long long) s->gpuWaitUs);
+        below.threadCpuNs = 2000000;
+        composite(3, &ahbSrc, NULL, &memDst, 100, 100, 9000, 0, 0, 0, 0, 1, 0);
+        CHECK(s->composites == 2 && s->compositeWallUs == 14000 && s->compositeThreadCpuUs == 3250 &&
+              s->compositeOffCpuUs == 10750 && s->compositeGe8ms == 1 && s->compositeGe16ms == 0 &&
+              s->worstCompositeUs == 9000 && s->worstCompositeOffCpuUs == 7000,
+              "sync-chain slow Composite/real CPU: n=%llu offcpu=%llu worst=%u",
+              (unsigned long long) s->composites, (unsigned long long) s->compositeOffCpuUs, s->worstCompositeOffCpuUs);
+        fakeThreadClockFails = 1;
+        composite(1, &memSrc, NULL, &memDst, 1, 1, 120, 0, 0, 0, 0, 0, 0);
+        CHECK(s->composites == 3 && s->compositeWallUs == 14120 && s->compositeThreadCpuUs == 3250 &&
+              s->compositeOffCpuUs == 10750 && s->clockFailures == 1,
+              "a failed CPU clock does not invent off-CPU time: failures=%llu", (unsigned long long) s->clockFailures);
+        fakeThreadClockFails = 0;
+        lorieSyncChainReport(chain, sizeof(chain), waits, sizeof(waits));
+        CHECK(strstr(chain, "composites=3 wall_us=14120 thread_cpu_us=3250 offcpu_us=10750") &&
+              strstr(chain, "cpu_clock_fail=1 worst_offcpu_us=7000") &&
+              strstr(waits, "root_waits=2 root_wait_us=4000 root_inside=1 root_inside_us=2300") &&
+              strstr(waits, "gpu_ahb_waits=3 gpu_ahb_wait_us=2400"),
+              "sync-chain report contents: %s / %s", chain, waits);
+        CHECK(!s->composites && !s->rootWaits && !s->gpuWaits && !s->clockFailures,
+              "sync-chain per-period reset");
+        fakePvfb.syncChainDiag = FALSE;
+        lorieSyncChainRootWait(45, 1000, TRUE, FALSE, 3000);
+        lorieSyncChainGpuWait(1000, EXA_PREPARE_SRC);
+        CHECK(!s->rootWaits && !s->gpuWaits, "diagnostic OFF must not collect root/GPU samples");
+    }
+
+    printf("TEXACOMPOSITE the RENDER composites timed by class (P11-C3-D1/E2): %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
     return fails != 0;
 }

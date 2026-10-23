@@ -23,6 +23,7 @@
 #include <sys/mman.h>
 #include <dri3.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <dlfcn.h>
 #include "fb.h"
 #include "mipointer.h"
@@ -202,6 +203,21 @@ typedef struct {
         uint64_t px, us, gpuUs, rootUs, lockUs, ahbUs;
     } compositeClasses[LORIE_COMPOSITE_CLASSES + 1];
     struct { uint32_t key, us, gpuUs, rootUs, lockUs, ahbUs, width, height; } worstComposite;
+
+    /* P11-C3-E2: opt-in, X main-thread-only measurements of actual thread CPU time within RENDER Composite,
+     * and the root/GPU waits that can hold it up. Never used by the renderer or to decide synchronization. */
+    Bool syncChainDiag, syncCompositeActive;
+    struct lorie_sync_chain {
+        uint64_t composites, compositeWallUs, compositeThreadCpuUs, compositeOffCpuUs;
+        uint64_t compositeGe8ms, compositeGe16ms, clockFailures;
+        uint64_t rootWaits, rootWaitUs, rootInsideWaits, rootInsideUs, rootNotTakenAtEntry;
+        uint64_t gpuWaits, gpuWaitUs, gpuInsideUs, gpuSrcUs, gpuDstUs, gpuMaskUs;
+        uint32_t worstCompositeUs, worstCompositeCpuUs, worstCompositeOffCpuUs;
+        uint32_t worstCompositeKey, worstCompositeWidth, worstCompositeHeight;
+        uint32_t worstCompositeGpuUs, worstCompositeRootUs, worstCompositeAhbUs;
+        uint32_t worstRootUs, worstRootSeq;
+        uint64_t worstRootQueuedToDoneUs;
+    } syncChain;
 } lorieScreenInfo;
 
 // P11-C2: root copies smaller than this stay on the X server's CPU. A guess to check on the device: the S24+'s root
@@ -212,6 +228,7 @@ static void lorieRootCopyWait(Bool takeBack);
 static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
                                 INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height);
 static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize);
+static void lorieSyncChainReport(char *composite, size_t compositeSize, char *waits, size_t waitsSize);
 static void lorieContentClientGone(CallbackListPtr *list, void *closure, void *data);
 
 ScreenPtr pScreenPtr;
@@ -515,6 +532,12 @@ void OsVendorInit(void) {
     // of them reads a clock.
     lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
     lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
+    // P11-C3-E2 diagnostics, ONLY with frameDiag and explicit opt-in; it never changes Xorg/client/kernel scheduling.
+    // Samples CLOCK_THREAD_CPUTIME_ID for each RENDER Composite and classifies CPU/GPU/root waits per five-second report.
+    lorieScreen.syncChainDiag = lorieScreen.frameDiag && getenv("TERMUX_X11_SYNC_CHAIN_DIAG") &&
+                                !strcmp(getenv("TERMUX_X11_SYNC_CHAIN_DIAG"), "1");
+    if (getenv("TERMUX_X11_SYNC_CHAIN_DIAG") && !lorieScreen.syncChainDiag)
+        log(WARN, "XlorieSyncChain: enable TERMUX_X11_RENDERER_VK_FRAME_DIAG=1 and TERMUX_X11_SYNC_CHAIN_DIAG=1 together");
     // Diagnostics: TERMUX_X11_FRAME_FREEZE_DIAG=1 watches, from a thread of its own, for work waiting with nothing
     // moving - in the X server or the renderer - and logs each such freeze as it begins and ends, and this process's
     // threads every 5 seconds (XlorieFreeze, XlorieXSched: lorieFreezeWatch). Off, none of it runs: no thread, no stage,
@@ -1035,6 +1058,45 @@ static Bool lorieOwnershipAsked(void) {
            LORIE_OWNERSHIP_SEQ(__atomic_load_n(&pvfb->state->backend.ownershipAck, __ATOMIC_ACQUIRE));
 }
 
+// P11-C3-E2: classifies completed waits on the X main thread, without affecting the futex or copy lifetime.
+// "not taken at entry" is a snapshot, NOT proof that acquiring the job caused the entire delay.
+static void lorieSyncChainRootWait(uint32_t seq, uint64_t us, Bool waited, Bool takenAtEntry, uint64_t queuedToDoneUs) {
+    struct lorie_sync_chain *s = &pvfb->syncChain;
+    if (!pvfb->syncChainDiag || !waited)
+        return;
+    s->rootWaits++;
+    s->rootWaitUs += us;
+    if (pvfb->syncCompositeActive) {
+        s->rootInsideWaits++;
+        s->rootInsideUs += us;
+    }
+    if (!takenAtEntry)
+        s->rootNotTakenAtEntry++;
+    if (us > s->worstRootUs) {
+        s->worstRootUs = us > UINT32_MAX ? UINT32_MAX : (uint32_t) us;
+        s->worstRootSeq = seq;
+        s->worstRootQueuedToDoneUs = queuedToDoneUs;
+    }
+}
+
+// The time lorieGpuWaitIdle spent waiting for a *specific AHB buffer* before an EXA CPU access.
+// Zero time/no wait is excluded. Neither root swap's GPU waits nor renderer-side fences are counted here.
+static void lorieSyncChainGpuWait(uint64_t us, int index) {
+    struct lorie_sync_chain *s = &pvfb->syncChain;
+    if (!pvfb->syncChainDiag || !us)
+        return;
+    s->gpuWaits++;
+    s->gpuWaitUs += us;
+    if (pvfb->syncCompositeActive)
+        s->gpuInsideUs += us;
+    if (index == EXA_PREPARE_SRC)
+        s->gpuSrcUs += us;
+    else if (index == EXA_PREPARE_DEST)
+        s->gpuDstUs += us;
+    else if (index == EXA_PREPARE_MASK)
+        s->gpuMaskUs += us;
+}
+
 /*
  * P11-C2 (TERMUX_X11_RENDERER_ROOT_GPU_COPY=1), the shared lock held: the swap's copy asked of the renderer's GPU
  * (lorie.h rootCopy) - its boxes clipped as the CPU copy clips them, those past the last slot copied within the
@@ -1102,9 +1164,11 @@ static void lorieRootCopyWait(Bool takeBack) {
     uint32_t seq = pvfb->rootCopy.seq, done = 0;
     Bool held = pvfb->accessLocks > 0, copy = FALSE, waited = FALSE;
     uint64_t startUs, blockedUs;
+    Bool takenAtEntry;
 
     if (!seq)
         return;
+    takenAtEntry = pvfb->syncChainDiag && __atomic_load_n(&st->rootCopy.taken, __ATOMIC_ACQUIRE) == seq;
     struct lorieXMark waitMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_ROOT_COPY_WAIT);  // P11-C3-C
     startUs = GetTimeInMicros();
     while ((done = __atomic_load_n(&st->rootCopy.done, __ATOMIC_ACQUIRE)) != seq) {
@@ -1137,6 +1201,12 @@ static void lorieRootCopyWait(Bool takeBack) {
         copy = TRUE;
     blockedUs = GetTimeInMicros() - startUs;
     __atomic_fetch_add(&st->diag.rootCopyCpuBlockUs, blockedUs, __ATOMIC_RELAXED);
+    if (pvfb->syncChainDiag && waited) {
+        uint64_t doneUs = done == seq ? __atomic_load_n(&st->rootCopy.doneUs, __ATOMIC_ACQUIRE) : 0;
+        uint64_t queuedUs = __atomic_load_n(&st->rootCopy.queuedUs, __ATOMIC_RELAXED);
+        lorieSyncChainRootWait(seq, blockedUs, waited, takenAtEntry,
+                               doneUs >= queuedUs && queuedUs ? doneUs - queuedUs : 0);
+    }
     // P11-C3: a wait the X server had to make; and, the renderer having settled the copy meanwhile, from that to here
     if (waited && pvfb->frameDiag) {
         uint64_t now = lorieMonotonicUs(), doneUs = __atomic_load_n(&st->rootCopy.doneUs, __ATOMIC_RELAXED);
@@ -1635,6 +1705,12 @@ static void lorieLogRendererDiag(void) {
             lorieCompositeReport(composites, sizeof(composites), classes, sizeof(classes));
             log(INFO, "XlorieComposite: %s", composites);
             log(INFO, "XlorieCompositeClasses: %s", classes);
+        }
+        if (pvfb->syncChainDiag) {
+            char chain[512], waits[512];
+            lorieSyncChainReport(chain, sizeof(chain), waits, sizeof(waits));
+            log(INFO, "XlorieSyncChain: %s", chain);
+            log(INFO, "XlorieSyncWait: %s", waits);
         }
 #undef TD32
 #undef HT
@@ -3199,6 +3275,51 @@ static uint32_t lorieCompositeKey(CARD8 op, PicturePtr src, PicturePtr mask, Pic
            m << 13 | (uint32_t) (src->transform || (mask && mask->transform)) << 15;
 }
 
+// Actual CPU execution of this *thread*; elapsed time minus execution is off-CPU (sleep OR runnable).
+// This does not use the Android renderer thread's clock; that lives in the separate Activity process.
+static uint64_t lorieCompositeThreadCpuNs(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) != 0)
+        return 0;
+    return (uint64_t) t.tv_sec * 1000000000ULL + (uint64_t) t.tv_nsec;
+}
+
+static void lorieSyncChainComposite(uint64_t wallUs, uint64_t threadStartNs, uint64_t threadEndNs, uint32_t key,
+                                    CARD16 width, CARD16 height, uint64_t gpuUs, uint64_t rootUs, uint64_t ahbUs) {
+    struct lorie_sync_chain *s = &pvfb->syncChain;
+    uint64_t threadUs, offCpuUs;
+
+    if (!pvfb->syncChainDiag)
+        return;
+    s->composites++;
+    s->compositeWallUs += wallUs;
+    if (wallUs >= 8000)
+        s->compositeGe8ms++;
+    if (wallUs >= 16000)
+        s->compositeGe16ms++;
+    if (!threadStartNs || threadEndNs < threadStartNs) {
+        s->clockFailures++;
+        return;  // no off-CPU estimate is possible for this composite
+    }
+    threadUs = (threadEndNs - threadStartNs) / 1000;
+    if (threadUs > wallUs)
+        threadUs = wallUs;  // clocks use different resolutions, never let a duration become negative
+    offCpuUs = wallUs - threadUs;
+    s->compositeThreadCpuUs += threadUs;
+    s->compositeOffCpuUs += offCpuUs;
+    if (offCpuUs > s->worstCompositeOffCpuUs) {
+        s->worstCompositeUs = wallUs > UINT32_MAX ? UINT32_MAX : (uint32_t) wallUs;
+        s->worstCompositeCpuUs = threadUs > UINT32_MAX ? UINT32_MAX : (uint32_t) threadUs;
+        s->worstCompositeOffCpuUs = offCpuUs > UINT32_MAX ? UINT32_MAX : (uint32_t) offCpuUs;
+        s->worstCompositeKey = key;
+        s->worstCompositeWidth = width;
+        s->worstCompositeHeight = height;
+        s->worstCompositeGpuUs = gpuUs > UINT32_MAX ? UINT32_MAX : (uint32_t) gpuUs;
+        s->worstCompositeRootUs = rootUs > UINT32_MAX ? UINT32_MAX : (uint32_t) rootUs;
+        s->worstCompositeAhbUs = ahbUs > UINT32_MAX ? UINT32_MAX : (uint32_t) ahbUs;
+    }
+}
+
 static void lorieCompositeName(char *out, size_t size, uint32_t key) {
     static const char *const ops[] = { "clear", "src", "dst", "over", "overrev", "in", "inrev", "out", "outrev", "atop",
                                        "atoprev", "xor", "add", "saturate" };
@@ -3227,11 +3348,17 @@ static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, Pictu
     uint32_t key = lorieCompositeKey(op, src, mask, dst), accesses = pvfb->xAccessesOpened, i;
     uint64_t gpu = dg->xGpuWaitUs, lock = dg->xStateLockWaitUs, root = dg->rootCopyCpuBlockUs, ahb = dg->xAhbCpuLockUs;
     uint64_t locks = dg->xAhbCpuAcquires, startUs = GetTimeInMicros(), us;
+    uint64_t threadStartNs = pvfb->syncChainDiag ? lorieCompositeThreadCpuNs() : 0, threadEndNs;
+    Bool compositeWasActive = pvfb->syncCompositeActive;
 
+    if (pvfb->syncChainDiag)
+        pvfb->syncCompositeActive = TRUE;
     ps->Composite = pvfb->composite;
     (*ps->Composite) (op, src, mask, dst, xSrc, ySrc, xMask, yMask, xDst, yDst, width, height);
     pvfb->composite = ps->Composite;
     ps->Composite = lorieCompositeTimed;
+    threadEndNs = pvfb->syncChainDiag ? lorieCompositeThreadCpuNs() : 0;
+    pvfb->syncCompositeActive = compositeWasActive;
 
     us = GetTimeInMicros() - startUs;
     gpu = dg->xGpuWaitUs - gpu;
@@ -3239,6 +3366,7 @@ static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, Pictu
     lock = lock > gpu ? lock - gpu : 0;
     root = dg->rootCopyCpuBlockUs - root;
     ahb = dg->xAhbCpuLockUs - ahb;
+    lorieSyncChainComposite(us, threadStartNs, threadEndNs, key, width, height, gpu, root, ahb);
     for (i = 0; i < LORIE_COMPOSITE_CLASSES; i++)
         if (!pvfb->compositeClasses[i].n || pvfb->compositeClasses[i].key == key) {
             c = &pvfb->compositeClasses[i];
@@ -3339,6 +3467,36 @@ static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes,
     composites = pvfb->composites;
     memset(c, 0, sizeof(pvfb->compositeClasses));
     memset(&pvfb->worstComposite, 0, sizeof(pvfb->worstComposite));
+}
+
+/* One pair of 5-second reports. Counters are local to the X main thread and reset together.  Importantly,
+ * thread_cpu_us is real CLOCK_THREAD_CPUTIME_ID; offcpu_us = wall - thread CPU, including both waiting and
+ * runqueue delays.  Do not subtract GPU/root waits from offcpu_us: those counters overlap it. */
+static void lorieSyncChainReport(char *composite, size_t compositeSize, char *waits, size_t waitsSize) {
+    const struct lorie_sync_chain *s = &pvfb->syncChain;
+    char worst[64] = "none";
+    if (s->worstCompositeOffCpuUs)
+        lorieCompositeName(worst, sizeof(worst), s->worstCompositeKey);
+    snprintf(composite, compositeSize, "composites=%llu wall_us=%llu thread_cpu_us=%llu offcpu_us=%llu "
+              "ge_8ms=%llu ge_16ms=%llu cpu_clock_fail=%llu worst_offcpu_us=%u worst_wall_us=%u "
+              "worst_thread_cpu_us=%u worst=%s:%ux%u:gpu=%u,root=%u,ahb=%u",
+              (unsigned long long) s->composites, (unsigned long long) s->compositeWallUs,
+              (unsigned long long) s->compositeThreadCpuUs, (unsigned long long) s->compositeOffCpuUs,
+              (unsigned long long) s->compositeGe8ms, (unsigned long long) s->compositeGe16ms,
+              (unsigned long long) s->clockFailures, s->worstCompositeOffCpuUs, s->worstCompositeUs,
+              s->worstCompositeCpuUs, worst, s->worstCompositeWidth, s->worstCompositeHeight,
+              s->worstCompositeGpuUs, s->worstCompositeRootUs, s->worstCompositeAhbUs);
+    snprintf(waits, waitsSize, "root_waits=%llu root_wait_us=%llu root_inside=%llu root_inside_us=%llu "
+              "root_not_taken_at_entry=%llu worst_root_wait_us=%u worst_root_seq=%u worst_root_queue_to_done_us=%llu "
+              "gpu_ahb_waits=%llu gpu_ahb_wait_us=%llu gpu_inside_us=%llu gpu_src_us=%llu gpu_dst_us=%llu gpu_mask_us=%llu",
+              (unsigned long long) s->rootWaits, (unsigned long long) s->rootWaitUs,
+              (unsigned long long) s->rootInsideWaits, (unsigned long long) s->rootInsideUs,
+              (unsigned long long) s->rootNotTakenAtEntry, s->worstRootUs, s->worstRootSeq,
+              (unsigned long long) s->worstRootQueuedToDoneUs,
+              (unsigned long long) s->gpuWaits, (unsigned long long) s->gpuWaitUs,
+              (unsigned long long) s->gpuInsideUs, (unsigned long long) s->gpuSrcUs,
+              (unsigned long long) s->gpuDstUs, (unsigned long long) s->gpuMaskUs);
+    memset(&pvfb->syncChain, 0, sizeof(pvfb->syncChain));
 }
 
 Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
@@ -3535,6 +3693,7 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
             gpuUs = GetTimeInMicros() - gpuStartUs;
             __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, gpuUs, __ATOMIC_RELAXED);
+            lorieSyncChainGpuWait(gpuUs, index);  // P11-C3-E2: EXA AHB read/write wait attribution
             if (pvfb->frameDiag)
                 lorieHistAdd(&pvfb->state->diag.xAccessGpu, gpuUs);
         }

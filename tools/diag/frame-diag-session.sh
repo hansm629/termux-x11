@@ -140,6 +140,20 @@ awk '
             comp[p] = 1; cn[p] += plus($0, "composites"); cus[p] += val($0, "us"); ccpuus[p] += val($0, "cpu_us")
             cgpuus[p] += val($0, "gpu_us"); crootus[p] += val($0, "root_us")
         }
+        # P11-C3-E2: CLOCK_THREAD_CPUTIME_ID measures actual X main-thread CPU execution, not leftover wall time.
+        # offcpu also includes sleeping on fences/futexes, so never add it to GPU/root wait as if disjoint.
+        if (/XlorieSyncChain: / && / composites=/) {
+            sync[p] = 1; syncn[p] += val($0, "composites"); swall[p] += val($0, "wall_us")
+            sthread[p] += val($0, "thread_cpu_us"); soff[p] += val($0, "offcpu_us")
+            s8[p] += val($0, "ge_8ms"); s16[p] += val($0, "ge_16ms"); scfail[p] += val($0, "cpu_clock_fail")
+            if (val($0, "worst_offcpu_us") + 0 > sworst[p] + 0) sworst[p] = val($0, "worst_offcpu_us")
+        }
+        if (/XlorieSyncWait: /) {
+            syncwait[p] = 1; srn[p] += val($0, "root_waits"); srus[p] += val($0, "root_wait_us")
+            srin[p] += val($0, "root_inside"); srinu[p] += val($0, "root_inside_us")
+            sgn[p] += val($0, "gpu_ahb_waits"); sgus[p] += val($0, "gpu_ahb_wait_us")
+            sgin[p] += val($0, "gpu_inside_us")
+        }
         if (/XlorieCopyDamage: / && / exa_composite_opt=on/) {
             dmg[p] = 1; dd[p] += plus($0, "deferred"); de[p] += plus($0, "early"); dr[p] += plus($0, "dropped")
         }
@@ -189,5 +203,12 @@ awk '
             if (dmg[p]) printf "; copy damage put off %s/s (early %s/s, dropped %s/s)", rate(dd[p]), rate(de[p]), rate(dr[p])
             if (rs[p]) printf "; root copies settled early: once acquired %s/s, waiting for the lock %s/s, the X server waiting %s/s", rate(ra[p]), rate(rl[p]), rate(rx[p])
             printf "\n"
+            if (sync[p]) {
+                printf "  sync chain (measured X thread): composites %s/s, wall %s ms/s, CPU running %s ms/s, off-CPU %s ms/s; >=8/16ms %d/%d, worst off-CPU %d us, clock failures %d\n",
+                       rate(syncn[p]), ms(swall[p]), ms(sthread[p]), ms(soff[p]), s8[p], s16[p], sworst[p], scfail[p]
+                if (syncwait[p])
+                    printf "  sync waits: root %d (total %s ms/s; within composites %d, %s ms/s), AHB GPU %d (total %s ms/s; within composites %s ms/s)\n",
+                           srn[p], ms(srus[p]), srin[p], ms(srinu[p]), sgn[p], ms(sgus[p]), ms(sgin[p])
+            }
         }
     }' "$OUT" "$OUT"

@@ -200,17 +200,25 @@ recipes = {
         + func(R, "static void rendererContentFrame(const struct lorie_content *c, uint64_t now) {"),
     # P11-C3-D1: the RENDER composites timed by class (TERMUX_X11_RENDERER_VK_FRAME_DIAG) - the X server's own fields
     # for them, their report (tdiaglog.c, texacomposite.c) and the timing itself (texacomposite.c)
-    "compositeconsts": lambda: macro(I, "LORIE_COMPOSITE_CLASSES"),
-    "compositefields": lambda: span(I, "    CompositeProcPtr composite;\n", "} worstComposite;"),
+    "compositeconsts": lambda: macro(I, "LORIE_COMPOSITE_CLASSES")
+        + macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_DEST")
+        + macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_SRC")
+        + macro(os.path.join(XS, "exa", "exa.h"), "EXA_PREPARE_MASK"),
+    "compositefields": lambda: span(I, "    CompositeProcPtr composite;\n", "} syncChain;"),
     "compositereport": lambda: func(I, "static void lorieCompositeName(char *out, size_t size, uint32_t key) {")
         + func(I, "static uint64_t lorieCompositeCpuUs(uint64_t us, uint64_t gpu, uint64_t root, uint64_t lock, uint64_t ahb) {")
         + macro(I, "LORIE_COMPOSITE_SHOWN")
         + func(I, "static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize) {"),
+    "syncchainreport": lambda: func(I, "static void lorieSyncChainReport(char *composite, size_t compositeSize, char *waits, size_t waitsSize) {"),
+    "syncchainwait": lambda: func(I, "static void lorieSyncChainRootWait(uint32_t seq, uint64_t us, Bool waited, Bool takenAtEntry, uint64_t queuedToDoneUs) {")
+        + func(I, "static void lorieSyncChainGpuWait(uint64_t us, int index) {"),
     "compositetimed": lambda: span(I, "typedef struct {\n    LorieBuffer *buffer;", "} LoriePixmapPriv;")
         + func(I, "static Bool lorieIsAhb(LoriePixmapPriv *priv) {")
         + span(I, "enum { LORIE_PICT_SOLID,", "LORIE_PICT_ROOT };")
         + func(I, "static uint32_t lorieCompositePict(PicturePtr pict) {")
         + func(I, "static uint32_t lorieCompositeKey(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst) {")
+        + func(I, "static uint64_t lorieCompositeThreadCpuNs(void) {")
+        + func(I, "static void lorieSyncChainComposite(uint64_t wallUs, uint64_t threadStartNs, uint64_t threadEndNs, uint32_t key,")
         + func(I, "static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,\n"
                   "                                INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {"),
     "xstage_decl": lambda: span(I, "enum { LORIE_X_LOOP,", "struct lorieXMark { uint32_t stage; uint64_t us; };"),

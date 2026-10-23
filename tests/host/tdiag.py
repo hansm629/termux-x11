@@ -279,6 +279,23 @@ check("  content to the screen: mean 21000 us, p99 up to >100000 us, max 60000 u
       "longest 240000 us" in r.stdout.splitlines() and "freezes (TERMUX_X11_FRAME_FREEZE_DIAG): 0 begun, 0 ended" in r.stdout and
       "phase glmark2+move: 1 reports (5 s)" in r.stdout, "frame-diag-session, a percentile past the last bucket:\n" + r.stdout)
 
+# P11-C3-E2: separate real CPU execution from wall/off-CPU and classify waits.  Reports already contain 5-second
+# increments, unlike the older cumulative counters; the summary must not treat overlapping off-CPU/GPU/root as additive.
+syncExtra = [Q % "01:50.100" + x for x in (
+    "XlorieSyncChain: composites=5000 wall_us=2000000 thread_cpu_us=1350000 offcpu_us=650000 ge_8ms=20 "
+    "ge_16ms=4 cpu_clock_fail=0 worst_offcpu_us=17000 worst_wall_us=21000 worst_thread_cpu_us=4000 "
+    "worst=over:ahb_a>root:800x600:gpu=2000,root=7000,ahb=1000",
+    "XlorieSyncWait: root_waits=80 root_wait_us=240000 root_inside=60 root_inside_us=220000 "
+    "root_not_taken_at_entry=10 worst_root_wait_us=20000 worst_root_seq=41 worst_root_queue_to_done_us=25000 "
+    "gpu_ahb_waits=70 gpu_ahb_wait_us=120000 gpu_inside_us=100000 gpu_src_us=70000 gpu_dst_us=50000 gpu_mask_us=0")]
+r, saved, made, left = session(True, marks[4:] + phaseReport("01:50.100") + syncExtra)
+check(r.returncode == 0 and
+      "  sync chain (measured X thread): composites 1000.0/s, wall 400.0 ms/s, CPU running 270.0 ms/s, off-CPU 130.0 ms/s; "
+      ">=8/16ms 20/4, worst off-CPU 17000 us, clock failures 0" in r.stdout and
+      "  sync waits: root 80 (total 48.0 ms/s; within composites 60, 44.0 ms/s), AHB GPU 70 "
+      "(total 24.0 ms/s; within composites 20.0 ms/s)" in r.stdout,
+      "frame-diag-session P11-C3-E2 sync-chain summary:\n" + r.stdout)
+
 
 print("renderer diagnostics scripts (%d cases): %s (%d failures)" % (len(cases), "FAIL" if fails else "PASS", fails))
 sys.exit(1 if fails else 0)

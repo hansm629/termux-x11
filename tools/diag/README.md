@@ -1,5 +1,14 @@
 # Renderer diagnostics
 
+## S24+ / One UI 8+ CPU–GPU synchronization experiment (P11-C3-E2)
+
+See [sync-chain-experiment.md](sync-chain-experiment.md) for the matched XFCE Compositor ON/OFF test and the
+`TERMUX_X11_SYNC_CHAIN_DIAG=1` opt-in.  In addition to the existing inferred `XlorieComposite: cpu_us`, the new
+`XlorieSyncChain` report uses the X server main thread's actual `CLOCK_THREAD_CPUTIME_ID` CPU execution.  Its
+`offcpu_us` includes **both** GPU/root sleeps and Linux scheduler runqueue waits, so those values overlap and should
+not be summed.  `XlorieSyncWait` classifies Root-copy waits and per-access AHB GPU waits.  This is diagnostics only:
+the X11/Android scheduling, compositing and copy paths are unchanged.
+
 The renderer runs in the Termux:X11 activity's process, whose logcat cannot be read without root or adb.
 It therefore records what it actually did in the state it shares with the X server
 (`struct lorie_renderer_diag`, `app/src/main/cpp/lorie/lorie.h`), and the X server logs that every 5 seconds
