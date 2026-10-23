@@ -31,10 +31,12 @@ plus X server main/render threads.  Increasing `uclamp_min` using `sched_setattr
 non-root Galaxy S26U Termux process, and is intentionally **not** attempted by this patch.
 
 To collect a low-overhead, unprivileged comparison during the original frame test, start this sampler in a second
-Termux terminal (the script watches for glmark2 appearing after the idle phase):
+Termux terminal.  The S24+ **does not need a cloned source checkout**: download just the script from this branch.
+It watches for glmark2 appearing after the idle phase:
 
 ```sh
-sh tools/diag/cpu-sched-sample.sh 120
+curl -fsSL "https://raw.githubusercontent.com/hansm629/termux-x11/experiment/p11-c3-e-xorg-scheduler/tools/diag/cpu-sched-sample.sh" -o "$HOME/cpu-sched-sample.sh"
+sh "$HOME/cpu-sched-sample.sh" 120
 ```
 
 It writes `~/tx11-sched-*.log` with one sample per second for accessible Linux processes.  `run_ns` and
