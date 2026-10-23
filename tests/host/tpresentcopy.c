@@ -91,14 +91,21 @@ typedef struct { struct { int width, height, depth; } drawable; LoriePixmapPriv 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((p)->priv)
 static struct {
     Bool gpuPresentDisabled;
+    Bool rootPresentGpu, exaCompositeOpt;
+    int accessLocks;
     struct { Bool legacyDrawing; } root;
     struct lorie_shared_server_state *state;
     uint64_t gpuCopySerialCounter, rootGpuCopyPending;
+    struct { uint32_t seq; } rootCopy;
 } vfb, *pvfb = &vfb;
 static struct { void *devPrivate; } screen, *pScreenPtr = &screen;
 static uint64_t gpuCopyAttempts, gpuCopyOffloads;
 static bool connectionAlive = true;
-static Bool lorieRootTwinned(void) { return FALSE; }     /* root double buffering off: the copies into the root are GPU copies */
+static Bool fakeRootTwinned;
+static Bool lorieRootTwinned(void) { return fakeRootTwinned; }
+static Bool lorieAhbPerAccess(void) { return TRUE; }
+static Bool lorieOwnershipAsked(void) { return FALSE; }
+static void lorieRootCopyWait(Bool takeBack) { (void) takeBack; }
 static bool lorieConnectionAlive(void) { return connectionAlive; }
 /* InitOutput.c's, but a pixmap not yet a buffer is not converted to one: every pixmap here has its buffer */
 static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
@@ -116,9 +123,12 @@ static void FatalError(const char *f, ...) { printf("FatalError %s\n", f); abort
 #include "wake_src.inc"
 static struct lorie_renderer_wake wakeRegion, *rendererWake = &wakeRegion;
 static int wakeups;
+static void (*onWakeForRootGpuTest)(void);
 static void countedWake(volatile struct lorie_renderer_wake *w) {
     wakeups++;
     lorieWakeRenderer(w);
+    if (onWakeForRootGpuTest)
+        onWakeForRootGpuTest();
 }
 #define lorieWakeRenderer(w) countedWake(w)
 
@@ -128,13 +138,30 @@ typedef int GLint, GLsizei;
 typedef unsigned char GLboolean;
 enum { GL_NEAREST = 0x2600, GL_LINEAR = 0x2601, GL_VIEWPORT = 0x0BA2, GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0,
        GL_TEXTURE_2D = 0x0DE1, GL_TEXTURE0 = 0x84C0, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
-       GL_FLOAT = 0x1406, GL_FALSE = 0, GL_TRIANGLE_STRIP = 5 };
+       GL_FLOAT = 0x1406, GL_FALSE = 0, GL_TRIANGLE_STRIP = 5,
+       GL_BLEND = 0x0BE2, GL_ONE = 1, GL_ZERO = 0, GL_ONE_MINUS_SRC_ALPHA = 0x0303,
+       GL_BLEND_SRC_RGB = 0x80C9, GL_BLEND_DST_RGB = 0x80C8,
+       GL_BLEND_SRC_ALPHA = 0x80CB, GL_BLEND_DST_ALPHA = 0x80CA };
 static GLuint g_texture_program = 1, gv_pos = 0, gv_coords = 1, g_texture_program_bgra = 2, gv_pos_bgra = 2, gv_coords_bgra = 3;
 static GLuint gpuCopyFbo, glProgram, glTexture, glTarget;
+static GLboolean gpuBlendEnabled;
+static GLint gpuBlendSrc = GL_ONE, gpuBlendDst = GL_ZERO, gpuBlendSrcAlpha = GL_ONE, gpuBlendDstAlpha = GL_ZERO;
+static GLboolean glIsEnabled(GLenum p) { return p == GL_BLEND && gpuBlendEnabled; }
+static void glEnable(GLenum p) { if (p == GL_BLEND) gpuBlendEnabled = true; }
+static void glDisable(GLenum p) { if (p == GL_BLEND) gpuBlendEnabled = false; }
+static void glBlendFuncSeparate(GLenum src, GLenum dst, GLenum srcAlpha, GLenum dstAlpha) {
+    gpuBlendSrc = src; gpuBlendDst = dst; gpuBlendSrcAlpha = srcAlpha; gpuBlendDstAlpha = dstAlpha;
+}
 static const float *glVertices;
 static struct { float v[16]; GLuint program, texture, target; } glDraws[32];
 static int glDrawCount;
-static void glGetIntegerv(GLenum e, GLint *v) { (void) e; v[0] = v[1] = v[2] = v[3] = 0; }
+static void glGetIntegerv(GLenum e, GLint *v) {
+    if (e == GL_BLEND_SRC_RGB) *v = gpuBlendSrc;
+    else if (e == GL_BLEND_DST_RGB) *v = gpuBlendDst;
+    else if (e == GL_BLEND_SRC_ALPHA) *v = gpuBlendSrcAlpha;
+    else if (e == GL_BLEND_DST_ALPHA) *v = gpuBlendDstAlpha;
+    else v[0] = v[1] = v[2] = v[3] = 0;
+}
 static void glGenFramebuffers(GLsizei n, GLuint *f) { (void) n; *f = 1; }
 static void glBindFramebuffer(GLenum t, GLuint f) { (void) t; (void) f; }
 static void glFramebufferTexture2D(GLenum t, GLenum a, GLenum tt, GLuint tex, GLint l) { (void) t; (void) a; (void) tt; (void) l; glTarget = tex; }
@@ -267,6 +294,9 @@ static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
 }
 #include "settleconsts_src.inc"
 #include "contentsync_src.inc"
+static Bool lorieGpuCopyIsDone(uint64_t serial);
+static int lorieGpuCopySettle(uint64_t serial);
+static void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer);
 #include "presentcopy_src.inc"
 
 /* P11-C3-D2: what the X server does meanwhile - whether the root copy was settled as the renderer took the lock (-1: it
@@ -654,6 +684,20 @@ static void queueDuringAcquire(void) {
     if (duringAcquire.src && !duringAcquire.queued)
         duringAcquire.queued = lorieTryScheduleGpuCopy(duringAcquire.src, duringAcquire.dst, NULL, 0, 0, &duringAcquire.serial,
                                                        &duringAcquire.dstBuffer);
+}
+
+/* P11-C4: only the root-Present opt-in test uses this. An independent renderer thread drains the queue
+ * while the X server's thread is inside lorieQueueGpuCopy waiting on completedSerial, as on Android. */
+static pthread_t rootGpuWorker;
+static bool rootGpuWorkerMade;
+static void *rootGpuWorkerRun(void *unused) {
+    (void) unused;
+    rendererVkApplyPendingGpuCopies();
+    return NULL;
+}
+static void rootGpuWorkerStart(void) {
+    if (pthread_create(&rootGpuWorker, NULL, rootGpuWorkerRun, NULL) == 0)
+        rootGpuWorkerMade = true;
 }
 
 /* P11-C3-C: a buffer coming from the connection `ms` later (rendererAddBuffer's part: in the list, then the wake) - or
@@ -2894,6 +2938,45 @@ int main(void) {
     }
 
     CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");
+    /* P11-C4: the root's front and back cannot be mixed; root Present must be refused unless the feature
+     * and deferred-damage protocol are enabled, then queued and COMPLETED on the device before returning
+     * to the X main thread. The AHBs are not released until its Present acknowledges the request. */
+    {
+        BoxRec oneBox = { 0, 0, 50, 20 };
+        RegionRec one = { 1, &oneBox };
+        uint64_t serialBefore = pvfb->gpuCopySerialCounter, completedBefore = st.gpuCopyQueue.completedSerial;
+        fakeRootTwinned = TRUE;
+        pvfb->rootPresentGpu = FALSE;
+        pvfb->exaCompositeOpt = TRUE;
+        st.diag.active = LORIE_ACTIVE_VULKAN;
+        CHECK(!lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer) &&
+              pvfb->gpuCopySerialCounter == serialBefore, "twinned root must retain CPU fallback by default");
+        pvfb->rootPresentGpu = TRUE;
+        pvfb->exaCompositeOpt = FALSE;
+        CHECK(!lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer),
+              "twinned root GPU copy must require deferred-damage handling");
+        pvfb->exaCompositeOpt = TRUE;
+        CHECK(!st.gpuInFlight.busy && st.gpuCopyQueue.readIndex == st.gpuCopyQueue.writeIndex,
+              "P11-C4 root GPU test started with a GPU job already pending");
+        onWakeForRootGpuTest = rootGpuWorkerStart;
+        rootGpuWorkerMade = false;
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer),
+              "P11-C4 opt-in twinned root did not accept GPU Present-copy");
+        onWakeForRootGpuTest = NULL;
+        if (rootGpuWorkerMade)
+            pthread_join(rootGpuWorker, NULL);
+        e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        CHECK(rootGpuWorkerMade && !dstBuffer && serial > completedBefore && lorieGpuCopyIsDone(serial) &&
+              e->recorded == LORIE_GPU_COPY_RECORDED && !st.gpuInFlight.busy &&
+              pvfb->rootGpuCopyPending == 1 && st.lock == 0,
+              "P11-C4 twinned root GPU completion/ref state: made=%d status=%u pending=%llu",
+              rootGpuWorkerMade, e->recorded, (unsigned long long) pvfb->rootGpuCopyPending);
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+        CHECK(!pvfb->rootGpuCopyPending && !src->refs && !src->gpuCopyPending,
+              "P11-C4 root Present completion did not release buffer references");
+        fakeRootTwinned = FALSE;
+        pvfb->rootPresentGpu = FALSE;
+    }
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",
           emu.violations);
     CHECK(emu.earlyPresents == earlyWithOption, "%d presents before their frame's fence with TERMUX_X11_RENDERER_VK_SUBMIT_OPT off",

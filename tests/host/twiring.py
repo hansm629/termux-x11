@@ -294,12 +294,13 @@ in_order("a failed access undone for the content", prep, 'Failed to lock buffer,
 check(prep.count("return FALSE;") == 1, "loriePrepareAccess fails other than where the content is undone")
 in_order("a stale read looked for under the lock, before the frame's wait", prep, "lorie_mutex_lock(&pvfb->state->lock",
          "lorieContentStaleRead(priv, index);", "lorieGpuWaitIdle(")
-in_order("published where the damage is taken up", xredraw, "if (rootDouble && (nonEmpty || pvfb->rootTwinStale)) {", "lorieRootSwap(priv)",
+in_order("published where the damage is taken up", xredraw,
+         "if (rootDouble && pvfb->rootGpuCopyPending == 0 && (nonEmpty || pvfb->rootTwinStale)) {", "lorieRootSwap(priv)",
          "DamageEmpty(pvfb->damage);", "pvfb->state->drawRequested = TRUE;", "lorieContentPublish(priv);",
          "if (pvfb->state->drawRequested || pvfb->state->cursor.moved || pvfb->state->cursor.updated) {")
 check(xredraw.count("lorieContentPublish(") == 1 and
-      "    if (nonEmpty && priv->buffer) {" in xredraw and
-      xredraw.split("    if (nonEmpty && priv->buffer) {", 1)[1].split("\n    }\n", 1)[0].count("\n        lorieContentPublish(priv);") == 1,
+      "    if (nonEmpty && priv->buffer && (!rootDouble || pvfb->rootGpuCopyPending == 0)) {" in xredraw and
+      xredraw.split("    if (nonEmpty && priv->buffer && (!rootDouble || pvfb->rootGpuCopyPending == 0)) {", 1)[1].split("\n    }\n", 1)[0].count("\n        lorieContentPublish(priv);") == 1,
       "the screen pixmap published at a tick for the cursor too (outside the block that takes its damage up)")
 in_order("the content taken under the lock, counted once presented", redraw, "rendererVkLock()", "rendererContentRead(&content);",
          "lorie_mutex_unlock(&state->lock", "lorieVkPresent(", "if (presented == LORIE_VK_FRAME_OK)", "rendererContentFrame(&content, lorieMonotonicUs());")
@@ -309,8 +310,8 @@ in_order("the content taken under the lock, counted once presented", redraw, "re
 # them only then
 sinit = func(I, "static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **argv) {")
 in_order("the composites timed over EXA's", sinit, "!exaDriverInit(pScreen, &lorieExa)", "!present_screen_init(pScreen, &loriePresentInfo)",
-         "    if (pvfb->frameDiag) {\n        PictureScreenPtr ps = GetPictureScreen(pScreen);\n        pvfb->composite = ps->Composite;\n"
-         "        ps->Composite = lorieCompositeTimed;\n    }")
+         "    if (pvfb->frameDiag || pvfb->xrenderGpu) {\n        PictureScreenPtr ps = GetPictureScreen(pScreen);\n        pvfb->composite = ps->Composite;\n"
+         "        ps->Composite = pvfb->frameDiag ? lorieCompositeTimed : lorieCompositeGpuOnly;\n    }")
 check(sinit.count("lorieCompositeTimed") == 1, "the composites timed other than with the frame diagnostics on")
 check("    if (pvfb->frameDiag)\n        pvfb->xAccessesOpened++;" in prep and open(I, encoding="utf-8").read().count("xAccessesOpened++") == 1,
       "the EXA accesses counted for the composites without the frame diagnostics, or not counted")
@@ -358,7 +359,7 @@ check("stateCond" not in rsrc and "pthread_cond_timedwait(" not in rsrc and "pth
 check("rendererCond" not in open(I, encoding="utf-8").read(), "the X server still signals the old condition variable")
 for what, body, publish in (
         ("tick", xredraw, "pvfb->state->rootWindowTextureID = LorieBuffer_description(rootDouble"),
-        ("GPU copy queued", func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,"),
+        ("GPU copy queued", func(I, "static Bool lorieQueueGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,"),
          "__atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE);"),
         ("root copy asked for", func(I, "static Bool lorieRootGpuCopyAsk(LorieBuffer *back, LorieBuffer *front, BoxPtr box, int n) {"),
          "__atomic_store_n(&st->rootCopy.seq, pvfb->rootCopySeq, __ATOMIC_RELEASE);"),

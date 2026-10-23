@@ -1349,6 +1349,8 @@ static bool rendererCopiesStillDeferred(void) {
 
 static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     bool fboSetUp = false;
+    GLboolean blendWasEnabled = GL_FALSE;
+    GLint blendSrcRgb = GL_ONE, blendDstRgb = GL_ZERO, blendSrcAlpha = GL_ONE, blendDstAlpha = GL_ZERO;
     uint64_t lastSerial = 0;
     uint64_t boundDstId = 0;
     GLint prevViewport[4];
@@ -1363,6 +1365,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
 
         if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded = LORIE_GPU_COPY_SKIPPED;
             lastSerial = entry.serial;
             state->gpuCopyQueue.readIndex++;
             continue;
@@ -1390,6 +1393,11 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
 
             if (!fboSetUp) {
                 glGetIntegerv(GL_VIEWPORT, prevViewport);
+                blendWasEnabled = glIsEnabled(GL_BLEND);
+                glGetIntegerv(GL_BLEND_SRC_RGB, &blendSrcRgb);
+                glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRgb);
+                glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcAlpha);
+                glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstAlpha);
                 if (!gpuCopyFbo)
                     glGenFramebuffers(1, &gpuCopyFbo);
                 glBindFramebuffer(GL_FRAMEBUFFER, gpuCopyFbo);
@@ -1417,6 +1425,12 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             }
 
             LorieBuffer_bindTexture(src);
+            if (entry.operator == LORIE_GPU_COPY_OP_OVER) {
+                glEnable(GL_BLEND);
+                glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                glDisable(GL_BLEND);
+            }
             {
                 static uint64_t srcSizeLogCount = 0;
                 if (lorieDebugEnabled && (srcSizeLogCount++ & 15) == 0 && srcDesc->buffer) {
@@ -1450,11 +1464,15 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             }
         }
 
+        state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded =
+            src && dst ? LORIE_GPU_COPY_RECORDED : LORIE_GPU_COPY_SKIPPED;
         lastSerial = entry.serial;
         state->gpuCopyQueue.readIndex++;
     }
 
     if (fboSetUp) {
+        glBlendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
+        if (blendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
     }
@@ -2107,7 +2125,7 @@ static uint32_t rendererVkCopyRegions(const LorieGpuCopyEntry *entry, uint32_t n
                                       const struct lorie_vk_image *d, VkImageCopy *regions) {
     uint32_t k, j, count = 0, why = 0;
 
-    if (!state->backend.vkTransferCopy)
+    if (!state->backend.vkTransferCopy || entry->operator != LORIE_GPU_COPY_OP_SRC)
         return 0;
     // Every condition is looked at, each one that fails recorded (rendererVkCountTransfer): the copy is made only
     // when none does.
@@ -2204,6 +2222,7 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
 
         if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded = LORIE_GPU_COPY_SKIPPED;
             *serial = entry.serial;
             continue;
         }
@@ -2240,12 +2259,16 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
             if (!count || !lorieVkFrameCopyImage(&vk, &vkr, s, d, regions, count)) {
                 for (k = 0; k < n; k++)
                     quads[k] = rendererVkCopyQuad(entry.rects[k], entry.xOff, entry.yOff, sd, dd, s->rgbaOrder != d->rgbaOrder);
-                if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {
+                if (!(entry.operator == LORIE_GPU_COPY_OP_OVER
+                        ? lorieVkFrameOver(&vk, &vkr, s, d, quads, n, filter)
+                        : lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter))) {
                     lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
                     return false;
                 }
             }
         }
+        state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded =
+            src && dst ? LORIE_GPU_COPY_RECORDED : LORIE_GPU_COPY_SKIPPED;
         *serial = entry.serial;
     }
     *readIndex = i;

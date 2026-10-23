@@ -29,6 +29,7 @@
 #include "mipointer.h"
 #include "micmap.h"
 #include "miline.h"
+#include "mipict.h"
 #include "shmint.h"
 #include "present_priv.h"
 #include "misyncshm.h"
@@ -115,6 +116,14 @@ typedef struct {
      * should it come to that, and whether they went meanwhile (abandoned); the shared locks EXA's open accesses hold
      * (loriePrepareAccess), which a renderer would wait for */
     Bool rootGpuCopy;
+    /* P11-C4 (opt-in): allow GPU Present-copy into the root's back buffer while the renderer keeps reading
+     * its other, front buffer. These root copies are finished before Present dispatch returns: no CPU command
+     * can run between queueing the write and its fence. The twin is never published until its damage is complete. */
+    Bool rootPresentGpu;
+    /* P11-C4: opt-in GPU acceleration of conservative XRender Src/Over quads (unmasked, untransformed,
+     * non-repeating, conventional 32-bit formats). Other operations use the original pixman/EXA path. */
+    Bool xrenderGpu;
+    uint64_t xrenderGpuSuccess, xrenderGpuFallback;
     uint32_t rootCopySeq;
     struct {
         uint32_t seq;
@@ -227,6 +236,8 @@ typedef struct {
 static void lorieRootCopyWait(Bool takeBack);
 static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
                                 INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height);
+static void lorieCompositeGpuOnly(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
+                                  INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height);
 static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize);
 static void lorieSyncChainReport(char *composite, size_t compositeSize, char *waits, size_t waitsSize);
 static void lorieContentClientGone(CallbackListPtr *list, void *closure, void *data);
@@ -523,6 +534,8 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_RENDERER_ROOT_GPU_COPY=1 has the renderer's GPU make that swap's copy, after the swap
     // (lorieRootGpuCopyAsk, lorieRootCopyWait).
     lorieScreen.rootGpuCopy = getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY"), "1");
+    lorieScreen.rootPresentGpu = getenv("TERMUX_X11_ROOT_PRESENT_GPU") && !strcmp(getenv("TERMUX_X11_ROOT_PRESENT_GPU"), "1");
+    lorieScreen.xrenderGpu = getenv("TERMUX_X11_XRENDER_GPU") && !strcmp(getenv("TERMUX_X11_XRENDER_GPU"), "1");
     // Experimental: TERMUX_X11_X_YIELD_ON_WAKE=1 lets a vsync tick or a GPU copy's completion break off the client
     // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
     __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
@@ -532,6 +545,9 @@ void OsVendorInit(void) {
     // of them reads a clock.
     lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
     lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
+    // P11-C4 GPU XRender does not depend on or turn on frame diagnostics. Its fast dispatch wrapper
+    // does not read clocks, so a regular desktop can opt in without paying for measurement overhead.
+    lorieScreen.state->backend.xrenderGpu = lorieScreen.xrenderGpu;
     // P11-C3-E2 diagnostics, ONLY with frameDiag and explicit opt-in; it never changes Xorg/client/kernel scheduling.
     // Samples CLOCK_THREAD_CPUTIME_ID for each RENDER Composite and classifies CPU/GPU/root waits per five-second report.
     lorieScreen.syncChainDiag = lorieScreen.frameDiag && getenv("TERMUX_X11_SYNC_CHAIN_DIAG") &&
@@ -1368,10 +1384,12 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
         // Impossible situation, but let's skip this step
         return TRUE;
 
-    // Root double buffering, once no GPU copy into the root (from before it was in effect) is still to be
-    // acknowledged: those went into the buffer the X server draws into. Not in effect, the twin falls out of date.
-    rootDouble = twinned && lorieRootTwinned() && pvfb->rootGpuCopyPending == 0;
-    if (rootDouble && (nonEmpty || pvfb->rootTwinStale)) {
+    // P11-C4: a GPU Present-copy into the back is already device-complete before this X thread can reach
+    // the next request/tick, but its vblank acknowledgement may still be pending. Keep sampling the *front*
+    // while that acknowledgement is outstanding: switching the display to the back would regress to
+    // single-buffer rendering and can show partially updated frames.
+    rootDouble = twinned && lorieRootTwinned() && (pvfb->rootPresentGpu || pvfb->rootGpuCopyPending == 0);
+    if (rootDouble && pvfb->rootGpuCopyPending == 0 && (nonEmpty || pvfb->rootTwinStale)) {
         if (lorieRootSwap(priv))
             pvfb->state->drawRequested = TRUE;
         else
@@ -1381,7 +1399,9 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
         pvfb->rootTwinStale = TRUE;
     pvfb->state->diag.xRootBuffers = rootDouble ? 2 : 1;
 
-    if (nonEmpty && priv->buffer) {
+    // Damage from a GPU-presented root copy is reported when its Present completes. Any normal root drawing
+    // accumulated meanwhile must stay pending until every GPU Present-copy has been acknowledged.
+    if (nonEmpty && priv->buffer && (!rootDouble || pvfb->rootGpuCopyPending == 0)) {
         // We should unlock and lock buffer in order to update texture content on some devices
         // In most cases AHardwareBuffer uses DMA memory which is shared between CPU and GPU
         // and this is not needed. But according to docs we should do it for any case.
@@ -1557,6 +1577,10 @@ static void lorieLogRendererDiag(void) {
                                      ? "fallback" : "on",
         TD(rootGpuCopyRequests), TD(rootGpuCopySubmits), TD(rootGpuCopyCompletions), TD(rootGpuCopyRects), TD(rootGpuCopyBytes),
         TD(rootGpuCopyCompletionUs), TD(rootCpuFallbacks), TD(rootCpuSmall), TD(rootCopyCpuBlockUs), pvfb->rootCopy.seq ? 1 : 0);
+    if (pvfb->xrenderGpu || pvfb->rootPresentGpu)
+        log(INFO, "XlorieCompositeGpu: root_present_gpu=%s xrender_gpu=%s src_over_done=%llu cpu_fallback=%llu",
+            pvfb->rootPresentGpu ? "on" : "off", pvfb->xrenderGpu ? "on" : "off",
+            (unsigned long long) pvfb->xrenderGpuSuccess, (unsigned long long) pvfb->xrenderGpuFallback);
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -2559,10 +2583,10 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     if (pvfb->contentDiag)
         AddCallback(&ClientStateCallback, lorieContentClientGone, NULL);
     // P11-C3-D1 (TERMUX_X11_RENDERER_VK_FRAME_DIAG=1): the RENDER composites timed, over EXA's
-    if (pvfb->frameDiag) {
+    if (pvfb->frameDiag || pvfb->xrenderGpu) {
         PictureScreenPtr ps = GetPictureScreen(pScreen);
         pvfb->composite = ps->Composite;
-        ps->Composite = lorieCompositeTimed;
+        ps->Composite = pvfb->frameDiag ? lorieCompositeTimed : lorieCompositeGpuOnly;
     }
 
     ShmRegisterFbFuncs(pScreen);
@@ -2742,8 +2766,36 @@ bool lorieRendererAvailable(void) {
 // for a plain window, or a Composite-redirected window's own backing pixmap. Returns FALSE
 // (caller falls back to the regular CPU present_copy_region) whenever either buffer isn't
 // GPU-sampleable, or the deferred copy queue is currently full.
-Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
-                              uint64_t *out_serial, void **out_dst_buffer) {
+/* P11-C4: wait for an opt-in synchronous XRender/root GPU operation without using X11 main-thread locks.
+ * Success means not merely that completedSerial advanced but that the renderer actually recorded a draw.
+ * The producer is the X11 main thread, so its ring slot cannot be reused while it waits here. The copy
+ * statuses are published before completedSerial's release-store after a fence. A cancelled/not-submitted
+ * operation may safely fall back to CPU; an in-flight one must NEVER be abandoned on an arbitrary timer. */
+static Bool lorieWaitGpuCopyRecorded(uint64_t serial) {
+    struct lorie_shared_server_state *st = pvfb->state;
+    uint64_t started = lorieMonotonicUs();
+    LorieGpuCopyEntry *entry = &st->gpuCopyQueue.entries[(st->gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+
+    while (!lorieGpuCopyIsDone(serial)) {
+        uint64_t elapsed = lorieMonotonicUs() - started;
+        if (elapsed >= 50000 || !lorieConnectionAlive() || !lorieRendererAvailable()) {
+            if (lorieGpuCopySettle(serial) == LORIE_GPU_COPY_CANCELLED)
+                return FALSE;
+        }
+        if (elapsed >= 1000000 && elapsed / 1000000 != (elapsed - 200) / 1000000)
+            log(WARN, "XlorieGpuSync: GPU copy still in flight after %llu us; preserving the buffer until it settles",
+                (unsigned long long) elapsed);
+        struct timespec pause = { 0, 200000 };
+        nanosleep(&pause, NULL);
+    }
+    return __atomic_load_n(&entry->recorded, __ATOMIC_ACQUIRE) == LORIE_GPU_COPY_RECORDED;
+}
+
+/* P11-C4: a queue entry from either Present (SRC) or the XRender opt-in (SRC/OVER). All queue fields,
+ * including operator, must be written BEFORE the release-store of writeIndex: the renderer may take it
+ * immediately in another process. The public Present entry point below always chooses SRC. */
+static Bool lorieQueueGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
+                               uint8_t operator, uint64_t *out_serial, void **out_dst_buffer) {
     LorieBuffer *srcBuffer, *dstBuffer;
     LoriePixmapPriv *priv;
     const LorieBuffer_Desc *desc, *dstDesc;
@@ -2758,12 +2810,20 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         return FALSE;
     }
 
-    // Root double buffering: the X server's own copy into the buffer it draws into. A GPU copy there would have
-    // the X server wait for the device again, which is what the twin is for.
-    if (dst == pScreenPtr->devPrivate && lorieRootTwinned()) {
+    // A root GPU write may only target the back while its *other* twin is displayed. Without the opt-in,
+    // or while another EXA CPU access is holding a lock/reservation, retain the old CPU fallback.
+    Bool rootTwinGpu = dst == pScreenPtr->devPrivate && lorieRootTwinned();
+    if (rootTwinGpu && (!pvfb->rootPresentGpu || !pvfb->exaCompositeOpt || !lorieAhbPerAccess() ||
+                        lorieOwnershipAsked() ||
+                        pvfb->accessLocks || pvfb->state->diag.active != LORIE_ACTIVE_VULKAN)) {
         gpuCopyAttempts++;
         return FALSE;
     }
+
+    // A root *swap* GPU copy could still be writing into what is now the back. Wait for that older
+    // copy to finish before queueing a Present write into the same buffer; this thread holds no GPU lock.
+    if (rootTwinGpu && pvfb->rootCopy.seq)
+        lorieRootCopyWait(FALSE);
 
     if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
         // No renderer to drain the queue, so fall back to CPU copy.
@@ -2844,6 +2904,8 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->numRects = (uint16_t) numRects;
     entry->dstDepth = (uint8_t) dst->drawable.depth;
     entry->cancelled = 0;
+    entry->operator = operator;
+    entry->recorded = LORIE_GPU_COPY_NOT_RECORDED;
     entry->queuedUs = lorieMonotonicUs();
     for (i = 0; i < numRects; i++)
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
@@ -2853,8 +2915,25 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
 
     *out_serial = entry->serial;
     gpuCopyAttempts++;
+    if (rootTwinGpu) {
+        /* P11-C4 conservative ordering bridge: the X server has a *single* thread which performs XRender and
+         * Present dispatch. Wait for this root write's Vulkan fence (completedSerial is published after it) before
+         * returning to that thread, otherwise it could CPU-write the back while a GPU copy into it is queued.
+         * This is deliberately not an end-to-end CPU-fence-free path; async batching needs a future root write
+         * reservation/flush protocol. The existing redirected-window GPU copies stay asynchronous. */
+        if (!lorieWaitGpuCopyRecorded(entry->serial)) {
+            // The GPU job was cancelled or skipped: release the reservation before the caller's CPU fallback.
+            lorieGpuCopyAck(pixmap, NULL);
+            return FALSE;
+        }
+    }
     gpuCopyOffloads++;
     return TRUE;
+}
+
+Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
+                              uint64_t *out_serial, void **out_dst_buffer) {
+    return lorieQueueGpuCopy(pixmap, dst, update, x_off, y_off, LORIE_GPU_COPY_OP_SRC, out_serial, out_dst_buffer);
 }
 
 // P10-B0: GPU copy completions, from the renderer's publish to the input thread (here, on it) - the low 32 bits of
@@ -3275,6 +3354,91 @@ static uint32_t lorieCompositeKey(CARD8 op, PicturePtr src, PicturePtr mask, Pic
            m << 13 | (uint32_t) (src->transform || (mask && mask->transform)) << 15;
 }
 
+/* P11-C4: conservative XRender acceleration via the already-tested cross-process AHB GPU-copy queue.
+ * This is deliberately a small supported subset, not a replacement for XRender's mask/transform/solid
+ * semantics. Failure at any point returns to the original CPU Composite. A GPU result is only accepted
+ * after the renderer's fence and recorded-success acknowledgement; a skipped image import never paints.
+ * Synchronous completion preserves ordering with *all* subsequent CPU XRender/EXA operations. */
+static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst,
+                                     INT16 xSrc, INT16 ySrc, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {
+    RegionRec region;
+    DrawablePtr s, d;
+    PixmapPtr sp, dp;
+    LoriePixmapPriv *sPriv, *dPriv;
+    int32_t sx, sy, dx, dy, sourceShiftX, sourceShiftY, offsetX, offsetY;
+    uint64_t serial = 0;
+    void *destBuffer = NULL;
+    Bool queued, done;
+
+    if (!pvfb->xrenderGpu || !lorieAhbPerAccess() || lorieOwnershipAsked() ||
+        pvfb->state->diag.active != LORIE_ACTIVE_VULKAN ||
+        (op != PictOpSrc && op != PictOpOver) || !src || !dst || mask ||
+        !src->pDrawable || !dst->pDrawable || src->pDrawable->pScreen != dst->pDrawable->pScreen ||
+        src->repeat || src->transform || src->alphaMap || src->filter != PictFilterNearest ||
+        dst->alphaMap || !width || !height || pvfb->accessLocks ||
+        (src->format != PICT_a8r8g8b8 && src->format != PICT_x8r8g8b8) ||
+        (dst->format != PICT_a8r8g8b8 && dst->format != PICT_x8r8g8b8))
+        return FALSE;
+
+    s = src->pDrawable;
+    d = dst->pDrawable;
+    sp = s->type == DRAWABLE_WINDOW ? s->pScreen->GetWindowPixmap((WindowPtr) s) : (PixmapPtr) s;
+    dp = d->type == DRAWABLE_WINDOW ? d->pScreen->GetWindowPixmap((WindowPtr) d) : (PixmapPtr) d;
+    sPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(sp);
+    dPriv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(dp);
+    if (!sPriv || !dPriv || !sPriv->buffer || !dPriv->buffer || sPriv->mem || dPriv->mem || sp == dp ||
+        LorieBuffer_description(sPriv->buffer)->id == LorieBuffer_description(dPriv->buffer)->id ||
+        sPriv->locked || dPriv->locked)
+        return FALSE;
+
+    sx = (int32_t) xSrc + s->x;
+    sy = (int32_t) ySrc + s->y;
+    dx = (int32_t) xDst + d->x;
+    dy = (int32_t) yDst + d->y;
+    if (sx < INT16_MIN || sx > INT16_MAX || sy < INT16_MIN || sy > INT16_MAX ||
+        dx < INT16_MIN || dx > INT16_MAX || dy < INT16_MIN || dy > INT16_MAX ||
+        !miComputeCompositeRegion(&region, src, NULL, dst, (INT16) sx, (INT16) sy, 0, 0,
+                                  (INT16) dx, (INT16) dy, width, height))
+        return FALSE;
+
+    // The region is in global destination coordinates. Copy regions are stored in source PIXMAP coordinates;
+    // a constant translation maps them to the renderer's src AHB and its dst AHB, including redirected windows.
+    sourceShiftX = sx - dx - sp->screen_x;
+    sourceShiftY = sy - dy - sp->screen_y;
+    offsetX = dx - sx + sp->screen_x - dp->screen_x;
+    offsetY = dy - sy + sp->screen_y - dp->screen_y;
+    if (RegionNumRects(&region) > LORIE_GPU_COPY_MAX_RECTS ||
+        sourceShiftX < INT16_MIN || sourceShiftX > INT16_MAX || sourceShiftY < INT16_MIN || sourceShiftY > INT16_MAX ||
+        offsetX < INT16_MIN || offsetX > INT16_MAX || offsetY < INT16_MIN || offsetY > INT16_MAX ||
+        (dp == pScreenPtr->devPrivate && lorieRootTwinned() && !pvfb->rootPresentGpu)) {
+        RegionUninit(&region);
+        return FALSE;
+    }
+
+    RegionTranslate(&region, sourceShiftX, sourceShiftY);
+    queued = lorieQueueGpuCopy(sp, dp, &region, (int16_t) offsetX, (int16_t) offsetY,
+                               op == PictOpOver ? LORIE_GPU_COPY_OP_OVER : LORIE_GPU_COPY_OP_SRC,
+                               &serial, &destBuffer);
+    if (queued) {
+        done = lorieWaitGpuCopyRecorded(serial);
+        // If the operation is cancelled, the renderer never uses its buffers. After a successful fence they
+        // are also ours again. Always drop the queue entry's lifetime refs before any CPU fallback.
+        lorieGpuCopyAck(sp, destBuffer);
+    } else
+        done = FALSE;
+
+    RegionTranslate(&region, -sourceShiftX, -sourceShiftY);
+    if (done) {
+        if (pvfb->contentDiag && sPriv->content.seq)
+            lorieContentStore(dp, &sPriv->content, lorieMonotonicUs(), TRUE);
+        DamageDamageRegion(d, &region);
+        pvfb->xrenderGpuSuccess++;
+    } else
+        pvfb->xrenderGpuFallback++;
+    RegionUninit(&region);
+    return done;
+}
+
 // Actual CPU execution of this *thread*; elapsed time minus execution is off-CPU (sleep OR runnable).
 // This does not use the Android renderer thread's clock; that lives in the separate Activity process.
 static uint64_t lorieCompositeThreadCpuNs(void) {
@@ -3354,7 +3518,8 @@ static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, Pictu
     if (pvfb->syncChainDiag)
         pvfb->syncCompositeActive = TRUE;
     ps->Composite = pvfb->composite;
-    (*ps->Composite) (op, src, mask, dst, xSrc, ySrc, xMask, yMask, xDst, yDst, width, height);
+    if (!lorieXRenderGpuComposite(op, src, mask, dst, xSrc, ySrc, xDst, yDst, width, height))
+        (*ps->Composite) (op, src, mask, dst, xSrc, ySrc, xMask, yMask, xDst, yDst, width, height);
     pvfb->composite = ps->Composite;
     ps->Composite = lorieCompositeTimed;
     threadEndNs = pvfb->syncChainDiag ? lorieCompositeThreadCpuNs() : 0;
@@ -3395,6 +3560,18 @@ static void lorieCompositeTimed(CARD8 op, PicturePtr src, PicturePtr mask, Pictu
         pvfb->worstComposite.width = width;
         pvfb->worstComposite.height = height;
     }
+}
+
+/* The normal P11-C4 GPU XRender dispatch: no frame timing, thread CPU clocks, histograms, or
+ * diagnostic string generation. The diagnostic wrapper above is installed only when requested. */
+static void lorieCompositeGpuOnly(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst, INT16 xSrc, INT16 ySrc,
+                                  INT16 xMask, INT16 yMask, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {
+    PictureScreenPtr ps = GetPictureScreen(dst->pDrawable->pScreen);
+    ps->Composite = pvfb->composite;
+    if (!lorieXRenderGpuComposite(op, src, mask, dst, xSrc, ySrc, xDst, yDst, width, height))
+        (*ps->Composite)(op, src, mask, dst, xSrc, ySrc, xMask, yMask, xDst, yDst, width, height);
+    pvfb->composite = ps->Composite;
+    ps->Composite = lorieCompositeGpuOnly;
 }
 
 // ... what is left of a composite's time for its own work, its waits and AHB CPU locks taken away.

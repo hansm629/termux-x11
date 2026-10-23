@@ -42,6 +42,8 @@ static struct {
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
     Bool exaCompositeOpt;
+    Bool xrenderGpu, rootPresentGpu;
+    uint64_t xrenderGpuSuccess, xrenderGpuFallback;
     Bool freezeDiag;
     Bool contentDiag;
     struct {

@@ -237,6 +237,7 @@ struct lorie_vk_renderer {
     VkShaderModule vert, frag;
     VkRenderPass copyPass[2];       /* rendering into an imported buffer: [0] R8G8B8A8, [1] B8G8R8A8 */
     VkPipeline copyPipeline[2];
+    VkPipeline overPipeline[2];   /* P11-C4: RENDER Over (premultiplied-alpha), per imported attachment format */
     /* the cursor: the renderer's own image, filled from the X server's bits through a staging buffer */
     VkImage cursor;
     VkDeviceMemory cursorMemory;
@@ -298,6 +299,8 @@ VkResult lorieVkFrameBegin(struct lorie_vk *vk, struct lorie_vk_renderer *r);
 bool lorieVkFrameUse(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *img, enum lorie_vk_use use);
 bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
                       const struct lorie_vk_quad *quads, uint32_t count, int filter);
+bool lorieVkFrameOver(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                     const struct lorie_vk_quad *quads, uint32_t count, int filter);
 // The regions copied from src into dst by vkCmdCopyImage (both images with the transfer usage, of one format or
 // lorieVkCopyFormats' one pair),
 // each buffer taken over for the transfer as lorieVkFrameCopy takes them for drawing. False: nothing recorded.

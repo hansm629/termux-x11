@@ -232,6 +232,13 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
+/* P11-C4: XRender Src and premultiplied-alpha Over can share the existing ordered AHB GPU queue. The
+ * original Present copy remains SRC; no blend, mask or transform is applied to a Present operation. */
+#define LORIE_GPU_COPY_OP_SRC  0u
+#define LORIE_GPU_COPY_OP_OVER 1u
+#define LORIE_GPU_COPY_NOT_RECORDED 0u
+#define LORIE_GPU_COPY_RECORDED     1u
+#define LORIE_GPU_COPY_SKIPPED      2u
 #define LORIE_GPU_IN_FLIGHT_MAX 32      /* AHBs one Vulkan frame may use (vk.h LORIE_VK_MAX_FRAME_IMAGES) */
 #define LORIE_CPU_ACCESS_MAX 8          /* P11-C3-B1: AHBs the X server may hold reserved at once (cpuAccess) */
 #define LORIE_GPU_IN_FLIGHT_MAIN 1u     /* gpuInFlight.busy: the renderer's (first) submission's list, ids */
@@ -248,6 +255,8 @@ typedef struct {
     uint8_t cancelled;      /* X, under the shared lock: its presentation was let go before any renderer recorded it -
                              * the renderers (which record under that lock) skip it, its serial completed as any other's
                              * (InitOutput.c lorieGpuCopySettle, P10-S1) */
+    uint8_t operator;       /* P11-C4: SRC or OVER; OVER uses premultiplied-alpha GPU blending */
+    uint8_t recorded;       /* renderer: RECORDED or SKIPPED; read by X only after completedSerial's release store */
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
 } LorieGpuCopyEntry;
 
@@ -325,6 +334,7 @@ struct lorie_backend_control {
                                                  * its request to the screen (struct lorie_content) */
     volatile uint8_t rootCopySchedOpt;          /* X: TERMUX_X11_ROOT_COPY_SCHED_OPT=1 - P11-C3-D2: the root copy
                                                  * submitted ahead (B2) settled as soon as it may be (renderer.c) */
+    volatile uint8_t xrenderGpu;               /* X: TERMUX_X11_XRENDER_GPU=1 - opt-in premultiplied Over pipeline */
     volatile uint32_t ownershipRequest;         /* renderer */
     volatile uint32_t ownershipAck;             /* X */
 };

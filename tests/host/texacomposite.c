@@ -79,6 +79,14 @@ static int fakeThreadClock(clockid_t clock, struct timespec *t) {
 }
 #define GetTimeInMicros() (fakeNow)
 #define clock_gettime fakeThreadClock
+/* GPU XRender is disabled for the established CPU-only Composite fixture. The new accelerated path has its
+ * own integration tests; this stub verifies the CPU wrapper still falls back when the option is disabled. */
+static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst,
+                                     INT16 xSrc, INT16 ySrc, INT16 xDst, INT16 yDst, CARD16 width, CARD16 height) {
+    (void) op; (void) src; (void) mask; (void) dst; (void) xSrc; (void) ySrc; (void) xDst; (void) yDst;
+    (void) width; (void) height;
+    return FALSE;
+}
 #include "compositetimed_src.inc"
 #undef clock_gettime
 #include "compositereport_src.inc"

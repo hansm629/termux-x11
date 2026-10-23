@@ -69,6 +69,40 @@ int main(void) {
     lorieVkRendererDestroy(&vk, &r);
     CHECK(emu.live == 0 && emu.pools == 0 && emu.fences == 0 && emu.buffers == 0 && emu.mapped == 0 && imp.memories == 0,
           "renderer objects left: %d objects, %d pools, %d fences, %d buffers", emu.live, emu.pools, emu.fences, emu.buffers);
+    /* P11-C4: the normal Vulkan startup makes neither Over pipeline; opt-in makes two format-specific
+     * premultiplied Over pipelines that use the existing imported AHB render-pass and shader path. */
+    CHECK(!r.overPipeline[0] && !r.overPipeline[1], "default renderer created optional XRender Over pipelines");
+    device();
+    st.backend.xrenderGpu = 1;
+    {
+        int overBefore = fakeOverPipelineCreates;
+        AHardwareBuffer *overSrc = NULL, *overDst = NULL;
+        struct lorie_vk_image *overSrcImage, *overDstImage;
+        CHECK(lorieVkRendererCreate(&vk, &r, &st) && r.overPipeline[0] && r.overPipeline[1] &&
+              fakeOverPipelineCreates == overBefore + 2,
+              "opt-in Vulkan must make two premultiplied Over pipelines (made %d, wanted %d)",
+              fakeOverPipelineCreates, overBefore + 2);
+        overSrc = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, X_USAGE);
+        overDst = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, X_USAGE);
+        overSrcImage = lorieVkImport(&vk, &images, 81, overSrc, 0, &st);
+        overDstImage = lorieVkImport(&vk, &images, 82, overDst, 0, &st);
+        CHECK(overSrcImage && overDstImage, "opt-in Vulkan failed to import source/destination AHBs for Over");
+        if (overSrcImage && overDstImage) {
+            int initialDraws = emu.draws;
+            CHECK(lorieVkFrameBegin(&vk, &r) == VK_SUCCESS &&
+                  lorieVkFrameOver(&vk, &r, overSrcImage, overDstImage, quads, 1, 0) &&
+                  lorieVkFrameSubmit(&vk, &r, 0, false, &st) == VK_SUCCESS &&
+                  emu.draws == initialDraws + 1 && emu.violations == 0,
+                  "XRender Over did not issue a GPU draw into the imported AHB with correct ownership");
+        }
+        lorieVkImagesClear(&vk, &images);
+        lorieVkRendererDestroy(&vk, &r);
+        AHardwareBuffer_release(overSrc);
+        AHardwareBuffer_release(overDst);
+        CHECK(emu.live == 0, "opt-in Vulkan destroyed with live GPU objects");
+        /* The later base-frame test checks exact push-constant order, independent of this opt-in draw. */
+        pushes = 0;
+    }
     for (long k = 1; k <= objects; k++) {
         device();
         emu.failObject = k;

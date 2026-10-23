@@ -1127,10 +1127,11 @@ static VkRenderPass lorieVkRenderPass(struct lorie_vk *vk, VkFormat format, bool
 }
 
 /*
- * The quad pipeline (shaders/quad.*) for `pass`. Blending, for the cursor, is GLES's SRC_ALPHA,
- * ONE_MINUS_SRC_ALPHA on colour; alpha keeps the destination's (one: the screen stays opaque).
+ * The quad pipeline (shaders/quad.*) for `pass`. Blend modes: 0 copy/Src; 1 cursor (straight
+ * SRC_ALPHA); 2 XRender Over (premultiplied SRC=ONE, DST=ONE_MINUS_SRC_ALPHA). XRender ARGB32 is
+ * premultiplied; reusing the cursor pipeline would multiply the source alpha twice.
  */
-static VkPipeline lorieVkPipeline(struct lorie_vk *vk, struct lorie_vk_renderer *r, VkRenderPass pass, bool blend) {
+static VkPipeline lorieVkPipeline(struct lorie_vk *vk, struct lorie_vk_renderer *r, VkRenderPass pass, int blend) {
     VkPipelineShaderStageCreateInfo stages[2] = {
             { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = r->vert, .pName = "main" },
             { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = r->frag, .pName = "main" } };
@@ -1145,8 +1146,12 @@ static VkPipeline lorieVkPipeline(struct lorie_vk *vk, struct lorie_vk_renderer 
     VkPipelineMultisampleStateCreateInfo multisample = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                          .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
     VkPipelineColorBlendAttachmentState attachment = {
-            .blendEnable = blend, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-            .colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+            .blendEnable = blend != 0,
+            .srcColorBlendFactor = blend == 2 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_SRC_ALPHA,
+            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            .colorBlendOp = VK_BLEND_OP_ADD,
+            .srcAlphaBlendFactor = blend == 2 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO,
+            .dstAlphaBlendFactor = blend == 2 ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
             .alphaBlendOp = VK_BLEND_OP_ADD,
             .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT };
     VkPipelineColorBlendStateCreateInfo colorBlend = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -1252,6 +1257,8 @@ void lorieVkRendererDestroy(struct lorie_vk *vk, struct lorie_vk_renderer *r) {
     for (i = 0; i < 2; i++) {
         if (r->copyPipeline[i])
             vk->DestroyPipeline(vk->device, r->copyPipeline[i], NULL);
+        if (r->overPipeline[i])
+            vk->DestroyPipeline(vk->device, r->overPipeline[i], NULL);
         if (r->copyPass[i])
             vk->DestroyRenderPass(vk->device, r->copyPass[i], NULL);
         if (r->samplers[i])
@@ -1396,6 +1403,10 @@ bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, vol
     for (i = 0; i < 2; i++) {
         LORIE_VK_MADE(r->copyPass[i] = lorieVkRenderPass(vk, i ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, false));
         LORIE_VK_MADE(r->copyPipeline[i] = lorieVkPipeline(vk, r, r->copyPass[i], false));
+        /* P11-C4: never create additional pipelines on the default (off) path; Vulkan compatibility and
+         * device initialization remain the same unless the user explicitly asks for GPU XRender. */
+        if (st && st->backend.xrenderGpu)
+            LORIE_VK_MADE(r->overPipeline[i] = lorieVkPipeline(vk, r, r->copyPass[i], 2));
     }
     {
         VkBufferCreateInfo info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = LORIE_VK_CURSOR_BYTES,
@@ -1669,13 +1680,13 @@ static VkDescriptorSet lorieVkDescriptor(struct lorie_vk *vk, struct lorie_vk_re
     return set;
 }
 
-bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
-                      const struct lorie_vk_quad *quads, uint32_t count, int filter) {
+static bool lorieVkFrameCopyOp(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                               const struct lorie_vk_quad *quads, uint32_t count, int filter, bool over) {
     int pass = dst->format == VK_FORMAT_B8G8R8A8_UNORM ? 1 : 0;
     VkDescriptorSet set;
     uint32_t i;
 
-    if (src == dst || !dst->attachView)
+    if (src == dst || !dst->attachView || (over && !r->overPipeline[pass]))
         return false;
     if (!dst->framebuffer) {
         VkFramebufferCreateInfo fb = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = r->copyPass[pass],
@@ -1694,7 +1705,7 @@ bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct l
                                         .framebuffer = dst->framebuffer, .renderArea = { { 0, 0 }, { dst->width, dst->height } } };
         VkViewport viewport = { 0.f, 0.f, (float) dst->width, (float) dst->height, 0.f, 1.f };
         vk->CmdBeginRenderPass(r->cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
-        vk->CmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->copyPipeline[pass]);
+        vk->CmdBindPipeline(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, over ? r->overPipeline[pass] : r->copyPipeline[pass]);
         vk->CmdSetViewport(r->cmd, 0, 1, &viewport);
         vk->CmdSetScissor(r->cmd, 0, 1, &begin.renderArea);
         vk->CmdBindDescriptorSets(r->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, 1, &set, 0, NULL);
@@ -1709,6 +1720,16 @@ bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct l
         vk->CmdEndRenderPass(r->cmd);
     }
     return true;
+}
+
+bool lorieVkFrameCopy(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                      const struct lorie_vk_quad *quads, uint32_t count, int filter) {
+    return lorieVkFrameCopyOp(vk, r, src, dst, quads, count, filter, false);
+}
+
+bool lorieVkFrameOver(struct lorie_vk *vk, struct lorie_vk_renderer *r, struct lorie_vk_image *src, struct lorie_vk_image *dst,
+                     const struct lorie_vk_quad *quads, uint32_t count, int filter) {
+    return lorieVkFrameCopyOp(vk, r, src, dst, quads, count, filter, true);
 }
 
 // The formats vkCmdCopyImage copies between here: one format, or B8G8R8A8_UNORM into R8G8B8A8_UNORM (a client's BGRA

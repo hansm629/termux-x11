@@ -1201,10 +1201,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreatePipelineLayout(VkDevice d, const Vk
     return VK_SUCCESS;
 }
 static VKAPI_ATTR void VKAPI_CALL fDestroyPipelineLayout(VkDevice d, VkPipelineLayout l, const VkAllocationCallbacks *a) { (void) d; (void) a; GONE(l); }
+static int fakeOverPipelineCreates;
 static VKAPI_ATTR VkResult VKAPI_CALL fCreateGraphicsPipelines(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *i,
                                                                const VkAllocationCallbacks *a, VkPipeline *p) {
     (void) d; (void) c; (void) a;
     CHECK(n == 1 && i->renderPass && i->layout, "fake device: pipeline");
+    if (i->pColorBlendState && i->pColorBlendState->attachmentCount) {
+        const VkPipelineColorBlendAttachmentState *blend = i->pColorBlendState->pAttachments;
+        if (blend->blendEnable && blend->srcColorBlendFactor == VK_BLEND_FACTOR_ONE) {
+            CHECK(blend->dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+                  blend->srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
+                  blend->dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+                  blend->colorBlendOp == VK_BLEND_OP_ADD && blend->alphaBlendOp == VK_BLEND_OP_ADD,
+                  "P11-C4 fake device: XRender Over must use premultiplied Src=ONE, Dst=ONE_MINUS_SRC_ALPHA");
+            fakeOverPipelineCreates++;
+        }
+    }
     MADE(VkPipeline, p);
     return VK_SUCCESS;
 }
