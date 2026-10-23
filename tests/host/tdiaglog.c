@@ -56,6 +56,7 @@ static struct {
 #include "compositefields_src.inc"
 } fakePvfb = { &fakeState }, *pvfb = &fakePvfb;
 #include "compositereport_src.inc"
+#include "syncchainreport_src.inc"  /* P11-C3-E2: real formatter; opt-in only */
 #include "diaglog_src.inc"
 
 static int fails;

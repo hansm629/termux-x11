@@ -140,6 +140,7 @@ struct fake_pvfb {
     } rootCopy;
     int accessLocks;
     Bool frameDiag;             /* P11-C3: TERMUX_X11_RENDERER_VK_FRAME_DIAG */
+    Bool syncChainDiag;         /* P11-C3-E2: disabled in this ownership-only fixture */
     uint32_t xAccessesOpened;   /* P11-C3-D1: the accesses counted for the composites (texacomposite.c times them) */
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
@@ -529,6 +530,16 @@ static void lorieContentAccess(PixmapPtr pPix, void *priv, int index, int how) {
 }
 static void lorieContentStaleRead(void *priv, int index) { (void) priv, (void) index; contentHooks++; }
 static void lorieRootCopyWait(Bool takeBack);
+/* This fixture tests ownership/copy semantics, not the opt-in diagnostic accounting.  The real accounting helpers
+ * are separately compiled from InitOutput.c and asserted in texacomposite.c; these must never be called here. */
+static void lorieSyncChainGpuWait(uint64_t us, int index) {
+    (void) us; (void) index;
+    CHECK(!pvfb->syncChainDiag, "ownership test unexpectedly enabled sync-chain diagnostics");
+}
+static void lorieSyncChainRootWait(uint32_t seq, uint64_t us, Bool waited, Bool takenAtEntry, uint64_t queuedToDoneUs) {
+    (void) seq; (void) us; (void) waited; (void) takenAtEntry; (void) queuedToDoneUs;
+    CHECK(!pvfb->syncChainDiag, "ownership test unexpectedly enabled sync-chain diagnostics");
+}
 #define lorie_shared_server_state fake_state
 #include "own_new_src.inc"
 #undef lorie_shared_server_state
