@@ -198,6 +198,7 @@ CONTROLS = [
      "townership"),
     ("a lost connection does not reset the ownership", "InitOutput.c",
      """static Bool lorieRendererGoneWorkProc(__unused ClientPtr client, __unused void *closure) {
+    lorieXRenderAsyncFlush(); // disconnected GPU: cancel and CPU-replay jobs before restoring persistent AHB locks
     lorieResetOwnership();""",
      """static Bool lorieRendererGoneWorkProc(__unused ClientPtr client, __unused void *closure) {""",
      "townership"),
@@ -571,8 +572,8 @@ CONTROLS = [
      """entry.xOff, entry.yOff, sd, dd, s->rgbaOrder == d->rgbaOrder);""",
      "tpresentcopy"),
     ("a copy drawn from its destination into its source", "renderer.c",
-     """if (!lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter)) {""",
-     """if (!lorieVkFrameCopy(&vk, &vkr, d, s, quads, n, filter)) {""",
+     """if (!lorieVkFramePorterDuff(&vk, &vkr, s, d, quads, n, filter, entry.operator)) {""",
+     """if (!lorieVkFramePorterDuff(&vk, &vkr, d, s, quads, n, filter, entry.operator)) {""",
      "tpresentcopy"),
     ("only a copy's first rectangle drawn", "renderer.c",
      """uint32_t n = entry.numRects < LORIE_GPU_COPY_MAX_RECTS ? entry.numRects : LORIE_GPU_COPY_MAX_RECTS, k, count;""",
@@ -624,8 +625,10 @@ CONTROLS = [
      """    if (writeIndex - readIndex > LORIE_GPU_COPY_QUEUE_CAPACITY) {""",
      "tpresentcopy"),
     ("a copy queued with no surface to draw it", "InitOutput.c",
-     """    if (!lorieConnectionAlive() || !lorieRendererAvailable()) {""",
-     """    if (!lorieConnectionAlive()) {""",
+     """    if (!lorieConnectionAlive() || !lorieRendererAvailable()) {
+        // No renderer to drain the queue, so fall back to CPU copy.""",
+     """    if (!lorieConnectionAlive()) {
+        // No renderer to drain the queue, so fall back to CPU copy.""",
      "tpresentcopy"),
     ("more rectangles queued than an entry holds", "InitOutput.c",
      """    if (numRects <= 0 || numRects > LORIE_GPU_COPY_MAX_RECTS) {""",
@@ -909,6 +912,7 @@ CONTROLS = [
     ("P10-S1: Vulkan copying an entry the X server cancelled", "renderer.c",
      """        if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded = LORIE_GPU_COPY_SKIPPED;
             *serial = entry.serial;
             continue;
         }""",
@@ -917,6 +921,7 @@ CONTROLS = [
     ("P10-S1: GLES copying an entry the X server cancelled", "renderer.c",
      """        if (entry.cancelled) {
             // Its presentation let go before it was recorded (InitOutput.c lorieGpuCopySettle): not copied, completed.
+            state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded = LORIE_GPU_COPY_SKIPPED;
             lastSerial = entry.serial;""",
      """        if (0) {
             lastSerial = entry.serial;""",
@@ -1872,7 +1877,7 @@ CONTROLS += [
      """    return us + 0 * other;""",
      "tdiaglog"),
     ("composite: timed with the frame diagnostics off", "InitOutput.c",
-     """    if (pvfb->frameDiag) {
+     """    if (pvfb->frameDiag || pvfb->xrenderGpu) {
         PictureScreenPtr ps = GetPictureScreen(pScreen);""",
      """    if (1) {
         PictureScreenPtr ps = GetPictureScreen(pScreen);""",
