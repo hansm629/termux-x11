@@ -15,20 +15,31 @@ typedef int16_t INT16;
 #define FALSE 0
 #define PictOpSrc 1
 #define PictOpOver 3
+#define PictOpClear 0
+#define PictOpOverReverse 4
+#define PictOpIn 5
+#define PictOpInReverse 6
+#define PictOpOut 7
+#define PictOpOutReverse 8
+#define PictOpAtop 9
+#define PictOpAtopReverse 10
+#define PictOpXor 11
+#define PictOpAdd 12
+#define PictOpSaturate 13
 #define PictFilterNearest 0
 #define PICT_a8r8g8b8 100
 #define PICT_x8r8g8b8 101
 #define LORIE_ACTIVE_VULKAN 1
-#define LORIE_GPU_COPY_OP_SRC 0u
-#define LORIE_GPU_COPY_OP_OVER 1u
-#define LORIE_GPU_COPY_MAX_RECTS 16
+#include "gpucopytypes_src.inc"
+#define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1
+#define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
 #define DRAWABLE_WINDOW 1
 #define DRAWABLE_PIXMAP 2
 
 typedef struct { short x1, y1, x2, y2; } BoxRec, *BoxPtr;
 typedef struct { int n; BoxRec rect; } RegionRec, *RegionPtr;
 #define RegionNumRects(p) ((p)->n)
-typedef struct { uint64_t id; } LorieBuffer_Desc;
+typedef struct { uint64_t id; uint32_t format; } LorieBuffer_Desc;
 typedef struct { LorieBuffer_Desc desc; } LorieBuffer;
 typedef struct { LorieBuffer *buffer; void *mem; void *locked; struct { uint32_t seq; } content; } LoriePixmapPriv;
 typedef struct _Drawable DrawableRec, *DrawablePtr;
@@ -49,7 +60,7 @@ struct _Picture {
 struct fake_state { struct { int active; } diag; };
 static struct { struct fake_state *state;
                 int xrenderGpu, rootPresentGpu, accessLocks, contentDiag;
-                unsigned xrenderGpuSuccess, xrenderGpuFallback; } world, *pvfb = &world;
+                unsigned xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuMinPixels, xrenderGpuSmallSkipped; } world, *pvfb = &world;
 static struct fake_state st;
 static ScreenRec screen, *pScreenPtr = &screen;
 static int failures, queued, acked, damaged, uninit, gpuAccepted = 1, gpuQueueAllowed = 1, perAccess = 1, rootTwinned;
@@ -102,7 +113,8 @@ static PixmapPtr getWindow(void *window) { (void)window; return windowImage; }
 #include "xrendergpu_src.inc"
 
 int main(void) {
-    LorieBuffer sb = { { 11 } }, db = { { 22 } };
+    LorieBuffer sb = { { 11, AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM } };
+    LorieBuffer db = { { 22, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM } };
     LoriePixmapPriv sp = { .buffer = &sb }, dp = { .buffer = &db };
     PixmapRec s = { { DRAWABLE_PIXMAP, 150, 100, &screen }, 150, 100, &sp };
     PixmapRec d = { { DRAWABLE_PIXMAP, 60, 40, &screen }, 60, 40, &dp };
@@ -123,14 +135,48 @@ int main(void) {
           lastOp == LORIE_GPU_COPY_OP_OVER && world.xrenderGpuSuccess == 2,
           "XRender Over must preserve its premultiplied blending op in GPU queue");
 
+    /* All 12 Porter-Duff operators that can be expressed by fixed blend factors. Dest-alpha
+     * dependent operators require a destination that actually stores alpha, not an RGBX AHB. */
+    {
+        const struct { int pict; uint8_t gpu; } operators[] = {
+            { PictOpSrc, LORIE_GPU_COPY_OP_SRC }, { PictOpOver, LORIE_GPU_COPY_OP_OVER },
+            { PictOpClear, LORIE_GPU_COPY_OP_CLEAR }, { PictOpOverReverse, LORIE_GPU_COPY_OP_OVER_REVERSE },
+            { PictOpIn, LORIE_GPU_COPY_OP_IN }, { PictOpInReverse, LORIE_GPU_COPY_OP_IN_REVERSE },
+            { PictOpOut, LORIE_GPU_COPY_OP_OUT }, { PictOpOutReverse, LORIE_GPU_COPY_OP_OUT_REVERSE },
+            { PictOpAtop, LORIE_GPU_COPY_OP_ATOP }, { PictOpAtopReverse, LORIE_GPU_COPY_OP_ATOP_REVERSE },
+            { PictOpXor, LORIE_GPU_COPY_OP_XOR }, { PictOpAdd, LORIE_GPU_COPY_OP_ADD } };
+        db.desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        dst.format = PICT_a8r8g8b8;
+        for (size_t i = 0; i < sizeof operators / sizeof operators[0]; i++)
+            check(lorieXRenderGpuComposite(operators[i].pict, &src, NULL, &dst, 2, 3, 4, 5, 60, 35) &&
+                  lastOp == operators[i].gpu, "all Porter-Duff ops must reach Vulkan with their exact operator");
+        db.desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+        dst.format = PICT_x8r8g8b8;
+        check(!lorieXRenderGpuComposite(PictOpIn, &src, NULL, &dst, 2, 3, 4, 5, 60, 35),
+              "DST_ALPHA GPU operator must reject an XRGB/RGBX destination");
+        check(!lorieXRenderGpuComposite(PictOpSaturate, &src, NULL, &dst, 2, 3, 4, 5, 60, 35),
+              "Saturate remains on pixel-correct software path");
+        sb.desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+        check(!lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 2, 3, 4, 5, 60, 35),
+              "ARGB32 source stored as RGBX AHB must not lose its alpha on GPU");
+        sb.desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        world.xrenderGpuMinPixels = 4096;
+        check(!lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 2, 3, 4, 5, 60, 35) &&
+              world.xrenderGpuSmallSkipped == 1,
+              "small XRender operations must avoid synchronous GPU-copy round trips");
+        world.xrenderGpuMinPixels = 0;
+    }
+
     gpuAccepted = 0;
+    int expectedAck = acked, expectedDamage = damaged;
     check(!lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 2, 3, 4, 5, 60, 35) &&
-          acked == 3 && damaged == 2 && world.xrenderGpuFallback == 1,
+          acked == expectedAck + 1 && damaged == expectedDamage && world.xrenderGpuFallback == 1,
           "device-skipped GPU Over must return CPU fallback exactly once and release refs");
     gpuAccepted = 1;
     gpuQueueAllowed = 0;
+    expectedAck = acked;
     check(!lorieXRenderGpuComposite(PictOpSrc, &src, NULL, &dst, 2, 3, 4, 5, 60, 35) &&
-          acked == 3 && world.xrenderGpuFallback == 2,
+          acked == expectedAck && world.xrenderGpuFallback == 2,
           "queue-full GPU Src must return CPU fallback without GPU acknowledgement");
     gpuQueueAllowed = 1;
 
@@ -168,7 +214,7 @@ int main(void) {
           "window drawable should resolve to its backing AHB pixmap");
     check(lastDamageType == DRAWABLE_PIXMAP, "damage must be reported on destination drawable");
 
-    printf("TXRENDERGPU Src/Over, clipping, fallback and AHB ownership: %s (%d failures)\n",
+    printf("TXRENDERGPU 12 Porter-Duff ops, clipping, alpha/cost gates, fallback and AHB ownership: %s (%d failures)\n",
            failures ? "FAIL" : "PASS", failures);
     return !!failures;
 }

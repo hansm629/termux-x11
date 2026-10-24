@@ -124,6 +124,8 @@ typedef struct {
      * non-repeating, conventional 32-bit formats). Other operations use the original pixman/EXA path. */
     Bool xrenderGpu;
     uint64_t xrenderGpuSuccess, xrenderGpuFallback;
+    uint32_t xrenderGpuMinPixels;
+    uint64_t xrenderGpuSmallSkipped;
     uint32_t rootCopySeq;
     struct {
         uint32_t seq;
@@ -434,7 +436,9 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
 
     desc = LorieBuffer_description(priv->buffer);
     if (desc->type == LORIEBUFFER_REGULAR) {
-        LorieBuffer_convert(priv->buffer, type, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
+        uint32_t format = pvfb->xrenderGpu && pixmap->drawable.depth == 32 ?
+                          AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM : AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+        LorieBuffer_convert(priv->buffer, type, format);
         if (desc->type != LORIEBUFFER_REGULAR) {
             // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
@@ -536,6 +540,18 @@ void OsVendorInit(void) {
     lorieScreen.rootGpuCopy = getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_GPU_COPY"), "1");
     lorieScreen.rootPresentGpu = getenv("TERMUX_X11_ROOT_PRESENT_GPU") && !strcmp(getenv("TERMUX_X11_ROOT_PRESENT_GPU"), "1");
     lorieScreen.xrenderGpu = getenv("TERMUX_X11_XRENDER_GPU") && !strcmp(getenv("TERMUX_X11_XRENDER_GPU"), "1");
+    // Avoid a synchronous GPU submission/fence roundtrip for tiny window decorations and glyphs.
+    // The threshold is intentionally conservative; users may set 0 for comparison or raise it.
+    lorieScreen.xrenderGpuMinPixels = 8192;
+    if (getenv("TERMUX_X11_XRENDER_GPU_MIN_PIXELS")) {
+        const char *value = getenv("TERMUX_X11_XRENDER_GPU_MIN_PIXELS");
+        char *end = NULL;
+        unsigned long n = strtoul(value, &end, 10);
+        if (value[0] >= '0' && value[0] <= '9' && end && !*end && n <= 16777216UL)
+            lorieScreen.xrenderGpuMinPixels = (uint32_t) n;
+        else
+            log(WARN, "XlorieXRenderGpu: invalid min pixels '%s'; using 8192", value);
+    }
     // Experimental: TERMUX_X11_X_YIELD_ON_WAKE=1 lets a vsync tick or a GPU copy's completion break off the client
     // dispatch round in progress at its next request boundary, to run before the round goes on (lorieQueueUrgentWorkProc).
     __atomic_store_n(&lorieScreen.yieldOnWake, getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIELD_ON_WAKE"), "1"),
@@ -1578,9 +1594,10 @@ static void lorieLogRendererDiag(void) {
         TD(rootGpuCopyRequests), TD(rootGpuCopySubmits), TD(rootGpuCopyCompletions), TD(rootGpuCopyRects), TD(rootGpuCopyBytes),
         TD(rootGpuCopyCompletionUs), TD(rootCpuFallbacks), TD(rootCpuSmall), TD(rootCopyCpuBlockUs), pvfb->rootCopy.seq ? 1 : 0);
     if (pvfb->xrenderGpu || pvfb->rootPresentGpu)
-        log(INFO, "XlorieCompositeGpu: root_present_gpu=%s xrender_gpu=%s src_over_done=%llu cpu_fallback=%llu",
+        log(INFO, "XlorieCompositeGpu: root_present_gpu=%s xrender_gpu=%s pd_done=%llu cpu_fallback=%llu tiny_cpu=%llu min_pixels=%u",
             pvfb->rootPresentGpu ? "on" : "off", pvfb->xrenderGpu ? "on" : "off",
-            (unsigned long long) pvfb->xrenderGpuSuccess, (unsigned long long) pvfb->xrenderGpuFallback);
+            (unsigned long long) pvfb->xrenderGpuSuccess, (unsigned long long) pvfb->xrenderGpuFallback,
+            (unsigned long long) pvfb->xrenderGpuSmallSkipped, pvfb->xrenderGpuMinPixels);
     log(INFO, "XlorieGles: egl_image_imports=%llu(+%llu) gles_copy_frames=%llu(+%llu) egl_swap_buffers=%llu(+%llu)",
         TD(eglImageImports), TD(glesCopyFrames), TD(eglSwapBuffers));
     log(INFO, "XlorieVk: instance_created=%llu(+%llu) device_created=%llu(+%llu) surface_created=%llu(+%llu) "
@@ -3366,19 +3383,43 @@ static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, 
     PixmapPtr sp, dp;
     LoriePixmapPriv *sPriv, *dPriv;
     int32_t sx, sy, dx, dy, sourceShiftX, sourceShiftY, offsetX, offsetY;
+    uint8_t gpuOperator, sourceFactor, targetFactor;
     uint64_t serial = 0;
     void *destBuffer = NULL;
     Bool queued, done;
 
     if (!pvfb->xrenderGpu || !lorieAhbPerAccess() || lorieOwnershipAsked() ||
-        pvfb->state->diag.active != LORIE_ACTIVE_VULKAN ||
-        (op != PictOpSrc && op != PictOpOver) || !src || !dst || mask ||
+        pvfb->state->diag.active != LORIE_ACTIVE_VULKAN || !src || !dst || mask ||
         !src->pDrawable || !dst->pDrawable || src->pDrawable->pScreen != dst->pDrawable->pScreen ||
         src->repeat || src->transform || src->alphaMap || src->filter != PictFilterNearest ||
         dst->alphaMap || !width || !height || pvfb->accessLocks ||
         (src->format != PICT_a8r8g8b8 && src->format != PICT_x8r8g8b8) ||
         (dst->format != PICT_a8r8g8b8 && dst->format != PICT_x8r8g8b8))
         return FALSE;
+
+    /* XRender operators are not Vulkan enums. Any op with a component-alpha mask, saturate,
+     * Disjoint/Conjoint factors, a custom transform or a picture gradient keeps pixman's semantics. */
+    switch (op) {
+        case PictOpSrc:          gpuOperator = LORIE_GPU_COPY_OP_SRC; break;
+        case PictOpOver:         gpuOperator = LORIE_GPU_COPY_OP_OVER; break;
+        case PictOpClear:        gpuOperator = LORIE_GPU_COPY_OP_CLEAR; break;
+        case PictOpOverReverse:  gpuOperator = LORIE_GPU_COPY_OP_OVER_REVERSE; break;
+        case PictOpIn:           gpuOperator = LORIE_GPU_COPY_OP_IN; break;
+        case PictOpInReverse:    gpuOperator = LORIE_GPU_COPY_OP_IN_REVERSE; break;
+        case PictOpOut:          gpuOperator = LORIE_GPU_COPY_OP_OUT; break;
+        case PictOpOutReverse:   gpuOperator = LORIE_GPU_COPY_OP_OUT_REVERSE; break;
+        case PictOpAtop:         gpuOperator = LORIE_GPU_COPY_OP_ATOP; break;
+        case PictOpAtopReverse:  gpuOperator = LORIE_GPU_COPY_OP_ATOP_REVERSE; break;
+        case PictOpXor:          gpuOperator = LORIE_GPU_COPY_OP_XOR; break;
+        case PictOpAdd:          gpuOperator = LORIE_GPU_COPY_OP_ADD; break;
+        default: return FALSE;
+    }
+    if (!lorieGpuCompositeFactors(gpuOperator, &sourceFactor, &targetFactor))
+        return FALSE;
+    if ((uint64_t) width * height < pvfb->xrenderGpuMinPixels) {
+        pvfb->xrenderGpuSmallSkipped++;
+        return FALSE;
+    }
 
     s = src->pDrawable;
     d = dst->pDrawable;
@@ -3389,6 +3430,20 @@ static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, 
     if (!sPriv || !dPriv || !sPriv->buffer || !dPriv->buffer || sPriv->mem || dPriv->mem || sp == dp ||
         LorieBuffer_description(sPriv->buffer)->id == LorieBuffer_description(dPriv->buffer)->id ||
         sPriv->locked || dPriv->locked)
+        return FALSE;
+    /* AHardwareBuffer RGBX reads always return alpha=1, even if the XRender picture is ARGB32.
+     * Its CPU memory may contain genuine alpha, so GPU blending on that import would be incorrect.
+     * Conservatively reject; enabling GPU XRender preserves 32-bit picture alpha in RGBA AHBs above. */
+    if ((src->format == PICT_a8r8g8b8 &&
+         LorieBuffer_description(sPriv->buffer)->format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM) ||
+        (dst->format == PICT_a8r8g8b8 &&
+         LorieBuffer_description(dPriv->buffer)->format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM))
+        return FALSE;
+    /* A destination without alpha logically has alpha=1; native RGBX attachment alpha can contain
+     * undefined bits, so hardware DST_ALPHA factors must not sample it. */
+    if (dst->format == PICT_x8r8g8b8 &&
+        (sourceFactor == LORIE_FACTOR_DST_ALPHA || sourceFactor == LORIE_FACTOR_ONE_MINUS_DST_ALPHA ||
+         targetFactor == LORIE_FACTOR_DST_ALPHA || targetFactor == LORIE_FACTOR_ONE_MINUS_DST_ALPHA))
         return FALSE;
 
     sx = (int32_t) xSrc + s->x;
@@ -3417,7 +3472,7 @@ static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, 
 
     RegionTranslate(&region, sourceShiftX, sourceShiftY);
     queued = lorieQueueGpuCopy(sp, dp, &region, (int16_t) offsetX, (int16_t) offsetY,
-                               op == PictOpOver ? LORIE_GPU_COPY_OP_OVER : LORIE_GPU_COPY_OP_SRC,
+                               gpuOperator,
                                &serial, &destBuffer);
     if (queued) {
         done = lorieWaitGpuCopyRecorded(serial);
@@ -3740,11 +3795,14 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
         return priv;
 
     uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
-    priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
+    // ARGB32 pixmaps carry premultiplied alpha; RGBX AHB imports force alpha to one and silently break
+    // transparency. Preserve alpha in the AHB only when the experimental GPU XRender path is enabled.
+    uint32_t format = pvfb->xrenderGpu && depth == 32 ? AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM : AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+    priv->buffer = LorieBuffer_allocate(width, height, format, type);
     *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
     // Root double buffering: the screen pixmap's twin, the same in every way (the pixmap's stride serves both).
     if (pvfb->rootDouble && type == LORIEBUFFER_AHARDWAREBUFFER && priv->buffer) {
-        priv->twin = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
+        priv->twin = LorieBuffer_allocate(width, height, format, type);
         if (priv->twin && LorieBuffer_description(priv->twin)->stride != LorieBuffer_description(priv->buffer)->stride) {
             LorieBuffer_release(priv->twin);
             priv->twin = NULL;

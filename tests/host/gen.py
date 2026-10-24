@@ -277,6 +277,7 @@ recipes = {
         + func(R, "static bool rendererHasBuffer(uint64_t id) {") + "static bool rendererRootCopyPending(void);\n"
         + func(R, "static void rendererAwaitBuffers(void) {")
         + func(R, "static LorieBuffer *rendererFindBuffer(uint64_t id, bool *later) {")
+        + func(R, "static GLenum lorieGlFactor(uint8_t factor) {")
         + func(R, "static uint64_t rendererApplyPendingGpuCopiesLocked(void) {")
         + func(R, "static bool rendererVkOwnedLocked(void) {")
         + func(R, "static void rendererVkInFlight(void) {")

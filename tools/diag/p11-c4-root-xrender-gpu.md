@@ -1,5 +1,10 @@
 # P11-C4 experimental GPU XRender + twinned Root GPU Present-copy
 
+> This document describes the P11-C4 baseline. The follow-up
+> [P11-C5-A](p11-c5-xrender-porter-duff.md) extends Porter-Duff GPU operators,
+> preserves alpha in ARGB32 AHBs, adds a GPU size gate and renames
+> `XlorieCompositeGpu: src_over_done` to `pd_done`.
+
 ## What this build does
 
 This **experimental** branch extends the existing Vulkan renderer's AHardwareBuffer GPU-copy queue:

@@ -82,6 +82,9 @@ int main(void) {
               fakeOverPipelineCreates == overBefore + 2,
               "opt-in Vulkan must make two premultiplied Over pipelines (made %d, wanted %d)",
               fakeOverPipelineCreates, overBefore + 2);
+        for (int i = 0; i < 2; i++)
+            for (int op = LORIE_GPU_COPY_OP_CLEAR; op < LORIE_GPU_COPY_OP_COUNT; op++)
+                CHECK(r.pdPipeline[i][op] != VK_NULL_HANDLE, "missing opt-in Porter-Duff pipeline format %d op %d", i, op);
         overSrc = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, X_USAGE);
         overDst = buffer(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, X_USAGE);
         overSrcImage = lorieVkImport(&vk, &images, 81, overSrc, 0, &st);
@@ -94,6 +97,17 @@ int main(void) {
                   lorieVkFrameSubmit(&vk, &r, 0, false, &st) == VK_SUCCESS &&
                   emu.draws == initialDraws + 1 && emu.violations == 0,
                   "XRender Over did not issue a GPU draw into the imported AHB with correct ownership");
+            /* Multiple blend operations into the same imported destination form a single command buffer:
+             * LOAD of the subsequent pass requires the explicit COLOR_ATTACHMENT memory dependency. */
+            initialDraws = emu.draws;
+            CHECK(lorieVkFrameBegin(&vk, &r) == VK_SUCCESS, "Porter-Duff batch begin failed");
+            for (uint8_t op = 0; op < LORIE_GPU_COPY_OP_COUNT; op++)
+                CHECK(lorieVkFramePorterDuff(&vk, &r, overSrcImage, overDstImage, quads, 1, 0, op),
+                      "Porter-Duff op=%u failed to record a GPU draw", op);
+            CHECK(lorieVkFrameSubmit(&vk, &r, 0, false, &st) == VK_SUCCESS &&
+                  emu.draws == initialDraws + LORIE_GPU_COPY_OP_COUNT && emu.violations == 0,
+                  "Porter-Duff 12-mode batch: draws=%d expected=%d, ownership violations=%d",
+                  emu.draws, initialDraws + LORIE_GPU_COPY_OP_COUNT, emu.violations);
         }
         lorieVkImagesClear(&vk, &images);
         lorieVkRendererDestroy(&vk, &r);

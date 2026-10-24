@@ -43,7 +43,8 @@ static struct {
     Bool exaLockOpt;
     Bool exaCompositeOpt;
     Bool xrenderGpu, rootPresentGpu;
-    uint64_t xrenderGpuSuccess, xrenderGpuFallback;
+    uint64_t xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuSmallSkipped;
+    uint32_t xrenderGpuMinPixels;
     Bool freezeDiag;
     Bool contentDiag;
     struct {

@@ -1208,7 +1208,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL fCreateGraphicsPipelines(VkDevice d, VkPip
     CHECK(n == 1 && i->renderPass && i->layout, "fake device: pipeline");
     if (i->pColorBlendState && i->pColorBlendState->attachmentCount) {
         const VkPipelineColorBlendAttachmentState *blend = i->pColorBlendState->pAttachments;
-        if (blend->blendEnable && blend->srcColorBlendFactor == VK_BLEND_FACTOR_ONE) {
+        if (blend->blendEnable && blend->srcColorBlendFactor == VK_BLEND_FACTOR_ONE &&
+            blend->dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
             CHECK(blend->dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
                   blend->srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE &&
                   blend->dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&

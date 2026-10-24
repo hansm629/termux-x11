@@ -232,10 +232,47 @@ typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
 
 #define LORIE_GPU_COPY_MAX_RECTS 16
 #define LORIE_GPU_COPY_QUEUE_CAPACITY 8
-/* P11-C4: XRender Src and premultiplied-alpha Over can share the existing ordered AHB GPU queue. The
- * original Present copy remains SRC; no blend, mask or transform is applied to a Present operation. */
+/* XRender's unmasked Porter-Duff subset. Present always uses SRC. Saturate and the
+ * Conjoint/Disjoint operators require programmable per-pixel factors, so still use pixman. */
 #define LORIE_GPU_COPY_OP_SRC  0u
 #define LORIE_GPU_COPY_OP_OVER 1u
+#define LORIE_GPU_COPY_OP_CLEAR 2u
+#define LORIE_GPU_COPY_OP_OVER_REVERSE 3u
+#define LORIE_GPU_COPY_OP_IN 4u
+#define LORIE_GPU_COPY_OP_IN_REVERSE 5u
+#define LORIE_GPU_COPY_OP_OUT 6u
+#define LORIE_GPU_COPY_OP_OUT_REVERSE 7u
+#define LORIE_GPU_COPY_OP_ATOP 8u
+#define LORIE_GPU_COPY_OP_ATOP_REVERSE 9u
+#define LORIE_GPU_COPY_OP_XOR 10u
+#define LORIE_GPU_COPY_OP_ADD 11u
+#define LORIE_GPU_COPY_OP_COUNT 12u
+
+enum lorie_gpu_factor {
+    LORIE_FACTOR_ZERO, LORIE_FACTOR_ONE, LORIE_FACTOR_SRC_ALPHA,
+    LORIE_FACTOR_ONE_MINUS_SRC_ALPHA, LORIE_FACTOR_DST_ALPHA, LORIE_FACTOR_ONE_MINUS_DST_ALPHA
+};
+
+/* Both Vulkan and GLES use the same premultiplied Porter-Duff factors, including alpha.
+ * Non-premultiplied source-over (used for the mouse cursor) is a distinct pipeline. */
+static inline bool lorieGpuCompositeFactors(uint8_t op, uint8_t *src, uint8_t *dst) {
+    switch (op) {
+        case LORIE_GPU_COPY_OP_SRC:          *src = LORIE_FACTOR_ONE;                 *dst = LORIE_FACTOR_ZERO; break;
+        case LORIE_GPU_COPY_OP_OVER:         *src = LORIE_FACTOR_ONE;                 *dst = LORIE_FACTOR_ONE_MINUS_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_CLEAR:        *src = LORIE_FACTOR_ZERO;                *dst = LORIE_FACTOR_ZERO; break;
+        case LORIE_GPU_COPY_OP_OVER_REVERSE: *src = LORIE_FACTOR_ONE_MINUS_DST_ALPHA; *dst = LORIE_FACTOR_ONE; break;
+        case LORIE_GPU_COPY_OP_IN:           *src = LORIE_FACTOR_DST_ALPHA;           *dst = LORIE_FACTOR_ZERO; break;
+        case LORIE_GPU_COPY_OP_IN_REVERSE:   *src = LORIE_FACTOR_ZERO;                *dst = LORIE_FACTOR_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_OUT:          *src = LORIE_FACTOR_ONE_MINUS_DST_ALPHA; *dst = LORIE_FACTOR_ZERO; break;
+        case LORIE_GPU_COPY_OP_OUT_REVERSE:  *src = LORIE_FACTOR_ZERO;                *dst = LORIE_FACTOR_ONE_MINUS_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_ATOP:         *src = LORIE_FACTOR_DST_ALPHA;           *dst = LORIE_FACTOR_ONE_MINUS_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_ATOP_REVERSE: *src = LORIE_FACTOR_ONE_MINUS_DST_ALPHA; *dst = LORIE_FACTOR_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_XOR:          *src = LORIE_FACTOR_ONE_MINUS_DST_ALPHA; *dst = LORIE_FACTOR_ONE_MINUS_SRC_ALPHA; break;
+        case LORIE_GPU_COPY_OP_ADD:          *src = LORIE_FACTOR_ONE;                 *dst = LORIE_FACTOR_ONE; break;
+        default: return false;
+    }
+    return true;
+}
 #define LORIE_GPU_COPY_NOT_RECORDED 0u
 #define LORIE_GPU_COPY_RECORDED     1u
 #define LORIE_GPU_COPY_SKIPPED      2u

@@ -140,26 +140,39 @@ enum { GL_NEAREST = 0x2600, GL_LINEAR = 0x2601, GL_VIEWPORT = 0x0BA2, GL_FRAMEBU
        GL_TEXTURE_2D = 0x0DE1, GL_TEXTURE0 = 0x84C0, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
        GL_FLOAT = 0x1406, GL_FALSE = 0, GL_TRIANGLE_STRIP = 5,
        GL_BLEND = 0x0BE2, GL_ONE = 1, GL_ZERO = 0, GL_ONE_MINUS_SRC_ALPHA = 0x0303,
+       GL_SRC_ALPHA = 0x0302, GL_DST_ALPHA = 0x0304, GL_ONE_MINUS_DST_ALPHA = 0x0305,
+       GL_FUNC_ADD = 0x8006, GL_BLEND_EQUATION_RGB = 0x8009, GL_BLEND_EQUATION_ALPHA = 0x883D,
        GL_BLEND_SRC_RGB = 0x80C9, GL_BLEND_DST_RGB = 0x80C8,
        GL_BLEND_SRC_ALPHA = 0x80CB, GL_BLEND_DST_ALPHA = 0x80CA };
 static GLuint g_texture_program = 1, gv_pos = 0, gv_coords = 1, g_texture_program_bgra = 2, gv_pos_bgra = 2, gv_coords_bgra = 3;
 static GLuint gpuCopyFbo, glProgram, glTexture, glTarget;
 static GLboolean gpuBlendEnabled;
 static GLint gpuBlendSrc = GL_ONE, gpuBlendDst = GL_ZERO, gpuBlendSrcAlpha = GL_ONE, gpuBlendDstAlpha = GL_ZERO;
+static GLint gpuBlendEqRgb = GL_FUNC_ADD, gpuBlendEqAlpha = GL_FUNC_ADD;
 static GLboolean glIsEnabled(GLenum p) { return p == GL_BLEND && gpuBlendEnabled; }
 static void glEnable(GLenum p) { if (p == GL_BLEND) gpuBlendEnabled = true; }
 static void glDisable(GLenum p) { if (p == GL_BLEND) gpuBlendEnabled = false; }
 static void glBlendFuncSeparate(GLenum src, GLenum dst, GLenum srcAlpha, GLenum dstAlpha) {
     gpuBlendSrc = src; gpuBlendDst = dst; gpuBlendSrcAlpha = srcAlpha; gpuBlendDstAlpha = dstAlpha;
 }
+static void glBlendEquationSeparate(GLenum rgb, GLenum alpha) {
+    gpuBlendEqRgb = rgb; gpuBlendEqAlpha = alpha;
+}
 static const float *glVertices;
-static struct { float v[16]; GLuint program, texture, target; } glDraws[32];
+static struct {
+    float v[16];
+    GLuint program, texture, target;
+    GLboolean blend;
+    GLint srcFactor, dstFactor, alphaSource, alphaDest, equation;
+} glDraws[32];
 static int glDrawCount;
 static void glGetIntegerv(GLenum e, GLint *v) {
     if (e == GL_BLEND_SRC_RGB) *v = gpuBlendSrc;
     else if (e == GL_BLEND_DST_RGB) *v = gpuBlendDst;
     else if (e == GL_BLEND_SRC_ALPHA) *v = gpuBlendSrcAlpha;
     else if (e == GL_BLEND_DST_ALPHA) *v = gpuBlendDstAlpha;
+    else if (e == GL_BLEND_EQUATION_RGB) *v = gpuBlendEqRgb;
+    else if (e == GL_BLEND_EQUATION_ALPHA) *v = gpuBlendEqAlpha;
     else v[0] = v[1] = v[2] = v[3] = 0;
 }
 static void glGenFramebuffers(GLsizei n, GLuint *f) { (void) n; *f = 1; }
@@ -181,6 +194,12 @@ static void glDrawArrays(GLenum mode, GLint first, GLsizei n) {
     memcpy(glDraws[glDrawCount].v, glVertices, sizeof glDraws[0].v);
     glDraws[glDrawCount].program = glProgram;
     glDraws[glDrawCount].texture = glTexture;
+    glDraws[glDrawCount].blend = gpuBlendEnabled;
+    glDraws[glDrawCount].srcFactor = gpuBlendSrc;
+    glDraws[glDrawCount].dstFactor = gpuBlendDst;
+    glDraws[glDrawCount].alphaSource = gpuBlendSrcAlpha;
+    glDraws[glDrawCount].alphaDest = gpuBlendDstAlpha;
+    glDraws[glDrawCount].equation = gpuBlendEqRgb;
     glDraws[glDrawCount++].target = glTarget;
 }
 #define checkGlError() ((void) 0)
@@ -2938,6 +2957,42 @@ int main(void) {
     }
 
     CHECK(!atFence.lockHeld, "a fence waited for under the X server's lock");
+    /* P11-C5: GLES compatibility mode must use precisely the same Porter-Duff factors as Vulkan,
+     * preserve alpha factors and restore whatever blend state the surrounding GUI used. */
+    {
+        Queue pd = { 0 };
+        gpuBlendEnabled = TRUE;
+        glBlendFuncSeparate(GL_DST_ALPHA, GL_SRC_ALPHA, GL_ONE, GL_ZERO);
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+        src->registered = root->registered = true;
+        for (uint8_t k = 0; k < 8; k++) {
+            LorieGpuCopyEntry *cmd = &pd.entries[k];
+            cmd->serial = 500 + k;
+            cmd->srcBufferId = src->desc.id;
+            cmd->dstBufferId = root->desc.id;
+            cmd->operator = k;
+            cmd->numRects = 1;
+            cmd->rects[0] = (LorieGpuCopyRect) { 0, 0, 20, 15 };
+        }
+        pd.writeIndex = 8;
+        CHECK(gles(&pd) == 507 && glDrawCount == 8, "GLES Porter-Duff batch: %d draws", glDrawCount);
+        for (uint8_t k = 0; k < 8 && k < glDrawCount; k++) {
+            uint8_t sf = 0, df = 0;
+            CHECK(lorieGpuCompositeFactors(k, &sf, &df) &&
+                  glDraws[k].blend == (k != LORIE_GPU_COPY_OP_SRC) &&
+                  (k == LORIE_GPU_COPY_OP_SRC ||
+                   (glDraws[k].srcFactor == (GLint) lorieGlFactor(sf) &&
+                    glDraws[k].dstFactor == (GLint) lorieGlFactor(df) &&
+                    glDraws[k].alphaSource == (GLint) lorieGlFactor(sf) &&
+                    glDraws[k].alphaDest == (GLint) lorieGlFactor(df) &&
+                    glDraws[k].equation == GL_FUNC_ADD)),
+                  "GLES Porter-Duff operator %u blend factors/equation", k);
+        }
+        CHECK(gpuBlendEnabled && gpuBlendSrc == GL_DST_ALPHA && gpuBlendDst == GL_SRC_ALPHA &&
+              gpuBlendSrcAlpha == GL_ONE && gpuBlendDstAlpha == GL_ZERO &&
+              gpuBlendEqRgb == GL_FUNC_ADD && gpuBlendEqAlpha == GL_FUNC_ADD,
+              "GLES deferred batch must restore the preexisting X11 composition blend state");
+    }
     /* P11-C4: the root's front and back cannot be mixed; root Present must be refused unless the feature
      * and deferred-damage protocol are enabled, then queued and COMPLETED on the device before returning
      * to the X main thread. The AHBs are not released until its Present acknowledges the request. */

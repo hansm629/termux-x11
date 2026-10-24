@@ -119,7 +119,9 @@ int LorieBuffer_createRegion(char const* name, size_t size) {
 static LorieBuffer* allocate(int32_t width, int32_t stride, int32_t height, int8_t format, int8_t type, AHardwareBuffer *buf, int fd, size_t size, off_t offset, bool takeFd) {
     AHardwareBuffer_Desc desc = {0};
     static uint64_t id = 0;
-    bool acceptable = (format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM || format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM) && width > 0 && height > 0;
+    bool acceptable = (format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ||
+                       format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM ||
+                       format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) && width > 0 && height > 0;
     LorieBuffer b = { .desc = { .width = width, .stride = stride, .height = height, .format = format, .type = type, .buffer = buf, .id = id++ }, .fd = takeFd ? fd : dup(fd), .size = size, .offset = offset };
 
     if (type != LORIEBUFFER_AHARDWAREBUFFER && !acceptable)
@@ -214,7 +216,9 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
     void *data;
     if (!buffer || buffer->desc.type != LORIEBUFFER_REGULAR
         || (type != LORIEBUFFER_FD && type != LORIEBUFFER_AHARDWAREBUFFER)
-        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM && format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
+        || (format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM &&
+            format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM &&
+            format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM))
         return;
 
     if (type == LORIEBUFFER_FD) {

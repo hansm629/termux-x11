@@ -1347,10 +1347,23 @@ static bool rendererCopiesStillDeferred(void) {
            __atomic_load_n(&state->cpuAccess.releases, __ATOMIC_ACQUIRE) == deferredReleases;
 }
 
+static GLenum lorieGlFactor(uint8_t factor) {
+    switch (factor) {
+        case LORIE_FACTOR_ZERO:                return GL_ZERO;
+        case LORIE_FACTOR_ONE:                 return GL_ONE;
+        case LORIE_FACTOR_SRC_ALPHA:           return GL_SRC_ALPHA;
+        case LORIE_FACTOR_ONE_MINUS_SRC_ALPHA: return GL_ONE_MINUS_SRC_ALPHA;
+        case LORIE_FACTOR_DST_ALPHA:           return GL_DST_ALPHA;
+        case LORIE_FACTOR_ONE_MINUS_DST_ALPHA: return GL_ONE_MINUS_DST_ALPHA;
+        default: return GL_ZERO;
+    }
+}
+
 static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
     bool fboSetUp = false;
     GLboolean blendWasEnabled = GL_FALSE;
     GLint blendSrcRgb = GL_ONE, blendDstRgb = GL_ZERO, blendSrcAlpha = GL_ONE, blendDstAlpha = GL_ZERO;
+    GLint blendEquationRgb = GL_FUNC_ADD, blendEquationAlpha = GL_FUNC_ADD;
     uint64_t lastSerial = 0;
     uint64_t boundDstId = 0;
     GLint prevViewport[4];
@@ -1398,6 +1411,8 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
                 glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRgb);
                 glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcAlpha);
                 glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstAlpha);
+                glGetIntegerv(GL_BLEND_EQUATION_RGB, &blendEquationRgb);
+                glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &blendEquationAlpha);
                 if (!gpuCopyFbo)
                     glGenFramebuffers(1, &gpuCopyFbo);
                 glBindFramebuffer(GL_FRAMEBUFFER, gpuCopyFbo);
@@ -1425,9 +1440,18 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
             }
 
             LorieBuffer_bindTexture(src);
-            if (entry.operator == LORIE_GPU_COPY_OP_OVER) {
+            if (entry.operator != LORIE_GPU_COPY_OP_SRC) {
+                uint8_t sf = 0, df = 0;
+                if (!lorieGpuCompositeFactors(entry.operator, &sf, &df)) {
+                    state->gpuCopyQueue.entries[state->gpuCopyQueue.readIndex % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded =
+                        LORIE_GPU_COPY_SKIPPED;
+                    lastSerial = entry.serial;
+                    state->gpuCopyQueue.readIndex++;
+                    continue;
+                }
                 glEnable(GL_BLEND);
-                glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+                glBlendFuncSeparate(lorieGlFactor(sf), lorieGlFactor(df), lorieGlFactor(sf), lorieGlFactor(df));
             } else {
                 glDisable(GL_BLEND);
             }
@@ -1472,6 +1496,7 @@ static uint64_t rendererApplyPendingGpuCopiesLocked(void) {
 
     if (fboSetUp) {
         glBlendFuncSeparate(blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha);
+        glBlendEquationSeparate(blendEquationRgb, blendEquationAlpha);
         if (blendWasEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
@@ -2243,6 +2268,15 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
                 (unsigned long long) (!src ? entry.srcBufferId : entry.dstBufferId));
         if (src && dst) {
             const LorieBuffer_Desc *sd = LorieBuffer_description(src), *dd = LorieBuffer_description(dst);
+            int pass = dd->format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? 1 : 0;
+            if (entry.operator >= LORIE_GPU_COPY_OP_CLEAR &&
+                (entry.operator >= LORIE_GPU_COPY_OP_COUNT || !vkr.pdPipeline[pass][entry.operator])) {
+                // Optional blend mode unsupported by this device. Mark it as skipped *without* recording
+                // a partial GPU command. The X thread sees the completed serial and uses pixman fallback.
+                state->gpuCopyQueue.entries[i % LORIE_GPU_COPY_QUEUE_CAPACITY].recorded = LORIE_GPU_COPY_SKIPPED;
+                *serial = entry.serial;
+                continue;
+            }
             struct lorie_vk_image *s = lorieVkImport(&vk, &vkImages, sd->id, sd->buffer, 0, state);
             struct lorie_vk_image *d = s ? lorieVkImport(&vk, &vkImages, dd->id, dd->buffer, 0, state) : NULL;
             struct lorie_vk_quad quads[LORIE_GPU_COPY_MAX_RECTS];
@@ -2259,9 +2293,7 @@ static bool rendererVkCopiesLocked(uint64_t *serial, uint32_t *readIndex) {
             if (!count || !lorieVkFrameCopyImage(&vk, &vkr, s, d, regions, count)) {
                 for (k = 0; k < n; k++)
                     quads[k] = rendererVkCopyQuad(entry.rects[k], entry.xOff, entry.yOff, sd, dd, s->rgbaOrder != d->rgbaOrder);
-                if (!(entry.operator == LORIE_GPU_COPY_OP_OVER
-                        ? lorieVkFrameOver(&vk, &vkr, s, d, quads, n, filter)
-                        : lorieVkFrameCopy(&vk, &vkr, s, d, quads, n, filter))) {
+                if (!lorieVkFramePorterDuff(&vk, &vkr, s, d, quads, n, filter, entry.operator)) {
                     lorieVkFallback(state, LORIE_FALLBACK_CLASS_RESOURCE_LOCAL, LORIE_FALLBACK_AHB_IMPORT, VK_SUCCESS);
                     return false;
                 }
