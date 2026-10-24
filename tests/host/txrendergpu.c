@@ -39,9 +39,11 @@ typedef int16_t INT16;
 typedef struct { short x1, y1, x2, y2; } BoxRec, *BoxPtr;
 typedef struct { int n; BoxRec rect; } RegionRec, *RegionPtr;
 #define RegionNumRects(p) ((p)->n)
+#define RegionRects(p) (&(p)->rect)
 typedef struct { uint64_t id; uint32_t format; } LorieBuffer_Desc;
 typedef struct { LorieBuffer_Desc desc; } LorieBuffer;
-typedef struct { LorieBuffer *buffer; void *mem; void *locked; struct { uint32_t seq; } content; } LoriePixmapPriv;
+struct lorie_content_stamp { uint32_t seq; };
+typedef struct { LorieBuffer *buffer; void *mem; void *locked; struct lorie_content_stamp content; } LoriePixmapPriv;
 typedef struct _Drawable DrawableRec, *DrawablePtr;
 typedef struct _Pixmap PixmapRec, *PixmapPtr;
 typedef struct _Screen ScreenRec, *ScreenPtr;
@@ -57,13 +59,30 @@ struct _Picture {
 };
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((p)->priv)
 
-struct fake_state { struct { int active; } diag; };
+struct fake_state { struct { int active; } diag; struct { uint32_t writeIndex; } gpuCopyQueue; };
+struct lorie_xrender_job {
+    uint64_t serial;
+    LorieBuffer *src, *dst;
+    PixmapPtr dstPixmap;
+    struct lorie_content_stamp content;
+    uint32_t queueIndex, srcFormat, dstFormat;
+    uint8_t op;
+    Bool root;
+    int16_t xOff, yOff;
+    uint16_t numRects;
+    LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
+};
 static struct { struct fake_state *state;
                 int xrenderGpu, rootPresentGpu, accessLocks, contentDiag;
-                unsigned xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuMinPixels, xrenderGpuSmallSkipped; } world, *pvfb = &world;
+                unsigned xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuMinPixels, xrenderGpuSmallSkipped;
+                Bool xrenderAsync;
+                struct lorie_xrender_job xrenderJobs[LORIE_GPU_COPY_QUEUE_CAPACITY];
+                uint32_t xrenderJobsCount;
+                uint64_t xrenderAsyncQueued;
+                } world, *pvfb = &world;
 static struct fake_state st;
 static ScreenRec screen, *pScreenPtr = &screen;
-static int failures, queued, acked, damaged, uninit, gpuAccepted = 1, gpuQueueAllowed = 1, perAccess = 1, rootTwinned;
+static int failures, queued, acked, damaged, uninit, flushed, gpuAccepted = 1, gpuQueueAllowed = 1, perAccess = 1, rootTwinned;
 static int ownershipPending;
 static uint8_t lastOp;
 static int lastXOff, lastYOff;
@@ -93,10 +112,14 @@ static void DamageDamageRegion(DrawablePtr d, RegionPtr r) {
     damaged++; lastDamage = r->rect; lastDamageType = d->type;
 }
 static Bool lorieQueueGpuCopy(PixmapPtr src, PixmapPtr dst, RegionPtr r, int16_t x, int16_t y,
-                              uint8_t op, uint64_t *serial, void **destBuffer) {
+                              uint8_t op, Bool isPresent, Bool asyncXrender,
+                              uint64_t *serial, void **destBuffer) {
     (void)src;(void)dst;
+    (void)isPresent;
+    (void)asyncXrender;
     if (!gpuQueueAllowed) return FALSE;
     queued++; lastSource = r->rect; lastOp = op; lastXOff = x; lastYOff = y;
+    st.gpuCopyQueue.writeIndex++;
     *serial = 41; *destBuffer = dst->priv->buffer; return TRUE;
 }
 static Bool lorieWaitGpuCopyRecorded(uint64_t serial) {
@@ -106,6 +129,8 @@ static Bool lorieWaitGpuCopyRecorded(uint64_t serial) {
 static void lorieGpuCopyAck(PixmapPtr src, void *dst) {
     (void)src;(void)dst; acked++;
 }
+static void lorieXRenderAsyncFlush(void) { flushed++; world.xrenderJobsCount = 0; }
+#include "xrenderasyncconflict_src.inc"
 /* GetWindowPixmap is not called in the pixmap-only tests, but a window case is included. */
 static PixmapPtr windowImage;
 static PixmapPtr getWindow(void *window) { (void)window; return windowImage; }
@@ -213,6 +238,27 @@ int main(void) {
     check(lorieXRenderGpuComposite(PictOpSrc, &src, NULL, &dst, 2, 3, 4, 5, 60, 35),
           "window drawable should resolve to its backing AHB pixmap");
     check(lastDamageType == DRAWABLE_PIXMAP, "damage must be reported on destination drawable");
+
+    /* P11-C5-B2: independent GPU writes can be queued without waiting on a fence; a second
+     * overlapping destination or RAW/WAR dependency must flush before it can be scheduled. */
+    {
+        int beforeFlushes = flushed, beforeQueued = queued, beforeAcks = acked;
+        world.xrenderAsync = 1;
+        world.rootPresentGpu = 0;
+        s.drawable.type = DRAWABLE_PIXMAP;
+        check(lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 0, 0, 0, 0, 32, 32) &&
+              world.xrenderJobsCount == 1 && queued == beforeQueued + 1 && acked == beforeAcks &&
+              world.xrenderAsyncQueued == 1 && flushed == beforeFlushes,
+              "async GPU Composite must queue and pin without waiting for the renderer");
+        check(lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 32, 0, 64, 0, 16, 20) &&
+              world.xrenderJobsCount == 2 && flushed == beforeFlushes,
+              "disjoint GPU writes into the same destination should batch without CPU fence");
+        check(lorieXRenderGpuComposite(PictOpOver, &src, NULL, &dst, 0, 0, 0, 0, 32, 32) &&
+              world.xrenderJobsCount == 1 && flushed == beforeFlushes + 1,
+              "overlapping destination writes must flush the previous batch");
+        world.xrenderAsync = 0;
+        lorieXRenderAsyncFlush();
+    }
 
     printf("TXRENDERGPU 12 Porter-Duff ops, clipping, alpha/cost gates, fallback and AHB ownership: %s (%d failures)\n",
            failures ? "FAIL" : "PASS", failures);

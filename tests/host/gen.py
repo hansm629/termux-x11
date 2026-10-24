@@ -210,6 +210,11 @@ recipes = {
         + macro(I, "LORIE_COMPOSITE_SHOWN")
         + func(I, "static void lorieCompositeReport(char *totals, size_t totalsSize, char *classes, size_t classesSize) {"),
     "xrendergpu": lambda: func(I, "static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, PicturePtr dst,"),
+    "xrenderasyncconflict": lambda: func(I, "static Bool lorieXRenderAsyncConflict(LorieBuffer *src, LorieBuffer *dst, RegionPtr srcRegion,"),
+    "xrenderasync": lambda: func(I, "static Bool lorieXRenderAsyncConflict(LorieBuffer *src, LorieBuffer *dst, RegionPtr srcRegion,")
+        + func(I, "static Bool lorieXRenderAsyncReplay(const struct lorie_xrender_job *job) {")
+        + func(I, "static void lorieXRenderAsyncFlush(void) {")
+        + func(I, "static void lorieXRenderAsyncFlushOnBuffer(LorieBuffer *buffer) {"),
     "syncchainreport": lambda: func(I, "static void lorieSyncChainReport(char *composite, size_t compositeSize, char *waits, size_t waitsSize) {"),
     "syncchainwait": lambda: func(I, "static void lorieSyncChainRootWait(uint32_t seq, uint64_t us, Bool waited, Bool takenAtEntry, uint64_t queuedToDoneUs) {")
         + func(I, "static void lorieSyncChainGpuWait(uint64_t us, int index) {"),
@@ -263,6 +268,7 @@ recipes = {
         + func(R, "static bool rendererCopyDeferred(const LorieGpuCopyEntry *entry, uint32_t index) {")
         + func(R, "static bool rendererCopiesStillDeferred(void) {")
         + func(I, "bool lorieRendererAvailable(void) {")
+        + func(I, "static void lorieAsyncRootPresentWait(void) {")
         + func(I, "static Bool lorieWaitGpuCopyRecorded(uint64_t serial) {")
         + func(I, "static Bool lorieQueueGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")
         + func(I, "Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,")

@@ -61,6 +61,7 @@ typedef int Bool;
 #define TRUE 1
 #define FALSE 0
 #define AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM 2
+#define AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM 1
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 typedef struct { short x1, y1, x2, y2; } BoxRec, *BoxPtr;
@@ -86,7 +87,7 @@ typedef struct LorieBuffer {
     uint32_t *shadow;
 } LorieBuffer;
 
-typedef struct FakePixmap { struct { void *ptr; } devPrivate; void *driverPriv; struct { int width, height; } drawable; } PixmapRec, *PixmapPtr;
+typedef struct FakePixmap { struct { void *ptr; } devPrivate; void *driverPriv; struct { int width, height, depth; } drawable; } PixmapRec, *PixmapPtr;
 typedef struct FakeWindow { PixmapPtr pixmap; } WindowRec, *WindowPtr;
 typedef struct FakeScreen ScreenRec, *ScreenPtr;
 struct FakeScreen {
@@ -130,6 +131,7 @@ struct fake_pvfb {
     uint8_t ownership;
     struct xorg_list ahbPersistent;
     Bool rootGpuCopy;           /* P11-C2: InitOutput.c's own */
+    Bool xrenderGpu, rootPresentAsync;
     uint32_t rootCopySeq;
     struct {
         uint32_t seq;
@@ -530,6 +532,11 @@ static void lorieContentAccess(PixmapPtr pPix, void *priv, int index, int how) {
 }
 static void lorieContentStaleRead(void *priv, int index) { (void) priv, (void) index; contentHooks++; }
 static void lorieRootCopyWait(Bool takeBack);
+/* P11-C5-B1 asynchronous Present is tested in tpresentcopy, not the ownership baseline fixture. */
+static void lorieAsyncRootPresentWait(void) {}
+/* P11-C5-B2 asynchronous XRender batch is disabled in this ownership-only fixture. */
+static void lorieXRenderAsyncFlush(void) {}
+static void lorieXRenderAsyncFlushOnBuffer(LorieBuffer *buf) { (void)buf; }
 /* This fixture tests ownership/copy semantics, not the opt-in diagnostic accounting.  The real accounting helpers
  * are separately compiled from InitOutput.c and asserted in texacomposite.c; these must never be called here. */
 static void lorieSyncChainGpuWait(uint64_t us, int index) {

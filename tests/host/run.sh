@@ -30,10 +30,17 @@ rm -rf "$OUT/vkinc" && mkdir -p "$OUT/vkinc" && cp -r "$VKINC/vulkan" "$OUT/vkin
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest tvkframe tvkrenderer tpresentcopy tpresentsafety tdispatchyield tbufferlock twake tsharedlock tfreeze tcontentframe texacomposite txrendergpu tporterduff"
+C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest tvkframe tvkrenderer tpresentcopy tpresentsafety tdispatchyield tbufferlock twake tsharedlock tfreeze tcontentframe texacomposite txrendergpu tporterduff tasyncxrender"
 rm -f "$OUT/diag-vulkan.log" "$OUT/diag-gles.log"     # written by tdiaglog: never judge an earlier run's
 for t in $C_TESTS; do
-    "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$OUT/vkinc" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm || { status=1; continue; }
+    if [ "$t" = tasyncxrender ]; then
+        PIXMAN_FLAGS=$(pkg-config --cflags --libs pixman-1) || exit 1
+    else
+        PIXMAN_FLAGS=
+    fi
+    # pkg-config outputs conventional compiler/linker switches with no shell metacharacters.
+    # shellcheck disable=SC2086
+    "$CC" -Wall -Wno-unused-function -O1 -pthread -I"$OUT" -I"$OUT/vkinc" -I"$HERE" "$HERE/$t.c" -o "$OUT/$t" -lm $PIXMAN_FLAGS || { status=1; continue; }
     OUT="$OUT" "$OUT/$t" || status=1
 done
 

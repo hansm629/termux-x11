@@ -42,8 +42,12 @@ static struct {
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
     Bool exaCompositeOpt;
-    Bool xrenderGpu, rootPresentGpu;
+    Bool xrenderGpu, rootPresentGpu, rootPresentAsync;
     uint64_t xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuSmallSkipped;
+    uint64_t rootPresentAsyncQueued, rootPresentCpuFlushes, rootPresentCpuFlushUs, rootPresentLastSerial, rootGpuCopyPending;
+    Bool xrenderAsync;
+    uint32_t xrenderJobsCount;
+    uint64_t xrenderAsyncQueued, xrenderAsyncFlushed, xrenderAsyncReplayed, xrenderAsyncFlushUs;
     uint32_t xrenderGpuMinPixels;
     Bool freezeDiag;
     Bool contentDiag;

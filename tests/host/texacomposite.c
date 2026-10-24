@@ -87,6 +87,7 @@ static Bool lorieXRenderGpuComposite(CARD8 op, PicturePtr src, PicturePtr mask, 
     (void) width; (void) height;
     return FALSE;
 }
+static void lorieXRenderAsyncFlush(void) {} /* disabled in the CPU-only timed Composite fixture */
 #include "compositetimed_src.inc"
 #undef clock_gettime
 #include "compositereport_src.inc"

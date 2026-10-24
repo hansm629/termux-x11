@@ -1,5 +1,9 @@
 # P11-C5-A: additional XRender GPU operators + conservative cost gate
 
+> This is the synchronous P11-C5-A baseline. The successor
+> [P11-C5-B](p11-c5-b-async-root-xrender.md) adds separate opt-in switches for
+> deferred root Present and bounded XRender GPU batches with CPU replay.
+
 This is the follow-up to P11-C4. **Keep Termux-Desktop's native XFCE4 compositor ON** and the
 Root Double Buffer ON. The Debian PRoot session is the benchmark application, *not* the desktop
 that owns `xfwm4`.

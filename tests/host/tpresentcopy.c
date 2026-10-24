@@ -91,11 +91,12 @@ typedef struct { struct { int width, height, depth; } drawable; LoriePixmapPriv 
 #define LORIE_PIXMAP_PRIV_FROM_PIXMAP(p) ((p)->priv)
 static struct {
     Bool gpuPresentDisabled;
-    Bool rootPresentGpu, exaCompositeOpt;
+    Bool rootPresentGpu, rootPresentAsync, exaCompositeOpt;
     int accessLocks;
     struct { Bool legacyDrawing; } root;
     struct lorie_shared_server_state *state;
     uint64_t gpuCopySerialCounter, rootGpuCopyPending;
+    uint64_t rootPresentLastSerial, rootPresentAsyncQueued, rootPresentCpuFlushes, rootPresentCpuFlushUs;
     struct { uint32_t seq; } rootCopy;
 } vfb, *pvfb = &vfb;
 static struct { void *devPrivate; } screen, *pScreenPtr = &screen;
@@ -106,6 +107,7 @@ static Bool lorieRootTwinned(void) { return fakeRootTwinned; }
 static Bool lorieAhbPerAccess(void) { return TRUE; }
 static Bool lorieOwnershipAsked(void) { return FALSE; }
 static void lorieRootCopyWait(Bool takeBack) { (void) takeBack; }
+static void lorieXRenderAsyncFlush(void) {} /* P11-C5-B2's replay is tested separately */
 static bool lorieConnectionAlive(void) { return connectionAlive; }
 /* InitOutput.c's, but a pixmap not yet a buffer is not converted to one: every pixmap here has its buffer */
 static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
@@ -3031,6 +3033,73 @@ int main(void) {
               "P11-C4 root Present completion did not release buffer references");
         fakeRootTwinned = FALSE;
         pvfb->rootPresentGpu = FALSE;
+    }
+    /* P11-C5-B1: an opt-in GPU Present to a twinned root returns before its Vulkan fence,
+     * retaining the existing Present ref/ack lifetime. A CPU owner of *that* back buffer waits
+     * only at the conflict boundary, before it acquires an EXA lock. When the renderer disappears
+     * before recording the job, settlement cancels it safely and Present still owns the ack. */
+    {
+        BoxRec oneBox = { 0, 0, 50, 20 };
+        RegionRec one = { 1, &oneBox };
+        uint64_t previousFlushes = pvfb->rootPresentCpuFlushes;
+        fakeRootTwinned = TRUE;
+        pvfb->rootPresentGpu = TRUE;
+        pvfb->rootPresentAsync = TRUE;
+        pvfb->exaCompositeOpt = TRUE;
+        st.diag.active = LORIE_ACTIVE_VULKAN;
+        CHECK(!st.gpuInFlight.busy && st.gpuCopyQueue.readIndex == st.gpuCopyQueue.writeIndex,
+              "P11-C5-B1 async root test must start with an empty GPU queue");
+        onWakeForRootGpuTest = NULL;  // no renderer: a synchronous path would stall here
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer) &&
+              pvfb->rootPresentLastSerial == serial && pvfb->rootPresentAsyncQueued == 1 &&
+              pvfb->rootGpuCopyPending == 1 && pvfb->rootPresentCpuFlushes == previousFlushes &&
+              !lorieGpuCopyIsDone(serial) && st.lock == 0,
+              "async root Present waited for GPU instead of returning with a pending operation");
+
+        // A GPU submit can happen after the X server went back to processing requests.
+        rootGpuWorkerStart();
+        if (rootGpuWorkerMade)
+            pthread_join(rootGpuWorker, NULL);
+        CHECK(rootGpuWorkerMade && lorieGpuCopyIsDone(serial) && st.gpuInFlight.busy == 0,
+              "the async Present never submitted/completed on the renderer thread");
+        lorieAsyncRootPresentWait();  // fast path: fence already done; no CPU wait
+        CHECK(pvfb->rootPresentCpuFlushes == previousFlushes && pvfb->rootGpuCopyPending == 1,
+              "completed async Present forced a second CPU wait or released the Present's ack");
+        lorieGpuCopyAck(&srcPix, dstBuffer);  // only Present owns the queued pixmap/ack references
+
+        // The next GPU Present is again asynchronous. CPU must block on its exact last serial.
+        rootGpuWorkerMade = false;
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer) &&
+              !lorieGpuCopyIsDone(serial), "async root job was completed synchronously");
+        rootGpuWorkerStart();
+        lorieAsyncRootPresentWait();  // root's next CPU reader/writer is the synchronization boundary
+        if (rootGpuWorkerMade)
+            pthread_join(rootGpuWorker, NULL);
+        CHECK(rootGpuWorkerMade && lorieGpuCopyIsDone(serial) &&
+              pvfb->rootPresentCpuFlushes == previousFlushes + 1 &&
+              pvfb->rootPresentCpuFlushUs > 0 && pvfb->rootGpuCopyPending == 1 && !st.lock,
+              "root's first CPU conflict did not flush the GPU writer outside EXA locks");
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+
+        // Disconnected renderer: lorieGpuCopySettle cancels the untouched request; it is
+        // never executed on a later renderer and its refs remain until Present acknowledges.
+        CHECK(lorieTryScheduleGpuCopy(&srcPix, &rootPix, &one, 0, 0, &serial, &dstBuffer),
+              "async root did not schedule the request that will be cancelled");
+        connectionAlive = false;
+        lorieAsyncRootPresentWait();
+        e = &st.gpuCopyQueue.entries[(st.gpuCopyQueue.writeIndex - 1) % LORIE_GPU_COPY_QUEUE_CAPACITY];
+        CHECK(e->cancelled && pvfb->rootGpuCopyPending == 1 && !st.lock,
+              "disconnected root copy must be cancelled but retain its Present refs");
+        connectionAlive = true;
+        rendererVkApplyPendingGpuCopies();
+        CHECK(lorieGpuCopyIsDone(serial) && e->recorded == LORIE_GPU_COPY_SKIPPED,
+              "cancelled root copy later executed on a renderer");
+        lorieGpuCopyAck(&srcPix, dstBuffer);
+        CHECK(!pvfb->rootGpuCopyPending && !src->refs && !src->gpuCopyPending,
+              "async Present cleanup leaked source refs or pending root copy");
+        pvfb->rootPresentAsync = FALSE;
+        pvfb->rootPresentGpu = FALSE;
+        fakeRootTwinned = FALSE;
     }
     CHECK(emu.violations == 0 && src->refs == 0 && fresh->refs == 0 && vfb.rootGpuCopyPending == 0, "at the end: %d violations, held refs",
           emu.violations);
