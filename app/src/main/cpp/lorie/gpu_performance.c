@@ -19,12 +19,14 @@
 #include "gpu_performance_policy.h"
 
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <android/log.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -36,6 +38,7 @@ static _Atomic int thermalStatus;
 static _Atomic bool appForeground;
 static _Atomic uint64_t lastPresentedNs;
 static _Atomic uint64_t presentedCount;
+static _Atomic unsigned displayRefreshHz = 60;
 static pthread_mutex_t workerMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t workerWake = PTHREAD_COND_INITIALIZER;
 static bool workerStarted;
@@ -84,11 +87,25 @@ struct gpu_pbuffer {
     EGLDisplay display;
     EGLSurface surface;
     EGLContext context;
+    PFNEGLCREATESYNCKHRPROC createSync;
+    PFNEGLCLIENTWAITSYNCKHRPROC waitSync;
+    PFNEGLDESTROYSYNCKHRPROC destroySync;
+    EGLSyncKHR pending[2];
+    unsigned pendingHead, pendingCount;
+    uint64_t oldestQueuedNs;
+    bool asyncEnabled;
 };
 
 static void releasePbuffer(struct gpu_pbuffer *gpu) {
     if (gpu->display == EGL_NO_DISPLAY)
         return;
+    if (gpu->destroySync) {
+        while (gpu->pendingCount) {
+            gpu->destroySync(gpu->display, gpu->pending[gpu->pendingHead]);
+            gpu->pendingHead = (gpu->pendingHead + 1) % 2;
+            gpu->pendingCount--;
+        }
+    }
     eglMakeCurrent(gpu->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (gpu->surface != EGL_NO_SURFACE)
         eglDestroySurface(gpu->display, gpu->surface);
@@ -146,7 +163,70 @@ static bool setupPbuffer(struct gpu_pbuffer *gpu) {
     if (gpu->surface == EGL_NO_SURFACE ||
         eglMakeCurrent(gpu->display, gpu->surface, gpu->surface, gpu->context) != EGL_TRUE)
         return false;
+    const char *extensions = eglQueryString(gpu->display, EGL_EXTENSIONS);
+    if (extensions && strstr(extensions, "EGL_KHR_fence_sync")) {
+        gpu->createSync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
+        gpu->waitSync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
+        gpu->destroySync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
+        gpu->asyncEnabled = gpu->createSync && gpu->waitSync && gpu->destroySync;
+    }
     GPU_LOG("EGL pbuffer ready: ES%d 16x16; all GPU vendors use the same path", esVersion);
+    GPU_LOG("async bounded GPU queue: %s (fallback glFinish available)",
+            gpu->asyncEnabled ? "available" : "unavailable");
+    return true;
+}
+
+/* Performance mode: at most two unconsumed off-screen GPU fences. Queueing a
+ * tiny GL clear followed by an EGL fence and glFlush avoids repeatedly
+ * blocking the helper CPU in glFinish(), without creating an unbounded GPU
+ * backlog. No fence or surface is shared with X11. Balanced and Maximum keep
+ * the previous glFinish workload, so real-device A/B remains possible.
+ * Return false to fall back to the original glFinish path. */
+static bool gpuPerfAsyncPulse(struct gpu_pbuffer *gpu, uint64_t pulseIndex,
+                              bool *submitted, uint64_t *completed) {
+    *submitted = false;
+    if (!gpu->asyncEnabled)
+        return false;
+
+    if (gpu->pendingCount == 2) {
+        EGLSyncKHR oldest = gpu->pending[gpu->pendingHead];
+        EGLint result = gpu->waitSync(gpu->display, oldest, 0, 0);
+        if (result == EGL_CONDITION_SATISFIED_KHR) {
+            gpu->destroySync(gpu->display, oldest);
+            gpu->pendingHead = (gpu->pendingHead + 1) % 2;
+            gpu->pendingCount--;
+            (*completed)++;
+            gpu->oldestQueuedNs = monoNs();
+        } else if (result == EGL_TIMEOUT_EXPIRED_KHR) {
+            if (monoNs() - gpu->oldestQueuedNs > UINT64_C(1000000000)) {
+                GPU_ERR("async GPU fence stalled for 1s; stopping synthetic GPU work");
+                gpu->asyncEnabled = false;
+                atomic_store_explicit(&selectedMode, GPU_PERF_OFF, memory_order_relaxed);
+                return true;  /* Do not call a potentially unbounded glFinish. */
+            }
+            return true;  /* Saturated: caller yields; do not submit more. */
+        } else {
+            GPU_ERR("async GPU fence error %#x; stopping synthetic GPU work", eglGetError());
+            gpu->asyncEnabled = false;
+            atomic_store_explicit(&selectedMode, GPU_PERF_OFF, memory_order_relaxed);
+            return true;
+        }
+    }
+
+    glClearColor((float)(pulseIndex & 255) / 255.0f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    EGLSyncKHR sync = gpu->createSync(gpu->display, EGL_SYNC_FENCE_KHR, NULL);
+    if (sync == EGL_NO_SYNC_KHR) {
+        GPU_ERR("EGL fence creation failed %#x; falling back to glFinish", eglGetError());
+        gpu->asyncEnabled = false;
+        return false;
+    }
+    glFlush();  /* Flush the clear AND fence into the driver's command stream. */
+    if (!gpu->pendingCount)
+        gpu->oldestQueuedNs = monoNs();
+    gpu->pending[(gpu->pendingHead + gpu->pendingCount) % 2] = sync;
+    gpu->pendingCount++;
+    *submitted = true;
     return true;
 }
 
@@ -170,6 +250,28 @@ static long tryReadGpuClock(void) {
     return -1;
 }
 
+/* Read-only, optional evidence for evaluating the system GPU governor. This
+ * never changes DVFS/thermal/cpuset state; unsupported nodes report -1. */
+static long tryReadGpuBusyPercent(void) {
+    FILE *f = fopen("/sys/kernel/gpu/gpu_busy", "r");
+    if (f) {
+        long pct = -1;
+        int read = fscanf(f, "%ld", &pct);
+        fclose(f);
+        if (read == 1 && pct >= 0 && pct <= 100)
+            return pct;
+    }
+    f = fopen("/sys/class/kgsl/kgsl-3d0/gpubusy", "r");
+    if (f) {
+        unsigned long busy = 0, total = 0;
+        int read = fscanf(f, "%lu %lu", &busy, &total);
+        fclose(f);
+        if (read == 2 && total && busy <= total)
+            return (long)((double)busy * 100.0 / (double)total);
+    }
+    return -1;
+}
+
 static const char *modeName(int mode) {
     switch (mode) {
         case GPU_PERF_BALANCED: return "balanced";
@@ -188,12 +290,15 @@ static void *gpuPerformanceThread(void *unused) {
     unsigned delayUs = 400;
     uint64_t sampleNs = monoNs(), sampleCpu = cpuNs(), reportNs = sampleNs;
     uint64_t loops = 0, previousLoops = 0, oldFrames = 0;
+    uint64_t completedAsync = 0, oldCompletedAsync = 0;
+    unsigned previousHz = 0;
     unsigned measuredCpu = 0;
 
     for (;;) {
         int mode = atomic_load_explicit(&selectedMode, memory_order_relaxed);
         bool foreground = atomic_load_explicit(&appForeground, memory_order_relaxed);
         int thermal = atomic_load_explicit(&thermalStatus, memory_order_relaxed);
+        unsigned refreshHz = atomic_load_explicit(&displayRefreshHz, memory_order_relaxed);
         uint64_t now = monoNs();
         uint64_t last = atomic_load_explicit(&lastPresentedNs, memory_order_relaxed);
         bool work = gpuPerfShouldWork(mode, foreground, thermal, now, last);
@@ -206,9 +311,23 @@ static void *gpuPerformanceThread(void *unused) {
             previousMode = -1;
             sampleNs = now;
             sampleCpu = cpuNs();
-            reportNs = now;
-            oldFrames = atomic_load(&presentedCount);
-            previousLoops = loops;
+            if (mode != GPU_PERF_OFF && now - reportNs >= UINT64_C(5000000000)) {
+                GPU_LOG("state=idle mode=%s visible=%d thermal=%d refresh_hz=%u "
+                        "last_frame_age_ms=%lld frames=%llu/5s reason=%s",
+                        modeName(mode), foreground, thermal, refreshHz,
+                        last && now >= last ?
+                            (long long)((now - last) / UINT64_C(1000000)) : -1LL,
+                        (unsigned long long)(atomic_load(&presentedCount) - oldFrames),
+                        !foreground ? "not_visible" :
+                        thermal >= 4 ? "thermal" :
+                        !last ? "no_frame" : "frames_idle");
+            }
+            if (now - reportNs >= UINT64_C(5000000000) || mode == GPU_PERF_OFF) {
+                reportNs = now;
+                oldFrames = atomic_load(&presentedCount);
+                previousLoops = loops;
+                oldCompletedAsync = completedAsync;
+            }
             waitForNewWork();
             continue;
         }
@@ -224,16 +343,23 @@ static void *gpuPerformanceThread(void *unused) {
             initialized = true;
         }
 
-        if (mode != previousMode) {
+        if (mode != previousMode || refreshHz != previousHz) {
             delayUs = mode == GPU_PERF_MAXIMUM ? 0 :
-                      mode == GPU_PERF_PERFORMANCE ? 200 : 700;
+                      mode == GPU_PERF_PERFORMANCE ?
+                          (refreshHz >= 90 ? 100 : 200) :
+                          (refreshHz >= 90 ? 400 : 700);
             previousMode = mode;
+            previousHz = refreshHz;
             sampleNs = reportNs = now;
             sampleCpu = cpuNs();
             previousLoops = loops;
             oldFrames = atomic_load(&presentedCount);
-            GPU_LOG("active mode=%s initial_delay_us=%u foreground=%d thermal=%d",
-                    modeName(mode), delayUs, foreground, thermal);
+            oldCompletedAsync = completedAsync;
+            GPU_LOG("state=active mode=%s initial_delay_us=%u visible=%d thermal=%d "
+                    "refresh_hz=%u gpu_path=%s",
+                    modeName(mode), delayUs, foreground, thermal, refreshHz,
+                    mode == GPU_PERF_PERFORMANCE && gpu.asyncEnabled ?
+                        "bounded_async" : "glFinish");
         }
         wasActive = true;
 
@@ -241,9 +367,20 @@ static void *gpuPerformanceThread(void *unused) {
          * back-to-back clear. No window surface, swapchain or X11 locks. */
         uint64_t pulseStartNs = monoNs();
         uint64_t pulseCpuStartNs = cpuNs();
-        glClearColor((float)(loops & 255) / 255.0f, 0.f, 0.f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFinish();
+        bool submitted = false;
+        bool asyncHandled = mode == GPU_PERF_PERFORMANCE &&
+                gpuPerfAsyncPulse(&gpu, loops, &submitted, &completedAsync);
+        if (!asyncHandled) {
+            glClearColor((float)(loops & 255) / 255.0f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glFinish();
+            submitted = true;
+        }
+        if (!submitted) {
+            // Two outstanding fences: no busy polling or unlimited queue.
+            sleepForUs(100);
+            continue;
+        }
         loops++;
         if ((loops & 1023u) == 0 && glGetError() != GL_NO_ERROR) {
             GPU_ERR("GLES context error; disabling assist (X11 unaffected)");
@@ -258,7 +395,7 @@ static void *gpuPerformanceThread(void *unused) {
              * CPU if a vendor's glFinish spins for more time than max_sleep_us.
              * Charge the helper's actual CPU time to the budget and yield the
              * difference. This preserves kernel scheduling for all OTHER tasks. */
-            unsigned budget = gpuPerfLimits(mode).cpu_budget_percent;
+            unsigned budget = gpuPerfLimitsForRefresh(mode, refreshHz).cpu_budget_percent;
             uint64_t busyNs = cpuNs() - pulseCpuStartNs;
             uint64_t elapsedNs = monoNs() - pulseStartNs;
             uint64_t requiredNs = (busyNs / budget) * 100 +
@@ -277,20 +414,26 @@ static void *gpuPerformanceThread(void *unused) {
             measuredCpu = (unsigned)((deltaCpu * 100) / deltaWall);
             if (measuredCpu > 100)
                 measuredCpu = 100;
-            delayUs = gpuPerfNextSleep(mode, delayUs, measuredCpu);
+            delayUs = gpuPerfNextSleepForRefresh(mode, refreshHz, delayUs, measuredCpu);
             sampleNs = now;
             sampleCpu = c;
         }
         if (now - reportNs >= UINT64_C(5000000000)) {
             uint64_t totalFrames = atomic_load(&presentedCount);
-            GPU_LOG("mode=%s pulses=%llu/5s cpu_pct=%u sleep_us=%u frames=%llu/5s "
-                    "gpu_clock_raw=%ld thermal=%d foreground=%d",
+            GPU_LOG("state=active mode=%s pulses=%llu/5s cpu_pct=%u sleep_us=%u "
+                    "frames=%llu/5s refresh_hz=%u gpu_path=%s async_done=%llu/5s "
+                    "async_pending=%u gpu_clock_raw=%ld gpu_busy_pct=%ld thermal=%d visible=%d",
                     modeName(mode), (unsigned long long)(loops - previousLoops),
                     measuredCpu, delayUs,
                     (unsigned long long)(totalFrames - oldFrames),
-                    tryReadGpuClock(), thermal, foreground);
+                    refreshHz, mode == GPU_PERF_PERFORMANCE && gpu.asyncEnabled ?
+                        "bounded_async" : "glFinish",
+                    (unsigned long long)(completedAsync - oldCompletedAsync),
+                    gpu.pendingCount, tryReadGpuClock(), tryReadGpuBusyPercent(),
+                    thermal, foreground);
             oldFrames = totalFrames;
             previousLoops = loops;
+            oldCompletedAsync = completedAsync;
             reportNs = now;
         }
     }
@@ -335,6 +478,14 @@ void gpuPerformanceSetForeground(bool foreground) {
 
 void gpuPerformanceSetThermal(int status) {
     atomic_store_explicit(&thermalStatus, status, memory_order_relaxed);
+    wakeWorker();
+}
+
+void gpuPerformanceSetRefreshRate(float refresh_rate) {
+    if (refresh_rate < 30.0f || refresh_rate > 240.0f)
+        refresh_rate = 60.0f;
+    unsigned hz = (unsigned)(refresh_rate + 0.5f);
+    atomic_store_explicit(&displayRefreshHz, hz, memory_order_relaxed);
     wakeWorker();
 }
 

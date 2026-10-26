@@ -146,7 +146,7 @@ E.g. <b>META</b> for <i>META key</i>, \n
 
     <string name="lorie_pref_rendererOutputMode">Renderer output mode (experimental)</string>
     <string name="lorie_pref_gpuPerformanceMode">Adaptive GPU Performance (experimental)</string>
-    <string name="lorie_pref_gpuPerformanceMode_summary">Rootless GPU warm-up for any EGL/GLES GPU; active only with on-screen frames. Balanced and Performance limit helper CPU use. Maximum can cause heavy heat and battery drain. Disable external gpu_keepalive to prevent duplication.</string>
+    <string name="lorie_pref_gpuPerformanceMode_summary">Rootless GPU warm-up for any EGL/GLES GPU while the window is visible and rendering. Performance uses bounded asynchronous GPU submissions when supported. Maximum can cause heavy heat and battery drain. Disable external gpu_keepalive to prevent duplication.</string>
     <string-array name="lorie_pref_gpuPerformanceMode_entries">
         <item>Off (default, external helper compatible)</item>
         <item>Balanced (low CPU / battery priority)</item>
@@ -158,6 +158,18 @@ E.g. <b>META</b> for <i>META key</i>, \n
         <item>balanced</item>
         <item>performance</item>
         <item>maximum</item>
+    </string-array>
+    <string name="lorie_pref_highRefreshSurfacePolicy">On-screen 90 Hz+ Surface pacing (experimental)</string>
+    <string name="lorie_pref_highRefreshSurfacePolicy_summary">Changes only the on-screen 90 Hz+ Surface frame-rate hint, not display resolution or DeX. Default is recommended for variable-rate graphics; Legacy reproduces the old FIXED_SOURCE path; System sends no hint.</string>
+    <string-array name="lorie_pref_highRefreshSurfacePolicy_entries">
+        <item>Default graphics (recommended)</item>
+        <item>System managed (no hint)</item>
+        <item>Legacy fixed-source (old 120 Hz behavior)</item>
+    </string-array>
+    <string-array name="lorie_pref_highRefreshSurfacePolicy_values">
+        <item>default</item>
+        <item>system</item>
+        <item>legacy_fixed</item>
     </string-array>
     <string name="lorie_pref_rendererOutputMode_summary">Compatibility first keeps the extra post-swap submit and its fence. Fast gaming output drops both. The paced variant additionally coalesces a redraw for a few frames after a slow swap. Gaming modes are experimental.</string>
     <string-array name="lorie_pref_rendererOutputMode_entries">

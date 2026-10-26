@@ -7,4 +7,5 @@
 void gpuPerformanceSetMode(int mode);
 void gpuPerformanceSetForeground(bool foreground);
 void gpuPerformanceSetThermal(int status);
+void gpuPerformanceSetRefreshRate(float refresh_rate);
 void gpuPerformanceNoteFrame(void);

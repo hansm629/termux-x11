@@ -318,6 +318,9 @@ static bool lorie_mutex_trylock(volatile int *m, volatile int *pid) {
 static Bool lorieGpuCopyIsDone(uint64_t serial);
 static int lorieGpuCopySettle(uint64_t serial);
 static void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer);
+/* App-side GPU warm-up observes a successful present; it does not participate
+ * in X11/Vulkan copy ordering, so the host Vulkan harness uses a no-op stub. */
+static void gpuPerformanceNoteFrame(void) { }
 #include "presentcopy_src.inc"
 
 /* P11-C3-D2: what the X server does meanwhile - whether the root copy was settled as the renderer took the lock (-1: it

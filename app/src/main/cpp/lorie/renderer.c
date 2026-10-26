@@ -1031,6 +1031,7 @@ __unused void rendererSetDisplayRefreshRate(JNIEnv* env, jobject self, jfloat re
         refreshRate = 60.0f;
 
     rendererDisplayRefreshRateHz = refreshRate;
+    gpuPerformanceSetRefreshRate(refreshRate);
 
     if (refreshRate >= 90.0f) {
         rendererHighRefreshEnabled = true;
@@ -1738,15 +1739,18 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         }
     }
 
+    EGLBoolean swapSucceeded;
     if (rendererPerfLogEnabled) {
         int64_t swapStartNs = rendererNowNs();
 
-        if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
+        swapSucceeded = eglSwapBuffers(egl_display, sfc);
+        if (swapSucceeded != EGL_TRUE)
             printEglError("Failed to swap buffers", __LINE__);
 
         swapUs = rendererNsToUs(rendererNowNs() - swapStartNs);
     } else {
-        if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
+        swapSucceeded = eglSwapBuffers(egl_display, sfc);
+        if (swapSucceeded != EGL_TRUE)
             printEglError("Failed to swap buffers", __LINE__);
     }
 
@@ -1784,7 +1788,8 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     state->renderedFrames++;
-    gpuPerformanceNoteFrame(); // GLES: visible frame, not a synthetic helper submission.
+    if (swapSucceeded == EGL_TRUE)
+        gpuPerformanceNoteFrame(); // GLES: only a successfully swapped display frame.
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
 
     if (rendererPerfLogEnabled) {

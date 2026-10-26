@@ -1,5 +1,73 @@
 # Termux-X11 Universal Adaptive GPU Performance Controller (experimental)
 
+## v2: S24+ and S26U on-screen / DeX findings (2026-10-26)
+
+The user observed S26U **1920×1080/120 Hz on-screen vkmark 5,369**
+versus **1920×1080/60 Hz DeX 12,086** (about 2.25×), with little
+improvement from the first integrated controller on S24+. These numbers
+are observations, **not a verified GPU-clock or Android governor root
+cause**. Physical display mode, Android Activity visibility, CPU cgroup,
+surface frame pacing and helper submission pressure must be separated.
+The external keepalive and app's integrated helper must never run
+concurrently during a comparison.
+
+This revision changes the following independently:
+
+1. **Multi-display visibility:** the helper follows Activity
+   `onStart/onStop` rather than `onResume/onPause`. A DeX multi-window
+   Activity can be paused while visible; the 1.1 s real-frame inactivity
+   cutoff and severe-thermal shutdown are unchanged. The thermal listener
+   now runs throughout visible time.
+2. **On-screen surface hint:** Android's `FIXED_SOURCE` is for video,
+   not an X11 graphics renderer. At 90 Hz or higher on the default display,
+   the new *Default graphics* policy uses
+   `FRAME_RATE_COMPATIBILITY_DEFAULT` with `ONLY_IF_SEAMLESS`.
+   *Legacy fixed-source* restores the old code for A/B. *System managed*
+   clears the hint. External/DeX 60 Hz clears any stale hint and otherwise
+   uses the native display policy. This does **not** cap the display at
+   60 Hz or rewrite the X11 resolution.
+3. **Bounded GPU work:** Performance mode uses a 2-fence EGL
+   `EGL_KHR_fence_sync` queue, `glFlush`, and nonblocking completion
+   polls when supported. There is no unbounded GPU submission, extra
+   X11 fence, or busy CPU poll. Unsupported EGL drivers use the previous
+   `glFinish` path; severe stalls disable the assist rather than freezing
+   the compositor. Balanced and Maximum retain the older `glFinish`
+   path, so their behavior can be compared.
+4. **Refresh-aware but vendor-neutral limits:** at >=90 Hz, Balanced
+   targets 16% helper CPU duty and Performance 36% (versus 12% and 28%
+   at 60 Hz). Maximum remains unlimited and should only be used briefly.
+   These are explicit power/performance tradeoffs, not a guarantee of
+   DeX-level FPS on every GPU.
+5. **Diagnostics while inactive:** `LorieGpuPerf` logs active/idle,
+   `visible`, `thermal`, `refresh_hz`, active EGL path, queue counts,
+   frames per five seconds, optional GPU clock/busy reads, and reasons
+   for inactivity. A silent helper no longer looks like a working helper.
+
+**Test protocol:** Install the APK + companion from the same CI build.
+Use `TX11_GPU_KEEPALIVE=0 tx11start`, with exactly the same Termux
+Desktop XFCE, native Termux clients and PRoot programs as before.
+Start with Performance and *Default graphics*, check `LorieGpuPerf` logs,
+then run one light and one heavy item each for vkmark and glmark2.
+Repeat at 1920×1080 on the S26U's 120 Hz panel and 60 Hz DeX display.
+For isolating the Surface hint, change **only** Default graphics to
+Legacy fixed-source while still on the 120 Hz panel. This control
+has no effect on DeX 60 Hz. Save a short diagnostic snapshot during
+each benchmark using:
+
+```sh
+sh tools/gpu-performance/capture-output-mode.sh onscreen
+sh tools/gpu-performance/capture-output-mode.sh dex
+```
+
+Compare **vkmark FPS/score, real content FPS, frame gaps, GPU clock/busy,
+and the benchmark process's /proc/PID/cgroup**; do not infer client CPU
+placement from the DevSpace shell's own cgroup. If the helper logs
+`state=idle` or `gpu_path=glFinish`, treat that as a separate
+diagnosis from a working bounded-async path. On S24+, compare briefly
+with Maximum to check whether small synthetic GLES activity can
+reproduce the known external 0 µs helper effect; do not leave Maximum
+enabled in daily use.
+
 ## Why this exists
 
 Samsung OneUI 8/9 and some Qualcomm/Samsung GPU firmwares show much worse
@@ -29,16 +97,19 @@ X server locks or fd synchronization chains.
 
 - A successful Vulkan or GLES screen presentation refreshes an atomic activity
   timestamp. **No** auxiliary jobs are dispatched to the screen.
-- MainActivity's onResume/onPause indicates visible foreground state.
+- MainActivity's onStart/onStop indicates window visibility, including
+  DeX multi-window while another window has input focus.
 - Android API 29+ thermal callbacks immediately suspend synthetic work at
   SEVERE / CRITICAL / EMERGENCY / SHUTDOWN. Earlier Android releases rely on
   screen/foreground gating; they do not receive the optional thermal callback.
 - No frames for at least 1.1 seconds, no foreground, severe thermal, or Off mode:
   helper **stops sending GPU work** and waits using pthread_cond_timedwait.
-- Balanced/Performance modes add nanosleep after each GLES job, cap the helper's
+- Balanced/Performance modes add nanosleep after each GPU job, cap the helper's
   **per-pulse CPU duty** using CLOCK_THREAD_CPUTIME_ID, then adjust the inter-job
   sleep on a 250 ms feedback interval. CPU utilization is the HELPER ONLY,
   not the whole CPU package, and can still vary with driver sleep accounting.
+- Performance uses bounded asynchronous EGL fences when supported. Balanced
+  retains synchronous glFinish for low-power control and comparison.
 - Maximum is the historical unlimited 0µs loop, for benchmark comparison.
   This can occupy a big core, worsen heat and battery, and should not be a
   production default.
@@ -62,8 +133,8 @@ Modes:
 | Mode | Auxiliary GPU requests | Nominal helper CPU policy |
 |---|---|---|
 | Off | Never | 0 |
-| Balanced | Off when idle; dynamic, min 250 µs inter-job sleep | ~12% duty target |
-| Performance | Off when idle; dynamic, min 50 µs inter-job sleep | ~28% duty target |
+| Balanced | Off when idle; 250 µs minimum at 60 Hz, 160 µs at 120 Hz | 12% at 60 Hz / 16% at 120 Hz |
+| Performance | Off when idle; bounded async EGL queue when available; fallback glFinish | 28% at 60 Hz / 36% at 120 Hz |
 | Maximum | Off when idle or app hidden; 0 µs when active | Unlimited; diagnostic only |
 
 **Default OFF on experimental builds.** The user's installed custom
@@ -109,9 +180,11 @@ logcat -d -s LorieGpuPerf:I | tail -n 30
 pidof gpu_keepalive  # should print nothing during integrated-mode testing
 ```
 
-Log fields: `mode`, `pulses/5s`, `cpu_pct` (auxiliary thread only),
-`sleep_us`, `frames/5s`, optional `gpu_clock_raw` (vendor units), `thermal`,
-`foreground`. If there are no presentation events, the helper stays idle.
+Log fields: `state=active|idle`, `mode`, `pulses/5s`, `cpu_pct`
+(auxiliary thread only), `sleep_us`, `frames/5s`, `refresh_hz`,
+`gpu_path`, `async_done`, `async_pending`, optional `gpu_clock_raw`
+(vendor units), `gpu_busy_pct`, `thermal`, `visible`.
+If there are no presentation events, the helper stays idle.
 
 ## A/B procedure for S24+ and S26U
 

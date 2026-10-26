@@ -879,6 +879,9 @@ setViewport(viewport.left, viewport.top, viewport.width(), viewport.height(), p.
             default: gpuModeValue = 0; break;
         }
         setGpuPerformanceModeNative(gpuModeValue);
+        // Re-evaluate the high-refresh hint when its experimental policy
+        // changes without requiring a Surface destruction/recreation.
+        updateRendererDisplayRefreshRate();
         String displayFilteringMode = p.displayFilteringMode.get();
         setFiltering("nearest".equals(displayFilteringMode) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
 
@@ -1018,28 +1021,32 @@ hardwareKbdScancodesWorkaround = p.hardwareKbdScancodesWorkaround.get();
 private void requestRendererSurfaceFrameRate(float refreshRate) {
     if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R)
         return;
-
-    // v3.13:
-    // Keep v3.12A on on-screen 90Hz+ output.
-    // Restore the v3.7-style DeX/60Hz path by not requesting Surface frame rate.
-    if (refreshRate < 90.0f) {
-        android.util.Log.d("LorieView", "v3.13 skipped surface frame rate request for low refresh " + refreshRate);
-        return;
-    }
-
     try {
         android.view.Surface surface = getHolder() != null ? getHolder().getSurface() : null;
-
         if (surface == null || !surface.isValid())
             return;
-
+        // Android documents FIXED_SOURCE for video playback. An X11 desktop
+        // produces variable-rate frames; it should use DEFAULT compatibility.
         surface.setFrameRate(
                 refreshRate,
                 android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
-                android.view.Surface.CHANGE_FRAME_RATE_ALWAYS);
-
-        android.util.Log.d("LorieView", "v3.13 requested surface frame rate DEFAULT ALWAYS " + refreshRate);
-    } catch (Throwable ignored) {
+                android.view.Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS);
+        android.util.Log.i("LorieView", "high-refresh Surface policy=default refresh=" + refreshRate);
+    } catch (Throwable t) {
+        android.util.Log.w("LorieView", "high-refresh default Surface hint unavailable", t);
+    }
+}
+private void clearRendererSurfaceFrameRate() {
+    if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R)
+        return;
+    try {
+        android.view.Surface surface = getHolder().getSurface();
+        if (surface != null && surface.isValid())
+            surface.setFrameRate(0.0f,
+                    android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    android.view.Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS);
+    } catch (Throwable t) {
+        android.util.Log.w("LorieView", "could not reset Surface frame-rate hint", t);
     }
 }
     /* v3.26-fixed-source-helper-begin */
@@ -1088,43 +1095,25 @@ private void updateRendererDisplayRefreshRate() {
         refreshRate = 60.0f;
 
     rendererSetDisplayRefreshRate(refreshRate);
-        /* v3.26-onscreen-surface-rate-fixed-source-begin */
-        // v3.26: keep DeX/external-display path untouched.
-        // Only default-display high-refresh on-screen output requests FIXED_SOURCE
-        // Surface frame rate, to force Android compositor pacing to 120Hz.
-        /* v3.28-display-diagnostic-begin */
-        // v3.28: diagnostic only. No timing, wait, sleep, skip, or renderer path changes.
-        try {
-            android.view.Display v328Display = getDisplay();
-            int v328DisplayId = v328Display != null ? v328Display.getDisplayId() : -1;
-            boolean v328DefaultDisplay =
-                    v328Display != null &&
-                    v328Display.getDisplayId() == android.view.Display.DEFAULT_DISPLAY;
-            float v328DisplayRefresh =
-                    v328Display != null ? v328Display.getRefreshRate() : -1.0f;
-
-            android.util.Log.d("LorieView",
-                    "v3.28 display diagnostic: refreshRateArg=" + refreshRate
-                            + " displayRefresh=" + v328DisplayRefresh
-                            + " displayId=" + v328DisplayId
-                            + " defaultDisplay=" + v328DefaultDisplay
-                            + " highRefresh=" + (refreshRate >= 90.0f));
-        } catch (Throwable t) {
-            android.util.Log.w("LorieView",
-                    "v3.28 display diagnostic failed", t);
-        }
-        /* v3.28-display-diagnostic-end */
-        android.view.Display v326Display = getDisplay();
-        boolean v326DefaultDisplay =
-                v326Display != null &&
-                v326Display.getDisplayId() == android.view.Display.DEFAULT_DISPLAY;
-
-        if (refreshRate >= 90.0f && v326DefaultDisplay) {
-            requestRendererSurfaceFrameRateFixedSource(refreshRate);
-        } else {
-            requestRendererSurfaceFrameRate(refreshRate);
-        }
-        /* v3.26-onscreen-surface-rate-fixed-source-end */
+    android.view.Display display = getDisplay();
+    int displayId = display != null ? display.getDisplayId() : -1;
+    boolean onScreenHighRefresh = displayId == android.view.Display.DEFAULT_DISPLAY
+            && refreshRate >= 90.0f;
+    String policy = android.preference.PreferenceManager
+            .getDefaultSharedPreferences(getContext())
+            .getString("highRefreshSurfacePolicy", "default");
+    android.util.Log.i("LorieView", "output refresh=" + refreshRate
+            + " displayId=" + displayId + " highRefresh=" + onScreenHighRefresh
+            + " surfacePolicy=" + policy);
+    if (!onScreenHighRefresh || "system".equals(policy)) {
+        // DeX/60 Hz stays on the native Android policy; clear a stale on-screen
+        // hint when the same Surface is moved between displays.
+        clearRendererSurfaceFrameRate();
+    } else if ("legacy_fixed".equals(policy)) {
+        requestRendererSurfaceFrameRateFixedSource(refreshRate);
+    } else {
+        requestRendererSurfaceFrameRate(refreshRate);
+    }
 }
 
 @FastNative private native void rendererSetDisplayRefreshRate(float refreshRate);

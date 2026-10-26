@@ -32,6 +32,29 @@ int main(void) {
     CHECK(gpuPerfNextSleep(GPU_PERF_PERFORMANCE, 50, 0) == 50);
     CHECK(gpuPerfNextSleep(GPU_PERF_BALANCED, 0, 0) >= balanced.min_sleep_us);
     CHECK(gpuPerfNextSleep(GPU_PERF_BALANCED, 10000, 90) <= balanced.max_sleep_us);
+    struct gpu_perf_limits highBalanced = gpuPerfLimitsForRefresh(GPU_PERF_BALANCED, 120);
+    struct gpu_perf_limits highPerformance = gpuPerfLimitsForRefresh(GPU_PERF_PERFORMANCE, 120);
+    CHECK(highBalanced.cpu_budget_percent > balanced.cpu_budget_percent);
+    CHECK(highPerformance.cpu_budget_percent >
+          gpuPerfLimits(GPU_PERF_PERFORMANCE).cpu_budget_percent);
+    CHECK(highPerformance.cpu_budget_percent < 100);
+    CHECK(gpuPerfLimitsForRefresh(GPU_PERF_MAXIMUM, 120).cpu_budget_percent == 100);
+    CHECK(gpuPerfLimitsForRefresh(GPU_PERF_PERFORMANCE, 60).cpu_budget_percent ==
+          gpuPerfLimits(GPU_PERF_PERFORMANCE).cpu_budget_percent);
+    CHECK(gpuPerfNextSleepForRefresh(GPU_PERF_PERFORMANCE, 120, 10, 99) >=
+          highPerformance.min_sleep_us);
+    CHECK(gpuPerfNextSleepForRefresh(GPU_PERF_PERFORMANCE, 120, 10000, 99) <=
+          highPerformance.max_sleep_us);
+    for (unsigned hz = 60; hz <= 120; hz += 60) {
+        for (int mode = GPU_PERF_BALANCED; mode <= GPU_PERF_MAXIMUM; mode++) {
+            struct gpu_perf_limits limits = gpuPerfLimitsForRefresh(mode, hz);
+            unsigned sleep = limits.min_sleep_us;
+            for (int i = 0; i < 400; ++i) {
+                sleep = gpuPerfNextSleepForRefresh(mode, hz, sleep, (i % 2) ? 90 : 0);
+                CHECK(sleep >= limits.min_sleep_us && sleep <= limits.max_sleep_us);
+            }
+        }
+    }
     for (int mode = GPU_PERF_BALANCED; mode <= GPU_PERF_MAXIMUM; mode++) {
         struct gpu_perf_limits limits = gpuPerfLimits(mode);
         unsigned sleep = limits.min_sleep_us;
@@ -40,7 +63,7 @@ int main(void) {
             CHECK(sleep >= limits.min_sleep_us && sleep <= limits.max_sleep_us);
         }
     }
-    printf("TGPUPERFORMANCE idle/foreground/thermal and CPU duty regulator: %s (%d failures)\n",
+    printf("TGPUPERFORMANCE idle/visibility/thermal and 60/120Hz CPU duty: %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

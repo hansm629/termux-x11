@@ -33,6 +33,20 @@ static inline struct gpu_perf_limits gpuPerfLimits(int mode) {
     }
 }
 
+/* A 120 Hz on-screen compositor wakes more frequently than a 60 Hz DeX
+ * session. Allow a modestly tighter GPU-warmup budget at high refresh without
+ * spinning an entire CPU core. Never use vendor or device-model heuristics. */
+static inline struct gpu_perf_limits gpuPerfLimitsForRefresh(int mode, unsigned refresh_hz) {
+    struct gpu_perf_limits limits = gpuPerfLimits(mode);
+    if (refresh_hz >= 90) {
+        if (mode == GPU_PERF_BALANCED)
+            return (struct gpu_perf_limits) {160, 2500, 16};
+        if (mode == GPU_PERF_PERFORMANCE)
+            return (struct gpu_perf_limits) {25, 1600, 36};
+    }
+    return limits;
+}
+
 /* Severe / critical / emergency / shutdown: stop synthetic work immediately, without
  * attempting to alter the device's own thermal power policy. Android's thermal constants
  * are monotonic and THERMAL_STATUS_SEVERE is 4 on supported SDKs. */
@@ -52,9 +66,10 @@ static inline bool gpuPerfShouldWork(int mode, bool foreground, int thermal,
 /* Bounded feedback regulator. sleep_us is the delay AFTER an EGL clear + glFinish,
  * not a busy-loop wait. The CPU budget measures only the helper's CPU time;
  * the driver's internal GPU work/power cannot be inferred from this metric. */
-static inline unsigned gpuPerfNextSleep(int mode, unsigned sleep_us,
-                                        unsigned cpu_percent) {
-    struct gpu_perf_limits limits = gpuPerfLimits(mode);
+static inline unsigned gpuPerfNextSleepForRefresh(int mode, unsigned refresh_hz,
+                                                  unsigned sleep_us,
+                                                  unsigned cpu_percent) {
+    struct gpu_perf_limits limits = gpuPerfLimitsForRefresh(mode, refresh_hz);
     unsigned step;
     if (!limits.cpu_budget_percent || mode == GPU_PERF_MAXIMUM)
         return limits.min_sleep_us;
@@ -75,4 +90,9 @@ static inline unsigned gpuPerfNextSleep(int mode, unsigned sleep_us,
                limits.min_sleep_us : sleep_us - step;
     }
     return sleep_us;
+}
+
+static inline unsigned gpuPerfNextSleep(int mode, unsigned sleep_us,
+                                        unsigned cpu_percent) {
+    return gpuPerfNextSleepForRefresh(mode, 60, sleep_us, cpu_percent);
 }

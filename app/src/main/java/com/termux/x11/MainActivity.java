@@ -796,10 +796,10 @@ private void runTermuxCommandFromTopApp(Intent intent) {
     }
 
     @Override
-    public void onResume() {
-        scheduleOutputProfileRefresh("on-resume");
-
-        super.onResume();
+    public void onStart() {
+        super.onStart();
+        // A visible DeX / multi-window Activity can be PAUSED without being
+        // stopped. Gate the GPU helper on actual visibility, not input focus.
         LorieView gpuView = getLorieView();
         if (gpuView != null) {
             gpuView.setGpuPerformanceForeground(true);
@@ -811,6 +811,13 @@ private void runTermuxCommandFromTopApp(Intent intent) {
                 }
             }
         }
+    }
+
+    @Override
+    public void onResume() {
+        scheduleOutputProfileRefresh("on-resume");
+
+        super.onResume();
 
         mNotification = buildNotification();
         mNotificationManager.notify(mNotificationId, mNotification);
@@ -820,7 +827,7 @@ private void runTermuxCommandFromTopApp(Intent intent) {
     }
 
     @Override
-    public void onPause() {
+    public void onStop() {
         LorieView gpuView = getLorieView();
         if (gpuView != null) gpuView.setGpuPerformanceForeground(false);
         if (android.os.Build.VERSION.SDK_INT >= 29 && gpuThermalListener != null) {
@@ -831,6 +838,11 @@ private void runTermuxCommandFromTopApp(Intent intent) {
             }
             gpuThermalListener = null;
         }
+        super.onStop();
+    }
+
+    @Override
+    public void onPause() {
         inputMethodManager.hideSoftInputFromWindow(getWindow().getDecorView().getRootView().getWindowToken(), 0);
 
         for (StatusBarNotification notification: mNotificationManager.getActiveNotifications())

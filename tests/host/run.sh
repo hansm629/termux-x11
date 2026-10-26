@@ -59,7 +59,14 @@ else
     status=1
 fi
 
-# each rule broken in a copy of the sources: the test guarding it must fail
-CC="$CC" PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tcontrols.py" "$LORIE" "$OUT" "$BASE" || status=1
+# Each rule broken in a copy of the sources: the test guarding it must fail.
+# Android phones may take minutes compiling hundreds of mutation variants.
+# Mobile smoke runs may skip only mutation testing; all regular C/diagnostic
+# tests above still run. The default continues to execute every control.
+if [ "${TX11_SKIP_MUTATIONS:-0}" = 1 ]; then
+    echo "Mutation controls skipped (TX11_SKIP_MUTATIONS=1, mobile smoke only)"
+else
+    CC="$CC" PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tcontrols.py" "$LORIE" "$OUT" "$BASE" || status=1
+fi
 
 exit $status
