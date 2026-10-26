@@ -11,6 +11,7 @@ import static com.termux.x11.LoriePreferences.ACTION_PREFERENCES_CHANGED;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.AppOpsManager;
+import android.app.GameManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -798,6 +799,19 @@ private void runTermuxCommandFromTopApp(Intent intent) {
     @Override
     public void onStart() {
         super.onStart();
+        // Android GAME power mode experiment: read-only confirmation, no
+        // synthetic EGL work, CPU spin, private Power HAL or sysfs writes.
+        // An OEM may still choose not to grant a GPU frequency boost.
+        if (BuildConfig.GAME_POWER_EXPERIMENT && SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                GameManager gameManager = getSystemService(GameManager.class);
+                Log.i("LorieGamePower", "foreground=true app_category=" + getApplicationInfo().category
+                        + " game_mode=" + (gameManager != null ? gameManager.getGameMode() : -1)
+                        + " android_sdk=" + SDK_INT);
+            } catch (RuntimeException e) {
+                Log.w("LorieGamePower", "GameManager query unavailable; Android rendering unaffected", e);
+            }
+        }
         // A visible DeX / multi-window Activity can be PAUSED without being
         // stopped. Gate the GPU helper on actual visibility, not input focus.
         LorieView gpuView = getLorieView();

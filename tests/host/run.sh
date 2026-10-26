@@ -47,6 +47,7 @@ done
 # the diagnostics scripts, on synthetic logs and on the ones tdiaglog wrote with the real formatter
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tdiag.py" "$HERE/../../tools/diag" "$OUT" || status=1
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tgpuwiring.py" || status=1
+PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/tgamecategory.py" || status=1
 
 # where the X server calls the AHB ownership code, and the order of the renderer's Vulkan steps
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/twiring.py" "$LORIE" || status=1

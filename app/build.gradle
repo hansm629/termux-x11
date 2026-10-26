@@ -14,6 +14,18 @@ if (!(tx11CohostTermuxValue in ['true', 'false'])) {
     throw new GradleException('tx11CohostTermux must be exactly true or false')
 }
 def tx11CohostTermux = tx11CohostTermuxValue == 'true'
+// Rootless GPU DVFS experiment: only an explicitly selected CI/manual build
+// is classified as a GAME. Production/default Termux:X11 stays unchanged.
+// Android 14+ may tell its Power HAL the foreground app is a game, but the
+// OEM is free to ignore that hint. The merged manifest is verified in CI.
+def tx11GamePowerExperimentValue = providers.gradleProperty('tx11GamePowerExperiment').orElse('false').get()
+if (!(tx11GamePowerExperimentValue in ['true', 'false'])) {
+    throw new GradleException('tx11GamePowerExperiment must be exactly true or false')
+}
+def tx11GamePowerExperiment = tx11GamePowerExperimentValue == 'true'
+if (tx11CohostTermux && tx11GamePowerExperiment) {
+    throw new GradleException('Do not combine GAME category and Termux cohost experimental builds')
+}
 
 android {
     namespace 'com.termux.x11'
@@ -23,6 +35,7 @@ android {
         applicationId "com.termux.x11"
         manifestPlaceholders = [tx11ProcessHost: tx11CohostTermux ? 'com.termux' : 'com.termux.x11']
         buildConfigField "boolean", "TERMUX_COHOST", tx11CohostTermux.toString()
+        buildConfigField "boolean", "GAME_POWER_EXPERIMENT", tx11GamePowerExperiment.toString()
         minSdkVersion 26
         targetSdkVersion 34
         versionCode 15

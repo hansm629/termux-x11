@@ -8,6 +8,11 @@ on:
         required: false
         type: boolean
         default: false
+      game_power_mode:
+        description: 'EXPERIMENT: Classify non-Cohost Termux:X11 as a GAME for Android Power HAL GAME mode; no extra CPU/GPU work'
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - master
@@ -56,8 +61,17 @@ jobs:
 
     - name: Build
       run: |
+        if [[ "${{ inputs.game_power_mode }}" == "true" ]]; then
+          if [[ "${{ inputs.cohost_termux }}" == "true" ]]; then
+            echo 'GAME power mode and cohost cannot be combined'
+            exit 1
+          fi
+          python3 tools/oneui-game-power/category.py enable
+        fi
         if [[ "${{ inputs.cohost_termux }}" == "true" ]]; then
           ./gradlew assembleDebug -Ptx11CohostTermux=true
+        elif [[ "${{ inputs.game_power_mode }}" == "true" ]]; then
+          ./gradlew assembleDebug -Ptx11GamePowerExperiment=true
         else
           ./gradlew assembleDebug
         fi
@@ -68,12 +82,19 @@ jobs:
         else
           python3 tools/oneui-cohost/verify-manifest.py com.termux.x11
         fi
+    - name: Verify GAME category in merged manifest
+      run: |
+        if [[ "${{ inputs.game_power_mode }}" == "true" ]]; then
+          python3 tools/oneui-game-power/category.py verify game
+        else
+          python3 tools/oneui-game-power/category.py verify none
+        fi
     - name: Build companion package
       run: ./build_termux_package
     - name: Store app-arm64-v8a-debug
       uses: actions/upload-artifact@v7
       with:
-        name: ${{ inputs.cohost_termux && 'termux-x11-arm64-v8a-COHOST-EXPERIMENT' || 'termux-x11-arm64-v8a-debug' }}
+        name: ${{ inputs.game_power_mode && 'termux-x11-arm64-v8a-GAME-POWER-EXPERIMENT' || (inputs.cohost_termux && 'termux-x11-arm64-v8a-COHOST-EXPERIMENT' || 'termux-x11-arm64-v8a-debug') }}
         path: ./app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
     
     - name: Store app-armeabi-v7a-debug
