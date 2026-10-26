@@ -36,6 +36,7 @@ static pthread_mutex_t lock;
 static pid_t lockingPid;
 static long holdMs;
 static volatile int holding;
+static volatile int releaseAbandonedHolder;
 
 static long nowMs(void) {
     struct timespec t;
@@ -65,12 +66,19 @@ static void *holder(void *arg) {
         usleep(holdMs * 1000);
         lockingPid = 0;
         pthread_mutex_unlock(&lock);
-    } else
-        pause();
+    } else {
+        /* Simulate a process which dies while holding the mutex. Some host
+         * libc implementations (notably Android Bionic) do not implement
+         * pthread_cancel, so let the test explicitly reap this holder.
+         * It deliberately exits WITHOUT unlocking the abandoned mutex. */
+        while (!__atomic_load_n(&releaseAbandonedHolder, __ATOMIC_ACQUIRE))
+            usleep(1000);
+    }
     return NULL;
 }
 static void startHolder(pthread_t *t, long ms) {
     holding = 0;
+    releaseAbandonedHolder = 0;
     holdMs = ms;
     pthread_create(t, NULL, holder, NULL);
     while (!__atomic_load_n(&holding, __ATOMIC_ACQUIRE))
@@ -127,7 +135,7 @@ int main(void) {
           ms, timedCalls);
     lorie_mutex_unlock(&lock, &lockingPid);
     connected = true;
-    pthread_cancel(t);
+    __atomic_store_n(&releaseAbandonedHolder, 1, __ATOMIC_RELEASE);
     pthread_join(t, NULL);
 
     /* held for good while connected: never taken from it */
@@ -142,7 +150,7 @@ int main(void) {
         connected = false;      /* let it end: the holder's process gone after all */
         pthread_join(w, NULL);
         connected = true;
-        pthread_cancel(t);
+        __atomic_store_n(&releaseAbandonedHolder, 1, __ATOMIC_RELEASE);
         pthread_join(t, NULL);
     }
 

@@ -70,6 +70,22 @@
 #include <unistd.h>
 #include "fakevk.h"
 
+/* Android Bionic does not expose the GNU pthread_timedjoin_np used by the
+ * two synthetic X-server wait tests below. Keep their deadlock detection on
+ * Termux too: use the existing test-wide SIGALRM watchdog, temporarily
+ * tightening it to four seconds during the join. glibc retains the GNU
+ * per-join deadline and error handling unchanged. */
+#ifdef __BIONIC__
+static int pthread_timedjoin_np(pthread_t thread, void **result,
+                                const struct timespec *deadline) {
+    (void)deadline;
+    alarm(4);
+    int status = pthread_join(thread, result);
+    alarm(30);
+    return status;
+}
+#endif
+
 /* ---- LorieBuffer: buffer.h's description; registration and references as the test keeps them ---- */
 #define __unused __attribute__((unused))
 #define _Nullable
