@@ -36,10 +36,12 @@ INC="-I$OUT/gen -I$OUT/gen/xserver -I$CPP/libxfont/include -I$CPP/pixman/pixman 
 status=0
 cd "$CPP"
 # The lorie sources, and the patched xserver files whose lorie hooks live in the patch itself.
-for f in lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/vk.c lorie/buffer.c \
+for f in lorie/InitOutput.c lorie/cmdentrypoint.c lorie/activity.c lorie/renderer.c lorie/gpu_performance.c lorie/vk.c lorie/buffer.c \
          "$X/exa/exa_unaccel.c" "$X/exa/exa.c" "$X/present/present_execute.c" "$X/present/present_scmd.c" \
          "$X/present/present_vblank.c" "$X/present/present_screen.c" "$X/dix/dispatch.c" "$X/os/WaitFor.c"; do
-    out=$("$CLANG" --target=aarch64-linux-android30 -fsyntax-only -std=gnu99 -Wno-everything \
+    standard=gnu99
+    [ "$f" != lorie/gpu_performance.c ] || standard=gnu11
+    out=$("$CLANG" --target=aarch64-linux-android30 -fsyntax-only "-std=$standard" -Wno-everything \
           -Werror=implicit -Werror=implicit-function-declaration -Werror=incompatible-pointer-types \
           -Werror=int-conversion -DHAVE_DIX_CONFIG_H -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XSERVER64=1 \
           -DEGL_NO_PLATFORM_SPECIFIC_TYPES -include lorie/shm/shm.h $INC "$f" 2>&1 | grep -E "error" || true)

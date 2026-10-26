@@ -868,6 +868,17 @@ setViewport(viewport.left, viewport.top, viewport.width(), viewport.height(), p.
     ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::handleClipboardChange;
 
     public void reloadPreferences(Prefs p) {
+        // Experimental controller for all EGL/GLES GPUs. Default OFF prevents
+        // doubling the existing external Termux-Desktop gpu_keepalive workload.
+        String gpuMode = p.get().getString("gpuPerformanceMode", "off");
+        int gpuModeValue;
+        switch (gpuMode) {
+            case "balanced": gpuModeValue = 1; break;
+            case "performance": gpuModeValue = 2; break;
+            case "maximum": gpuModeValue = 3; break;
+            default: gpuModeValue = 0; break;
+        }
+        setGpuPerformanceModeNative(gpuModeValue);
         String displayFilteringMode = p.displayFilteringMode.get();
         setFiltering("nearest".equals(displayFilteringMode) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
 
@@ -1121,6 +1132,17 @@ private void updateRendererDisplayRefreshRate() {
     @FastNative private native void surfaceChanged(Surface surface);
     @FastNative private native void setFiltering(int filtering);
 @FastNative private native void setSmoothPresentationEnabled(boolean enabled);
+@FastNative private native void setGpuPerformanceModeNative(int mode);
+@FastNative private native void setGpuPerformanceForegroundNative(boolean foreground);
+@FastNative private native void setGpuPerformanceThermalNative(int status);
+
+    public void setGpuPerformanceForeground(boolean foreground) {
+        setGpuPerformanceForegroundNative(foreground);
+    }
+
+    public void setGpuPerformanceThermal(int status) {
+        setGpuPerformanceThermalNative(status);
+    }
 @FastNative private native void setRendererPerfLogEnabled(boolean enabled);
 @FastNative private native void setPostSwapTouchEnabled(boolean enabled);
 @FastNative private native void setPostSwapFenceWaitEnabled(boolean enabled);

@@ -27,6 +27,7 @@
 #include "list.h"
 #include "lorie.h"
 #include "vk.h"
+#include "gpu_performance.h"
 #include <limits.h>
 
 #include <unistd.h>
@@ -603,6 +604,21 @@ void rendererSetPerfLogEnabled(JNIEnv* env, jobject self, jboolean enabled) {
     (void) self;
 
     rendererPerfLogEnabled = enabled == JNI_TRUE;
+}
+
+void rendererSetGpuPerformanceMode(JNIEnv* env, jobject self, jint mode) {
+    (void)env; (void)self;
+    gpuPerformanceSetMode(mode);
+}
+
+void rendererSetGpuPerformanceForeground(JNIEnv* env, jobject self, jboolean foreground) {
+    (void)env; (void)self;
+    gpuPerformanceSetForeground(foreground == JNI_TRUE);
+}
+
+void rendererSetGpuPerformanceThermal(JNIEnv* env, jobject self, jint status) {
+    (void)env; (void)self;
+    gpuPerformanceSetThermal(status);
 }
 
 void rendererSetPostSwapTouchEnabled(JNIEnv* env, jobject self, jboolean enabled) {
@@ -1768,6 +1784,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     }
 
     state->renderedFrames++;
+    gpuPerformanceNoteFrame(); // GLES: visible frame, not a synthetic helper submission.
     rendererPublishFrameStats(frameStartNs, rootWaitUs, gpuCopySerial != 0, coalesceWaitUs);
 
     if (rendererPerfLogEnabled) {
@@ -3258,6 +3275,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     state->renderedFrames++;
     if (presented == LORIE_VK_FRAME_OK)
         rendererContentFrame(&content, lorieMonotonicUs());     // P11-C3-D0
+    if (presented == LORIE_VK_FRAME_OK)
+        gpuPerformanceNoteFrame(); // Vulkan: only a frame actually presented.
     if (rendererProgressOn()) {
         state->progress.takenSeq = askSeq;      // P11-C3-C: presented - the asks there were as it began, taken up
         state->progress.takenUs = startUs;

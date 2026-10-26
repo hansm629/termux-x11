@@ -67,6 +67,15 @@
     app:summary="@string/lorie_pref_rendererPerfLog_summary"
     app:defaultValue="false" />
 
+<ListPreference
+    app:key="gpuPerformanceMode"
+    app:title="@string/lorie_pref_gpuPerformanceMode"
+    app:summary="@string/lorie_pref_gpuPerformanceMode_summary"
+    app:defaultValue="off"
+    app:entries="@array/lorie_pref_gpuPerformanceMode_entries"
+    app:entryValues="@array/lorie_pref_gpuPerformanceMode_values"
+    app:useSimpleSummaryProvider="true" />
+
 <SwitchPreferenceCompat app:key="adjustResolution" app:defaultValue="false" />
         <SwitchPreferenceCompat app:key="displayStretch" app:defaultValue="false" />
         <SwitchPreferenceCompat app:key="Reseed" app:defaultValue="true" />

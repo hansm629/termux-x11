@@ -188,6 +188,31 @@ public static final String ACTION_STOP = "com.termux.x11.ACTION_STOP";
 
     @SuppressLint("StaticFieldLeak")
     private static MainActivity instance;
+    private Object gpuThermalListener;
+
+    // Isolate Android Q+ thermal API references from API 26-28 class loading.
+    private static final class GpuThermalApi29 {
+        static Object subscribe(MainActivity activity) {
+            android.os.PowerManager manager =
+                    (android.os.PowerManager) activity.getSystemService(POWER_SERVICE);
+            if (manager == null) return null;
+            android.os.PowerManager.OnThermalStatusChangedListener listener = status -> {
+                LorieView view = activity.getLorieView();
+                if (view != null) view.setGpuPerformanceThermal(status);
+            };
+            activity.getLorieView().setGpuPerformanceThermal(manager.getCurrentThermalStatus());
+            manager.addThermalStatusListener(listener);
+            return listener;
+        }
+
+        static void unsubscribe(MainActivity activity, Object listener) {
+            android.os.PowerManager manager =
+                    (android.os.PowerManager) activity.getSystemService(POWER_SERVICE);
+            if (manager != null)
+                manager.removeThermalStatusListener(
+                        (android.os.PowerManager.OnThermalStatusChangedListener) listener);
+        }
+    }
 
     public MainActivity() {
         instance = this;
@@ -775,6 +800,17 @@ private void runTermuxCommandFromTopApp(Intent intent) {
         scheduleOutputProfileRefresh("on-resume");
 
         super.onResume();
+        LorieView gpuView = getLorieView();
+        if (gpuView != null) {
+            gpuView.setGpuPerformanceForeground(true);
+            if (android.os.Build.VERSION.SDK_INT >= 29 && gpuThermalListener == null) {
+                try {
+                    gpuThermalListener = GpuThermalApi29.subscribe(this);
+                } catch (RuntimeException e) {
+                    Log.w("LorieGpuPerf", "Thermal callback unavailable; using conservative activity gating", e);
+                }
+            }
+        }
 
         mNotification = buildNotification();
         mNotificationManager.notify(mNotificationId, mNotification);
@@ -785,6 +821,16 @@ private void runTermuxCommandFromTopApp(Intent intent) {
 
     @Override
     public void onPause() {
+        LorieView gpuView = getLorieView();
+        if (gpuView != null) gpuView.setGpuPerformanceForeground(false);
+        if (android.os.Build.VERSION.SDK_INT >= 29 && gpuThermalListener != null) {
+            try {
+                GpuThermalApi29.unsubscribe(this, gpuThermalListener);
+            } catch (RuntimeException e) {
+                Log.w("LorieGpuPerf", "Thermal callback could not be unregistered", e);
+            }
+            gpuThermalListener = null;
+        }
         inputMethodManager.hideSoftInputFromWindow(getWindow().getDecorView().getRootView().getWindowToken(), 0);
 
         for (StatusBarNotification notification: mNotificationManager.getActiveNotifications())

@@ -145,6 +145,20 @@ E.g. <b>META</b> for <i>META key</i>, \n
     <string name="lorie_pref_rendererRootFenceWait_summary">Keeps the existing wait for root window drawing to finish before presenting. Turn this off only for frame pacing tests; it may cause flicker, tearing, or visual artifacts.</string>
 
     <string name="lorie_pref_rendererOutputMode">Renderer output mode (experimental)</string>
+    <string name="lorie_pref_gpuPerformanceMode">Adaptive GPU Performance (experimental)</string>
+    <string name="lorie_pref_gpuPerformanceMode_summary">Rootless GPU warm-up for any EGL/GLES GPU; active only with on-screen frames. Balanced and Performance limit helper CPU use. Maximum can cause heavy heat and battery drain. Disable external gpu_keepalive to prevent duplication.</string>
+    <string-array name="lorie_pref_gpuPerformanceMode_entries">
+        <item>Off (default, external helper compatible)</item>
+        <item>Balanced (low CPU / battery priority)</item>
+        <item>Performance (adaptive CPU budget)</item>
+        <item>Maximum (unlimited benchmark; high power)</item>
+    </string-array>
+    <string-array name="lorie_pref_gpuPerformanceMode_values">
+        <item>off</item>
+        <item>balanced</item>
+        <item>performance</item>
+        <item>maximum</item>
+    </string-array>
     <string name="lorie_pref_rendererOutputMode_summary">Compatibility first keeps the extra post-swap submit and its fence. Fast gaming output drops both. The paced variant additionally coalesces a redraw for a few frames after a slow swap. Gaming modes are experimental.</string>
     <string-array name="lorie_pref_rendererOutputMode_entries">
         <item>Compatibility first</item>

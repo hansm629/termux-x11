@@ -280,6 +280,7 @@ add_library(Xlorie SHARED
         "lorie/InitInput.c"
         "lorie/InputXKB.c"
         "lorie/renderer.c"
+        "lorie/gpu_performance.c"
         "lorie/vk.c"
         "lorie/buffer.c"
         "lorie/activity.c")
