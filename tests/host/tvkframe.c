@@ -253,26 +253,32 @@ int main(void) {
               "acquire whose fence never signals: not a failure");
     }
 
-    /* the present mode: smooth - FIFO; immediate - the lowest latency the surface lists */
+    /* WSI preference: default MAILBOX where available, explicit legacy
+     * IMMEDIATE rollback, then FIFO. Smooth presentation always chooses FIFO. */
     {
-        static const struct { bool smooth; VkPresentModeKHR modes[3]; uint32_t n; VkPresentModeKHR want; const char *name; } t[] = {
-            { false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_IMMEDIATE_KHR, "IMMEDIATE" },
-            { false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR }, 2, VK_PRESENT_MODE_MAILBOX_KHR, "MAILBOX" },
-            { false, { VK_PRESENT_MODE_FIFO_KHR }, 1, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
-            { true, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
+        static const struct { bool smooth, legacy; VkPresentModeKHR modes[3]; uint32_t n; VkPresentModeKHR want; const char *name; } t[] = {
+            { false, false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_MAILBOX_KHR, "MAILBOX" },
+            { false, true, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_IMMEDIATE_KHR, "IMMEDIATE" },
+            { false, false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 2, VK_PRESENT_MODE_IMMEDIATE_KHR, "IMMEDIATE" },
+            { false, false, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR }, 2, VK_PRESENT_MODE_MAILBOX_KHR, "MAILBOX" },
+            { false, false, { VK_PRESENT_MODE_FIFO_KHR }, 1, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
+            { true, true, { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR }, 3, VK_PRESENT_MODE_FIFO_KHR, "FIFO" },
         };
         for (unsigned k = 0; k < sizeof t / sizeof *t; k++) {
             device();
+            st.backend.vkPreferImmediate = t[k].legacy;
             CHECK(lorieVkRendererCreate(&vk, &r, &st), "renderer objects not made");
             memcpy(emu.presentModes, t[k].modes, sizeof t[k].modes);
             emu.presentModeCount = t[k].n;
             r.smooth = t[k].smooth;
+            CHECK(r.preferImmediate == t[k].legacy, "renderer did not honor IMMEDIATE rollback");
             CHECK(lorieVkSwapchainCreate(&vk, &r, &window, &st) && emu.swapchainInfo.presentMode == t[k].want && r.presentMode == t[k].want &&
                   !strcmp((const char *) st.diag.vkPresentMode, t[k].name) && lorieVkPresentModeFor(&vk, &r, t[k].smooth) == t[k].want,
                   "present mode %u (%s, %u listed): made with %d, logged %s", k, t[k].smooth ? "smooth" : "immediate", t[k].n,
                   emu.swapchainInfo.presentMode, (const char *) st.diag.vkPresentMode);
         }
         r.smooth = false;
+        st.backend.vkPreferImmediate = 0;
     }
 
     /* fifty frames with every acquire and present SUBOPTIMAL (a swapchain not pre-rotated): one swapchain */

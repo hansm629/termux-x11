@@ -368,6 +368,10 @@ struct lorie_backend_control {
                                                  * rendererVkRedraw): the copies queued go ahead of a frame, in a
                                                  * submission of their own, in every present mode; a frame with none of
                                                  * them is presented before its fence is waited for */
+    volatile uint8_t vkPreferImmediate;         /* X: TERMUX_X11_RENDERER_VK_PRESENT_IMMEDIATE=1: original WSI
+                                                 * IMMEDIATE preference, otherwise MAILBOX where supported */
+    volatile uint8_t vkEarlyPresent;            /* X: no-copy screen frame can queue present before CPU
+                                                 * fence wait. Default enabled, 0 restores serialized legacy. */
     volatile uint8_t freezeDiag;                /* X: TERMUX_X11_FRAME_FREEZE_DIAG=1 - P11-C3-C's freeze watchdog: the
                                                  * renderer keeps its stage (struct lorie_progress) */
     volatile uint8_t contentDiag;               /* X: TERMUX_X11_CONTENT_FRAME_DIAG=1 - P11-C3-D0: client content from

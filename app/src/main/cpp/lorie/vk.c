@@ -1373,6 +1373,7 @@ bool lorieVkRendererCreate(struct lorie_vk *vk, struct lorie_vk_renderer *r, vol
     int i;
 
     memset(r, 0, sizeof(*r));
+    r->preferImmediate = st && st->backend.vkPreferImmediate;
     {
         VkCommandPoolCreateInfo info = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                          .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk->queueFamily };
@@ -1470,7 +1471,14 @@ VkPresentModeKHR lorieVkPresentModeFor(struct lorie_vk *vk, struct lorie_vk_rend
         immediate |= modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR;
         mailbox |= modes[i] == VK_PRESENT_MODE_MAILBOX_KHR;
     }
-    return immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : mailbox ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    /* IMMEDIATE can incur competing WSI submissions and tearing on Vulkan-over-Android
+     * while a native Vulkan game also presents. MAILBOX is the nonblocking,
+     * tear-free low-latency option when the surface provides it.
+     * Restore the former preference with TERMUX_X11_RENDERER_VK_PRESENT_IMMEDIATE=1. */
+    if (r->preferImmediate && immediate)
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    return mailbox ? VK_PRESENT_MODE_MAILBOX_KHR :
+           immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
 }
 
 static const char *lorieVkPresentModeName(VkPresentModeKHR mode) {

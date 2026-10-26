@@ -301,7 +301,7 @@ int main(void) {
                 offLines += strstr(line, "XlorieVkFramePacing:") || strstr(line, "XlorieVkPipeline:") ||
                             strstr(line, "XlorieRootCopyTiming:") || strstr(line, "XlorieXLatency:") || strstr(line, "XlorieFrameGaps:") ||
                             strstr(line, "XlorieComposite:") || strstr(line, "XlorieCompositeClasses:");
-                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
+                offBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=off exa_lock_opt=off vk_schedule_opt=off freeze_diag=off vk_present_pref=mailbox vk_present_early=off\n");
                 backendLines += strstr(line, "XlorieBackend:") != NULL;
             }
             if (logf)
@@ -365,7 +365,7 @@ int main(void) {
         fclose(logf);
         logf = fopen(path, "r");
         while (fgets(line, sizeof line, logf)) {
-            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off vk_schedule_opt=off freeze_diag=off\n");
+            onBackend += strstr(line, "XlorieBackend:") && strstr(line, " vk_frame_diag=on exa_lock_opt=off vk_schedule_opt=off freeze_diag=off vk_present_pref=mailbox vk_present_early=off\n");
             if (strstr(line, "XlorieVkFramePacing:") && ++n[0] == 2)
                 pacingOk = strstr(line, "XlorieVkFramePacing: frame_start_us=100/9620/20000/50000/35000/10/4 "
                                         "present_delta_us=4/25000/50000/50000/33334/3/1 wake_us=1/200000/>100000/>100000/200000/1/1 "

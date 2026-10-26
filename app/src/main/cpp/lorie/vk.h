@@ -262,7 +262,8 @@ struct lorie_vk_renderer {
     VkRenderPass screenPass;
     VkPipeline screenPipeline, cursorPipeline;
     bool recreate;                  /* out of date, or another present mode wanted: made again before the next frame */
-    bool smooth;                    /* the present mode wanted: FIFO, else the lowest latency the surface has */
+    bool smooth;                    /* the present mode wanted: FIFO, else MAILBOX (or legacy IMMEDIATE opt-in) */
+    bool preferImmediate;           /* legacy WSI mode, default false; set from shared X server preferences */
     bool held;                      /* image heldIndex acquired by a frame that drew nothing: the next frame's */
     uint32_t heldIndex;
     VkPresentModeKHR presentMode;   /* the one the swapchain was made with */

@@ -561,6 +561,17 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_RENDERER_VK_SUBMIT_OPT=1, the Vulkan frames' submissions and presents (renderer.c).
     lorieScreen.state->backend.vkSubmitOpt = getenv("TERMUX_X11_RENDERER_VK_SUBMIT_OPT") &&
                                              !strcmp(getenv("TERMUX_X11_RENDERER_VK_SUBMIT_OPT"), "1");
+    // Prefer MAILBOX over IMMEDIATE on Android where both exist. Keep the former default available
+    // as an explicit A/B rollback, independent of GPU-copy and Vulkan submit optimization flags.
+    lorieScreen.state->backend.vkPreferImmediate =
+        getenv("TERMUX_X11_RENDERER_VK_PRESENT_IMMEDIATE") &&
+        !strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_IMMEDIATE"), "1");
+    // Present a copy-free Vulkan frame after queueing GPU commands; the presentation engine
+    // waits on the signalled semaphore. Preserve the mandatory fence wait before reclaiming
+    // CPU/foreign ownership of any imported AHB. Setting 0 restores serialized presentation.
+    lorieScreen.state->backend.vkEarlyPresent =
+        !(getenv("TERMUX_X11_RENDERER_VK_PRESENT_EARLY") &&
+          !strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_EARLY"), "0"));
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
@@ -1595,7 +1606,7 @@ static void lorieLogRendererDiag(void) {
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "
               "x_gpu_wait_us=%llu(+%llu) x_ahb_cpu_lock_us=%llu(+%llu) root_buffers=%u x_root_copy_us=%llu(+%llu) "
               "vk_transfer_copy=%s x_yield_on_wake=%s root_copy_opt=%s vk_submit_opt=%s vk_frame_diag=%s exa_lock_opt=%s "
-              "vk_schedule_opt=%s freeze_diag=%s",
+              "vk_schedule_opt=%s freeze_diag=%s vk_present_pref=%s vk_present_early=%s",
         pvfb->state->backend.requested == LORIE_BACKEND_VULKAN ? "vulkan"
             : pvfb->state->backend.requested == LORIE_BACKEND_GLES ? "gles" : "auto",
         pvfb->state->backend.requestedInvalid ? "(invalid-value)" : "",
@@ -1609,7 +1620,9 @@ static void lorieLogRendererDiag(void) {
         pvfb->state->backend.vkTransferCopy ? "on" : "off", __atomic_load_n(&pvfb->yieldOnWake, __ATOMIC_RELAXED) ? "on" : "off",
         !pvfb->rootCopyOpt ? "off" : pvfb->rootCopyOptFailed ? "fallback" : "on", pvfb->state->backend.vkSubmitOpt ? "on" : "off",
         pvfb->frameDiag ? "on" : "off", pvfb->exaLockOpt ? "on" : "off", pvfb->state->backend.vkScheduleOpt ? "on" : "off",
-        pvfb->freezeDiag ? "on" : "off");
+        pvfb->freezeDiag ? "on" : "off",
+        pvfb->state->backend.vkPreferImmediate ? "immediate" : "mailbox",
+        pvfb->state->backend.vkEarlyPresent ? "on" : "off");
     // P11-C3-B: what the scheduling options did - B1's reservations instead of the shared lock, and the copies the
     // renderer left queued for one
     log(INFO, "XlorieSchedule: exa_lock_opt=%s x_access_reserved=%llu(+%llu) x_access_reserve_full=%llu(+%llu) "

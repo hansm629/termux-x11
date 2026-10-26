@@ -1312,6 +1312,42 @@ int main(void) {
     st.backend.vkSubmitOpt = 0;
     earlyWithOption = emu.earlyPresents;
 
+    /* Independent no-copy early Present: keep GPU-copy submission options
+     * disabled, queue Present on the rendered semaphore before waiting for
+     * the frame fence, and still wait before returning the imported AHB to
+     * the X server. A Present GPU-copy in the same frame still serializes. */
+    {
+        int early0 = emu.earlyPresents, presents0 = emu.presents, fails0 = vkFailures;
+        uint32_t earlyDiag0 = st.diag.vkEarlyPresents;
+        st.backend.vkEarlyPresent = 1;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(emu.earlyPresents == early0 + 1 && emu.presents == presents0 + 1 &&
+              st.diag.vkEarlyPresents == earlyDiag0 + 1 &&
+              !st.gpuInFlight.busy && !emu.fencePending &&
+              vkFailures == fails0 && emu.violations == 0,
+              "no-copy early Present: count %d, pending fence %d, failures %d, violations %d",
+              emu.earlyPresents - early0, emu.fencePending,
+              vkFailures - fails0, emu.violations);
+        st.gpuInFlight.busy = 0;
+
+        CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0,
+                                     &serial, &dstBuffer),
+              "early Present copy protection: not queued");
+        early0 = emu.earlyPresents;
+        presents0 = emu.presents;
+        st.drawRequested = 1;
+        rendererVkRedraw(&waiting);
+        CHECK(emu.earlyPresents == early0 && emu.presents == presents0 + 1 &&
+              lorieGpuCopyIsDone(serial) && !st.gpuInFlight.busy &&
+              vkFailures == fails0 && emu.violations == 0,
+              "early Present with a copy: must publish the copy before Present");
+        lorieGpuCopyAck(&bgraPix, dstBuffer);
+        st.gpuInFlight.busy = 0;
+        st.backend.vkEarlyPresent = 0;
+        earlyWithOption++;  /* counted independently from SUBMIT_OPT */
+    }
+
     /* P11-C2: root double buffering's copy by the GPU (rendererVkRootCopy) - taken under the X server's lock, drawn
      * from the buffer the X server drew into into the other as GPU copies are drawn (each buffer acquired from the
      * foreign owner and given back), both listed in flight while the device runs it and the lock let go, settled as

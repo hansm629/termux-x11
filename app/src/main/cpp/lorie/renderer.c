@@ -3217,7 +3217,7 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
 
     // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
     // once the fence was waited for, as the present below.
-    if ((early = submitOpt && res == VK_SUCCESS && !serial)) {
+    if ((early = (submitOpt || state->backend.vkEarlyPresent) && res == VK_SUCCESS && !serial)) {
         if (diag)
             ft.presentStartUs = lorieMonotonicUs();
         rendererStage(LORIE_R_PRESENT);
