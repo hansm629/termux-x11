@@ -61,6 +61,13 @@ check(before_first_return(redraw, "lorieProcessOwnershipRequest();"),
 early = "if (lorieAhbPerAccess() && !twinned)\n        pvfb->state->waitForNextFrame = false;"
 check(redraw.find(early) >= 0 and redraw.find(early) < redraw.find("loriePerformVblanks();"),
       "lorieRedraw does not allow a Vulkan frame before its vblanks queue the Present copies")
+check("lorieFrameGateRearmAfterVblanks(pvfb->vkSingleFramePerTick," in redraw and
+      "preVblankVulkanRelease" in redraw and
+      redraw.find("lorieFrameGateRearmAfterVblanks(") > redraw.find("lorieRecheckGpuCopies();"),
+      "one-frame-per-tick opt-in does not protect the second post-vblank rearm")
+check("else if (gpuCopyPending)\n            rendererVkApplyPendingGpuCopies();" in
+      open(os.path.join(L, "renderer.c"), encoding="utf-8").read(),
+      "one-frame-per-tick must keep processing GPU Present copies without a screen frame")
 
 connected = func(I, "void lorieActivityConnected(void) {")
 check("lorieResetOwnership();" in connected, "a new renderer connection does not reset the ownership")

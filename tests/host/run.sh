@@ -30,7 +30,7 @@ rm -rf "$OUT/vkinc" && mkdir -p "$OUT/vkinc" && cp -r "$VKINC/vulkan" "$OUT/vkin
 PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/textract.py" "$HERE/extract.py" || status=1
 
 # C tests built from generated sources: tests/host/<name>.c, compiled with -I"$OUT".
-C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest tvkframe tvkrenderer tpresentcopy tpresentsafety tdispatchyield tbufferlock twake tsharedlock tfreeze tcontentframe texacomposite txrendergpu tporterduff tasyncxrender tgpuperformance"
+C_TESTS="tdiaglog townership tvkinit tvkimport tvkbarrier tvkselftest tvkframe tvkrenderer tpresentcopy tpresentsafety tdispatchyield tbufferlock twake tsharedlock tfreeze tcontentframe texacomposite txrendergpu tporterduff tasyncxrender tgpuperformance tframegate"
 rm -f "$OUT/diag-vulkan.log" "$OUT/diag-gles.log"     # written by tdiaglog: never judge an earlier run's
 for t in $C_TESTS; do
     if [ "$t" = tasyncxrender ]; then

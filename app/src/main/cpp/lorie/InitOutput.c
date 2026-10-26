@@ -45,6 +45,7 @@
 #include "client.h"
 #include "extnsionst.h"
 #include "lorie.h"
+#include "frame_gate_policy.h"
 
 #define DRM_FORMAT_MOD_LINEAR 0
 
@@ -168,6 +169,10 @@ typedef struct {
      * the renderer for a frame, and the frames presented then (lorieFramesShown); the period's slowest client request
      * (ddxRequestTimed) - its time, its client's index and command, its opcodes and their extension */
     Bool frameDiag, frameAsked;
+    /* Experimental one-visible-Vulkan-frame-per-tick gate (single root AHB,
+     * PER_ACCESS). Preserves pre-vblank wake for Present-copy deadlock safety. */
+    Bool vkSingleFramePerTick;
+    uint64_t vkSecondRearmSuppressed;
     uint32_t framesAtAsk;
     struct {
         uint32_t us;
@@ -614,6 +619,9 @@ void OsVendorInit(void) {
     // requests, ticks and AHB accesses, logged every 5 seconds (XlorieVkFramePacing and the lines after it). Off, none
     // of them reads a clock.
     lorieScreen.frameDiag = getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG") && !strcmp(getenv("TERMUX_X11_RENDERER_VK_FRAME_DIAG"), "1");
+    lorieScreen.vkSingleFramePerTick =
+        getenv("TERMUX_X11_RENDERER_VK_SINGLE_FRAME_PER_TICK") &&
+        !strcmp(getenv("TERMUX_X11_RENDERER_VK_SINGLE_FRAME_PER_TICK"), "1");
     lorieScreen.state->backend.vkFrameDiag = lorieScreen.frameDiag;
     // P11-C4 GPU XRender does not depend on or turn on frame diagnostics. Its fast dispatch wrapper
     // does not read clocks, so a regular desktop can opt in without paying for measurement overhead.
@@ -1420,6 +1428,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
     Bool twinned, rootDouble;
+    Bool preVblankVulkanRelease;
     uint64_t tickUs = pvfb->frameDiag || pvfb->freezeDiag ? lorieMonotonicUs() : 0;
     // P11-C3-C: in a tick, for the freeze watchdog, until it is over
     struct lorieXMark tickMark __attribute__((cleanup(lorieXLeave))) = lorieXEnter(LORIE_X_TICK);
@@ -1434,6 +1443,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     lorieXRenderAsyncFlush(); // settle the batch once per Root tick, not after each GPU Composite
     lorieProcessOwnershipRequest();
     twinned = lorieRootTwinned();
+    preVblankVulkanRelease = lorieAhbPerAccess() && !twinned;
 
     pvfb->current_msc++;
     // Vulkan (PER_ACCESS): the frame this tick allows is allowed before the vblanks run, so that the Present copies
@@ -1446,7 +1456,11 @@ static Bool lorieRedraw(__unused ClientPtr pClient, void *closure) {
     // settled at every tick too, waiting for nothing (patches/xserver.patch lorieRecheckGpuCopies).
     lorieRecheckGpuCopies();
 
-    pvfb->state->waitForNextFrame = false;
+    if (lorieFrameGateRearmAfterVblanks(pvfb->vkSingleFramePerTick,
+                                        preVblankVulkanRelease))
+        pvfb->state->waitForNextFrame = false;
+    else
+        pvfb->vkSecondRearmSuppressed++;
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
         return TRUE;
@@ -1595,12 +1609,23 @@ static const char *const lorieXferCheckNames[] = { LORIE_VK_XFER_CHECKS(LORIE_NA
 
 static void lorieLogRendererDiag(void) {
     static struct lorie_renderer_diag prev;
+    static uint64_t prevVkSecondRearmSuppressed;
     struct lorie_renderer_diag d;
     char reasons[1024];
     size_t used = 0;
     int i;
 
     memcpy(&d, (const void *) &pvfb->state->diag, sizeof(d));
+    log(INFO, "XlorieVkTickGate: enabled=%s suppressed_post_vblank_rearms=%llu(+%llu) "
+              "vsync_ticks=%llu(+%llu) vk_frames=%llu(+%llu)",
+        pvfb->vkSingleFramePerTick ? "on" : "off",
+        (unsigned long long) pvfb->vkSecondRearmSuppressed,
+        (unsigned long long) (pvfb->vkSecondRearmSuppressed - prevVkSecondRearmSuppressed),
+        (unsigned long long) d.xTicksRun,
+        (unsigned long long) (d.xTicksRun - prev.xTicksRun),
+        (unsigned long long) d.vkFramesPresented,
+        (unsigned long long) (d.vkFramesPresented - prev.vkFramesPresented));
+    prevVkSecondRearmSuppressed = pvfb->vkSecondRearmSuppressed;
 #define TD(f) (unsigned long long) d.f, (unsigned long long) (d.f - prev.f)
     log(INFO, "XlorieBackend: requested=%s%s vk_fail_at=%s%s vk_selftest=%s%s active=%s ownership=%s ownership_transitions=%u "
               "ownership_refused=%u x_ahb_cpu_acquires=%llu(+%llu) x_state_lock_wait_us=%llu(+%llu) "

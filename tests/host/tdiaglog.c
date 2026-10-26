@@ -37,6 +37,8 @@ static struct {
     int yieldOnWake, rootCopyOpt, rootCopyOptFailed, rootGpuCopy;
     struct { uint32_t seq; } rootCopy;
     Bool frameDiag, frameAsked;
+    Bool vkSingleFramePerTick;
+    uint64_t vkSecondRearmSuppressed;
     uint32_t framesAtAsk;
     struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
