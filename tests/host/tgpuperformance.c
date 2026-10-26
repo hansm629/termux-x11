@@ -42,14 +42,36 @@ int main(void) {
     CHECK(!gpuPerfFastClear(200000));
     CHECK(gpuPerfFastMaximumSleepNs(1700, 1600) >=
           GPU_PERF_FAST_MAX_MIN_INTERVAL_NS - 1700);
-    CHECK(gpuPerfFastMaximumSleepNs(250000, 20000) == 0);
+    CHECK(gpuPerfFastMaximumSleepNs(250000, 20000) ==
+          GPU_PERF_FAST_MAX_MIN_INTERVAL_NS - 250000);
     CHECK(gpuPerfFastMaximumSleepNs(100000, 80000) > 40000);
-    CHECK(GPU_PERF_FAST_READBACK_INTERVAL_NS >= UINT64_C(5000000));
+    CHECK(GPU_PERF_FAST_READBACK_INTERVAL_NS >= UINT64_C(50000000));
     CHECK(gpuPerfReadbackDue(UINT64_C(100000000), 0));
     CHECK(!gpuPerfReadbackDue(UINT64_C(100000001), UINT64_C(100000000)));
-    CHECK(!gpuPerfReadbackDue(UINT64_C(107999999), UINT64_C(100000000)));
-    CHECK(gpuPerfReadbackDue(UINT64_C(108000000), UINT64_C(100000000)));
+    CHECK(!gpuPerfReadbackDue(UINT64_C(149999999), UINT64_C(100000000)));
+    CHECK(gpuPerfReadbackDue(UINT64_C(150000000), UINT64_C(100000000)));
     CHECK(gpuPerfReadbackDue(UINT64_C(1), UINT64_C(100000000)));
+    /* Native Vulkan clients must outrank synthetic GPU warming if the
+     * helper detects a near-no-op GL clear path and real GPU demand. */
+    CHECK(!gpuPerfRealGpuNeedsPriority(false, 100));
+    CHECK(!gpuPerfRealGpuNeedsPriority(true, -1));
+    CHECK(!gpuPerfRealGpuNeedsPriority(true, 24));
+    CHECK(gpuPerfRealGpuNeedsPriority(true, 25));
+    CHECK(gpuPerfRealGpuNeedsPriority(true, 100));
+    CHECK(!gpuPerfRealGpuNeedsPriority(true, 101));
+    CHECK(gpuPerfBackoffUntil(t, 0, false, 95) == 0);
+    CHECK(gpuPerfBackoffUntil(t, 0, true, 24) == 0);
+    CHECK(gpuPerfBackoffUntil(t, 0, true, 70) ==
+          t + GPU_PERF_REAL_GPU_BACKOFF_NS);
+    CHECK(gpuPerfBackoffUntil(t + UINT64_C(100000000), t +
+          GPU_PERF_REAL_GPU_BACKOFF_NS, true, 0) ==
+          t + GPU_PERF_REAL_GPU_BACKOFF_NS);
+    CHECK(gpuPerfBackoffUntil(t + UINT64_C(250000000), t +
+          GPU_PERF_REAL_GPU_BACKOFF_NS, true, 70) ==
+          t + UINT64_C(250000000) + GPU_PERF_REAL_GPU_BACKOFF_NS);
+    CHECK(gpuPerfBackoffActive(t, t + GPU_PERF_REAL_GPU_BACKOFF_NS));
+    CHECK(!gpuPerfBackoffActive(t + GPU_PERF_REAL_GPU_BACKOFF_NS,
+                                t + GPU_PERF_REAL_GPU_BACKOFF_NS));
     struct gpu_perf_limits highBalanced = gpuPerfLimitsForRefresh(GPU_PERF_BALANCED, 120);
     struct gpu_perf_limits highPerformance = gpuPerfLimitsForRefresh(GPU_PERF_PERFORMANCE, 120);
     CHECK(highBalanced.cpu_budget_percent > balanced.cpu_budget_percent);
@@ -81,7 +103,7 @@ int main(void) {
             CHECK(sleep >= limits.min_sleep_us && sleep <= limits.max_sleep_us);
         }
     }
-    printf("TGPUPERFORMANCE idle/thermal/60-120Hz and fast-clear CPU spin guard: %s (%d failures)\n",
+    printf("TGPUPERFORMANCE idle/thermal/60-120Hz, fast-clear spin and real-GPU priority: %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

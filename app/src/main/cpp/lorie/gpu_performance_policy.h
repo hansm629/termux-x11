@@ -23,8 +23,32 @@ enum {
  * GPU busy. The test is on measured work latency, not GPU vendor or sysfs.
  * Readback verification remains a separate (bounded) operation. */
 #define GPU_PERF_FAST_CLEAR_THRESHOLD_NS UINT64_C(20000)
-#define GPU_PERF_FAST_MAX_MIN_INTERVAL_NS UINT64_C(125000)
-#define GPU_PERF_FAST_READBACK_INTERVAL_NS UINT64_C(8000000)
+/* S24+ vkmark ran near 252 MHz while a synchronous 1x1 readback was being
+ * forced ~120 times/sec. Reducing this private helper workload is preferable
+ * to competing with actual Vulkan client rendering. */
+#define GPU_PERF_FAST_MAX_MIN_INTERVAL_NS UINT64_C(1000000)
+#define GPU_PERF_FAST_READBACK_INTERVAL_NS UINT64_C(50000000)
+#define GPU_PERF_BUSY_SAMPLE_NS UINT64_C(250000000)
+#define GPU_PERF_REAL_GPU_BACKOFF_NS UINT64_C(750000000)
+#define GPU_PERF_REAL_GPU_BUSY_PCT 25
+
+static inline bool gpuPerfRealGpuNeedsPriority(bool fast_clear, long gpu_busy_pct) {
+    return fast_clear && gpu_busy_pct >= GPU_PERF_REAL_GPU_BUSY_PCT &&
+           gpu_busy_pct <= 100;
+}
+
+static inline uint64_t gpuPerfBackoffUntil(uint64_t now_ns, uint64_t previous_until,
+                                          bool fast_clear, long gpu_busy_pct) {
+    if (gpuPerfRealGpuNeedsPriority(fast_clear, gpu_busy_pct)) {
+        uint64_t until = now_ns + GPU_PERF_REAL_GPU_BACKOFF_NS;
+        return until > previous_until ? until : previous_until;
+    }
+    return previous_until;
+}
+
+static inline bool gpuPerfBackoffActive(uint64_t now_ns, uint64_t until_ns) {
+    return now_ns < until_ns;
+}
 
 static inline bool gpuPerfFastClear(uint64_t avg_clear_ns) {
     return avg_clear_ns > 0 && avg_clear_ns < GPU_PERF_FAST_CLEAR_THRESHOLD_NS;
@@ -37,8 +61,9 @@ static inline bool gpuPerfReadbackDue(uint64_t now_ns, uint64_t previous_ns) {
 
 /* Maximum normally retains its original zero-delay behavior. For a measured
  * near-no-op GL clear loop only, cap the helper's CPU duty to 55%, and make
- * each pulse at least 125us apart. This fixes 100%-of-a-core ANGLE loops
- * without slowing normal GPU-bound Adreno glFinish (>125us) paths. */
+ * each pulse at least 1ms apart. Give the real Vulkan client priority when
+ * the kernel reports substantial GPU activity; normal GPU-bound Adreno
+ * glFinish (>20us) paths remain unchanged. */
 static inline uint64_t gpuPerfFastMaximumSleepNs(uint64_t elapsed_ns,
                                                  uint64_t cpu_ns) {
     const uint64_t cpu_budget_percent = UINT64_C(55);

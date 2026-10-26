@@ -46,7 +46,9 @@ contains(native / "gpu_performance.c",
           'gpuPerfPrepareVerificationDraw(', 'glDrawArrays(GL_TRIANGLES, 0, 3)',
           'glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel)',
           'gpuPerfFastMaximumSleepNs(', 'gpu_readbacks=%llu/5s',
-          'pthread_setname_np(pthread_self(), "LorieGpuAssist")'])
+          'pthread_setname_np(pthread_self(), "LorieGpuAssist")',
+          'gpuPerfBackoffUntil(', 'gpuPerfBackoffActive(',
+          'state=gpu-priority mode=', 'GPU_PERF_BUSY_SAMPLE_NS'])
 
 a = "{http://schemas.android.com/apk/res-auto}"
 elements = ET.parse(xml).getroot().iter()

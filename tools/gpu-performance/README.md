@@ -1,5 +1,58 @@
 # Termux-X11 Universal Adaptive GPU Performance Controller (experimental)
 
+## v4: prioritize real GPU clients over the helper (S24+ score regression)
+
+The user's S24+ (Exynos 2400, Xclipse 940) produced a **vkmark score of
+430** with the v3 integrated Maximum helper and only three benchmark
+scenes. A separate local test of `vertex:device-local=true` gave
+**364 FPS** with the same 252MHz GPU clock before and after that scene.
+These data confirm poor actual Vulkan client performance, not just a
+perceived stutter. It has NOT been established that the helper is its
+sole cause; a clean Off comparison was not obtained because the
+`termux-x11-preference` command hung on the installed shared-process
+S24+ app. We killed only that temporary CLI experiment, leaving the
+user's original Maximum setting and desktop intact.
+
+At 120Hz the v3 helper forced about **600 synchronous 1-pixel
+`glReadPixels` readbacks every 5s** and submitted about **18,000
+clears every 5s**. The readbacks matched the intended color, but GPU
+clock readings still mostly showed 252MHz. An existing native external
+keepalive performed **1.33M GL clear/finish operations per second**
+during one additional 1-second probe without moving the 252MHz GPU
+clock. This brief measurement was made while the integrated helper was
+also running; it is not a clean external-only FPS comparison.
+
+The revised fast-clear-only policy uses these observations:
+
+1. Read the optional *read-only* GPU utilization node **once per 250ms**.
+   If it reports at least 25% GPU busy, suspend synthetic GPU submissions
+   for at least 750ms. Consecutive high-utilization samples extend the
+   holdoff; low GPU busy allows helper activity to resume. Logs
+   `state=gpu-priority` and `state=gpu-assist-resume` identify this
+   arbitration. It never writes kernel governor, clocks, cgroups, or
+   changes the actual renderer or Vulkan WSI.
+2. Reduce forced synchronous GPU readbacks from an 8ms interval (125Hz)
+   to a 50ms interval (20Hz). Reduce the ultra-fast clear loop to at most
+   about 1,000 attempts/sec via a 1ms minimum interval. The previous
+   CPU duty budget, foreground, frame-activity and severe-thermal guards
+   remain in place. The **normal S26U Adreno** path stays unchanged;
+   only an actual measured fast-clear EGL context gets this arbitration.
+3. On unknown/permission-denied GPU utilization readings the helper
+   safely falls back to the bounded, lower-rate fast-clear path.
+   Clock and busy data are diagnostics, not evidence of a guaranteed
+   clock boost.
+
+**Goal:** stop the ineffective helper from stealing GPU execution time
+when a real game or vkmark is running. This may improve scores, but it
+cannot force a higher DVFS state on an unprivileged Samsung device, and
+no S24+ v4 APK test has yet been completed. Compare Off, Performance,
+Maximum and the external helper at the SAME device temperature,
+resolution and display output. On S24+, check `state=gpu-priority`
+alongside vkmark FPS and the GPU clock. If scores stay around 430 even
+when synthetic work is paused, the next investigation must isolate
+Android vendor Vulkan driver / kernel GPU governor and renderer
+regressions against `3c98ffa`, rather than adding more fake GPU work.
+
 ## v3: prevent Exynos CPU spin; materialize actual GPU work
 
 The S24+ (Xclipse 940, Android ANGLE over Vulkan) provided a direct

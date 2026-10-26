@@ -474,6 +474,10 @@ static void *gpuPerformanceThread(void *unused) {
     uint64_t completedAsync = 0, oldCompletedAsync = 0;
     uint64_t readbacks = 0, oldReadbacks = 0, readbackMismatches = 0;
     uint64_t cpuPacedPulses = 0, oldCpuPacedPulses = 0;
+    uint64_t nextGpuBusySampleNs = 0, realGpuBackoffUntilNs = 0;
+    uint64_t realGpuYieldCount = 0;
+    long sampledGpuBusy = -1;
+    bool givingRealGpuPriority = false;
     unsigned previousHz = 0;
     unsigned measuredCpu = 0;
     unsigned suspiciousFastStreak = 0;
@@ -493,6 +497,9 @@ static void *gpuPerformanceThread(void *unused) {
                         (unsigned long long)atomic_load(&presentedCount));
             wasActive = false;
             previousMode = -1;
+            givingRealGpuPriority = false;
+            nextGpuBusySampleNs = realGpuBackoffUntilNs = 0;
+            sampledGpuBusy = -1;
             sampleNs = now;
             sampleCpu = cpuNs();
             if (mode != GPU_PERF_OFF && now - reportNs >= UINT64_C(5000000000)) {
@@ -549,6 +556,55 @@ static void *gpuPerformanceThread(void *unused) {
                     gpu.fastClear);
         }
         wasActive = true;
+
+        /* Only the measured ANGLE-style ultra-fast GL clear path is allowed
+         * to arbitrate with the real rendering workload. The normal Adreno
+         * helper path is unchanged. The governor-reported busy percentage
+         * is used as a PRIORITY signal, never to modify clocks/governors.
+         * One read per 250ms, not one per X11 frame or helper pulse. */
+        if (gpu.fastClear) {
+            now = monoNs();
+            if (!nextGpuBusySampleNs || now >= nextGpuBusySampleNs) {
+                sampledGpuBusy = tryReadGpuBusyPercent();
+                nextGpuBusySampleNs = now + GPU_PERF_BUSY_SAMPLE_NS;
+                realGpuBackoffUntilNs =
+                    gpuPerfBackoffUntil(now, realGpuBackoffUntilNs,
+                                        gpu.fastClear, sampledGpuBusy);
+            }
+            if (gpuPerfBackoffActive(now, realGpuBackoffUntilNs)) {
+                if (!givingRealGpuPriority) {
+                    GPU_LOG("state=gpu-priority mode=%s busy_pct=%ld "
+                            "fast_clear=1; synthetic EGL work suspended "
+                            "while real GPU work is busy",
+                            modeName(mode), sampledGpuBusy);
+                    givingRealGpuPriority = true;
+                    realGpuYieldCount++;
+                }
+                if (now - reportNs >= UINT64_C(5000000000)) {
+                    uint64_t totalFrames = atomic_load(&presentedCount);
+                    GPU_LOG("state=gpu-priority mode=%s gpu_busy_pct=%ld "
+                            "frames=%llu/5s refresh_hz=%u synthetic_pulses=0 "
+                            "gpu_clock_raw=%ld",
+                            modeName(mode), sampledGpuBusy,
+                            (unsigned long long)(totalFrames - oldFrames),
+                            refreshHz, tryReadGpuClock());
+                    oldFrames = totalFrames;
+                    previousLoops = loops;
+                    oldReadbacks = readbacks;
+                    oldCpuPacedPulses = cpuPacedPulses;
+                    oldCompletedAsync = completedAsync;
+                    reportNs = now;
+                }
+                waitForNewWork();
+                continue;
+            }
+        }
+        if (givingRealGpuPriority) {
+            GPU_LOG("state=gpu-assist-resume mode=%s busy_pct=%ld "
+                    "fast_clear=1",
+                    modeName(mode), sampledGpuBusy);
+            givingRealGpuPriority = false;
+        }
 
         /* Change one pixel colour to avoid drivers discarding an identical
          * back-to-back clear. No window surface, swapchain or X11 locks. */
@@ -640,7 +696,8 @@ static void *gpuPerformanceThread(void *unused) {
                     "frames=%llu/5s refresh_hz=%u gpu_path=%s async_done=%llu/5s "
                     "async_pending=%u fast_clear=%d glfinish_probe_ns=%llu "
                     "gpu_readbacks=%llu/5s readback_mismatches=%llu "
-                    "cpu_paced=%llu/5s gpu_clock_raw=%ld gpu_busy_pct=%ld "
+                    "cpu_paced=%llu/5s gpu_priority_yields=%llu "
+                    "gpu_clock_raw=%ld gpu_busy_pct=%ld "
                     "thermal=%d visible=%d",
                     modeName(mode), (unsigned long long)(loops - previousLoops),
                     measuredCpu, delayUs,
@@ -653,6 +710,7 @@ static void *gpuPerformanceThread(void *unused) {
                     (unsigned long long)(readbacks - oldReadbacks),
                     (unsigned long long)readbackMismatches,
                     (unsigned long long)(cpuPacedPulses - oldCpuPacedPulses),
+                    (unsigned long long)realGpuYieldCount,
                     tryReadGpuClock(), tryReadGpuBusyPercent(),
                     thermal, foreground);
             oldFrames = totalFrames;
