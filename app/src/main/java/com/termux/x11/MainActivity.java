@@ -271,6 +271,12 @@ private void runTermuxCommandFromTopApp(Intent intent) {
     @SuppressLint({"AppCompatMethod", "ObsoleteSdkInt", "ClickableViewAccessibility", "WrongConstant", "UnspecifiedRegisterReceiverFlag"})
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Also serves as the S24+/S26U rootless scheduler experiment's runtime proof:
+        // the experimental build must report the same PID as the com.termux Android process.
+        Log.i("OneUiProcessHost", "cohost=" + BuildConfig.TERMUX_COHOST
+                + " process=" + getApplicationInfo().processName
+                + " pid=" + android.os.Process.myPid()
+                + " uid=" + android.os.Process.myUid());
 
         android.preference.PreferenceManager
                 .getDefaultSharedPreferences(this)

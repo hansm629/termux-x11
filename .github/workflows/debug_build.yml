@@ -2,6 +2,12 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      cohost_termux:
+        description: 'EXPERIMENT: Run the Termux-X11 Android UI in the com.termux process (shared UID + signing required)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - master
@@ -49,13 +55,25 @@ jobs:
             ${{ runner.os }}-gradle-
 
     - name: Build
-      run: ./gradlew assembleDebug
+      run: |
+        if [[ "${{ inputs.cohost_termux }}" == "true" ]]; then
+          ./gradlew assembleDebug -Ptx11CohostTermux=true
+        else
+          ./gradlew assembleDebug
+        fi
+    - name: Verify process host in merged manifest
+      run: |
+        if [[ "${{ inputs.cohost_termux }}" == "true" ]]; then
+          python3 tools/oneui-cohost/verify-manifest.py com.termux
+        else
+          python3 tools/oneui-cohost/verify-manifest.py com.termux.x11
+        fi
     - name: Build companion package
       run: ./build_termux_package
     - name: Store app-arm64-v8a-debug
       uses: actions/upload-artifact@v7
       with:
-        name: termux-x11-arm64-v8a-debug
+        name: ${{ inputs.cohost_termux && 'termux-x11-arm64-v8a-COHOST-EXPERIMENT' || 'termux-x11-arm64-v8a-debug' }}
         path: ./app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
     
     - name: Store app-armeabi-v7a-debug

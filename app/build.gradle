@@ -1,11 +1,28 @@
 apply plugin: 'com.android.application'
 
+// OneUI 8/9 scheduler experiment. Android assigns foreground cpusets to *processes*, not
+// to the entire shared UID: Termux's own shells can lose CPU6/7 when com.termux.x11 is
+// top-app. The cohost variant runs X11's Android components in Termux's app process so
+// both visible X11 and TermuxService-launched workloads share the top-app process group.
+//
+// OFF by default. Only explicit -Ptx11CohostTermux=true makes the experimental APK.
+// Requires com.termux and com.termux.x11 to share a UID and signing certificate, already
+// required by AndroidManifest.xml's sharedUserId. Do not deploy this APK to the DevSpace
+// host device: upgrading a shared-process APK can restart the Termux process/MCP server.
+def tx11CohostTermuxValue = providers.gradleProperty('tx11CohostTermux').orElse('false').get()
+if (!(tx11CohostTermuxValue in ['true', 'false'])) {
+    throw new GradleException('tx11CohostTermux must be exactly true or false')
+}
+def tx11CohostTermux = tx11CohostTermuxValue == 'true'
+
 android {
     namespace 'com.termux.x11'
     //noinspection GrDeprecatedAPIUsage
     compileSdkVersion 34
     defaultConfig {
         applicationId "com.termux.x11"
+        manifestPlaceholders = [tx11ProcessHost: tx11CohostTermux ? 'com.termux' : 'com.termux.x11']
+        buildConfigField "boolean", "TERMUX_COHOST", tx11CohostTermux.toString()
         minSdkVersion 26
         targetSdkVersion 34
         versionCode 15
