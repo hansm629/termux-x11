@@ -41,7 +41,7 @@ assert 'setGpuPerformanceForeground(false)' not in activity_src.split(
 contains(native / "gpu_performance.c",
          ['gpuPerfLimitsForRefresh(', 'gpuPerfAsyncPulse(', 'gpu->pendingCount == 2',
           'EGL_SYNC_FENCE_KHR', 'gpuPerformanceSetRefreshRate(',
-          'GPU_PERF_PERFORMANCE &&', 'state=idle mode='])
+          'GPU_PERF_PERFORMANCE &&', 'state=idle mode=', 'configured mode=%s'])
 
 a = "{http://schemas.android.com/apk/res-auto}"
 elements = ET.parse(xml).getroot().iter()
@@ -70,4 +70,15 @@ contains(java / "LorieView.java",
          ['"highRefreshSurfacePolicy"', 'requestRendererSurfaceFrameRate(refreshRate)',
           'requestRendererSurfaceFrameRateFixedSource(refreshRate)',
           'clearRendererSurfaceFrameRate();'])
+# LoriePreferences iterates and assigns localized summaries before attaching
+# SimpleSummaryProvider in Java. Declaring it in XML on a preference which has
+# a localized _summary resource caused the actual Output screen to crash with
+# IllegalStateException in Preference.setSummary(). Check both sides, including
+# the defensive Java guard, so future list additions cannot regress this.
+pref_java = (java / "LoriePreferences.java").read_text()
+assert 'p.getSummaryProvider() == null' in pref_java
+for p in ET.parse(xml).getroot().iter("ListPreference"):
+    key = p.attrib[a + "key"]
+    if key in ("gpuPerformanceMode", "highRefreshSurfacePolicy"):
+        assert p.attrib.get(a + "useSimpleSummaryProvider") != "true", key
 print("TGPUWIRING cross-vendor controller JNI, preference, thermal/foreground and build: PASS")

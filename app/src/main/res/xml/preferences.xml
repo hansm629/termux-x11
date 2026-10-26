@@ -73,8 +73,7 @@
     app:summary="@string/lorie_pref_gpuPerformanceMode_summary"
     app:defaultValue="off"
     app:entries="@array/lorie_pref_gpuPerformanceMode_entries"
-    app:entryValues="@array/lorie_pref_gpuPerformanceMode_values"
-    app:useSimpleSummaryProvider="true" />
+    app:entryValues="@array/lorie_pref_gpuPerformanceMode_values" />
 
 <ListPreference
     app:key="highRefreshSurfacePolicy"
@@ -82,8 +81,7 @@
     app:summary="@string/lorie_pref_highRefreshSurfacePolicy_summary"
     app:defaultValue="default"
     app:entries="@array/lorie_pref_highRefreshSurfacePolicy_entries"
-    app:entryValues="@array/lorie_pref_highRefreshSurfacePolicy_values"
-    app:useSimpleSummaryProvider="true" />
+    app:entryValues="@array/lorie_pref_highRefreshSurfacePolicy_values" />
 
 <SwitchPreferenceCompat app:key="adjustResolution" app:defaultValue="false" />
         <SwitchPreferenceCompat app:key="displayStretch" app:defaultValue="false" />

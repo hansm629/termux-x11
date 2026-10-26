@@ -34,6 +34,7 @@
 #define GPU_ERR(...) __android_log_print(ANDROID_LOG_WARN, "LorieGpuPerf", __VA_ARGS__)
 
 static _Atomic int selectedMode;
+static _Atomic bool modeConfiguredOnce;
 static _Atomic int thermalStatus;
 static _Atomic bool appForeground;
 static _Atomic uint64_t lastPresentedNs;
@@ -465,7 +466,11 @@ static void startWorkerIfNeeded(void) {
 void gpuPerformanceSetMode(int mode) {
     if (mode < GPU_PERF_OFF || mode > GPU_PERF_MAXIMUM)
         mode = GPU_PERF_OFF;
-    atomic_store_explicit(&selectedMode, mode, memory_order_relaxed);
+    int previous = atomic_exchange_explicit(&selectedMode, mode, memory_order_relaxed);
+    bool first = !atomic_exchange_explicit(&modeConfiguredOnce, true, memory_order_relaxed);
+    if (first || previous != mode)
+        GPU_LOG("configured mode=%s worker=%s", modeName(mode),
+                mode == GPU_PERF_OFF ? "disabled" : "enabled");
     if (mode != GPU_PERF_OFF)
         startWorkerIfNeeded();
     wakeWorker();

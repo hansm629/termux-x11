@@ -258,7 +258,11 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
                 if ((id = findId(p.getKey())) != 0)
                     p.setTitle(getResources().getString(id));
 
-                if ((id = findId(p.getKey() + "_summary")) != 0)
+                // AndroidX throws IllegalStateException if setSummary() is called
+                // while XML (useSimpleSummaryProvider) already installed a
+                // SummaryProvider. Keep the provider for the selected list value.
+                if ((id = findId(p.getKey() + "_summary")) != 0
+                        && p.getSummaryProvider() == null)
                     p.setSummary(getResources().getString(id));
 
                 if (p instanceof ListPreference) {
