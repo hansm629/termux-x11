@@ -29,8 +29,25 @@ out="$HOME/tx11-gpu-${tag}-$(date '+%Y%m%d-%H%M%S').log"
         fi
     done
     printf '\n=== integrated helper / mode + output display info ===\n'
-    logcat -d -s LorieGpuPerf:I LorieGpuPerf:W LorieView:I LorieView:W \
+    # Do not repeat the same tag with :I and :W: the last one may hide INFO.
+    logcat -d -s LorieGpuPerf:I LorieView:I '*:S' \
         2>/dev/null | tail -n 70 || true
+    printf '\n=== GPU helper thread scheduling and CPU affinity ===\n'
+    for app in com.termux.x11 com.termux; do
+        for pid in $(pidof "$app" 2>/dev/null); do
+            for task in /proc/"$pid"/task/*; do
+                [ -r "$task/comm" ] || continue
+                comm="$(cat "$task/comm" 2>/dev/null || true)"
+                case "$comm" in
+                    LorieGpuAssist)
+                        printf 'pid=%s tid=%s name=%s\n' "$pid" "${task##*/}" "$comm"
+                        grep -E '^Cpus_allowed_list:' "$task/status" 2>/dev/null || true
+                        grep -E 'cpuset:|cpu:' "$task/cgroup" 2>/dev/null || true
+                        ;;
+                esac
+            done
+        done
+    done
     printf '\n=== external gpu_keepalive (should be absent) ===\n'
     pgrep -af '^/data/data/com.termux/files/home/alroot-virpipe/gpu_keepalive ' || true
 } | tee "$out"

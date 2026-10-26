@@ -1,5 +1,71 @@
 # Termux-X11 Universal Adaptive GPU Performance Controller (experimental)
 
+## v3: prevent Exynos CPU spin; materialize actual GPU work
+
+The S24+ (Xclipse 940, Android ANGLE over Vulkan) provided a direct
+on-device diagnosis: at **Maximum** the app helper executed
+**2.8-3.1 million glClear/glFinish loops per 5s**, spent **99% of one
+CPU core**, and often logged a low or zero GPU busy/clock reading.
+This is a *fast returning off-screen clear workload*, not evidence of
+actual GPU acceleration. The S26U's same helper executed about 18-24k
+loops/5s at 9-16% CPU. These are observed controller metrics, not
+comparable GPU benchmark scores.
+
+The GPU vendor is **not** the policy selector. The new controller measures
+the EGL context's glFinish clear latency using a brief startup probe, and
+can also detect a sequence of 32 unexpectedly fast synchronous pulses.
+For a measured ultra-fast (<20us) pbuffer clear path:
+
+- Periodically (at most once per 8ms) draw a small varying-color
+  triangle into its private 16x16 EGL Pbuffer using a GLES2 shader and
+  read **one RGBA pixel** back. This makes the framebuffer result
+  observable instead of generating millions of overwritten clears.
+  Shader setup and readback are optional; failure logs a warning and
+  leaves the normal X11 renderer untouched.
+- Use a measured, non-vendor-specific **125us minimum interval** and
+  **55% helper-thread CPU duty limit** in Maximum. Previously Maximum
+  could peg an Xclipse big core at 99%. Normal GPU-bound Maximum
+  (`glFinish` longer than 20us) remains unpaced.
+- Use bounded, CPU-duty-regulated synchronous verification instead of
+  an unobservable async clear queue for the measured fast-clear path.
+  The original bounded-async path is unchanged on devices without this
+  anomaly. The helper never shares GL/Vulkan resources with X11.
+- When switching back from async Performance to sync Maximum, dispose
+  of completed helper-only EGL fence objects after glFinish instead of
+  retaining two stale pending slots.
+
+This is a **candidate fix** for the 100%-of-a-core spin and ineffective
+S24+ GPU boost, not a claim that S24+ now matches the external sidecar.
+`glReadPixels` may itself synchronize the GPU, which is why its
+frequency is bounded and the worker's CPU duty is monitored. It is
+possible that 8ms readback intervals do not maintain full GPU
+frequency; the actual A/B benchmark must decide.
+
+Validation on each device (native Termux-Desktop XFCE, unchanged X
+resolution and scene, external keepalive absent):
+
+```sh
+TX11_GPU_KEEPALIVE=0 tx11start
+# Select Balanced / Performance / Maximum in the Android app's Output settings
+logcat -d -s LorieGpuPerf:I '*:S' | tail -n 35
+```
+
+In S24+ Maximum, check `glFinish_probe_ns`, `fast_clear=1`,
+`gpu_readbacks`, `cpu_paced`, and **per-thread** CPU consumption.
+Ideally `shader_draw=1` appears at EGL setup. If readback verification
+fails, the controller logs why; the CPU cap still applies.
+In S26U Maximum, expect `fast_clear=0`, no forced readbacks and no
+unnecessary change to the previous Adreno glFinish path.
+Use 1 light and 1 heavy scene each of vkmark and glmark2 on 120Hz
+on-screen and 60Hz DeX where available, plus SuperTuxKart frame pacing
+and thermal/battery observations. The GPU performance score and the
+actual new-content FPS are different measurements.
+
+The correct filtered diagnostic command includes **one** tag level,
+not repeated `LorieGpuPerf:I LorieGpuPerf:W`: Android logcat may resolve
+the repeated spec to the final W-only filter, hiding the INFO logs.
+Use `logcat -d -s LorieGpuPerf:I '*:S'`.
+
 ## v2: S24+ and S26U on-screen / DeX findings (2026-10-26)
 
 The user observed S26U **1920×1080/120 Hz on-screen vkmark 5,369**
@@ -176,7 +242,7 @@ audio settings. It is never run automatically. Setting
 Diagnostics from Termux:
 
 ```sh
-logcat -d -s LorieGpuPerf:I | tail -n 30
+logcat -d -s LorieGpuPerf:I '*:S' | tail -n 30
 pidof gpu_keepalive  # should print nothing during integrated-mode testing
 ```
 

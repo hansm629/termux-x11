@@ -151,7 +151,7 @@ E.g. <b>META</b> for <i>META key</i>, \n
         <item>Off (default, external helper compatible)</item>
         <item>Balanced (low CPU / battery priority)</item>
         <item>Performance (adaptive CPU budget)</item>
-        <item>Maximum (unlimited benchmark; high power)</item>
+        <item>Maximum (unlimited GPU-bound; fast-clear CPU safety guard)</item>
     </string-array>
     <string-array name="lorie_pref_gpuPerformanceMode_values">
         <item>off</item>

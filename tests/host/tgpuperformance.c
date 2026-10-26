@@ -32,6 +32,24 @@ int main(void) {
     CHECK(gpuPerfNextSleep(GPU_PERF_PERFORMANCE, 50, 0) == 50);
     CHECK(gpuPerfNextSleep(GPU_PERF_BALANCED, 0, 0) >= balanced.min_sleep_us);
     CHECK(gpuPerfNextSleep(GPU_PERF_BALANCED, 10000, 90) <= balanced.max_sleep_us);
+    /* S24+ ANGLE glFinish took ~1.7us per off-screen clear: such a loop
+     * previously reached ~590k iterations/sec and held a core at 99%.
+     * An Adreno glFinish around 200us must stay on the original fast path. */
+    CHECK(gpuPerfFastClear(1700));
+    CHECK(gpuPerfFastClear(19999));
+    CHECK(!gpuPerfFastClear(0));
+    CHECK(!gpuPerfFastClear(20000));
+    CHECK(!gpuPerfFastClear(200000));
+    CHECK(gpuPerfFastMaximumSleepNs(1700, 1600) >=
+          GPU_PERF_FAST_MAX_MIN_INTERVAL_NS - 1700);
+    CHECK(gpuPerfFastMaximumSleepNs(250000, 20000) == 0);
+    CHECK(gpuPerfFastMaximumSleepNs(100000, 80000) > 40000);
+    CHECK(GPU_PERF_FAST_READBACK_INTERVAL_NS >= UINT64_C(5000000));
+    CHECK(gpuPerfReadbackDue(UINT64_C(100000000), 0));
+    CHECK(!gpuPerfReadbackDue(UINT64_C(100000001), UINT64_C(100000000)));
+    CHECK(!gpuPerfReadbackDue(UINT64_C(107999999), UINT64_C(100000000)));
+    CHECK(gpuPerfReadbackDue(UINT64_C(108000000), UINT64_C(100000000)));
+    CHECK(gpuPerfReadbackDue(UINT64_C(1), UINT64_C(100000000)));
     struct gpu_perf_limits highBalanced = gpuPerfLimitsForRefresh(GPU_PERF_BALANCED, 120);
     struct gpu_perf_limits highPerformance = gpuPerfLimitsForRefresh(GPU_PERF_PERFORMANCE, 120);
     CHECK(highBalanced.cpu_budget_percent > balanced.cpu_budget_percent);
@@ -63,7 +81,7 @@ int main(void) {
             CHECK(sleep >= limits.min_sleep_us && sleep <= limits.max_sleep_us);
         }
     }
-    printf("TGPUPERFORMANCE idle/visibility/thermal and 60/120Hz CPU duty: %s (%d failures)\n",
+    printf("TGPUPERFORMANCE idle/thermal/60-120Hz and fast-clear CPU spin guard: %s (%d failures)\n",
            fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }

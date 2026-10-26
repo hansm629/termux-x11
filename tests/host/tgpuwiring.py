@@ -41,7 +41,12 @@ assert 'setGpuPerformanceForeground(false)' not in activity_src.split(
 contains(native / "gpu_performance.c",
          ['gpuPerfLimitsForRefresh(', 'gpuPerfAsyncPulse(', 'gpu->pendingCount == 2',
           'EGL_SYNC_FENCE_KHR', 'gpuPerformanceSetRefreshRate(',
-          'GPU_PERF_PERFORMANCE &&', 'state=idle mode=', 'configured mode=%s'])
+          'GPU_PERF_PERFORMANCE &&', 'state=idle mode=', 'configured mode=%s',
+          'gpuPerfProbeClearNs()', 'gpuPerfFastClear(gpu->probeClearNs)',
+          'gpuPerfPrepareVerificationDraw(', 'glDrawArrays(GL_TRIANGLES, 0, 3)',
+          'glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel)',
+          'gpuPerfFastMaximumSleepNs(', 'gpu_readbacks=%llu/5s',
+          'pthread_setname_np(pthread_self(), "LorieGpuAssist")'])
 
 a = "{http://schemas.android.com/apk/res-auto}"
 elements = ET.parse(xml).getroot().iter()
