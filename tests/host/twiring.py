@@ -69,6 +69,25 @@ check("else if (gpuCopyPending)\n            rendererVkApplyPendingGpuCopies();"
       open(os.path.join(L, "renderer.c"), encoding="utf-8").read(),
       "one-frame-per-tick must keep processing GPU Present copies without a screen frame")
 
+# V8: a CPU reservation must be published while holding state->lock, before
+# dropping it and before GPU-completion waiting. GPU-copy and root sampling
+# both honor the reservation until the X server releases it.
+reserve_src = func(I, "static Bool lorieCpuReserve(uint64_t id) {")
+prepare_src = func(I, "Bool loriePrepareAccess(PixmapPtr pPix, int index) {")
+renderer_src = open(os.path.join(L, "renderer.c"), encoding="utf-8").read()
+check("pvfb->exaEarlyReserveRoot && lorieGpuInFlight(st, id)" in reserve_src,
+      "V8 early root reservation must require an actual in-flight GPU frame")
+check("pvfb->exaEarlyReserve && pvfb->accessLocks == 1" in prepare_src and
+      prepare_src.find("priv->reserved = reservedBeforeWait = TRUE;") <
+      prepare_src.find("lorieGpuWaitIdle(pvfb->state, false,") and
+      prepare_src.find("lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);") <
+      prepare_src.find("lorieGpuWaitIdle(pvfb->state, false,"),
+      "V8 must reserve an AHB and drop the global lock before waiting for its prior GPU frame")
+check("if (owned && lorieCpuReserved(state, desc->id))" in renderer_src and
+      "vkr.held = true;" in renderer_src and
+      "syscall(SYS_futex, &state->cpuAccess.releases" in renderer_src,
+      "V8 root reservation requires the Vulkan renderer's safe held-swapchain retry")
+
 connected = func(I, "void lorieActivityConnected(void) {")
 check("lorieResetOwnership();" in connected, "a new renderer connection does not reset the ownership")
 

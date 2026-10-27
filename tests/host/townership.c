@@ -146,6 +146,9 @@ struct fake_pvfb {
     uint32_t xAccessesOpened;   /* P11-C3-D1: the accesses counted for the composites (texacomposite.c times them) */
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;            /* P11-C3-B1: TERMUX_X11_EXA_LOCK_OPT */
+    Bool exaEarlyReserve;       /* V8: TERMUX_X11_EXA_EARLY_RESERVE; optional before in-flight wait */
+    Bool exaEarlyReserveRoot;
+    uint64_t exaEarlyReserveWaits, exaEarlyReserveWaitUs;
     Bool freezeDiag;            /* P11-C3-C: TERMUX_X11_FRAME_FREEZE_DIAG - the stage this thread is in */
     Bool contentDiag;           /* P11-C3-D0: TERMUX_X11_CONTENT_FRAME_DIAG (tcontentframe.c runs its hooks) */
     uint32_t xStage;
@@ -220,8 +223,19 @@ static long fakeFutexWait(volatile uint32_t *word, int op, uint32_t value) {
     }
     gpuWaits++;
     CHECK(op == FUTEX_WAIT && *word == value, "%s op %d: not a futex wait on the list's word", runName, opIndex);
-    if (checked)
-        CHECK(checked->state->lock > 0, "%s op %d: waited for a Vulkan frame without the shared lock", runName, opIndex);
+    if (checked && !checked->state->lock) {
+        struct fake_state *st = checked->state;
+        uint64_t id = st->gpuInFlight.ids[0];
+        bool reserved = false;
+        for (uint32_t i = 0; i < st->cpuAccess.count; i++)
+            reserved |= st->cpuAccess.ids[i] == id;
+        /* A reservation may precede completion of the *previous* frame,
+         * but no CPU lock is allowed until that frame's fence is over. */
+        CHECK(checked->exaEarlyReserve && st->gpuInFlight.count == 1 &&
+              reserved && id < (uint64_t) nbuffers && !buffers[id]->cpuHeld &&
+              checked->accessLocks == 0,
+              "%s op %d: early GPU wait without a protected, CPU-unlocked reservation", runName, opIndex);
+    }
     if (gpuWaits > 2000) {
         CHECK(0, "%s op %d: a wait for a Vulkan frame that does not end", runName, opIndex);
         *word = 0;
@@ -670,18 +684,23 @@ static void rendererView(const char *where) {
     xorg_list_for_each_entry(priv, &checked->ahbPersistent, persistentLink)
         CHECK(!wasFreed(priv), "%s op %d, %s: a destroyed pixmap is still remembered", runName, opIndex, where);
     if (answered() == LORIE_OWNERSHIP_PER_ACCESS) {
-        /* P11-C3-B1: but for one the X server holds reserved (cpuAccess), which no renderer touches - and which no
-         * submitted frame uses, ever */
+        /* P11-C3-B1: a reserved AHB must not be CPU-locked while a frame
+         * uses it. V8 permits reserving before the *previous* frame
+         * completes, precisely to await its fence without the global lock. */
         for (i = 0; i < nbuffers; i++)
             if (!buffers[i]->released && buffers[i]->desc.type == LORIEBUFFER_AHARDWAREBUFFER)
                 CHECK(!buffers[i]->cpuHeld || lorieCpuReserved(checked->state, buffers[i]->desc.id),
                       "%s op %d, %s: AHB %llu CPU-locked though PER_ACCESS is answered", runName, opIndex, where,
                       buffers[i]->desc.id);
         for (i = 0; i < (int) checked->state->cpuAccess.count; i++) {
-            CHECK(!lorieGpuInFlight(checked->state, checked->state->cpuAccess.ids[i]),
-                  "%s op %d, %s: AHB %llu reserved while a submitted frame uses it", runName, opIndex, where,
-                  (unsigned long long) checked->state->cpuAccess.ids[i]);
-            CHECK(checked->state->cpuAccess.ids[i] != checked->state->rootWindowTextureID,
+            uint64_t id = checked->state->cpuAccess.ids[i];
+            LorieBuffer *b = bufferWithId(id);
+            CHECK(!lorieGpuInFlight(checked->state, id) ||
+                  (checked->exaEarlyReserve && b && !b->cpuHeld),
+                  "%s op %d, %s: AHB %llu reserved and CPU-locked before its previous GPU frame completed",
+                  runName, opIndex, where, (unsigned long long) id);
+            CHECK(checked->state->cpuAccess.ids[i] != checked->state->rootWindowTextureID ||
+                  checked->exaEarlyReserveRoot,
                   "%s op %d, %s: the published root reserved", runName, opIndex, where);
         }
     } else
@@ -1544,6 +1563,62 @@ int main(void) {
             CHECK(ok && gpuWaits == waits0 + 1 && !st->gpuInFlight.busy && lorieCpuReserved(st, xb[4]->desc.id) && st->lock == 0,
                   "B1 frame in flight: %d waits, reserved %d", gpuWaits - waits0, lorieCpuReserved(st, xb[4]->desc.id));
             lorieFinishAccess(&xr[4], EXA_PREPARE_DEST);
+
+            /* V8: an already in-flight GPU frame using a *non-published* AHB
+             * can be waited for with no global lock, only when that AHB has
+             * first been reserved under the shared lock. Mock futex verifies
+             * the reservation exists and that the CPU has not yet locked it. */
+            newWorld.exaEarlyReserve = TRUE;
+            waits0 = gpuWaits;
+            st->gpuInFlight.ids[0] = xb[4]->desc.id;
+            st->gpuInFlight.count = 1, st->gpuInFlight.pid = getpid(), st->gpuInFlight.busy = 1;
+            gpuSlices = 2;      /* two intermediate timeouts, then completion */
+            ok = loriePrepareAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(ok && gpuWaits == waits0 + 3 && st->lock == 0 &&
+                  lorieCpuReserved(st, xb[4]->desc.id) && xb[4]->cpuHeld &&
+                  !lorieGpuInFlight(st, xb[4]->desc.id) &&
+                  newWorld.exaEarlyReserveWaits == 1 && newWorld.exaEarlyReserveWaitUs > 0,
+                  "V8 early reserved wait: %d waits, lock %d, reservation %d, CPU held %d, counted %llu",
+                  gpuWaits - waits0, st->lock, lorieCpuReserved(st, xb[4]->desc.id),
+                  xb[4]->cpuHeld, (unsigned long long) newWorld.exaEarlyReserveWaits);
+            lorieFinishAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(!lorieCpuReserved(st, xb[4]->desc.id) && st->lock == 0 &&
+                  !xb[4]->cpuHeld, "V8 early reserve left a lock or reservation behind");
+
+            /* Even with V8 enabled, the AHB currently published as the root
+             * can never be reserved or let go of the shared lock early. */
+            st->rootWindowTextureID = xb[4]->desc.id;
+            waits0 = gpuWaits;
+            st->gpuInFlight.ids[0] = xb[4]->desc.id;
+            st->gpuInFlight.count = 1, st->gpuInFlight.pid = getpid(), st->gpuInFlight.busy = 1;
+            ok = loriePrepareAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(ok && gpuWaits == waits0 + 1 && !lorieCpuReserved(st, xb[4]->desc.id) &&
+                  st->lock == 1 && newWorld.accessLocks == 1 &&
+                  newWorld.exaEarlyReserveWaits == 1,
+                  "V8 published root must retain legacy lock and GPU wait");
+            lorieFinishAccess(&xr[4], EXA_PREPARE_DEST);
+            st->rootWindowTextureID = buffers[1]->desc.id;
+            /* Explicit root opt-in: while the *previous* frame reads the
+             * published root, reserve it first, release the shared lock,
+             * then wait before CPU locking. The renderer's reserved-root
+             * path must not draw it until the reservation is released. */
+            st->rootWindowTextureID = xb[4]->desc.id;
+            newWorld.exaEarlyReserveRoot = TRUE;
+            waits0 = gpuWaits;
+            st->gpuInFlight.ids[0] = xb[4]->desc.id;
+            st->gpuInFlight.count = 1, st->gpuInFlight.pid = getpid(), st->gpuInFlight.busy = 1;
+            ok = loriePrepareAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(ok && gpuWaits == waits0 + 1 && st->lock == 0 &&
+                  lorieCpuReserved(st, xb[4]->desc.id) && xb[4]->cpuHeld &&
+                  newWorld.exaEarlyReserveWaits == 2,
+                  "V8 opt-in root: frame wait under reservation failed or held the global lock");
+            lorieFinishAccess(&xr[4], EXA_PREPARE_DEST);
+            CHECK(!lorieCpuReserved(st, xb[4]->desc.id) && !xb[4]->cpuHeld &&
+                  st->lock == 0,
+                  "V8 root reservation was not fully released");
+            newWorld.exaEarlyReserveRoot = FALSE;
+            st->rootWindowTextureID = buffers[1]->desc.id;
+            newWorld.exaEarlyReserve = FALSE;
 
             /* no free slot: the shared lock, counted */
             for (int k = 0; k < LORIE_CPU_ACCESS_MAX; k++)

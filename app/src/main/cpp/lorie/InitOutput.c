@@ -189,6 +189,16 @@ typedef struct {
     /* P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1, lorie.h cpuAccess): PER_ACCESS AHB accesses reserve the AHB instead of
      * holding the shared lock through the access */
     Bool exaLockOpt;
+    /* Opt-in: reserve a non-published AHB before waiting on its previous
+     * Vulkan user so the shared X server/renderer mutex is not held while
+     * the GPU finishes. The reservation blocks any *new* GPU use. */
+    Bool exaEarlyReserve;
+    /* Higher-risk experimental extension: only while an old frame still
+     * owns the published root AHB, allow an early CPU reservation of it.
+     * rendererVkRedraw already handles a reserved root by holding its
+     * acquired swapchain image and waiting for the reservation release. */
+    Bool exaEarlyReserveRoot;
+    uint64_t exaEarlyReserveWaits, exaEarlyReserveWaitUs;
 
     /* P11-C3-D1-A (TERMUX_X11_EXA_COMPOSITE_OPT=1, lorieDeferCopyDamage): a Present GPU copy's damage reported once the
      * copy is done */
@@ -648,6 +658,22 @@ void OsVendorInit(void) {
     // Experimental: TERMUX_X11_EXA_LOCK_OPT=1 has a PER_ACCESS AHB access reserve the AHB for itself instead of holding
     // the shared lock - and so the renderer's frames - through the CPU drawing (loriePrepareAccess, lorie.h cpuAccess).
     lorieScreen.exaLockOpt = getenv("TERMUX_X11_EXA_LOCK_OPT") && !strcmp(getenv("TERMUX_X11_EXA_LOCK_OPT"), "1");
+    lorieScreen.exaEarlyReserve = lorieScreen.exaLockOpt &&
+                                  getenv("TERMUX_X11_EXA_EARLY_RESERVE") &&
+                                  !strcmp(getenv("TERMUX_X11_EXA_EARLY_RESERVE"), "1");
+    lorieScreen.exaEarlyReserveRoot = lorieScreen.exaEarlyReserve &&
+                                      getenv("TERMUX_X11_EXA_EARLY_RESERVE_ROOT") &&
+                                      !strcmp(getenv("TERMUX_X11_EXA_EARLY_RESERVE_ROOT"), "1");
+    if (getenv("TERMUX_X11_EXA_EARLY_RESERVE") &&
+        !strcmp(getenv("TERMUX_X11_EXA_EARLY_RESERVE"), "1") &&
+        !lorieScreen.exaEarlyReserve)
+        log(WARN, "XlorieEarlyReserve: requires TERMUX_X11_EXA_LOCK_OPT=1 and "
+                  "TERMUX_X11_EXA_EARLY_RESERVE=1; retaining legacy ordering");
+    if (getenv("TERMUX_X11_EXA_EARLY_RESERVE_ROOT") &&
+        !strcmp(getenv("TERMUX_X11_EXA_EARLY_RESERVE_ROOT"), "1") &&
+        !lorieScreen.exaEarlyReserveRoot)
+        log(WARN, "XlorieEarlyReserve: ROOT requires both EXA_LOCK_OPT=1 and "
+                  "EXA_EARLY_RESERVE=1; the published root keeps the shared mutex");
     // Experimental: TERMUX_X11_EXA_COMPOSITE_OPT=1 reports a Present GPU copy's damage once the copy is done, not as it is
     // queued - a compositor then reads (composites) the window's content with the copy in it, without waiting for the
     // frame that runs it (lorieDeferCopyDamage, patches/xserver.patch present_damage_gpu_copy).
@@ -1658,6 +1684,18 @@ static void lorieLogRendererDiag(void) {
         pvfb->exaLockOpt ? "on" : "off", TD(xAccessReserved), TD(xAccessReserveFull), TD(copiesDeferred), TD(copiesDeferredWakes),
         pvfb->state->backend.vkScheduleOpt ? "on" : "off", TD(rootAhead), TD(rootAheadXWaiting), TD(rootChainConsumed),
         TD(rootAheadUnavailable), TD(buffersAwaited), TD(bufferAwaitUs), TD(buffersGivenUp), TD(copiesLeftForBuffers));
+    if (pvfb->exaEarlyReserve) {
+        static uint64_t prevWaits, prevWaitUs;
+        log(INFO, "XlorieEarlyReserve: enabled=on root=%s reservations_before_gpu_wait=%llu(+%llu) "
+                  "gpu_wait_outside_global_lock_us=%llu(+%llu)",
+            pvfb->exaEarlyReserveRoot ? "on" : "off",
+            (unsigned long long) pvfb->exaEarlyReserveWaits,
+            (unsigned long long) (pvfb->exaEarlyReserveWaits - prevWaits),
+            (unsigned long long) pvfb->exaEarlyReserveWaitUs,
+            (unsigned long long) (pvfb->exaEarlyReserveWaitUs - prevWaitUs));
+        prevWaits = pvfb->exaEarlyReserveWaits;
+        prevWaitUs = pvfb->exaEarlyReserveWaitUs;
+    }
     // P11-C3-D2: the root copies submitted ahead settled before their frame's submission, and why
     log(INFO, "XlorieRootCopySched: root_copy_sched_opt=%s vk_schedule_opt=%s settled_acquired=%llu(+%llu) "
               "settled_lock_wait=%llu(+%llu) settled_x_waiting=%llu(+%llu)",
@@ -4207,12 +4245,15 @@ static inline __always_inline Bool lorieNeedsGpuLock(PixmapPtr pPix, LoriePixmap
 
 /*
  * P11-C3-B1 (TERMUX_X11_EXA_LOCK_OPT=1, lorie.h cpuAccess), holding the shared lock: AHB `id` reserved for one CPU
- * access of this X server - never the root it publishes (rootWindowTextureID: the renderer samples it), nor with no
- * slot free (counted).
+ * access of this X server - not the root it publishes (the renderer samples it)
+ * except in V8's explicit root-early-reserve mode while a previous GPU frame
+ * still uses it. No reservation when all 8 slots are taken (counted).
  */
 static Bool lorieCpuReserve(uint64_t id) {
     struct lorie_shared_server_state *st = pvfb->state;
-    if (!pvfb->exaLockOpt || id == st->rootWindowTextureID)
+    if (!pvfb->exaLockOpt ||
+        (id == st->rootWindowTextureID &&
+         !(pvfb->exaEarlyReserveRoot && lorieGpuInFlight(st, id))))
         return FALSE;
     if (st->cpuAccess.count >= LORIE_CPU_ACCESS_MAX) {
         __atomic_fetch_add(&st->diag.xAccessReserveFull, 1, __ATOMIC_RELAXED);
@@ -4246,6 +4287,7 @@ static void lorieCpuReleasedWake(void) {
 Bool loriePrepareAccess(PixmapPtr pPix, int index) {
     LoriePixmapPriv *priv = exaGetPixmapDriverPrivate(pPix);
     Bool perAccessAhb = lorieAhbPerAccess() && lorieIsAhb(priv);
+    Bool reservedBeforeWait = FALSE;
     if (priv && priv->buffer)
         lorieXRenderAsyncFlushOnBuffer(priv->buffer);
     if (pvfb->rootPresentAsync && pPix == pScreenPtr->devPrivate)
@@ -4268,21 +4310,40 @@ Bool loriePrepareAccess(PixmapPtr pPix, int index) {
             priv->accessStartUs = GetTimeInMicros();
             lorieHistAdd(&pvfb->state->diag.xAccessLock, priv->accessStartUs - waitStartUs);
         }
-        // PER_ACCESS: the renderer lets the lock go while the device runs a frame; not while it uses this one.
+        // AHB CPU access must wait for the previous GPU submission before CPU-locking the buffer.
+        // V8 (opt-in): reserve this non-published AHB while under the shared lock, then
+        // let that mutex go BEFORE the GPU futex wait. A renderer that next takes the lock
+        // cannot submit another GPU access to this reserved buffer. The already-submitted
+        // work remains tracked by gpuInFlight until its frame fence signals.
         if (perAccessAhb && !priv->locked && !priv->mem) {
             uint64_t gpuStartUs = GetTimeInMicros(), gpuUs;
+            uint64_t id = LorieBuffer_description(priv->buffer)->id;
+            if (pvfb->exaEarlyReserve && pvfb->accessLocks == 1 &&
+                lorieGpuInFlight(pvfb->state, id) && lorieCpuReserve(id)) {
+                priv->reserved = reservedBeforeWait = TRUE;
+                if (priv->accessStartUs)
+                    priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);
+                pvfb->accessLocks--;
+                __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs,
+                                   GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
+                lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
+            }
             lorieGpuWaitIdle(pvfb->state, false, LorieBuffer_description(priv->buffer)->id);
             gpuUs = GetTimeInMicros() - gpuStartUs;
+            if (reservedBeforeWait) {
+                pvfb->exaEarlyReserveWaits++;
+                pvfb->exaEarlyReserveWaitUs += gpuUs;
+            }
             __atomic_fetch_add(&pvfb->state->diag.xGpuWaitUs, gpuUs, __ATOMIC_RELAXED);
             lorieSyncChainGpuWait(gpuUs, index);  // P11-C3-E2: EXA AHB read/write wait attribution
             if (pvfb->frameDiag)
                 lorieHistAdd(&pvfb->state->diag.xAccessGpu, gpuUs);
         }
-        if (perAccessAhb)
+        if (perAccessAhb && !reservedBeforeWait)
             __atomic_fetch_add(&pvfb->state->diag.xStateLockWaitUs, GetTimeInMicros() - waitStartUs, __ATOMIC_RELAXED);
         // P11-C3-B1: no frame uses it now; reserved, no renderer will until FinishAccess lets it go - and the shared
         // lock is let go before the CPU lock is taken, for the whole of the CPU access
-        if (perAccessAhb && lorieCpuReserve(LorieBuffer_description(priv->buffer)->id)) {
+        if (perAccessAhb && !reservedBeforeWait && lorieCpuReserve(LorieBuffer_description(priv->buffer)->id)) {
             priv->reserved = TRUE;
             if (priv->accessStartUs)
                 priv->accessHoldUs = (uint32_t) (GetTimeInMicros() - priv->accessStartUs);

@@ -43,6 +43,9 @@ static struct {
     struct { uint32_t us; int client, major, minor; char cmd[24], ext[24]; } worstRequest;
     struct { uint32_t us; int width, height, index; Bool reserved; } worstAccess;
     Bool exaLockOpt;
+    Bool exaEarlyReserve;
+    Bool exaEarlyReserveRoot;
+    uint64_t exaEarlyReserveWaits, exaEarlyReserveWaitUs;
     Bool exaCompositeOpt;
     Bool xrenderGpu, rootPresentGpu, rootPresentAsync;
     uint64_t xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuSmallSkipped;

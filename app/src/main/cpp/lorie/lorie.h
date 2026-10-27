@@ -992,7 +992,9 @@ static inline __always_inline bool lorieGpuSubmitterGone(volatile struct lorie_s
 }
 
 /*
- * Holding `lock`: returns once AHB `id` - or, with `every`, any AHB - is in no submitted Vulkan frame that is not
+ * Holding `lock`, or (when every is false) holding a cpuAccess reservation
+ * for this exact AHB:
+ * returns once AHB `id` - or, with `every`, any AHB - is in no submitted Vulkan frame that is not
  * over. The submitter ends the wait without `lock` (futex wake on `busy`); every 33 ms the submitter is looked
  * for, and a list whose submitter no longer exists is cleared here. Waits for as long as the submitter exists
  * and has not said so: it does, in bounded time, unless its device hangs.

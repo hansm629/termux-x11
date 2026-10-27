@@ -3153,8 +3153,10 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
             return;
         }
     }
-    // P11-C3-B1: the root reserved by the X server for a CPU access - which its rule never allows (lorie.h cpuAccess) -
-    // is not sampled: the image kept for the next frame, the copies run alone, a release waited for (bounded).
+    // P11-C3-B1/V8: a root reservation is only possible with opt-in
+    // EXA_EARLY_RESERVE_ROOT. A reserved root is NEVER sampled by Vulkan.
+    // Keep the acquired image until a later frame, run independent copies,
+    // and wait for the CPU reservation to be released (bounded futex).
     if (owned && lorieCpuReserved(state, desc->id)) {
         uint32_t releases = __atomic_load_n(&state->cpuAccess.releases, __ATOMIC_ACQUIRE);
         struct timespec slice = { 0, 33 * 1000000 };
