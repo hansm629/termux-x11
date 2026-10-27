@@ -93,6 +93,11 @@ typedef struct {
 
     Bool dri3;
     Bool gpuPresentDisabled;
+    /* v10 opt-in: ask Present to clip GPU copies to the window's visible region.
+     * The original Region is retained for CPU fallback; a successfully queued GPU
+     * copy owns the clipped Region for exact, deferred damage until completion. */
+    Bool presentGpuClip;
+    uint64_t presentClipQueued, presentClipPixelsBefore, presentClipPixelsAfter;
 
     uint64_t vblank_interval;
     struct xorg_list vblank_queue;
@@ -594,6 +599,12 @@ void OsVendorInit(void) {
     lorieScreen.state->backend.vkCopyEarlyPresent =
         getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY") &&
         !strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY"), "1");
+    // v10: independent, opt-in visible-region clipping for X Present GPU-copy
+    // requests. The old CPU fallback and original Region are kept on any
+    // allocation failure or when the renderer cannot accept the GPU copy.
+    lorieScreen.presentGpuClip =
+        getenv("TERMUX_X11_PRESENT_GPU_VISIBLE_CLIP") &&
+        !strcmp(getenv("TERMUX_X11_PRESENT_GPU_VISIBLE_CLIP"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
@@ -1702,6 +1713,22 @@ static void lorieLogRendererDiag(void) {
             (unsigned long long) (pvfb->exaEarlyReserveWaitUs - prevWaitUs));
         prevWaits = pvfb->exaEarlyReserveWaits;
         prevWaitUs = pvfb->exaEarlyReserveWaitUs;
+    }
+    {
+        static uint64_t prevCopies, prevBefore, prevAfter;
+        log(INFO, "XloriePresentClip: enabled=%s gpu_copies=%llu(+%llu) before_pixels=%llu(+%llu) "
+                  "after_pixels=%llu(+%llu) saved_pixels=%llu",
+            pvfb->presentGpuClip ? "on" : "off",
+            (unsigned long long) pvfb->presentClipQueued,
+            (unsigned long long) (pvfb->presentClipQueued - prevCopies),
+            (unsigned long long) pvfb->presentClipPixelsBefore,
+            (unsigned long long) (pvfb->presentClipPixelsBefore - prevBefore),
+            (unsigned long long) pvfb->presentClipPixelsAfter,
+            (unsigned long long) (pvfb->presentClipPixelsAfter - prevAfter),
+            (unsigned long long) (pvfb->presentClipPixelsBefore - pvfb->presentClipPixelsAfter));
+        prevCopies = pvfb->presentClipQueued;
+        prevBefore = pvfb->presentClipPixelsBefore;
+        prevAfter = pvfb->presentClipPixelsAfter;
     }
     // P11-C3-D2: the root copies submitted ahead settled before their frame's submission, and why
     log(INFO, "XlorieRootCopySched: root_copy_sched_opt=%s vk_schedule_opt=%s settled_acquired=%llu(+%llu) "
@@ -2981,6 +3008,38 @@ static Bool lorieWaitGpuCopyRecorded(uint64_t serial) {
         nanosleep(&pause, NULL);
     }
     return __atomic_load_n(&entry->recorded, __ATOMIC_ACQUIRE) == LORIE_GPU_COPY_RECORDED;
+}
+
+/* v10: the Xorg Present patch asks only when preparing a *new* GPU copy.
+ * Never change CPU Present's region or the Xorg Present completion protocol. */
+Bool loriePresentGpuClipEnabled(void) {
+    return pvfb && pvfb->presentGpuClip;
+}
+
+static uint64_t loriePresentRegionPixels(PixmapPtr pixmap, RegionPtr r) {
+    uint64_t pixels = 0;
+    int i, n;
+    BoxPtr b;
+
+    if (!r)
+        return (uint64_t) pixmap->drawable.width * pixmap->drawable.height;
+    n = RegionNumRects(r);
+    b = RegionRects(r);
+    for (i = 0; i < n; i++)
+        if (b[i].x2 > b[i].x1 && b[i].y2 > b[i].y1)
+            pixels += (uint64_t) (b[i].x2 - b[i].x1) * (uint64_t) (b[i].y2 - b[i].y1);
+    return pixels;
+}
+
+/* Called only after an actually accepted GPU copy. The source region is not
+ * modified by the clipping attempt; its lifetime still belongs to Present.
+ * This records submitted pixels, not an assumed GPU clock or FPS gain. */
+void loriePresentGpuClipRecord(PixmapPtr pixmap, RegionPtr before, RegionPtr after) {
+    if (!loriePresentGpuClipEnabled())
+        return;
+    pvfb->presentClipQueued++;
+    pvfb->presentClipPixelsBefore += loriePresentRegionPixels(pixmap, before);
+    pvfb->presentClipPixelsAfter += loriePresentRegionPixels(pixmap, after);
 }
 
 /* P11-C5-B2: a batch may contain overlapping *reads*, and disjoint destination writes, but no

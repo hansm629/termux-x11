@@ -102,6 +102,9 @@ static bool gpuMay(uint64_t s) { return s && completed < s && !isCancelled(s); }
 
 static int queueVblankFails;        /* the next n queue_vblank calls fail */
 static bool connectionAlive = true, rendererAvailable = true;
+static bool forceGpuFallback;      /* opt-in visibility clip must never contaminate the CPU fallback */
+static RegionRec lastGpuRegion;    /* the exact copy region observed by the fake GPU queue */
+static bool lastGpuRegionSet;
 static char trail[512];
 static PixmapPtr current;           /* the presentation's pixmap, for the steps that no longer have it */
 static void step(const char *what, PixmapPtr p) {
@@ -112,7 +115,11 @@ static uint64_t nextSerial;
 
 static Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
                                     uint64_t *out_serial, void **out_dst_buffer) {
-    (void) dst; (void) update; (void) x_off; (void) y_off;
+    (void) dst; (void) x_off; (void) y_off;
+    if (forceGpuFallback)
+        return FALSE;
+    lastGpuRegion = update ? *update : (RegionRec) { 1, 0, 0, pixmap->drawable.width, pixmap->drawable.height };
+    lastGpuRegionSet = true;
     pixmap->copySerial = *out_serial = ++nextSerial;
     *out_dst_buffer = &dstPixmap;
     pixmap->refs++;                 /* the X server's references (LorieBuffer_acquire), until the ack */
@@ -172,7 +179,32 @@ static void present_vblank_notify(struct present_vblank *v, CARD16 kind, CARD16 
 }
 static int regionsDestroyed, regionsLive;
 static bool regionCopyFails;
-static void RegionDestroy(RegionPtr r) { if (r) regionsDestroyed++; }
+static bool regionAllocFails;
+static RegionPtr gpuClipAllocated[16];
+static int gpuClipLive;
+static RegionPtr gpuClipOwn(const RegionRec *value) {
+    RegionPtr r;
+    if (regionAllocFails || gpuClipLive >= 16 || !(r = malloc(sizeof(*r))))
+        return NULL;
+    *r = *value;
+    gpuClipAllocated[gpuClipLive++] = r;
+    return r;
+}
+static RegionPtr RegionDuplicate(RegionPtr r) { return gpuClipOwn(r); }
+static RegionPtr RegionCreate(BoxRec *b, int n) {
+    RegionRec r = b && n ? (RegionRec) { 1, b->x1, b->y1, b->x2, b->y2 } : (RegionRec) { 0 };
+    return gpuClipOwn(&r);
+}
+static void RegionDestroy(RegionPtr r) {
+    if (r) regionsDestroyed++;
+    for (int i = 0; i < gpuClipLive; i++)
+        if (r == gpuClipAllocated[i]) {
+            gpuClipAllocated[i] = gpuClipAllocated[--gpuClipLive];
+            free(r);
+            break;
+        }
+}
+static Bool RegionNotEmpty(RegionPtr r) { return r && r->n != 0; }
 static void RegionNull(RegionPtr r) { *r = (RegionRec) { 0 }; regionsLive++; }
 static void RegionInit(RegionPtr r, BoxRec *b, int n) { *r = b && n ? (RegionRec) { 1, b->x1, b->y1, b->x2, b->y2 } : (RegionRec) { 0 }; regionsLive++; }
 static void RegionUninit(RegionPtr r) { (void) r; regionsLive--; }
@@ -184,6 +216,18 @@ static void RegionIntersect(RegionPtr d, RegionPtr a, RegionPtr b) {
     if (!a->n || !b->n || r.x1 >= r.x2 || r.y1 >= r.y2)
         r = (RegionRec) { 0 };
     *d = r;
+}
+/* The v10 option and measurement hooks: only the copied regions count, never a
+ * request for which the GPU refused the work or a region allocation failed. */
+static bool clipEnabled;
+static int clipRecorded;
+static uint64_t clipBeforePixels, clipAfterPixels;
+static Bool loriePresentGpuClipEnabled(void) { return clipEnabled; }
+static void loriePresentGpuClipRecord(PixmapPtr p, RegionPtr before, RegionPtr after) {
+    clipRecorded++;
+    clipBeforePixels += before && before->n ? (uint64_t) (before->x2 - before->x1) * (before->y2 - before->y1) :
+                        (uint64_t) p->drawable.width * p->drawable.height;
+    clipAfterPixels += (uint64_t) (after->x2 - after->x1) * (after->y2 - after->y1);
 }
 /* P11-C3-D1-A: the damage reported, logged apart (dtrail) - its box, and whether the GPU may still write then */
 static char dtrail[256];
@@ -320,6 +364,10 @@ static void dreset(void) {
     damageDeferred = regionsDestroyed = 0;
     memset(damageHow, 0, sizeof damageHow);
     nextUpdate = (RegionRec) { 0 }, nextXOff = nextYOff = 0;
+    clipRecorded = 0;
+    clipBeforePixels = clipAfterPixels = 0;
+    lastGpuRegion = (RegionRec) { 0 };
+    lastGpuRegionSet = false;
 }
 
 static void reset(void) {
@@ -331,6 +379,7 @@ static void reset(void) {
     queueVblankFails = 0;
     connectionAlive = rendererAvailable = true;
     outOfMemory = false;
+    forceGpuFallback = false;
     xorg_list_init(&windowPriv.vblank);
     xorg_list_init(&present_exec_queue);
 }
@@ -368,9 +417,9 @@ static void expect(const char *what, const char *want, int kind) {
 /* nothing held after a case: every reference back, no retired copy left, every vblank and retired copy freed */
 static void clean(const char *what, PixmapPtr p, int refs) {
     CHECK(p->refs == refs && dstPixmap.refs == 0 && xorg_list_is_empty(&present_retired_copies) && retiredMade == retiredReleased &&
-          allocs == 0, "%s: references %d (want %d), destination %d, retired copies %s, %d made and %d let go, %d allocations left",
+          allocs == 0 && gpuClipLive == 0, "%s: references %d (want %d), destination %d, retired copies %s, %d made and %d let go, %d allocations left; %d clip regions",
           what, p->refs, refs, dstPixmap.refs, xorg_list_is_empty(&present_retired_copies) ? "none" : "left", retiredMade,
-          retiredReleased, allocs);
+          retiredReleased, allocs, gpuClipLive);
 }
 
 int main(void) {
@@ -772,6 +821,77 @@ int main(void) {
     CHECK(!strcmp(dtrail, "damage(100,50,900,650)!") && !regionsLive, "off, out of memory: %s (want the clip)", dtrail);
     gpuDone(a.copySerial);
     clean("damage, off, out of memory", &a, 0);
+
+    /* v10: preserve the original source update for CPU fallback, but actually
+     * send only the intersection with the screen-coordinate window clipList
+     * to the GPU. Damage tracks those SAME source coordinates once copied. */
+    clipEnabled = true;
+    window.clipList = (RegionRec) { 1, 200, 80, 500, 280 };
+    reset();
+    dreset();
+    v = presentation(&a);        /* full 800x600: visible source rectangle 100,30..400,230 */
+    CHECK(lastGpuRegionSet && lastGpuRegion.n &&
+          lastGpuRegion.x1 == 100 && lastGpuRegion.y1 == 30 &&
+          lastGpuRegion.x2 == 400 && lastGpuRegion.y2 == 230,
+          "v10 visible full copy: sent (%d,%d)..(%d,%d), want (100,30)..(400,230)",
+          lastGpuRegion.x1, lastGpuRegion.y1, lastGpuRegion.x2, lastGpuRegion.y2);
+    CHECK(clipRecorded == 1 && clipBeforePixels == 480000 && clipAfterPixels == 60000 &&
+          !strcmp(dtrail, "damage(200,80,500,280)!"),
+          "v10 GPU clip/full damage: %s; %d records, pixels %llu/%llu",
+          dtrail, clipRecorded, (unsigned long long) clipBeforePixels, (unsigned long long) clipAfterPixels);
+    gpuDone(a.copySerial);
+    CHECK(gpuClipLive == 0 && regionsDestroyed == 1, "v10 copied region leaked or was destroyed twice");
+    clean("v10 GPU clip, full update", &a, 0);
+
+    /* Source rectangle, present offset, deferred Damage, and actual GPU
+     * pixels must agree; no damage or premature buffer release until done. */
+    deferDamage = true;
+    reset();
+    dreset();
+    nextUpdate = (RegionRec) { 1, 0, 0, 400, 400 }, nextXOff = 5, nextYOff = 6;
+    v = presentation(&a);
+    CHECK(lastGpuRegion.n && lastGpuRegion.x1 == 95 && lastGpuRegion.y1 == 24 &&
+          lastGpuRegion.x2 == 395 && lastGpuRegion.y2 == 224,
+          "v10 offset clip: sent (%d,%d)..(%d,%d), want (95,24)..(395,224)",
+          lastGpuRegion.x1, lastGpuRegion.y1, lastGpuRegion.x2, lastGpuRegion.y2);
+    CHECK(!dtrail[0] && v->lorie_damage_deferred && v->update != &nextUpdate &&
+          clipRecorded == 1 && clipBeforePixels == 160000 && clipAfterPixels == 60000,
+          "v10 offset clip: pending damage/region, recorded %d %llu/%llu",
+          clipRecorded, (unsigned long long) clipBeforePixels, (unsigned long long) clipAfterPixels);
+    gpuDone(a.copySerial);
+    CHECK(!strcmp(dtrail, "damage(200,80,500,280)+") && damageBeforeIdle &&
+          damagedTold == 1 && !damagedUntold && regionsDestroyed == 2 && gpuClipLive == 0,
+          "v10 offset clip: delayed damage/regions %s, destroyed %d, live %d",
+          dtrail, regionsDestroyed, gpuClipLive);
+    clean("v10 GPU clip, delayed damage", &a, 0);
+
+    /* Xorg cannot drop fully occluded pixels or an unchanged update on a
+     * failed GPU submit. Here a new clipped Region has been allocated, yet
+     * the fake GPU rejects the operation: the CPU copy uses the ORIGINAL. */
+    deferDamage = false;
+    reset();
+    dreset();
+    forceGpuFallback = true;
+    nextUpdate = (RegionRec) { 1, 0, 0, 400, 400 };
+    v = presentation(&a);
+    CHECK(lastGpuRegion.n == 0 && !clipRecorded && !gpuClipLive &&
+          !strcmp(trail, "cpu-copy+ idle+ complete(copy)+"),
+          "v10 CPU fallback must keep the original region, and destroy transient clip (%s)", trail);
+    clean("v10 CPU fallback", &a, 0);
+
+    reset();
+    dreset();
+    regionAllocFails = true;
+    nextUpdate = (RegionRec) { 1, 0, 0, 400, 400 };
+    v = presentation(&a);
+    CHECK(lastGpuRegion.n && lastGpuRegion.x1 == 0 && lastGpuRegion.y1 == 0 &&
+          lastGpuRegion.x2 == 400 && lastGpuRegion.y2 == 400 &&
+          !clipRecorded && !gpuClipLive, "v10 allocation failure must use the unmodified original GPU copy");
+    gpuDone(a.copySerial);
+    clean("v10 visibility clip OOM fallback", &a, 0);
+    regionAllocFails = false;
+    clipEnabled = false;
+    window.clipList = (RegionRec) { 1, 100, 50, 900, 650 };
 
     /* on: none as it is queued, nor while it runs; once it is done, before the client is told its pixmap is idle */
     deferDamage = true;

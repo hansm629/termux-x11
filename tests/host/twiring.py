@@ -117,6 +117,17 @@ check('getenv("TERMUX_X11_X_YIELD_ON_WAKE") && !strcmp(getenv("TERMUX_X11_X_YIEL
       "OsVendorInit does not read TERMUX_X11_X_YIELD_ON_WAKE=1")
 
 R = os.path.join(L, "renderer.c")
+present_patch = open(os.path.join(os.path.dirname(L), "patches", "xserver.patch"), encoding="utf-8").read()
+check("+++ ./exa/exa_unaccel.c" in present_patch and
+      "+        pExaScr->prepare_access_reg(pPixmap, EXA_PREPARE_DEST, prgnSrc);" in present_patch and
+      "+        exaPrepareAccess(pDrawable, EXA_PREPARE_DEST);" in present_patch and
+      "+    exaFinishAccess(pDrawable, EXA_PREPARE_DEST);" in present_patch,
+      "v10 ExaCheckCopyWindow must prepare/finish the actual destination rather than mark its writes as source reads")
+check('getenv("TERMUX_X11_PRESENT_GPU_VISIBLE_CLIP")' in init and
+      "loriePresentGpuClipEnabled()" in present_patch and
+      "gpuVisibleUpdate ? gpuVisibleUpdate : vblank->update" in present_patch and
+      "loriePresentGpuClipRecord(vblank->pixmap, vblank->update, gpuVisibleUpdate)" in present_patch,
+      "v10 GPU Present visibility clipping must be opt-in, use clipped GPU rectangles and retain original CPU fallback")
 def in_order(what, body, *steps):
     at = 0
     for s_ in steps:

@@ -237,6 +237,18 @@
  
          InputThreadInit();
  
++++ ./exa/exa_unaccel.c
+@@ -384,5 +384,5 @@
+-        pExaScr->prepare_access_reg(pPixmap, EXA_PREPARE_SRC, prgnSrc);
++        pExaScr->prepare_access_reg(pPixmap, EXA_PREPARE_DEST, prgnSrc);
+         RegionTranslate(prgnSrc, -xoff, -yoff);
+     }
+     else
+-        exaPrepareAccess(pDrawable, EXA_PREPARE_SRC);
++        exaPrepareAccess(pDrawable, EXA_PREPARE_DEST);
+@@ -393,1 +393,1 @@
+-    exaFinishAccess(pDrawable, EXA_PREPARE_SRC);
++    exaFinishAccess(pDrawable, EXA_PREPARE_DEST);
 +++ ./include/os.h
 @@ -557,6 +557,16 @@
  extern _X_EXPORT void
@@ -404,7 +416,7 @@
  
      screen_priv->re_execute(vblank);
  }
-@@ -61,12 +63,75 @@
+@@ -61,12 +63,76 @@
      return FALSE;
  }
  
@@ -477,13 +489,41 @@
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
++    RegionPtr                    gpuVisibleUpdate = NULL;
  
      /* If present_flip failed, we may have to requeue for the next MSC */
      if (vblank->exec_msc == crtc_msc + 1 &&
-@@ -79,12 +144,86 @@
+@@ -79,12 +145,128 @@
          return;
      }
  
++    /* v10 (opt-in): only the visible part of this Present copy needs a GPU blit.
++     * The source update is in presented-pixmap coordinates, whereas clipList is
++     * in screen coordinates. Keep the ORIGINAL region for CPU fallback, and
++     * only replace it after a GPU copy really was queued. In particular, a
++     * failed allocation or an empty clip cannot silently drop a presentation. */
++    if (!vblank->gpu_copy_pending && loriePresentGpuClipEnabled()) {
++        BoxRec full = { 0, 0, vblank->pixmap->drawable.width, vblank->pixmap->drawable.height };
++        RegionRec visible;
++        gpuVisibleUpdate = vblank->update ? RegionDuplicate(vblank->update) : RegionCreate(&full, 1);
++        if (gpuVisibleUpdate) {
++            RegionNull(&visible);
++            if (RegionCopy(&visible, &window->clipList)) {
++                RegionTranslate(&visible, -((int) vblank->x_off + window->drawable.x),
++                                -((int) vblank->y_off + window->drawable.y));
++                RegionIntersect(gpuVisibleUpdate, gpuVisibleUpdate, &visible);
++            } else {
++                RegionDestroy(gpuVisibleUpdate);
++                gpuVisibleUpdate = NULL;
++            }
++            RegionUninit(&visible);
++            if (gpuVisibleUpdate && !RegionNotEmpty(gpuVisibleUpdate)) {
++                RegionDestroy(gpuVisibleUpdate);
++                gpuVisibleUpdate = NULL;
++            }
++        }
++    }
++
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    /* lorie: a GPU copy was already scheduled and is not known done (P10-S1): never given up while the renderer may
 +     * still run it - nothing waits here. Polled again at msc+1 if that can be queued, and by lorieRecheckGpuCopies at
@@ -524,8 +564,19 @@
 +        present_damage_gpu_copy(vblank, LORIE_COPY_DAMAGE_DONE);    /* lorie: P11-C3-D1-A - the content there now */
 +        lorieContentCopyDone(vblank->lorie_content_seq, vblank->lorie_content_us, vblank->lorie_copy_us, gpuCopyDst);
 +    } else if (present_retired_copy_reserve(vblank) &&
-+               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst, vblank->update, gpuCopyXOff, gpuCopyYOff,
++               lorieTryScheduleGpuCopy(vblank->pixmap, gpuCopyDst,
++                                        gpuVisibleUpdate ? gpuVisibleUpdate : vblank->update, gpuCopyXOff, gpuCopyYOff,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
++        /* The queue copied these rectangles synchronously. The same clipped
++         * region must drive (possibly deferred) Damage when the GPU finishes.
++         * Keep the original until success so the CPU fallback remains exact. */
++        if (gpuVisibleUpdate) {
++            loriePresentGpuClipRecord(vblank->pixmap, vblank->update, gpuVisibleUpdate);
++            if (vblank->update)
++                RegionDestroy(vblank->update);
++            vblank->update = gpuVisibleUpdate;
++            gpuVisibleUpdate = NULL;
++        }
 +        /* lorie: our GPU blit writes the destination pixmap directly, bypassing the normal GC
 +         * ops that Damage tracking hooks into, so report it manually - on the window, so this also
 +         * reaches Composite's per-window damage for redirected windows, not just lorie's own root
@@ -556,6 +607,10 @@
 +            lorieCountGpuCopyEarly(LORIE_GPU_COPY_EARLY_POLL_FIRST);
 +        return;
 +    } else {
++        /* A GPU copy did not get queued. Xorg's CPU copy must use the original
++         * full region, never the transient visibility optimization. */
++        if (gpuVisibleUpdate)
++            RegionDestroy(gpuVisibleUpdate);
 +        present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +
 +        /* present_copy_region sticks the region into a scratch GC,
@@ -572,7 +627,7 @@
      screen_priv->flush(window);
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
-@@ -110,6 +249,7 @@
+@@ -110,6 +292,7 @@
      else
          mode = PresentCompleteModeCopy;
  
@@ -589,7 +644,7 @@
  #include <X11/X.h>
  #include "scrnintstr.h"
  #include "misc.h"
-@@ -90,8 +91,97 @@
+@@ -90,8 +91,99 @@
      Bool                abort_flip;     /* aborting this flip */
      PresentFlipReason   reason;         /* reason for which flip is not possible */
      Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
@@ -624,6 +679,8 @@
 + * window's own backing pixmap) to the renderer's GPU context instead of a CPU CopyArea. */
 +extern Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
 +                                     uint64_t *out_serial, void **out_dst_buffer);
++extern Bool loriePresentGpuClipEnabled(void);
++extern void loriePresentGpuClipRecord(PixmapPtr pixmap, RegionPtr before, RegionPtr after);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer);
 +/* lorie: implemented in lorie/cmdentrypoint.c. Avoids waiting forever on a GPU copy that a dead renderer will never finish. */

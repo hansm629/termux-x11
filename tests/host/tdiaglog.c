@@ -46,6 +46,8 @@ static struct {
     Bool exaEarlyReserve;
     Bool exaEarlyReserveRoot;
     uint64_t exaEarlyReserveWaits, exaEarlyReserveWaitUs;
+    Bool presentGpuClip;
+    uint64_t presentClipQueued, presentClipPixelsBefore, presentClipPixelsAfter;
     Bool exaCompositeOpt;
     Bool xrenderGpu, rootPresentGpu, rootPresentAsync;
     uint64_t xrenderGpuSuccess, xrenderGpuFallback, xrenderGpuSmallSkipped;
@@ -77,7 +79,7 @@ static int fails;
 int main(void) {
     const char *out = getenv("OUT");
     char path[512], line[4096];
-    int i, reports = 0, deltaOk = 0, backendOk = 0, selftestLines = 0;
+    int i, reports = 0, deltaOk = 0, backendOk = 0, selftestLines = 0, clipReports = 0;
 
     snprintf(path, sizeof path, "%s/diag-vulkan.log", out ? out : ".");
     logf = fopen(path, "w");
@@ -92,7 +94,11 @@ int main(void) {
     fakeState.diag.vkSelftestFormatsPassed = 7;
     fakeState.diag.vkSelftestUs = 2100000;
     fakeState.diag.vkSurfaceCreated = fakeState.diag.vkSwapchainCreated = 1;
+    fakePvfb.presentGpuClip = 1;
     for (i = 0; i < 4; i++) {
+        fakePvfb.presentClipQueued += 100;
+        fakePvfb.presentClipPixelsBefore += 120000;
+        fakePvfb.presentClipPixelsAfter += 30000;
         fakeState.diag.vkAhbImportAttempts += 2; fakeState.diag.vkAhbImportSuccess += 2;
         fakeState.diag.vkImportedSourceDraws += 300; fakeState.diag.vkImportedDestinationDraws += 50;
         fakeState.diag.vkRenderCommands += 350; fakeState.diag.vkQueueSubmits += 300;
@@ -105,6 +111,16 @@ int main(void) {
     fclose(logf);
     logf = fopen(path, "r");
     while (fgets(line, sizeof line, logf)) {
+        if (strstr(line, "XloriePresentClip:")) {
+            char copies[64], before[64], after[64], saved[64];
+            clipReports++;
+            snprintf(copies, sizeof copies, "gpu_copies=%d(+100)", clipReports * 100);
+            snprintf(before, sizeof before, "before_pixels=%d(+120000)", clipReports * 120000);
+            snprintf(after, sizeof after, "after_pixels=%d(+30000)", clipReports * 30000);
+            snprintf(saved, sizeof saved, "saved_pixels=%d", clipReports * 90000);
+            CHECK(strstr(line, "enabled=on") && strstr(line, copies) && strstr(line, before) &&
+                  strstr(line, after) && strstr(line, saved), "present clip counters do not match source: %s", line);
+        }
         if (strstr(line, "XlorieVkSelftest:")) {
             CHECK(strstr(line, "XlorieVkSelftest: result=pass compares=9000(+") && strstr(line, " iterations=1000 formats_passed=0x7 ") &&
                   strstr(line, " fail_step=NONE "), "self-test line: %s", line);
@@ -120,6 +136,7 @@ int main(void) {
     }
     fclose(logf);
     CHECK(selftestLines == 4, "vulkan log: %d self-test lines", selftestLines);
+    CHECK(clipReports == 4, "vulkan log: %d visibility clip reports (expected four)", clipReports);
     {
         int transferLines = 0;
         logf = fopen(path, "r");
