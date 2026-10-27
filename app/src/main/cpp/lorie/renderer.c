@@ -3217,9 +3217,15 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
-    // P11-C1: no copy in it (serial: the last entry it took, cancelled ones too), presented now; its result taken up
-    // once the fence was waited for, as the present below.
-    if ((early = (submitOpt || state->backend.vkEarlyPresent) && res == VK_SUCCESS && !serial)) {
+    // v9: a frame with Present copies may queue its *swapchain* presentation before
+    // the CPU waits for the frame fence: QueuePresentKHR waits on rendered[index],
+    // signalled only when GPU work (copies, root composition and FOREIGN ownership
+    // releases) finishes. The GPU-copy completedSerial, queue readIndex, in-flight
+    // AHB list and X client idle notifications MUST remain fence-gated below.
+    // v5's copy-free early Present still follows its independent default switch.
+    if ((early = res == VK_SUCCESS &&
+                 ((!serial && (submitOpt || state->backend.vkEarlyPresent)) ||
+                  (serial && state->backend.vkCopyEarlyPresent)))) {
         if (diag)
             ft.presentStartUs = lorieMonotonicUs();
         rendererStage(LORIE_R_PRESENT);
@@ -3228,6 +3234,8 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
         if (diag)
             ft.presentEndUs = lorieMonotonicUs();
         LORIE_DIAG_ADD(state, vkEarlyPresents, 1);
+        if (serial)
+            LORIE_DIAG_ADD(state, vkCopyEarlyPresents, 1);
     }
     // P11-C3-B2: the root copy submitted ahead - over by now or soon: the device runs it before this frame
     if (vkAux.pending) {
@@ -3260,6 +3268,10 @@ static void rendererVkRedraw(bool *waitingForBuffers) {
             notifyGpuCopyPublished(publishedUs, serial);
         }
         rendererVkCountCopies(queued, n, true, startUs, lockedUs, inflightUs, submittedUs, fencedUs, publishedUs);
+        if (serial) {
+            LORIE_DIAG_ADD(state, vkCopyFrames, 1);
+            LORIE_DIAG_ADD(state, vkCopyFrameFenceWaitUs, vkr.fenceWaitUs);
+        }
     }
 
     if (!owned) {

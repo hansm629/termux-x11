@@ -372,6 +372,10 @@ struct lorie_backend_control {
                                                  * IMMEDIATE preference, otherwise MAILBOX where supported */
     volatile uint8_t vkEarlyPresent;            /* X: no-copy screen frame can queue present before CPU
                                                  * fence wait. Default enabled, 0 restores serialized legacy. */
+    volatile uint8_t vkCopyEarlyPresent;        /* X: TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY=1 (opt-in):
+                                                 * also queue a screen frame carrying GPU Present copies before
+                                                 * waiting for its fence. Copies are NOT acknowledged until the
+                                                 * fence confirms that their imported AHBs are no longer in use. */
     volatile uint8_t freezeDiag;                /* X: TERMUX_X11_FRAME_FREEZE_DIAG=1 - P11-C3-C's freeze watchdog: the
                                                  * renderer keeps its stage (struct lorie_progress) */
     volatile uint8_t contentDiag;               /* X: TERMUX_X11_CONTENT_FRAME_DIAG=1 - P11-C3-D0: client content from
@@ -521,6 +525,12 @@ struct lorie_renderer_diag {
     /* TERMUX_X11_RENDERER_VK_SUBMIT_OPT: frames whose queued copies went ahead in a submission of their own where
      * they would have gone in the frame's (not FIFO); frames presented before their fence was waited for */
     volatile uint32_t vkCopiesAhead, vkEarlyPresents;
+    /* v9: screen frames that carried GPU Present copies; among them, Present requests
+     * queued before their fence, and the total GPU completion wait for such frames
+     * (both early and legacy paths), to distinguish a timing improvement from
+     * fewer frames or GPU work. */
+    volatile uint32_t vkCopyFrames, vkCopyEarlyPresents;
+    volatile uint64_t vkCopyFrameFenceWaitUs;
     volatile uint8_t vkSelftest;                /* 0 not run, 1 passed, 2 failed */
     /* the ownership self-test (vk.c lorieVkSelftest): byte-exact compares that passed, iterations per format and
      * direction, formats that passed / could not be tested (bit 0 RGBA, 1 RGBX, 2 BGRA), its duration; where it

@@ -1315,7 +1315,7 @@ int main(void) {
     /* Independent no-copy early Present: keep GPU-copy submission options
      * disabled, queue Present on the rendered semaphore before waiting for
      * the frame fence, and still wait before returning the imported AHB to
-     * the X server. A Present GPU-copy in the same frame still serializes. */
+     * the X server. A Present GPU-copy still serializes with v9 OFF. */
     {
         int early0 = emu.earlyPresents, presents0 = emu.presents, fails0 = vkFailures;
         uint32_t earlyDiag0 = st.diag.vkEarlyPresents;
@@ -1344,6 +1344,61 @@ int main(void) {
               "early Present with a copy: must publish the copy before Present");
         lorieGpuCopyAck(&bgraPix, dstBuffer);
         st.gpuInFlight.busy = 0;
+
+        /* v9 opt-in: a frame carrying an actual GPU Present-copy is allowed
+         * to enqueue its *swapchain* Present before the CPU waits on its GPU
+         * fence. The fake present checks the rendered semaphore. The completion
+         * hook records whether Present was ALREADY enqueued and whether the
+         * fence and every AHB in-flight release happened before it was
+         * published to the X client. */
+        {
+            int notified0 = notified.count, waits0 = atFence.waits;
+            int presents0 = emu.presents, early0 = emu.earlyPresents;
+            uint32_t copyFrames0 = st.diag.vkCopyFrames, copyEarly0 = st.diag.vkCopyEarlyPresents;
+            uint64_t copyWait0 = st.diag.vkCopyFrameFenceWaitUs;
+
+            st.backend.vkCopyEarlyPresent = 1;
+            CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0,
+                                         &serial, &dstBuffer), "v9 copy-early Present: not queued");
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            CHECK(emu.earlyPresents == early0 + 1 && emu.presents == presents0 + 1 &&
+                  st.diag.vkCopyEarlyPresents == copyEarly0 + 1 &&
+                  st.diag.vkCopyFrames == copyFrames0 + 1 && st.diag.vkCopyFrameFenceWaitUs >= copyWait0 &&
+                  atFence.waits == waits0 + 1 && inFlightAtFence(3, bgra, redirected, root) &&
+                  notified.count == notified0 + 1 && notified.presents == presents0 + 1 &&
+                  notified.fenceWaits == waits0 + 1 && notified.fenceWaited &&
+                  notified.cleared && notified.released && lorieGpuCopyIsDone(serial) &&
+                  !st.gpuInFlight.busy && st.lock == 0 &&
+                  vkFailures == fails0 && emu.violations == 0,
+                  "v9 copy-early Present: copy fence did not gate imported AHB reuse / serial publication");
+            lorieGpuCopyAck(&bgraPix, dstBuffer);
+            st.gpuInFlight.busy = 0;
+
+            /* A swapchain OUT_OF_DATE response is not a completed GPU copy.
+             * Even though the early present request cannot be displayed,
+             * the recorded copy must still finish, the AHB must be released,
+             * and the X client must get its completion only after the fence. */
+            notified0 = notified.count;
+            early0 = emu.earlyPresents;
+            presents0 = emu.presents;
+            emu.presentResult = VK_ERROR_OUT_OF_DATE_KHR;
+            CHECK(lorieTryScheduleGpuCopy(&bgraPix, &redirectedPix, NULL, 0, 0,
+                                         &serial, &dstBuffer), "v9 out-of-date copy-early Present: not queued");
+            st.drawRequested = 1;
+            rendererVkRedraw(&waiting);
+            CHECK(emu.earlyPresents == early0 + 1 && emu.presents == presents0 + 1 &&
+                  notified.count == notified0 + 1 && notified.presents == presents0 + 1 &&
+                  notified.cleared && notified.fenceWaited && notified.released &&
+                  lorieGpuCopyIsDone(serial) && !st.gpuInFlight.busy && vkr.recreate &&
+                  vkFailures == fails0 && emu.violations == 0,
+                  "v9 copy-early out-of-date: copy fence/ownership was not completed before client notification");
+            emu.presentResult = VK_SUCCESS;
+            lorieGpuCopyAck(&bgraPix, dstBuffer);
+            st.gpuInFlight.busy = 0;
+            st.backend.vkCopyEarlyPresent = 0;
+            earlyWithOption += 2;
+        }
         st.backend.vkEarlyPresent = 0;
         earlyWithOption++;  /* counted independently from SUBMIT_OPT */
     }

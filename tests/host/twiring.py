@@ -131,6 +131,14 @@ in_order("root double buffering", func(I, "static Bool lorieRedraw(__unused Clie
          "loriePerformVblanks();", "lorieRootSwap(priv)", "rootDouble ? priv->twin : priv->buffer")
 
 redraw = func(R, "static void rendererVkRedraw(bool *waitingForBuffers) {")
+check('getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY")' in init and
+      '!strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY"), "1")' in init and
+      "serial && state->backend.vkCopyEarlyPresent" in redraw,
+      "v9 copy-early Present must be opt-in and gated on a frame carrying a GPU copy")
+check(0 <= redraw.find("presented = lorieVkPresent(") <
+      redraw.find("res = lorieVkFrameWait(") <
+      redraw.find("__atomic_store_n(&state->gpuCopyQueue.completedSerial, serial, __ATOMIC_RELEASE);"),
+      "v9 must queue Present before waiting for the frame fence, but publish copy serial only AFTER the fence")
 # the swapchain is made again when out of date (vk.c); sizes come with a new surface, not from querying the window
 check("ANativeWindow_get" not in redraw, "a Vulkan frame compares the window's size with the swapchain's")
 in_order("Vulkan frame", redraw, "lorieVkAcquire(", "rendererVkLock()", "rendererVkOwnedLocked()",

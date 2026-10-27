@@ -587,6 +587,13 @@ void OsVendorInit(void) {
     lorieScreen.state->backend.vkEarlyPresent =
         !(getenv("TERMUX_X11_RENDERER_VK_PRESENT_EARLY") &&
           !strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_EARLY"), "0"));
+    // v9 (opt-in): enqueue a present request for a frame that *does* carry
+    // GPU copies before the CPU waits for that submission's fence. A Vulkan
+    // render-finished semaphore gates actual display consumption; the CPU
+    // only publishes completedSerial / releases imported AHBs after the fence.
+    lorieScreen.state->backend.vkCopyEarlyPresent =
+        getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY") &&
+        !strcmp(getenv("TERMUX_X11_RENDERER_VK_PRESENT_COPY_EARLY"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_DOUBLE=1 gives the screen pixmap a second buffer (lorieRootSwap).
     lorieScreen.rootDouble = getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE") && !strcmp(getenv("TERMUX_X11_RENDERER_ROOT_DOUBLE"), "1");
     // Experimental: TERMUX_X11_RENDERER_ROOT_COPY_OPT=1 has that swap lock the back for reading and the front for writing,
@@ -1750,6 +1757,10 @@ static void lorieLogRendererDiag(void) {
         TD(vkCopiesAhead), TD(vkEarlyPresents),
         d.vkSelftest == 1 ? "pass" : d.vkSelftest == 2 ? "fail" : "none",
         (const char *) d.vkDevice, d.vkDriverVersion, d.vkApiVersion, (const char *) d.vkPresentMode);
+    log(INFO, "XlorieVkCopyPresent: enabled=%s copy_frames=%llu(+%llu) copy_early_presents=%llu(+%llu) "
+              "copy_frame_fence_wait_us=%llu(+%llu)",
+        pvfb->state->backend.vkCopyEarlyPresent ? "on" : "off",
+        TD(vkCopyFrames), TD(vkCopyEarlyPresents), TD(vkCopyFrameFenceWaitUs));
     log(INFO, "XlorieVkSelftest: result=%s compares=%llu(+%llu) iterations=%u formats_passed=0x%x formats_unavailable=0x%x "
               "us=%llu fail_step=%s fail_format=%u fail_direction=%u fail_iteration=%u fail_offset=%u fail_expected=0x%02x "
               "fail_actual=0x%02x fail_vkresult=%d",
